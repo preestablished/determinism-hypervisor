@@ -11,11 +11,26 @@
 //! Code is no_std-compatible by construction (core + alloc idioms only);
 //! flipping the crate to `#![no_std]` later only needs blake3's `std`
 //! feature dropped.
+//!
+//! ORDERING CONTRACT (§3.2, deliberate): records MUST be appended in icount
+//! order — one global watermark across canonical AND AUX records, because
+//! file order is the normative order. Emitters that derive AUX data late
+//! (e.g. a digest computed at a pause) must buffer and append it in order
+//! themselves; the writer will reject regressions loudly rather than write
+//! a spec-violating file.
+//!
+//! Header field validity (clock_den != 0 etc.) is the MachineConfig layer's
+//! contract; this writer serializes the fields verbatim.
 
 /// Format version, major.minor in the high/low byte (§3.1): 1.0.
 pub const FORMAT_VERSION: u16 = 0x0100;
 pub const HEADER_LEN: usize = 256;
 pub const MAX_PAYLOAD: usize = 4096;
+/// DEV_EVENT caller data cap: the 8-byte device_id/event_type/data_len
+/// preamble lives inside the §3.2 payload, so data is bounded by 4088, not
+/// 4096. (NET_RX in M5 is framed raw — payload IS the frame, ≤ 2048 — and
+/// will not inherit this preamble or this limit.)
+pub const MAX_DEV_EVENT_DATA: usize = MAX_PAYLOAD - 8;
 
 pub const FLAG_SEALED: u32 = 1 << 0;
 pub const FLAG_HAS_AUX: u32 = 1 << 1;
@@ -135,10 +150,10 @@ impl LogWriter {
         event_type: u16,
         data: &[u8],
     ) -> Result<(), WriteError> {
-        let data_len: u32 = data
-            .len()
-            .try_into()
-            .map_err(|_| WriteError::PayloadTooLong)?;
+        if data.len() > MAX_DEV_EVENT_DATA {
+            return Err(WriteError::PayloadTooLong);
+        }
+        let data_len = data.len() as u32;
         let mut payload = Vec::with_capacity(8 + data.len());
         payload.extend_from_slice(&device_id.to_le_bytes());
         payload.extend_from_slice(&event_type.to_le_bytes());
@@ -240,10 +255,13 @@ impl LogWriter {
         let mut payload = [0u8; 40];
         payload[0] = params.stop_reason;
         payload[8..40].copy_from_slice(&params.end_state_hash);
-        // END is AUX-flagged? No: §3.3 lists END under AUX kinds table but it
-        // is structural; we keep rflags.AUX = 1 so minimal replayers that
-        // skip AUX records still terminate on end_icount from the header.
+        // §3.3 (normative): END carries rflags.AUX = 1 and boundary_rip = 0;
+        // a minimal replayer that skips AUX records still terminates via the
+        // header's end_icount/end_state_hash. END does NOT count toward
+        // flags.HAS_AUX — snapshot has_aux before appending it.
+        let has_aux = self.has_aux;
         self.record(KIND_END, RFLAG_AUX, params.end_icount, 0, &payload)?;
+        self.has_aux = has_aux;
 
         let h = &self.header;
         let buf = &mut self.buf;
@@ -343,7 +361,8 @@ mod tests {
         assert_eq!(&log[6..8], &[0x00, 0x01]); // 0x0100 LE: minor, major
         assert_eq!(u32::from_le_bytes(log[8..12].try_into().unwrap()), 256);
         let flags = u32::from_le_bytes(log[12..16].try_into().unwrap());
-        assert_eq!(flags, FLAG_SEALED | FLAG_HAS_AUX); // END is AUX-flagged
+        // END alone does not set HAS_AUX (§3.1 normative ruling).
+        assert_eq!(flags, FLAG_SEALED);
         assert_eq!(&log[16..48], &[0xAA; 32]);
         assert_eq!(&log[48..80], &[0xDD; 32]);
         assert_eq!(&log[80..112], &[0xBB; 32]);
@@ -459,11 +478,24 @@ mod tests {
     #[test]
     fn payload_limit_enforced() {
         let mut w = LogWriter::new(header());
-        let big = vec![0u8; MAX_PAYLOAD]; // dev_event adds an 8-byte preamble
+        // dev_event data is capped at 4088 (8-byte preamble inside the
+        // 4096 payload limit): the boundary fits, one more byte does not.
+        let max = vec![0u8; MAX_DEV_EVENT_DATA];
+        w.dev_event(1, 0, 1, 1, &max).unwrap();
+        let over = vec![0u8; MAX_DEV_EVENT_DATA + 1];
         assert_eq!(
-            w.dev_event(1, 0, 1, 1, &big),
+            w.dev_event(2, 0, 1, 1, &over),
             Err(WriteError::PayloadTooLong)
         );
+    }
+
+    #[test]
+    fn aux_flag_set_only_by_real_aux_records() {
+        let mut w = LogWriter::new(header());
+        w.frame_mark(10, 0, 1).unwrap();
+        let log = w.seal(seal_params()).unwrap();
+        let flags = u32::from_le_bytes(log[12..16].try_into().unwrap());
+        assert_eq!(flags, FLAG_SEALED | FLAG_HAS_AUX);
     }
 
     #[test]
