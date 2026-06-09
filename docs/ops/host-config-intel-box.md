@@ -35,7 +35,7 @@ that same constant, so this document's `2-5` literals are descriptive, not load-
 | 5 | THP off for slot memfds (`MADV_NOHUGEPAGE` convention) | THP mode = `madvise` → memfds get no THP unless code opts in; `dh-workerd` additionally calls `MADV_NOHUGEPAGE` on every slot mapping | ✅ — preflight must assert mode is `madvise` or `never` |
 | 6 | `kernel.nmi_watchdog=0` (frees a PMU counter, stops host NMI injection — gates M2 skid acceptance) | `1` | ❌ apply |
 | 7 | `perf_event_paranoid` permitting `perf_event_open` by the service user | `4` (Ubuntu hardening level — denies all unprivileged use) | ❌ apply |
-| 8 | Pin kernel + microcode as determinism-class baseline | kernel `6.8.0-88-generic`, microcode `0xfa` | ✅ recorded in `ci/determinism-class.lock` |
+| 8 | Pin kernel + microcode as determinism-class baseline | kernel `6.8.0-88-generic`, microcode `0xfa` | ✅ baselined — superseded post-reboot by the `-124` re-baseline (see below); `ci/determinism-class.lock` is the source of truth |
 
 ### CPU frequency decision (not a §7.4 bullet — decided, not omitted)
 
@@ -115,6 +115,13 @@ sudo apt-mark hold linux-image-generic linux-generic intel-microcode
 
 The nightly compares the live host against the lock and **fails on drift** — that is
 the designed tripwire, and the hold is what makes drift a deliberate act.
+
+This tripwire already fired once, at apply time (2026-06-09): the §7.4 reboot booted
+the already-installed `6.8.0-124-generic` instead of the `6.8.0-88-generic` the
+pre-apply audit recorded (the audit table above is the historical pre-apply
+snapshot). No corpus or recorded icounts existed yet, so the lock was simply
+re-baselined to `-124` — and the apt-mark hold matters precisely because the next
+such surprise will not be free.
 
 To absorb a deliberate kernel/microcode update:
 
