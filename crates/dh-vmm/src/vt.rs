@@ -5,10 +5,15 @@
 /// The per-VM clock rational, fixed for the VM's lifetime and recorded in
 /// every DHILOG header. Default 1:1 — one virtual nanosecond per retired
 /// instruction ("deterministic 1 GHz").
+///
+/// Terms are `u32` because that is their width on the wire and on disk
+/// (API.md: ClockRational in MachineConfig and the DHILOG header) — keeping
+/// the in-memory type the same width makes lossy casts unrepresentable in
+/// the future header writer. The math below promotes to u128 regardless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClockRatio {
-    num: u64,
-    den: u64,
+    num: u32,
+    den: u32,
 }
 
 impl Default for ClockRatio {
@@ -19,20 +24,20 @@ impl Default for ClockRatio {
 
 impl ClockRatio {
     /// Both terms must be nonzero; the ratio is otherwise unconstrained.
-    pub fn new(num: u64, den: u64) -> Option<Self> {
+    pub fn new(num: u32, den: u32) -> Option<Self> {
         (num != 0 && den != 0).then_some(Self { num, den })
     }
 
-    pub fn num(self) -> u64 {
+    pub fn num(self) -> u32 {
         self.num
     }
 
-    pub fn den(self) -> u64 {
+    pub fn den(self) -> u32 {
         self.den
     }
 
     /// `vns = icount * num / den`, u128 intermediate, truncating division
-    /// (ARCH §4). The u128 product cannot overflow (u64×u64 < u128); `None`
+    /// (ARCH §4). The u128 product cannot overflow (u64×u32 < u128); `None`
     /// means the *result* exceeds u64 — a fault for the caller to surface
     /// loudly, never to saturate silently.
     pub fn vns_from_icount(self, icount: u64) -> Option<u64> {
@@ -70,6 +75,22 @@ mod tests {
 
     const CASES: usize = 20_000;
 
+    // Ratio terms: mostly small, with the extremes ARCH cares about mixed
+    // into the random domain (1 and u32::MAX) so the properties cover
+    // 1/u32::MAX and u32::MAX/1, not just hand-written unit cases.
+    fn term(rng: &mut XorShift) -> u32 {
+        match rng.next() % 8 {
+            0 => 1,
+            1 => u32::MAX,
+            2 => u32::MAX - (rng.next() % 1000) as u32,
+            _ => 1 + (rng.next() % 1000) as u32,
+        }
+    }
+
+    fn ratio(rng: &mut XorShift) -> ClockRatio {
+        ClockRatio::new(term(rng), term(rng)).unwrap()
+    }
+
     #[test]
     fn default_is_one_to_one() {
         let r = ClockRatio::default();
@@ -105,10 +126,21 @@ mod tests {
     }
 
     #[test]
+    fn ratio_extremes_are_exact() {
+        let slow = ClockRatio::new(1, u32::MAX).unwrap();
+        assert_eq!(slow.vns_from_icount(u64::from(u32::MAX)), Some(1));
+        assert_eq!(slow.vns_from_icount(u64::from(u32::MAX) - 1), Some(0));
+        assert_eq!(slow.icount_for_vns_target(1), Some(u64::from(u32::MAX)));
+        let fast = ClockRatio::new(u32::MAX, 1).unwrap();
+        assert_eq!(fast.vns_from_icount(1), Some(u64::from(u32::MAX)));
+        assert_eq!(fast.icount_for_vns_target(u64::from(u32::MAX) + 1), Some(2));
+    }
+
+    #[test]
     fn prop_monotone_in_icount() {
         let mut rng = XorShift(0x9E3779B97F4A7C15);
         for _ in 0..CASES {
-            let r = ClockRatio::new(1 + rng.next() % 1000, 1 + rng.next() % 1000).unwrap();
+            let r = ratio(&mut rng);
             let i = rng.next();
             let (Some(a), Some(b)) = (r.vns_from_icount(i), r.vns_from_icount(i.saturating_add(1)))
             else {
@@ -122,14 +154,17 @@ mod tests {
     fn prop_timer_target_is_minimal_reaching_icount() {
         let mut rng = XorShift(0xD1B54A32D192ED03);
         for _ in 0..CASES {
-            let r = ClockRatio::new(1 + rng.next() % 1000, 1 + rng.next() % 1000).unwrap();
+            let r = ratio(&mut rng);
             let t = rng.next() % (1 << 48);
             let Some(j) = r.icount_for_vns_target(t) else {
                 continue;
             };
+            // vns(j) <= T + floor(num/den), so it can only exceed u64 range
+            // when T is near u64::MAX or num/den is astronomically large;
+            // with T < 2^48 and num <= u32::MAX it always fits.
             let reached = r
                 .vns_from_icount(j)
-                .expect("vns(j) overflows only if t did");
+                .expect("fits: T < 2^48, num/den <= u32::MAX");
             assert!(
                 reached >= t,
                 "vns(target icount) < T: ratio={r:?} T={t} j={j}"
@@ -151,9 +186,11 @@ mod tests {
         // produced that vns), and exactly i when the division was exact.
         let mut rng = XorShift(0xA0761D6478BD642F);
         for _ in 0..CASES {
-            let r = ClockRatio::new(1 + rng.next() % 1000, 1 + rng.next() % 1000).unwrap();
+            let r = ratio(&mut rng);
             let i = rng.next() % (1 << 48);
-            let vns = r.vns_from_icount(i).unwrap();
+            let Some(vns) = r.vns_from_icount(i) else {
+                continue; // u32::MAX/1 ratios can push vns past u64 at large i
+            };
             let Some(back) = r.icount_for_vns_target(vns) else {
                 continue;
             };
