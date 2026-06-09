@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod vt;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
     Empty,
