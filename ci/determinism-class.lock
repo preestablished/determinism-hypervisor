@@ -1,0 +1,9 @@
+# Determinism-class baseline for the kvm-intel CI runner (ARCH §7.4, API.md §2.8).
+# The nightly fails if the live host drifts from these values without a deliberate
+# bump; a bump requires re-baselining the record/replay corpus (IMPLEMENTATION-PLAN,
+# "Host-environment pinning"). vmm_version is code-side and intentionally absent.
+#
+# Host: infra-control (Intel box), baselined 2026-06-09.
+cpu_model=GenuineIntel family 6 model 158 stepping 10 (Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz)
+microcode=0xfa
+host_kernel=6.8.0-88-generic
