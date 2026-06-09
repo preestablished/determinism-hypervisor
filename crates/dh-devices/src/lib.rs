@@ -1,18 +1,94 @@
+//! dh-devices (ARCH §6): deterministic device models.
+//!
+//! Every device is a plain Rust state machine driven exclusively through
+//! [`DetDevice`] with a [`ctx::DevCtx`]. No device may read host time, host
+//! randomness, or do host I/O on the execution path. That rule is enforced
+//! three ways: this crate's lint config (clippy `disallowed_types` /
+//! `disallowed_methods`, see the workspace clippy.toml), the
+//! `no_host_ambient_authority` source-grep test below, and code review.
 #![forbid(unsafe_code)]
+#![deny(clippy::disallowed_types, clippy::disallowed_methods)]
+
+pub mod bus;
+pub mod ctx;
+
+pub use bus::{BusError, MmioBus, WINDOW_LEN};
+pub use ctx::{DevCtx, EntropySource, GuestMem, IrqRequest, MemError};
 
 pub const DEVICE_MODEL_COMPONENT: &str = "dh-devices";
 
+/// Restore failed: section bytes malformed for this device/version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MmioRange {
-    pub base: u64,
-    pub len: u64,
-}
+pub struct RestoreError;
 
+/// The device contract (ARCH §6).
+///
+/// Snapshot seam (deliberate Phase-1 shape): devices produce/consume their
+/// raw DHSNAP *section contents*; the section framing (tag, sec_version,
+/// len — API.md §4) is owned by `dh-snapshot`, which wraps these calls when
+/// it lands. `device_id` doubles as the §6.1 MAGIC register value and
+/// `section_version` as VERSION — both are served by the bus, read-only.
 pub trait DetDevice {
-    fn range(&self) -> MmioRange;
-    fn snapshot_label(&self) -> &'static str;
+    fn device_id(&self) -> u16;
+    /// Version of this device's snapshot section layout (and the §6.1
+    /// VERSION register value).
+    fn section_version(&self) -> u16;
+    /// `off` is window-relative, ≥ 0x08 (bus owns 0x00/0x04), pre-validated
+    /// to 4/8 bytes naturally aligned. Unknown offsets must read as zeros —
+    /// never host state.
+    fn mmio_read(&mut self, off: u64, data: &mut [u8], ctx: &mut DevCtx);
+    /// Same preconditions as `mmio_read`. Unknown offsets are ignored.
+    fn mmio_write(&mut self, off: u64, data: &[u8], ctx: &mut DevCtx);
+    /// Append this device's section contents (versioned by
+    /// `section_version`). Must be a pure function of device state.
+    fn snapshot(&self, out: &mut Vec<u8>);
+    fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError>;
 }
 
 pub fn input_payload_digest(payload: &[u8]) -> [u8; 32] {
     dh_inputlog::payload_digest(payload)
+}
+
+#[cfg(test)]
+mod deny_list_gate {
+    /// The CI-grep half of the §6 deny-list gate: the execution path in
+    /// this crate must never name host time, host randomness, network, or
+    /// filesystem APIs. (The clippy half catches typed usage; this catches
+    /// any spelling, including fully-qualified paths in new code.)
+    #[test]
+    fn no_host_ambient_authority() {
+        let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let forbidden = [
+            "std::time",
+            "rand::",
+            "std::net",
+            "std::fs",
+            "SystemTime",
+            "Instant::now",
+        ];
+        let mut hits = Vec::new();
+        for entry in std::fs::read_dir(src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let allowed_here = path.ends_with("lib.rs");
+            for (lineno, line) in text.lines().enumerate() {
+                if allowed_here {
+                    continue; // this gate module is the one allowed mention site
+                }
+                for tok in forbidden {
+                    if line.contains(tok) {
+                        hits.push(format!("{}:{}: {tok}", path.display(), lineno + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "deny-listed host APIs found:\n{}",
+            hits.join("\n")
+        );
+    }
 }

@@ -1,0 +1,15 @@
+# ARCH §6 deny-list gate: no host time, host randomness, network, or host
+# I/O in device models. Paired with #![deny(clippy::disallowed_types,
+# clippy::disallowed_methods)] in src/lib.rs and the no_host_ambient_authority
+# source-grep test.
+disallowed-types = [
+    { path = "std::time::Instant", reason = "devices must not read host time (ARCH §6)" },
+    { path = "std::time::SystemTime", reason = "devices must not read host time (ARCH §6)" },
+    { path = "std::net::TcpStream", reason = "no host network on the execution path (ARCH §6)" },
+    { path = "std::net::UdpSocket", reason = "no host network on the execution path (ARCH §6)" },
+    { path = "std::fs::File", reason = "no host I/O on the execution path (ARCH §6)" },
+]
+disallowed-methods = [
+    { path = "std::fs::read", reason = "no host I/O on the execution path (ARCH §6)" },
+    { path = "std::fs::write", reason = "no host I/O on the execution path (ARCH §6)" },
+]
