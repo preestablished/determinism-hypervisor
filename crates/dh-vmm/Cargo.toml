@@ -1,0 +1,8 @@
+[package]
+name = "dh-vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dh-types = { path = "../dh-types" }

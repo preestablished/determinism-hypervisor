@@ -1,0 +1,25 @@
+name: ci
+on:
+  pull_request:
+  push:
+jobs:
+  rust:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+        working-directory: repo
+      - run: cargo build --workspace
+        working-directory: repo
+      - run: cargo test --workspace
+        working-directory: repo
