@@ -116,6 +116,13 @@ sudo apt-mark hold linux-image-generic linux-generic intel-microcode
 The nightly compares the live host against the lock and **fails on drift** — that is
 the designed tripwire, and the hold is what makes drift a deliberate act.
 
+This tripwire already fired once, at apply time (2026-06-09): the §7.4 reboot booted
+the already-installed `6.8.0-124-generic` instead of the `6.8.0-88-generic` the
+pre-apply audit recorded (the audit table above is the historical pre-apply
+snapshot). No corpus or recorded icounts existed yet, so the lock was simply
+re-baselined to `-124` — and the apt-mark hold matters precisely because the next
+such surprise will not be free.
+
 To absorb a deliberate kernel/microcode update:
 
 1. `sudo apt-mark unhold ...`, upgrade, reboot.

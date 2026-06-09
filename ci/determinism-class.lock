@@ -12,12 +12,15 @@
 # vmm_version (the 4th §2.8 tuple field) is deliberately absent: it is code-side,
 # reported at runtime by dh-workerd from the dh-vmm crate version.
 #
-# Host: infra-control (Intel box), baselined 2026-06-09. Kernel and microcode
-# packages are apt-mark held at baseline time (see runbook).
+# Host: infra-control (Intel box), baselined 2026-06-09. Re-baselined same day:
+# the §7.4 apply reboot picked up the already-installed 6.8.0-124 kernel (was
+# 6.8.0-88 at first audit); no corpus or recorded icounts existed yet, so this
+# was a free re-baseline. Kernel and microcode packages are apt-mark held at
+# baseline time (see runbook).
 cpu_vendor=GenuineIntel
 cpu_family=6
 cpu_model_id=158
 cpu_stepping=10
 cpu_brand=Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz
 microcode=0xfa
-host_kernel=6.8.0-88-generic
+host_kernel=6.8.0-124-generic
