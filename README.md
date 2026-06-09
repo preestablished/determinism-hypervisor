@@ -17,8 +17,9 @@ section 1:
 - `crates/dh-proto`: thin wrappers over the sibling
   `../control-plane/crates/determinism-proto` path dependency.
 - `crates/dh-worker`: daemon layer. It may depend on all workspace crates;
-  no workspace crate depends on it.
-- `tools/dh-cli`: local debug CLI.
+  nothing depends on it — not other crates, and not `tools/dh-cli` either
+  (ARCH §1: "nothing depends on `dh-worker`").
+- `tools/dh-cli`: local debug CLI. Drives the VMM directly via `dh-vmm`.
 - `tests/nanokernel` and `tests/determinism`: architecture test homes.
 
 Disposition of the initial scaffold-only crates:
