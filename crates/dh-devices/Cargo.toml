@@ -1,5 +1,8 @@
 [package]
-name = "dh-types"
+name = "dh-devices"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+dh-inputlog.workspace = true

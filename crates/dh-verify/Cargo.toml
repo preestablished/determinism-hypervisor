@@ -1,8 +1,8 @@
 [package]
-name = "dh-smoke"
+name = "dh-verify"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dh-worker = { path = "../dh-worker" }
+dh-snapshot.workspace = true

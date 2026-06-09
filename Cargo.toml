@@ -1,5 +1,15 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/dh-detclock",
+    "crates/dh-devices",
+    "crates/dh-inputlog",
+    "crates/dh-proto",
+    "crates/dh-snapshot",
+    "crates/dh-verify",
+    "crates/dh-vmm",
+    "crates/dh-worker",
+    "tools/dh-cli",
+]
 resolver = "2"
 
 [workspace.package]
@@ -8,4 +18,13 @@ version = "0.1.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+blake3 = "1"
 determinism-proto = { path = "../control-plane/crates/determinism-proto", default-features = false }
+dh-detclock = { path = "crates/dh-detclock" }
+dh-devices = { path = "crates/dh-devices" }
+dh-inputlog = { path = "crates/dh-inputlog" }
+dh-proto = { path = "crates/dh-proto" }
+dh-snapshot = { path = "crates/dh-snapshot" }
+dh-verify = { path = "crates/dh-verify" }
+dh-vmm = { path = "crates/dh-vmm" }
+dh-worker = { path = "crates/dh-worker" }
