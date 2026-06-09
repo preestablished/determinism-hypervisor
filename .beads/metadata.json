@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "determinism_hypervisor",
+  "project_id": "994d1bdb-af51-4ed7-97c8-b5bcd2085b42"
+}
