@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod agenda;
 pub mod vt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
