@@ -1,9 +1,23 @@
 # Determinism-class baseline for the kvm-intel CI runner (ARCH §7.4, API.md §2.8).
 # The nightly fails if the live host drifts from these values without a deliberate
 # bump; a bump requires re-baselining the record/replay corpus (IMPLEMENTATION-PLAN,
-# "Host-environment pinning"). vmm_version is code-side and intentionally absent.
+# "Host-environment pinning"). Extraction commands that reproduce each value live
+# in docs/ops/host-config-intel-box.md ("re-baseline procedure").
 #
-# Host: infra-control (Intel box), baselined 2026-06-09.
-cpu_model=GenuineIntel family 6 model 158 stepping 10 (Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz)
+# Parse contract (for the nightly comparator, which does not exist yet):
+#   - lines starting with '#' and blank lines are ignored
+#   - split each remaining line on the FIRST '='; key left, value right
+#   - values are opaque and compared byte-exact (no normalization)
+#
+# vmm_version (the 4th §2.8 tuple field) is deliberately absent: it is code-side,
+# reported at runtime by dh-workerd from the dh-vmm crate version.
+#
+# Host: infra-control (Intel box), baselined 2026-06-09. Kernel and microcode
+# packages are apt-mark held at baseline time (see runbook).
+cpu_vendor=GenuineIntel
+cpu_family=6
+cpu_model_id=158
+cpu_stepping=10
+cpu_brand=Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz
 microcode=0xfa
 host_kernel=6.8.0-88-generic
