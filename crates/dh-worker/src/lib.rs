@@ -1,8 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub fn preflight_summary() -> String {
-    let missing = dh_vmm::missing_caps(&dh_vmm::required_caps_template());
-    format!("kvm_m0_missing_caps={}", missing.len())
+    dh_vmm::m0_missing_caps_summary()
 }
 
 pub fn workspace_component_count() -> usize {

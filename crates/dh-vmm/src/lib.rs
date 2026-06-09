@@ -44,6 +44,16 @@ pub fn missing_caps(caps: &KvmCaps) -> Vec<&'static str> {
     .collect()
 }
 
+// Single source of the M0 preflight summary line: dh-worker's preflight and
+// dh-cli both print it, but neither may define it — dh-cli must not depend on
+// dh-worker (ARCH §1), so the shared format lives here.
+pub fn m0_missing_caps_summary() -> String {
+    format!(
+        "kvm_m0_missing_caps={}",
+        missing_caps(&required_caps_template()).len()
+    )
+}
+
 pub fn architecture_components_present() -> bool {
     dh_detclock::DET_CLOCK_COMPONENT == "dh-detclock"
         && dh_devices::DEVICE_MODEL_COMPONENT == "dh-devices"
@@ -62,5 +72,10 @@ mod tests {
     #[test]
     fn arch_components_are_linked() {
         assert!(architecture_components_present());
+    }
+
+    #[test]
+    fn m0_summary_format_is_stable() {
+        assert_eq!(m0_missing_caps_summary(), "kvm_m0_missing_caps=0");
     }
 }
