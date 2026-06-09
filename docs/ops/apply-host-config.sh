@@ -38,6 +38,13 @@ verify() {
   local gov; gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo none)
   check "cpufreq.governor(cpu0)" "$gov" "performance"
 
+  # The CI runner / service user must be able to open /dev/kvm directly.
+  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    printf 'ok    %-28s rw as %s\n' "dev.kvm" "$(id -un)"
+  else
+    printf 'FAIL  %-28s not rw as %s (kvm group?)\n' "dev.kvm" "$(id -un)"; fail=1
+  fi
+
   # No IRQ may have a slot core in its effective affinity (irqaffinity= at
   # boot; per-driver overrides would show up here). The [$SLOT_CORES] glob
   # relies on single-digit CPU ids — guaranteed by the 6-CPU host guard.

@@ -7,7 +7,7 @@ select it with `runs-on: [self-hosted, kvm-intel]`.
 | | |
 |---|---|
 | Runner name | `infra-control-kvm-intel` |
-| Labels | `self-hosted`, `Linux`, `X64`, **`kvm-intel`** |
+| Labels | `self-hosted`, `Linux`, `X64`, **`kvm-intel`** (the load-bearing one — first three are GitHub defaults shared with every other runner on this box) |
 | Repo | `preestablished/determinism-hypervisor` |
 | Directory | `~infra-admin/actions-runner-determinism-hypervisor` |
 | Service unit | `actions.runner.preestablished-determinism-hypervisor.infra-control-kvm-intel.service` |
@@ -21,12 +21,29 @@ its version is NOT part of the determinism class — kernel/microcode are, see
 
 ## Host access the jobs rely on
 
-- **`/dev/kvm`** — `infra-admin` is in the `kvm` group.
+- **`/dev/kvm`** — `infra-admin` is in the `kvm` group;
+  `apply-host-config.sh --verify` asserts rw access when run as the runner user.
 - **`perf_event_open`** — `kernel.perf_event_paranoid=1` set by the §7.4 host
-  config ([host-config-intel-box.md](./host-config-intel-box.md)); no file caps
-  on any binary.
-- Both are asserted by `bash docs/ops/apply-host-config.sh --verify` and, once
-  it lands, `dh-workerd --preflight`.
+  config ([host-config-intel-box.md](./host-config-intel-box.md)). `--verify`
+  checks the sysctl (a proxy — it does not perform an actual
+  `perf_event_open`); the real end-to-end assertion is `dh-workerd
+  --preflight` once it lands.
+
+## Security: public repo + privileged runner
+
+This repo is **public** and this runner has `/dev/kvm`, a relaxed perf
+paranoid level, and three other repos' runners as neighbors — fork-PR code
+execution is the canonical self-hosted-runner hazard. Standing policy
+(applied 2026-06-09 via `gh api`, verify in Settings → Actions → General):
+
+- **Fork-PR approval**: `all_external_contributors` — every workflow run from
+  an outside fork waits for maintainer approval, not just first-timers.
+- **Default workflow token permissions**: `read` (repo contents read-only,
+  cannot approve PRs).
+- The CI workflow split (determinism-hypervisor-4jq) must additionally keep
+  `kvm-intel` jobs off fork PRs entirely (e.g. gate on
+  `github.event.pull_request.head.repo.full_name == github.repository`);
+  hosted-runner jobs are the only thing a fork PR may trigger.
 
 ## Isolation from slot cores
 
@@ -59,7 +76,7 @@ expires after 1 hour; `svc.sh` appears only after `config.sh` has run.
 
 ```bash
 cd ~/actions-runner-determinism-hypervisor
-sudo ./svc.sh install infra-admin
+sudo ./svc.sh install infra-admin   # arg = run-as user (defaults to $SUDO_USER, passed explicitly anyway)
 sudo ./svc.sh start
 sudo ./svc.sh status
 ```
@@ -71,7 +88,9 @@ sudo systemctl restart actions.runner.preestablished-determinism-hypervisor.infr
 journalctl -u actions.runner.preestablished-determinism-hypervisor.infra-control-kvm-intel.service -f
 ```
 
-Health check (expect `online` once the service runs):
+Health check (expect `online` once the service runs; **empty output means the
+runner is not registered at all** — distinct from `offline` = registered but
+service down):
 
 ```bash
 gh api repos/preestablished/determinism-hypervisor/actions/runners \
@@ -90,9 +109,17 @@ TOKEN=$(gh api -X POST repos/preestablished/determinism-hypervisor/actions/runne
 ## Caveats
 
 - **One KVM job at a time**: the determinism and perf jobs assume a quiesced
-  host (4 slot cores, exclusive PMU counters). Workflow jobs targeting
-  `kvm-intel` must set `concurrency` so runs queue rather than overlap
-  (determinism-hypervisor-4jq owns the workflow split).
+  host (4 slot cores, exclusive PMU counters). A single runner instance
+  already runs one job at a time — that serialization is automatic. Workflow
+  `concurrency` groups are still wanted for queue hygiene (collapse stale
+  queued runs) and to keep the guarantee if a second `kvm-intel` runner is
+  ever added (determinism-hypervisor-4jq owns the workflow split):
+
+  ```yaml
+  concurrency:
+    group: kvm-intel-${{ github.workflow }}
+    cancel-in-progress: false   # never kill a determinism run mid-measurement
+  ```
 - The three other runners on this box serve other repos on the housekeeping
   cores; their jobs can add noise to perf gates. Perf-gate flakiness →
   schedule the nightly when the box is quiet before touching margins.
