@@ -5,4 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dh-types = { path = "../dh-types" }
+dh-detclock.workspace = true
+dh-devices.workspace = true
+dh-inputlog.workspace = true
+dh-proto.workspace = true
+dh-snapshot.workspace = true

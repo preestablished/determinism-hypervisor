@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package determinism.hypervisor.v1;
+
+// Canonical schema placeholder for the hypervisor surface until the
+// control-plane determinism-proto path dependency owns generated code.
+service Hypervisor {}
