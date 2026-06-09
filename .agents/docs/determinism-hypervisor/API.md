@@ -83,7 +83,10 @@ message MachineConfig {
   BootSpec boot           = 7;
   uint64 epoch_len        = 8;   // instructions per epoch (default 50_000_000)
   HashEpochs hash_epochs  = 9;   // EPOCHS_ON (default) | FINAL_ONLY
-  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results)
+  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results;
+                                 //   for that reason it is EXCLUDED from the canonical
+                                 //   MachineConfig encoding / machine_config_hash preimage
+                                 //   — landing knobs must not fork snapshot identity)
 }
 message BootSpec {
   oneof kind {
