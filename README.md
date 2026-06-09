@@ -7,7 +7,10 @@ The Cargo workspace follows `.agents/docs/determinism-hypervisor/ARCHITECTURE.md
 section 1:
 
 - `crates/dh-vmm`: core VMM library. It owns the former `dh-types` slot-state
-  scaffold and the former `dh-kvm` capability-check scaffold.
+  scaffold and the former `dh-kvm` capability-check scaffold. Depends on
+  `dh-detclock`/`dh-devices`/`dh-inputlog` per ARCH §1, plus `dh-proto` and
+  `dh-snapshot` (a deliberate superset; ARCH §1's dependency line under-lists
+  these two).
 - `crates/dh-detclock`: guest instruction counter and PMI boundary timing home.
 - `crates/dh-devices`: deterministic device-model home.
 - `crates/dh-inputlog`: DHILOG core. Its dependency set is intentionally limited
@@ -17,8 +20,9 @@ section 1:
 - `crates/dh-proto`: thin wrappers over the sibling
   `../control-plane/crates/determinism-proto` path dependency.
 - `crates/dh-worker`: daemon layer. It may depend on all workspace crates;
-  no workspace crate depends on it.
-- `tools/dh-cli`: local debug CLI.
+  nothing depends on it — not other crates, and not `tools/dh-cli` either
+  (ARCH §1: "nothing depends on `dh-worker`").
+- `tools/dh-cli`: local debug CLI. Drives the VMM directly via `dh-vmm`.
 - `tests/nanokernel` and `tests/determinism`: architecture test homes.
 
 Disposition of the initial scaffold-only crates:

@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-dh-worker.workspace = true
+dh-vmm.workspace = true
