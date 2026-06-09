@@ -50,6 +50,11 @@ pub const MEM_ALIGN: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_EPOCH_LEN: u64 = 50_000_000;
 pub const DEFAULT_SKID_MARGIN: u32 = 8192;
 pub const DEFAULT_RESYNC_SLACK: u32 = 1024;
+/// Bounds on variable-length parts — keeps every length far from the u32
+/// cast and gives the forever-frozen format hard decode limits.
+pub const MAX_CMDLINE: usize = 4096;
+pub const MAX_CPUID_LEAVES: usize = 4096;
+pub const MAX_DEVICES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineConfig {
@@ -67,11 +72,13 @@ pub struct MachineConfig {
     /// Instructions per epoch (hash grid).
     pub epoch_len: u64,
     pub hash_epochs: HashEpochs,
-    /// PMI landing margin in instructions (landing only; never affects
-    /// results — ARCH §3.2). Part of the preimage because it is part of the
-    /// machine's declared execution envelope.
+    /// PMI landing margin in instructions. Landing-only: ARCH §3.2
+    /// guarantees the landed result is independent of it, so it is carried
+    /// as config but EXCLUDED from the canonical encoding / preimage —
+    /// changing a landing knob must not fork snapshot identity.
     pub skid_margin: u32,
-    /// Single-step refinement slack for the landing engine (Phase-1 knob).
+    /// Single-step refinement slack (Phase-1 landing knob). Excluded from
+    /// the preimage for the same reason; also not a wire field.
     pub resync_slack: u32,
     /// Masked CPUID table; sorted by (function, index), unique.
     pub cpuid_table: Vec<CpuidLeaf>,
@@ -110,6 +117,18 @@ impl MachineConfig {
         }
         if self.epoch_len == 0 {
             return Err(ConfigError::ZeroEpochLen);
+        }
+        let cmdline = match &self.boot {
+            BootSpec::Elf { cmdline, .. } | BootSpec::BzImage { cmdline, .. } => cmdline,
+        };
+        if cmdline.len() > MAX_CMDLINE {
+            return Err(ConfigError::CmdlineTooLong);
+        }
+        if self.cpuid_table.len() > MAX_CPUID_LEAVES {
+            return Err(ConfigError::CpuidTableTooLarge);
+        }
+        if self.device_set.len() > MAX_DEVICES {
+            return Err(ConfigError::DeviceSetTooLarge);
         }
         if !self
             .cpuid_table
@@ -160,13 +179,15 @@ impl MachineConfig {
                 out.extend_from_slice(cmdline);
             }
         }
+        // epoch_len/hash_epochs ARE preimage members: epoch hashes feed the
+        // §8.5 chain, so they change the comparison object itself. The
+        // landing knobs (skid_margin, resync_slack) are deliberately NOT
+        // encoded — see the field docs.
         out.extend_from_slice(&self.epoch_len.to_le_bytes());
         out.push(match self.hash_epochs {
             HashEpochs::EpochsOn => 1,
             HashEpochs::FinalOnly => 2,
         });
-        out.extend_from_slice(&self.skid_margin.to_le_bytes());
-        out.extend_from_slice(&self.resync_slack.to_le_bytes());
         out.extend_from_slice(&(self.cpuid_table.len() as u32).to_le_bytes());
         for leaf in &self.cpuid_table {
             for v in [
@@ -199,6 +220,9 @@ pub enum ConfigError {
     MemNotAligned,
     VcpusNotOne,
     ZeroEpochLen,
+    CmdlineTooLong,
+    CpuidTableTooLarge,
+    DeviceSetTooLarge,
     CpuidTableUnsorted,
     DeviceSetUnsorted,
 }
@@ -262,9 +286,7 @@ mod tests {
         let tail = &bytes[expected.len()..];
         let mut exp_tail = Vec::new();
         exp_tail.extend_from_slice(&DEFAULT_EPOCH_LEN.to_le_bytes());
-        exp_tail.push(1); // EPOCHS_ON
-        exp_tail.extend_from_slice(&DEFAULT_SKID_MARGIN.to_le_bytes());
-        exp_tail.extend_from_slice(&DEFAULT_RESYNC_SLACK.to_le_bytes());
+        exp_tail.push(1); // EPOCHS_ON — landing knobs are NOT encoded
         exp_tail.extend_from_slice(&2u32.to_le_bytes());
         exp_tail.extend_from_slice(&0u32.to_le_bytes()); // f=0
         exp_tail.extend_from_slice(&0u32.to_le_bytes());
@@ -307,6 +329,17 @@ mod tests {
             cmdline.push(b'x');
         }
         assert_ne!(h, c.config_hash().unwrap());
+    }
+
+    #[test]
+    fn landing_knobs_do_not_fork_identity() {
+        // ARCH §3.2: results are independent of the landing machinery, so
+        // skid_margin / resync_slack must NOT change machine_config_hash.
+        let h = config().config_hash().unwrap();
+        let mut c = config();
+        c.skid_margin = 16384;
+        c.resync_slack = 4096;
+        assert_eq!(h, c.config_hash().unwrap());
     }
 
     #[test]
@@ -363,6 +396,16 @@ mod tests {
         let mut c = config();
         c.device_set = vec![2, 2];
         assert_eq!(c.validate(), Err(ConfigError::DeviceSetUnsorted));
+
+        let mut c = config();
+        if let BootSpec::Elf { cmdline, .. } = &mut c.boot {
+            *cmdline = vec![0u8; MAX_CMDLINE + 1];
+        }
+        assert_eq!(c.validate(), Err(ConfigError::CmdlineTooLong));
+
+        let mut c = config();
+        c.device_set = (0..=(MAX_DEVICES as u16)).collect();
+        assert_eq!(c.validate(), Err(ConfigError::DeviceSetTooLarge));
     }
 
     #[test]
