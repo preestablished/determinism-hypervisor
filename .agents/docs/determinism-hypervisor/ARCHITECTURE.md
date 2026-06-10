@@ -231,12 +231,12 @@ guarantee:
   iterating), it keeps stepping until `RIP` advances. `RCX` is recorded in boundary
   diagnostics but is not part of the landing rule.
 - VM-exiting instructions retire **zero** guest instructions. MEASURED in isolation
-  on the kvm-intel class for `CPUID`, PIO `OUT`, MMIO read, and MMIO write (counting
-  guest, bit-stable across cold boots/cores/processes/load; see
-  `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); `HLT` and PIO `IN` are EXPECTED to
-  follow the same mechanism but are not yet isolated (PIO `IN` is constrained by the
-  bit-identical icounts of IN-heavy boots; `HLT` isolation belongs to the
-  counting_semantics acceptance). The mechanism: the instruction exits before
+  on the kvm-intel class for `CPUID`, PIO `OUT`, MMIO read, MMIO write, and `HLT`
+  (counting guest + the counting_semantics single-step attribution: every park-loop
+  hlt/jmp cycle advances the counter by exactly 1 — the jmp alone; see
+  `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); PIO `IN` is EXPECTED to follow the
+  same mechanism but is not yet isolated (constrained by the bit-identical icounts
+  of IN-heavy boots). The mechanism: the instruction exits before
   retirement and KVM completes it host-side by skipping `RIP`, which an
   `exclude_host=1` counter never sees. (An earlier revision of this section claimed
   "retire exactly once, on the completing resume"; the empirics refuted that.)
@@ -268,7 +268,10 @@ loop:
       KVM_RUN                               # one KVM_EXIT_DEBUG per step
       service any interleaved MMIO exits (count unchanged until retirement)
       c = read_counter()                    # re-read; never assume +1
-      (REP rule: if RIP unchanged, continue stepping without counting a boundary)
+      (REP rule: if RIP unchanged, continue stepping without counting a boundary;
+       re-assert guest_debug after every handled exit — an MMIO-WRITE exit eats the
+       pending single-step trap: the emulator completes the instruction and clears
+       TF without delivering the #DB, and an un-re-armed step would free-run)
   if c > N: fatal DivergenceError::Overshoot   # P0: skid margin too small, see risks
 ```
 

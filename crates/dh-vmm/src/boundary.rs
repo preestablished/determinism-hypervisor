@@ -163,7 +163,17 @@ pub fn land_at(
                 // One step. The counter re-read at loop top is the ONLY
                 // progress signal (never assume +1; REP rule).
                 Ok(VcpuExit::Debug(_)) => {}
-                Ok(exit) => on_exit(exit)?,
+                Ok(exit) => {
+                    on_exit(exit)?;
+                    // MEASURED (iteration 50, kernel 6.8): an MMIO-WRITE
+                    // exit eats the pending single-step trap — the
+                    // emulator completes the instruction and clears TF
+                    // without delivering the #DB, so re-entry would
+                    // FREE-RUN past the target (Overshoot). MMIO reads
+                    // and PIO keep the trap. Re-asserting guest_debug
+                    // re-arms TF; harmless where the trap survived.
+                    set_singlestep(&mut guard, true)?;
+                }
                 Err(e) if e.errno() == libc::EINTR => {
                     clear_immediate_exit(&mut guard);
                 }
@@ -210,6 +220,12 @@ pub fn step_one_entry(
                 if let Err(e) = on_exit(exit) {
                     break Err(e);
                 }
+                // Re-arm TF: an MMIO-write exit clears it without the
+                // #DB (see land_at; measured iteration 50). NOTE the
+                // entry then traps after the NEXT instruction — the
+                // write already completed, so one entry can span the
+                // write plus its successor.
+                set_singlestep(&mut guard, true)?;
             }
             Err(e) if e.errno() == libc::EINTR => clear_immediate_exit(&mut guard),
             Err(e) => break Err(BoundaryError::Kvm(format!("KVM_RUN: {e}"))),
