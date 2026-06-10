@@ -22,6 +22,10 @@ use perf_event_open_sys as sys;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 
+/// Sentinel arming period: large enough to never fire within a segment
+/// (hard cap is 10e9 instructions), small enough to stay valid for the PMU.
+pub const NEVER_FIRES_PERIOD: u64 = 1 << 62;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CounterError {
     /// perf_event_open failed (errno + context). EACCES usually means
@@ -58,8 +62,11 @@ impl InstRetired {
         attr.set_exclude_idle(1);
         // exclude_user / exclude_kernel stay 0: guest user+kernel count.
         attr.set_disabled(1);
-        // Overflow fields (sample_period, wakeup_events) are armed per run
-        // segment by the boundary engine bead, not at open time.
+        // Open as a SAMPLING event (kernel rejects IOC_PERIOD on
+        // non-sampling events) with a never-fires sentinel period; the
+        // boundary engine re-arms the real period per run segment.
+        attr.__bindgen_anon_1.sample_period = NEVER_FIRES_PERIOD;
+        attr.__bindgen_anon_2.wakeup_events = 1; // §3.1
         attr.read_format = u64::from(
             sys::bindings::PERF_FORMAT_TOTAL_TIME_ENABLED
                 | sys::bindings::PERF_FORMAT_TOTAL_TIME_RUNNING,
@@ -125,6 +132,66 @@ impl InstRetired {
         #[allow(unsafe_code)]
         let rc = unsafe { sys::ioctls::ENABLE(self.fd.as_raw_fd(), 0) };
         ioctl_result("ENABLE", rc)
+    }
+
+    /// Arm the overflow period for the next run segment (§3.1
+    /// PERF_EVENT_IOC_PERIOD). The boundary engine sets period =
+    /// (target icount - current icount) - skid_margin.
+    pub fn arm_period(&self, period: u64) -> Result<(), CounterError> {
+        let mut p = period;
+        // SAFETY: valid perf fd; PERF_EVENT_IOC_PERIOD reads a u64 through
+        // the pointer passed as the ioctl arg (the sys wrapper forwards the
+        // u64 verbatim, so we pass the address).
+        #[allow(unsafe_code)]
+        let rc = unsafe { sys::ioctls::PERIOD(self.fd.as_raw_fd(), &mut p as *mut u64 as u64) };
+        ioctl_result("PERIOD", rc)
+    }
+
+    /// Route overflow signals to the vCPU thread (§3.1): F_SETOWN_EX with
+    /// F_OWNER_TID + F_SETSIG(signo) + O_ASYNC. The signal handler (dh-vmm
+    /// run module) sets kvm_run.immediate_exit — the KVM_CAP_IMMEDIATE_EXIT
+    /// protocol makes the kick race-free.
+    pub fn route_overflow_to_thread(&self, tid: i32, signo: i32) -> Result<(), CounterError> {
+        // libc lacks f_owner_ex on this target; define the ABI struct
+        // locally (kernel: include/uapi/asm-generic/fcntl.h).
+        #[repr(C)]
+        struct FOwnerEx {
+            type_: libc::c_int,
+            pid: libc::pid_t,
+        }
+        const F_OWNER_TID: libc::c_int = 0;
+        const F_SETOWN_EX: libc::c_int = 15;
+        const F_SETSIG: libc::c_int = 10;
+        let owner = FOwnerEx {
+            type_: F_OWNER_TID,
+            pid: tid,
+        };
+        // SAFETY: valid fd; fcntl with a valid f_owner_ex pointer / flags.
+        #[allow(unsafe_code)]
+        unsafe {
+            if libc::fcntl(self.fd.as_raw_fd(), F_SETOWN_EX, &owner) != 0 {
+                return Err(CounterError::Ioctl(format!(
+                    "F_SETOWN_EX: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if libc::fcntl(self.fd.as_raw_fd(), F_SETSIG, signo) != 0 {
+                return Err(CounterError::Ioctl(format!(
+                    "F_SETSIG: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let flags = libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL);
+            if flags < 0
+                || libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_ASYNC) != 0
+            {
+                return Err(CounterError::Ioctl(format!(
+                    "O_ASYNC: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn disable(&self) -> Result<(), CounterError> {

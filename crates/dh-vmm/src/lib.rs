@@ -3,6 +3,7 @@
 pub mod agenda;
 pub mod config;
 pub mod kvm;
+pub mod run;
 pub mod vt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
