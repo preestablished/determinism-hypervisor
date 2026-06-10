@@ -2,6 +2,11 @@
 //! N consecutive runs, ZERO divergence. Generic over the run's outcome
 //! fingerprint — dh-cli's `gate` subcommand and the tests/determinism
 //! suite drive it with VM machinery; this crate stays pure.
+//!
+//! HONESTY NOTE: N runs in one process sample within-boot variation
+//! (PMI timing, scheduler interference, cache state) — cross-host-boot
+//! and cross-kernel divergence is the dedicated runner's long-baseline
+//! job, not this gate's.
 
 /// One gate execution: every run's fingerprint, and the first divergence
 /// if any. The REPORT (artifact) lists all fingerprints so a failure is

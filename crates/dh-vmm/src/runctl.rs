@@ -105,8 +105,12 @@ pub struct ScheduledInjection {
 
 /// A guest-armed one-shot pv-clock timer (ARCH §4): the caller reads it
 /// from the device (`PvClock::armed()`) before compiling the segment.
-/// `deadline_vns` is segment-relative here (the caller subtracts the
-/// segment's vns base from the device's absolute deadline).
+/// `deadline_vns` is COUNTER-SPACE vns — the same origin as
+/// `counter.read()` (zero at the counter reset, i.e. boot). Today that
+/// origin never moves; when M4 restore gives segments a nonzero vns
+/// base, the caller subtracts the base from the device's absolute
+/// deadline BEFORE constructing this (review iter-41: the conversion
+/// itself is origin-0; only the start clamp is segment-aware).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerArm {
     pub deadline_vns: u64,
