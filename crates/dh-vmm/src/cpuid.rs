@@ -59,6 +59,11 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
                     | L1_ECX_PDCM
                     | L1_ECX_RDRAND);
                 e.edx &= !(L1_EDX_TM | L1_EDX_ACPI);
+                // EBX[31:24] is the initial APIC ID: which HOST LP the
+                // ioctl ran on. It flipped the masked-table hash between
+                // runs of the same binary (iteration-48 review, live).
+                // Host placement, never machine identity: zeroed.
+                e.ebx &= 0x00FF_FFFF;
             }
             (6, _) => {
                 // Thermal & power management leaf: ARAT, turbo, HWP, the
@@ -96,6 +101,17 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
                 // (KVM_PMU_CAP_DISABLE) and must never be advertised — it
                 // would also contend with the host's pinned INST_RETIRED
                 // counter (ARCH §3.1).
+                e.eax = 0;
+                e.ebx = 0;
+                e.ecx = 0;
+                e.edx = 0;
+            }
+            (0xB, _) | (0x1F, _) => {
+                // Extended topology leaves: EDX is the executing LP's
+                // x2APIC ID — host placement, run-to-run unstable
+                // (iteration-48 review, live). x2APIC is masked out of
+                // leaf 1 anyway, so the enumeration means nothing to the
+                // guest: zeroed like leaves 6/0xA.
                 e.eax = 0;
                 e.ebx = 0;
                 e.ecx = 0;

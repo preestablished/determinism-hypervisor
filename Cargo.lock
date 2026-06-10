@@ -79,7 +79,11 @@ version = "0.1.0"
 name = "determinism-tests"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "detguest-host",
  "dh-detclock",
+ "dh-devices",
+ "dh-inputlog",
  "dh-verify",
  "dh-vmm",
  "kvm-ioctls",
