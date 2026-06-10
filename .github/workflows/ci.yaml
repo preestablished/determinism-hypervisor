@@ -52,6 +52,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # tests/nanokernel's build.rs assembles the test guests with nasm
+      # (cross-assembles x86 on the arm runner too; linking falls back to
+      # the sysroot rust-lld there).
+      - run: which nasm || { sudo apt-get update && sudo apt-get install -y nasm; }
       # NOT `cargo fmt --all`: cargo-fmt's --all also formats local path
       # dependencies, i.e. the sibling checkouts (control-plane, guest-sdk),
       # whose formatting must not gate this repo's CI. Scope to our members,
