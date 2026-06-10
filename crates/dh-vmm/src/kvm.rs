@@ -15,6 +15,11 @@ use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 pub const MMIO_HOLE_BASE: u64 = 0xD000_0000;
 pub const MMIO_HOLE_LEN: u64 = 0x7000;
 
+/// ARCH §8.2: dirty ring entry count; ring bytes = entries × 16-byte
+/// kvm_dirty_gfn (power of two, as KVM requires).
+pub const DIRTY_RING_ENTRIES: u64 = 65536;
+pub const DIRTY_RING_BYTES: u64 = DIRTY_RING_ENTRIES * 16;
+
 /// PIO map (§2.2): debug serial + the detcall window; all else RAZ/WI.
 pub const PIO_SERIAL_BASE: u16 = 0x3F8;
 pub const PIO_SERIAL_LEN: u16 = 8;
@@ -121,6 +126,19 @@ impl KvmSystem {
             .kvm
             .create_vm()
             .map_err(|e| KvmError::VmCreate(e.to_string()))?;
+
+        // Dirty ring (ARCH §8.2: 65536 entries) must be enabled BEFORE any
+        // vCPU exists — it cannot be retrofitted without recreating the VM.
+        // With memslot flags 0 nothing is logged yet; M4 turns harvesting on.
+        if self.dirty_ring {
+            let mut cap = kvm_bindings::kvm_enable_cap {
+                cap: kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL,
+                ..Default::default()
+            };
+            cap.args[0] = DIRTY_RING_BYTES;
+            vm.enable_cap(&cap)
+                .map_err(|e| KvmError::VmCreate(format!("dirty ring enable: {e}")))?;
+        }
 
         let memfd = memfd_nohuge(mem_bytes)?;
         let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
@@ -289,7 +307,15 @@ fn host_addr(mem: &GuestMemoryMmap<()>) -> Result<u64, KvmError> {
 fn memfd_nohuge(len: u64) -> Result<std::fs::File, KvmError> {
     use std::os::fd::FromRawFd;
     #[allow(unsafe_code)]
-    let fd = unsafe { libc::memfd_create(c"dh-slot-ram".as_ptr(), libc::MFD_CLOEXEC) };
+    // MFD_ALLOW_SEALING is load-bearing: §8.4 freezes forked parents with
+    // F_SEAL_FUTURE_WRITE, and sealing CANNOT be retrofitted onto a memfd
+    // created without this flag (EPERM forever).
+    let fd = unsafe {
+        libc::memfd_create(
+            c"dh-slot-ram".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
     if fd < 0 {
         return Err(KvmError::Memory(format!(
             "memfd_create: {}",
