@@ -60,6 +60,8 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("hello", hello_elf());
     assert_guest_shape("sti_window", sti_window_elf());
     assert_guest_shape("timer_guest", timer_guest_elf());
+    assert_guest_shape("counting", counting_elf());
+    assert_guest_shape("rep_loop", rep_loop_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -145,6 +147,49 @@ fn landing_loop_asm_matches_rust_constants() {
     assert_eq!(
         instrs, LANDING_LOOP_INSTRS_PER_ITER,
         "loop body drifted from the documented per-iteration count"
+    );
+}
+
+/// Same pin for rep_loop (bead 8g1): the body between `.loop:` and its
+/// closing `jmp .loop` must be exactly REP_LOOP_INSTRS_PER_ITER
+/// instructions (REP MOVSB is one line, one retirement), and the
+/// `mov rcx, 64` must match REP_LOOP_RCX_AT_REP_START — the landing
+/// test's mid-REP detector depends on both.
+#[test]
+fn rep_loop_asm_matches_rust_constants() {
+    let asm =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/rep_loop.asm")).unwrap();
+    let mut in_loop = false;
+    let mut instrs = 0u64;
+    let mut rcx_load: Option<u64> = None;
+    for line in asm.lines() {
+        let t = line.split(';').next().unwrap().trim();
+        if t == ".loop:" {
+            in_loop = true;
+            continue;
+        }
+        if !in_loop || t.is_empty() || t.ends_with(':') || t.starts_with("align") {
+            continue;
+        }
+        instrs += 1;
+        if let Some(rest) = t.strip_prefix("mov") {
+            let rest = rest.trim();
+            if let Some(v) = rest.strip_prefix("rcx,") {
+                rcx_load = Some(v.trim().parse().unwrap());
+            }
+        }
+        if t.starts_with("jmp") {
+            break;
+        }
+    }
+    assert_eq!(
+        instrs, REP_LOOP_INSTRS_PER_ITER,
+        "rep_loop body drifted from the documented per-iteration count"
+    );
+    assert_eq!(
+        rcx_load,
+        Some(REP_LOOP_RCX_AT_REP_START),
+        "the mid-REP detector value drifted from the asm"
     );
 }
 

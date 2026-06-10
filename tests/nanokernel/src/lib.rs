@@ -142,6 +142,19 @@ pub const COUNTING_MMIO_THR_GPA: u64 = 0xD000_6008;
 /// RCX for the region's REP MOVSB (bytes copied; retires as ONE).
 pub const COUNTING_REP_BYTES: u64 = 256;
 
+/// The REP-string landing torture guest (bead 8g1): endless 6-instruction
+/// loop around a 64-byte REP MOVSB, with RCX as a built-in mid-REP
+/// detector — RCX is 64 exactly at the REP start, 0 everywhere else, and
+/// any other value at a landed boundary is a §3.2 violation.
+pub fn rep_loop_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/rep_loop.elf"))
+}
+
+/// Retired instructions per rep_loop iteration (REP MOVSB counts 1).
+pub const REP_LOOP_INSTRS_PER_ITER: u64 = 6;
+/// The REP's byte count: RCX at a REP-start boundary; 0 anywhere else.
+pub const REP_LOOP_RCX_AT_REP_START: u64 = 64;
+
 /// The ring descriptors the guest writes at header offset 0x10, in C, I,
 /// A, W order as (offset, size). Mirrors the asm dword stores — the
 /// channel_interop test attaches a page built from THESE values through
