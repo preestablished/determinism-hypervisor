@@ -107,10 +107,9 @@ fn drain_events_returns_guest_records_and_bumps_consumer() {
     // The intern folded into the channel's name table, and the consumer bump
     // surfaced through the sink (it mutates channel memory → input log).
     assert_eq!(ch.intern_name(1), Some("io_read"));
-    assert!(sink
-        .ops
-        .iter()
-        .any(|op| matches!(op, SinkOp::ConsBump { ring: RingId::W, new_cons } if *new_cons == n as u32)));
+    assert!(sink.ops.iter().any(
+        |op| matches!(op, SinkOp::ConsBump { ring: RingId::W, new_cons } if *new_cons == n as u32)
+    ));
 }
 
 #[test]
@@ -198,7 +197,10 @@ fn read_manifest_retries_past_a_transient_writer() {
     let ch = Channel::attach(gm, BASE).unwrap();
     let m = ch.read_manifest().unwrap();
     assert_eq!(m.header.region_count, 0);
-    assert!(ch.guest_mem().served_odd.get(), "retry path never exercised");
+    assert!(
+        ch.guest_mem().served_odd.get(),
+        "retry path never exercised"
+    );
 }
 
 #[test]
