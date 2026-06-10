@@ -20,12 +20,6 @@ pub struct RunReport {
     pub serial: Vec<u8>,
 }
 
-fn gettid() -> i32 {
-    // dh-cli forbids unsafe; std exposes no gettid, but the thread id via
-    // /proc/self is overkill — the main thread's tid IS the pid.
-    std::process::id() as i32
-}
-
 pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<RunReport, String> {
     use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 
@@ -38,7 +32,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
 
     let counter = InstRetired::open_for_current_thread().map_err(|e| format!("{e:?}"))?;
     counter
-        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .route_overflow_to_thread(dh_vmm::run::current_tid(), dh_vmm::run::kick_signal())
         .map_err(|e| format!("{e:?}"))?;
     counter
         .arm_period(NEVER_FIRES_PERIOD)
