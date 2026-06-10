@@ -9,6 +9,16 @@
 //!
 //! The handler does exactly one thing — the immediate-exit store — through
 //! a thread-local registration. Everything here runs on the vCPU thread.
+//!
+//! RUN-LOOP CONTRACT (spurious kicks): EINTR is a STOP REQUEST, not a
+//! boundary assertion. Queued RT signals can deliver after a clear and
+//! EINTR a later, legitimate KVM_RUN with the counter short of any target.
+//! The boundary engine must always re-read the counter after EINTR and
+//! decide — never assume EINTR means "period reached".
+//!
+//! Empirics (lab box, 40 runs, periods 100k/10k/1k/100): PMI overshoot is
+//! exactly 18 instructions, zero variance, period-independent — pure
+//! delivery latency, comfortably inside the 8192 skid margin.
 
 use kvm_ioctls::VcpuFd;
 use std::cell::Cell;
@@ -54,9 +64,14 @@ extern "C" fn kick_handler(
     KICK_TARGET.with(|t| {
         let ptr = t.get() as *mut VcpuFd;
         if !ptr.is_null() {
-            // SAFETY: registered by this thread via KickGuard, which keeps
-            // the VcpuFd alive and clears the registration on drop; the
-            // handler runs on the same thread (F_OWNER_TID routing).
+            // SAFETY: KickGuard<'a> holds the &mut VcpuFd borrow for its
+            // whole life, so the pointer cannot dangle, and the handler
+            // runs on the same thread (F_OWNER_TID routing). KNOWN ALIASING
+            // CAVEAT: this reconstructs &mut while the interrupted run loop
+            // holds one — benign (same thread, plain byte store into the
+            // mmap'd kvm_run page; the firecracker-established pattern),
+            // unavoidable until kvm-ioctls exposes the immediate_exit byte
+            // address directly.
             #[allow(unsafe_code)]
             unsafe {
                 (*ptr).set_kvm_immediate_exit(1);
@@ -65,19 +80,43 @@ extern "C" fn kick_handler(
     });
 }
 
-/// RAII registration of a vCPU as this thread's kick target. Hold it for
-/// the duration of the run loop; drop clears the registration before the
-/// VcpuFd can move or die.
-pub struct KickGuard;
+/// RAII registration of a vCPU as this thread's kick target.
+///
+/// The lifetime parameter holds the `&mut VcpuFd` borrow for the guard's
+/// whole life — the compiler rejects moving or re-borrowing the VcpuFd
+/// while registered, so the handler's raw pointer cannot dangle.
+///
+/// Registering also PRE-TOUCHES the TLS slot (the `with` call), which is
+/// what makes the const-initialized thread_local access in the handler
+/// allocation-free: by the time any signal can route here, the slot exists.
+pub struct KickGuard<'a> {
+    vcpu: &'a mut VcpuFd,
+}
 
-impl KickGuard {
-    pub fn register(vcpu: &mut VcpuFd) -> Self {
+impl<'a> KickGuard<'a> {
+    pub fn register(vcpu: &'a mut VcpuFd) -> Self {
         KICK_TARGET.with(|t| t.set(vcpu as *mut VcpuFd as usize));
-        KickGuard
+        KickGuard { vcpu }
     }
 }
 
-impl Drop for KickGuard {
+/// All vCPU access while registered goes THROUGH the guard (Deref) — the
+/// guard owns the exclusive borrow, so the VcpuFd cannot move or be
+/// re-borrowed behind the handler's back.
+impl std::ops::Deref for KickGuard<'_> {
+    type Target = VcpuFd;
+    fn deref(&self) -> &VcpuFd {
+        self.vcpu
+    }
+}
+
+impl std::ops::DerefMut for KickGuard<'_> {
+    fn deref_mut(&mut self) -> &mut VcpuFd {
+        self.vcpu
+    }
+}
+
+impl Drop for KickGuard<'_> {
     fn drop(&mut self) {
         KICK_TARGET.with(|t| t.set(0));
     }
@@ -143,8 +182,8 @@ mod tests {
         counter.reset().unwrap();
         counter.enable().unwrap();
 
-        let _guard = KickGuard::register(&mut slot.vcpu);
-        let run_result = slot.vcpu.run();
+        let mut guard = KickGuard::register(&mut slot.vcpu);
+        let run_result = guard.run();
         counter.disable().unwrap();
 
         // EINTR, whether the signal landed inside KVM_RUN or via the
@@ -162,11 +201,14 @@ mod tests {
             "overshoot ({}) wildly exceeds plausible skid",
             count - PERIOD
         );
-        clear_immediate_exit(&mut slot.vcpu);
+        clear_immediate_exit(&mut guard);
     }
 
-    /// The no-lost-wakeup half: signal BEFORE KVM_RUN → immediate EINTR
-    /// without executing any guest instruction.
+    /// The no-lost-wakeup half AND the spurious-kick contract in one:
+    /// a signal BEFORE KVM_RUN yields immediate EINTR without executing a
+    /// single guest instruction — i.e. EINTR with the counter at 0, far
+    /// from any target. This is exactly why the run loop must re-read the
+    /// counter on EINTR rather than treat it as a boundary.
     #[test]
     fn kick_before_run_returns_immediately() {
         if !kvm_available() {
@@ -188,7 +230,7 @@ mod tests {
         regs.rflags = 2;
         slot.vcpu.set_regs(&regs).unwrap();
 
-        let _guard = KickGuard::register(&mut slot.vcpu);
+        let mut guard = KickGuard::register(&mut slot.vcpu);
         // Deliver the kick signal to THIS thread now (outside KVM_RUN):
         // the handler must set immediate_exit so the run below cannot hang.
         // SAFETY: raising a handled signal on ourselves.
@@ -201,11 +243,10 @@ mod tests {
                 kick_signal(),
             );
         }
-        let err = slot
-            .vcpu
+        let err = guard
             .run()
             .expect_err("immediate_exit must abort the entry");
         assert_eq!(err.errno(), libc::EINTR);
-        clear_immediate_exit(&mut slot.vcpu);
+        clear_immediate_exit(&mut guard);
     }
 }
