@@ -6,6 +6,10 @@
 //! cadence — one TimerArm per 1M-icount segment, 10 fires per run — which
 //! exercises the identical §4-convert → agenda → §3.4-deliver chain.
 
+// Everything here drives KVM (x86_64-only; bead v5w) - the whole test
+// target compiles to empty on other arches.
+#![cfg(target_arch = "x86_64")]
+
 mod common;
 
 use common::*;

@@ -3,6 +3,10 @@
 //! across 100 cold-boot runs, with delivered > requested and the guest
 //! ISR observably running post-STI.
 
+// Everything here drives KVM (x86_64-only; bead v5w) - the whole test
+// target compiles to empty on other arches.
+#![cfg(target_arch = "x86_64")]
+
 mod common;
 
 use common::*;

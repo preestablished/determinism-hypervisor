@@ -1,6 +1,10 @@
 //! The M0 acceptance, LIVE (kvm-intel lane + lab box; skips elsewhere):
 //! boot hello.elf, read "HELLO\n" off the serial sink, exit on HLT.
 
+// Everything here drives KVM (x86_64-only; bead v5w) - the whole test
+// target compiles to empty on other arches.
+#![cfg(target_arch = "x86_64")]
+
 use std::io::ErrorKind;
 
 fn kvm_usable() -> bool {

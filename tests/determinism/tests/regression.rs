@@ -6,6 +6,10 @@
 //! HARDWARE-GATED: runs in the kvm-intel lane (and on the lab box);
 //! hosted lanes skip on the /dev/kvm probe.
 
+// Everything here drives KVM (x86_64-only; bead v5w) - the whole test
+// target compiles to empty on other arches.
+#![cfg(target_arch = "x86_64")]
+
 use std::io::ErrorKind;
 use std::sync::atomic::AtomicBool;
 

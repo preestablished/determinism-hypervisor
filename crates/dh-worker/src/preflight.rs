@@ -213,6 +213,7 @@ pub fn host_checks() -> Vec<CheckResult> {
 
 /// §2.1 capability gate via dh-vmm (named-missing-caps on failure), plus a
 /// slot-VM construction smoke (memfd, NOHUGEPAGE, dirty ring, vCPU).
+#[cfg(target_arch = "x86_64")]
 pub fn kvm_checks() -> Vec<CheckResult> {
     match dh_vmm::kvm::KvmSystem::open() {
         Ok(sys) => {
@@ -251,6 +252,19 @@ pub fn kvm_checks() -> Vec<CheckResult> {
             want: "all present".into(),
         }],
     }
+}
+
+/// Non-x86_64 hosts can never satisfy §2.1 (VMX-shaped KVM): the check
+/// fails honestly instead of not compiling (bead v5w — the host-side
+/// parsers above still build and test on every arch).
+#[cfg(not(target_arch = "x86_64"))]
+pub fn kvm_checks() -> Vec<CheckResult> {
+    vec![CheckResult {
+        name: "kvm.caps(§2.1)",
+        ok: false,
+        got: format!("target_arch={}", std::env::consts::ARCH),
+        want: "x86_64 (VMX)".into(),
+    }]
 }
 
 /// The full preflight: §7.4 host + §2.1 KVM. Returns all results; the

@@ -9,6 +9,10 @@ dh-detclock.workspace = true
 dh-devices.workspace = true
 dh-verify.workspace = true
 dh-vmm.workspace = true
+
+# x86_64-only (bead v5w): all lib modules are cfg-gated; these deps are
+# only reachable from them.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 kvm-bindings = "0.14.0"
 libc = "0.2.186"
 kvm-ioctls = "0.24.0"
