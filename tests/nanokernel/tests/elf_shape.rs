@@ -57,6 +57,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pipeline_smoke", pipeline_smoke_elf());
     assert_guest_shape("landing_loop", landing_loop_elf());
     assert_guest_shape("device_exercise", device_exercise_elf());
+    assert_guest_shape("hello", hello_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -142,5 +143,17 @@ fn landing_loop_asm_matches_rust_constants() {
     assert_eq!(
         instrs, LANDING_LOOP_INSTRS_PER_ITER,
         "loop body drifted from the documented per-iteration count"
+    );
+}
+
+/// hello's emitted bytes live in .rodata — the ELF must literally contain
+/// HELLO_SERIAL_OUTPUT, so the constant and the asm string cannot drift.
+#[test]
+fn hello_elf_embeds_the_serial_string() {
+    let elf = hello_elf();
+    let needle = HELLO_SERIAL_OUTPUT;
+    assert!(
+        elf.windows(needle.len()).any(|w| w == needle),
+        "HELLO_SERIAL_OUTPUT not found in hello.elf"
     );
 }
