@@ -14,14 +14,48 @@ use crate::vt::ClockRatio;
 /// One masked CPUID leaf (function, index → registers). The table is the
 /// §2.2 CPUID determinism mask's output slot; the mask itself lands with the
 /// CPUID bead. Must be sorted by (function, index), no duplicates.
+///
+/// `flags` carries the KVM entry flags (SIGNIFCANT_INDEX etc.) — they
+/// shape how KVM dispatches subleaves, so they are machine behavior and
+/// part of the ONE canonical preimage (bead nq5: cpuid.rs's table hash
+/// and this struct's encoding must never fork on representation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuidLeaf {
     pub function: u32,
     pub index: u32,
+    pub flags: u32,
     pub eax: u32,
     pub ebx: u32,
     pub ecx: u32,
     pub edx: u32,
+}
+
+impl CpuidLeaf {
+    /// THE canonical leaf encoding — the single preimage shared by
+    /// MachineConfig's encoding and cpuid.rs's `cpuid_table_hash`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        for v in [
+            self.function,
+            self.index,
+            self.flags,
+            self.eax,
+            self.ebx,
+            self.ecx,
+            self.edx,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Canonical hash of a sorted leaf table (the MachineConfig determinism
+/// class's CPUID component): blake3 over [`CpuidLeaf::encode_into`].
+pub fn cpuid_leaves_hash(leaves: &[CpuidLeaf]) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(leaves.len() * 28);
+    for leaf in leaves {
+        leaf.encode_into(&mut bytes);
+    }
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// Boot selection (API.md §2.1 BootSpec). Phase 1 boots ELF; BzImage fields
@@ -190,16 +224,7 @@ impl MachineConfig {
         });
         out.extend_from_slice(&(self.cpuid_table.len() as u32).to_le_bytes());
         for leaf in &self.cpuid_table {
-            for v in [
-                leaf.function,
-                leaf.index,
-                leaf.eax,
-                leaf.ebx,
-                leaf.ecx,
-                leaf.edx,
-            ] {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
+            leaf.encode_into(&mut out);
         }
         out.extend_from_slice(&(self.device_set.len() as u32).to_le_bytes());
         for id in &self.device_set {
@@ -244,6 +269,7 @@ mod tests {
             CpuidLeaf {
                 function: 0,
                 index: 0,
+                flags: 0,
                 eax: 0xD,
                 ebx: 0,
                 ecx: 0,
@@ -252,6 +278,7 @@ mod tests {
             CpuidLeaf {
                 function: 1,
                 index: 0,
+                flags: 0,
                 eax: 0x0,
                 ebx: 0,
                 ecx: 0,
@@ -289,11 +316,12 @@ mod tests {
         exp_tail.push(1); // EPOCHS_ON — landing knobs are NOT encoded
         exp_tail.extend_from_slice(&2u32.to_le_bytes());
         exp_tail.extend_from_slice(&0u32.to_le_bytes()); // f=0
-        exp_tail.extend_from_slice(&0u32.to_le_bytes());
+        exp_tail.extend_from_slice(&0u32.to_le_bytes()); // index
+        exp_tail.extend_from_slice(&0u32.to_le_bytes()); // flags (bead nq5)
         exp_tail.extend_from_slice(&0xDu32.to_le_bytes());
         exp_tail.extend_from_slice(&[0u8; 12]); // ebx, ecx, edx
         exp_tail.extend_from_slice(&1u32.to_le_bytes()); // f=1
-        exp_tail.extend_from_slice(&[0u8; 20]); // index..edx all zero
+        exp_tail.extend_from_slice(&[0u8; 24]); // index/flags..edx all zero
         exp_tail.extend_from_slice(&3u32.to_le_bytes());
         exp_tail.extend_from_slice(&1u16.to_le_bytes());
         exp_tail.extend_from_slice(&2u16.to_le_bytes());

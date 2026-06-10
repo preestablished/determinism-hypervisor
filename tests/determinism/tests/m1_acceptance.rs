@@ -164,6 +164,9 @@ fn run_m1(base_path: &std::path::Path) -> Result<RunOutcome, String> {
         machine_config_hash: config.config_hash().map_err(|e| format!("{e:?}"))?,
         clock_num: 1,
         clock_den: 1,
+        // The real writer fingerprint (bead 4ld): per-segment header
+        // field, a property of the encoder, present on restore paths too.
+        encoder_fingerprint: dh_devices::detchannel::wire_encoder_fingerprint(),
     });
     let mut serial = DebugSerial::new();
     let mut beacons: Vec<GuestEvent> = Vec::new();
@@ -315,7 +318,8 @@ fn m1_device_exercise_end_to_end() {
 
     // Channel mutations were logged: exactly 5 records, bit-stable
     // (review-measured: CHANNEL_INIT pio answers + doorbell DEV_EVENTs +
-    // the entropy AUX record).
+    // the entropy AUX record). The encoder fingerprint travels in the
+    // segment HEADER (bead 4ld), not as a record.
     assert_eq!(out.log_records, 5, "DHILOG record count");
 
     // The guest's sector-0 write landed in the overlay ONLY.

@@ -157,19 +157,28 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
 /// entries sorted by (function, index), fields serialized LE. KVM's own
 /// entry order is not part of machine behavior.
 pub fn cpuid_table_hash(cpuid: &CpuId) -> [u8; 32] {
+    crate::config::cpuid_leaves_hash(&to_leaves(cpuid))
+}
+
+/// The kvm table as sorted [`crate::config::CpuidLeaf`]s — the bridge
+/// into MachineConfig's canonical representation (bead nq5: ONE
+/// preimage; this is also how bead 8jx wires the masked table into the
+/// config).
+pub fn to_leaves(cpuid: &CpuId) -> Vec<crate::config::CpuidLeaf> {
     let mut entries: Vec<_> = cpuid.as_slice().to_vec();
     entries.sort_by_key(|e| (e.function, e.index));
-    let mut bytes = Vec::with_capacity(entries.len() * 28);
-    for e in &entries {
-        bytes.extend_from_slice(&e.function.to_le_bytes());
-        bytes.extend_from_slice(&e.index.to_le_bytes());
-        bytes.extend_from_slice(&e.flags.to_le_bytes());
-        bytes.extend_from_slice(&e.eax.to_le_bytes());
-        bytes.extend_from_slice(&e.ebx.to_le_bytes());
-        bytes.extend_from_slice(&e.ecx.to_le_bytes());
-        bytes.extend_from_slice(&e.edx.to_le_bytes());
-    }
-    *blake3::hash(&bytes).as_bytes()
+    entries
+        .iter()
+        .map(|e| crate::config::CpuidLeaf {
+            function: e.function,
+            index: e.index,
+            flags: e.flags,
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+        })
+        .collect()
 }
 
 #[cfg(test)]

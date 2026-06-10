@@ -65,6 +65,14 @@ pub struct SegmentHeader {
     pub machine_config_hash: [u8; 32],
     pub clock_num: u32,
     pub clock_den: u32,
+    /// The detguest-wire ENCODER FINGERPRINT (bead 4ld): a property of
+    /// the writer, carried per segment in the header (NOT a device
+    /// record — restore/fork segments re-attach without a CHANNEL_INIT
+    /// and must still carry their writer's fingerprint). AUX SDK_EVENT
+    /// digests are computed by re-encoding drained payloads; a verifier
+    /// compares fingerprints before digests to detect encoder skew
+    /// (HEAD-wins sibling dep). Zero ⇒ no SDK digests in this segment.
+    pub encoder_fingerprint: u64,
 }
 
 /// Everything known only at the end boundary.
@@ -280,9 +288,10 @@ impl LogWriter {
         buf[160..168].copy_from_slice(&params.end_icount.to_le_bytes());
         buf[168..176].copy_from_slice(&params.end_vns.to_le_bytes());
         buf[176..208].copy_from_slice(&params.end_state_hash);
+        buf[240..248].copy_from_slice(&h.encoder_fingerprint.to_le_bytes());
         let body_hash = blake3::hash(&buf[HEADER_LEN..]);
         buf[208..240].copy_from_slice(body_hash.as_bytes());
-        // [240..256) reserved, already zeros.
+        // [248..256) reserved, already zeros.
         Ok(self.buf)
     }
 
@@ -341,6 +350,7 @@ mod tests {
             machine_config_hash: [0xCC; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         }
     }
 

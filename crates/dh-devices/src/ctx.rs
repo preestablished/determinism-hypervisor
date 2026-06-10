@@ -193,6 +193,7 @@ mod tests {
             machine_config_hash: [0; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         })
     }
 
