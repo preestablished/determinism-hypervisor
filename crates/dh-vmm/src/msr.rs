@@ -121,7 +121,6 @@ pub fn on_denied_wrmsr(_index: u32) -> MsrAction {
 mod tests {
     use super::*;
     use crate::kvm::KvmSystem;
-    use kvm_ioctls::{MsrExitReason, VcpuExit};
     use vm_memory::{Bytes, GuestAddress};
 
     fn kvm_available() -> bool {
@@ -139,7 +138,7 @@ mod tests {
     fn allow_ranges_cover_exactly_the_chosen_set() {
         let allowed: Vec<u32> = ALLOW_RANGES
             .iter()
-            .flat_map(|(base, count)| (*base..*base + *count))
+            .flat_map(|(base, count)| *base..*base + *count)
             .collect();
         assert_eq!(
             allowed,

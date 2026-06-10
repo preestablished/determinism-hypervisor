@@ -2,11 +2,19 @@ name: ci
 on:
   pull_request:
   push:
+
+# Both jobs need the sibling repos next to this checkout: the workspace has
+# path deps on ../control-plane (determinism-proto) and ../guest-sdk
+# (detguest-host, detguest-wire). Sibling HEAD wins — there is no rev pinning.
 jobs:
-  rust:
+  # Host-runnable lane: fmt, clippy, build, and the unit-layer tests (codecs,
+  # agenda math, vns rational math, detchannel smoke, ...). Runs on x86_64 and
+  # aarch64 — Spark-side devs touch shared code, so it must build/run on arm.
+  # KVM-requiring tests guard on /dev/kvm at runtime and self-skip here.
+  host:
     strategy:
       matrix:
-        runner: [ubuntu-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -16,9 +24,41 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/control-plane
           path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - run: cargo fmt --all -- --check
         working-directory: repo
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: repo
+      - run: cargo build --workspace
+        working-directory: repo
+      - run: cargo test --workspace
+        working-directory: repo
+
+  # KVM-gated lane: same suite on the Intel box with /dev/kvm, where the
+  # live-KVM tests (vcpu run loops, MSR filter #GP, timer determinism) stop
+  # self-skipping and actually exercise the hypervisor.
+  kvm-intel:
+    runs-on: [self-hosted, kvm-intel]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -r /dev/kvm || { echo "::error::/dev/kvm not available on runner"; exit 1; }
       - run: cargo build --workspace
         working-directory: repo
       - run: cargo test --workspace

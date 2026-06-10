@@ -405,8 +405,9 @@ mod tests {
             let in1 = AgendaInputs {
                 start_icount: start,
                 injections: &injections,
-                epoch_len: (rng.next() % 4 != 0).then(|| nz(1 + rng.next() % 50_000)),
-                goal_poll_period: (rng.next() % 2 == 0).then(|| nz(1 + rng.next() % 50_000)),
+                epoch_len: (!rng.next().is_multiple_of(4)).then(|| nz(1 + rng.next() % 50_000)),
+                goal_poll_period: (rng.next().is_multiple_of(2))
+                    .then(|| nz(1 + rng.next() % 50_000)),
                 final_stop: match rng.next() % 3 {
                     0 => FinalStop::IcountBudget(budget),
                     1 if !edge => FinalStop::VnsBudget(budget),
