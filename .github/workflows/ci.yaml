@@ -1,20 +1,41 @@
 name: ci
 on:
+  # pull_request covers PR branches; push is limited to main (post-merge
+  # verification) so every PR commit isn't built twice.
   pull_request:
   push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run per ref; superseded runs are cancelled (keeps the single
+# self-hosted box from queueing stale work).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # Both jobs need the sibling repos next to this checkout: the workspace has
 # path deps on ../control-plane (determinism-proto) and ../guest-sdk
 # (detguest-host, detguest-wire). Sibling HEAD wins — there is no rev pinning.
 jobs:
-  # Host-runnable lane: fmt, clippy, build, and the unit-layer tests (codecs,
-  # agenda math, vns rational math, detchannel smoke, ...). Runs on x86_64 and
-  # aarch64 — Spark-side devs touch shared code, so it must build/run on arm.
-  # KVM-requiring tests guard on /dev/kvm at runtime and self-skip here.
+  # Host-runnable lane: fmt, clippy, build, and the unit-layer tests. Runs on
+  # x86_64 and aarch64 — Spark-side devs touch shared code, so the shared
+  # crates must build/run on arm. KVM-requiring tests guard on /dev/kvm at
+  # runtime and self-skip here.
   host:
     strategy:
+      fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-latest
+            cargo-args: --workspace
+          # dh-vmm consumes x86_64-only kvm-bindings APIs (MSR filter, CPUID)
+          # with no cfg gates, so it and its dependents (dh-worker, dh-cli)
+          # cannot build on aarch64. The arm lane covers the shared crates;
+          # making the agenda/vt math arm-buildable is tracked in beads.
+          - runner: ubuntu-24.04-arm
+            cargo-args: --workspace --exclude dh-vmm --exclude dh-worker --exclude dh-cli
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -33,11 +54,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
         working-directory: repo
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy ${{ matrix.cargo-args }} --all-targets -- -D warnings
         working-directory: repo
-      - run: cargo build --workspace
+      - run: cargo build ${{ matrix.cargo-args }}
         working-directory: repo
-      - run: cargo test --workspace
+      - run: cargo test ${{ matrix.cargo-args }}
         working-directory: repo
 
   # KVM-gated lane: same suite on the Intel box with /dev/kvm, where the
@@ -61,7 +82,7 @@ jobs:
           repository: ${{ github.repository_owner }}/guest-sdk
           path: guest-sdk
       - uses: dtolnay/rust-toolchain@stable
-      - run: test -r /dev/kvm || { echo "::error::/dev/kvm not available on runner"; exit 1; }
+      - run: test -c /dev/kvm && test -r /dev/kvm || { echo "::error::/dev/kvm not available/readable on runner"; exit 1; }
       - run: cargo build --workspace
         working-directory: repo
       - run: cargo test --workspace
