@@ -249,6 +249,17 @@ pub enum ExitEvent {
     PioIgnored {
         port: u16,
     },
+    /// Filter-denied RDMSR: deterministic value already written into the
+    /// exit by dispatch (msr policy); run control trace-logs the index.
+    MsrReadDenied {
+        index: u32,
+    },
+    /// Filter-denied WRMSR: #GP already armed by dispatch (msr policy);
+    /// run control surfaces it (never silently absorbed).
+    MsrWriteDenied {
+        index: u32,
+        data: u64,
+    },
     Hlt,
     Shutdown,
     /// Exit kinds later beads own (PMI/debug/MSR...) — carried verbatim.
@@ -297,6 +308,30 @@ pub fn classify_exit(exit: VcpuExit<'_>) -> ExitEvent {
                 }
             } else {
                 ExitEvent::PioIgnored { port } // WI
+            }
+        }
+        // Filter-denied MSR accesses: the §2.2 deterministic emulation is
+        // applied HERE, in dispatch — a denied WRMSR resumed without
+        // error=1 is silently acked as success by KVM (live-verified),
+        // which is exactly the R6 silent-absorption this must prevent.
+        VcpuExit::X86Rdmsr(exit) => {
+            match crate::msr::on_denied_rdmsr(exit.index) {
+                crate::msr::MsrAction::SupplyValue(v) => {
+                    *exit.data = v;
+                    *exit.error = 0;
+                }
+                crate::msr::MsrAction::InjectGp => *exit.error = 1,
+            }
+            ExitEvent::MsrReadDenied { index: exit.index }
+        }
+        VcpuExit::X86Wrmsr(exit) => {
+            match crate::msr::on_denied_wrmsr(exit.index) {
+                crate::msr::MsrAction::InjectGp => *exit.error = 1,
+                crate::msr::MsrAction::SupplyValue(_) => *exit.error = 0,
+            }
+            ExitEvent::MsrWriteDenied {
+                index: exit.index,
+                data: exit.data,
             }
         }
         VcpuExit::Hlt => ExitEvent::Hlt,
