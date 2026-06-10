@@ -1,4 +1,6 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // targeted allows in counter.rs (perf_event_open, ioctl, read)
+
+pub mod counter;
 
 pub const DET_CLOCK_COMPONENT: &str = "dh-detclock";
 

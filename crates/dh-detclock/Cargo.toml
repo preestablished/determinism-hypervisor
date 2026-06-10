@@ -3,3 +3,7 @@ name = "dh-detclock"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+libc = "0.2.186"
+perf-event-open-sys = "6.0.0"
