@@ -57,6 +57,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pipeline_smoke", pipeline_smoke_elf());
     assert_guest_shape("landing_loop", landing_loop_elf());
     assert_guest_shape("device_exercise", device_exercise_elf());
+    assert_guest_shape("hello", hello_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines

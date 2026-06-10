@@ -53,6 +53,16 @@ pub const LANDING_LOOP_INSTRS_PER_ITER: u64 = 8;
 /// instructions (the M2 landing test budget).
 pub const LANDING_LOOP_DEFAULT_ITERS: u64 = 12_500_000;
 
+/// The M0 boot-path stub (see asm/hello.asm): "HELLO\n" on debug serial,
+/// then the HLT park. dh-cli's boot subcommand (bead 1mz) accepts M0 with
+/// this guest.
+pub fn hello_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"))
+}
+
+/// The serial bytes hello emits before parking.
+pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
+
 /// The M1 acceptance guest (see asm/device_exercise.asm): exercises
 /// pv-clock, pv-entropy, pv-pad, pv-blk, and the detchannel (CHANNEL_INIT
 /// + one ring-W Beacon + doorbell), one serial progress byte per stage.
@@ -97,6 +107,7 @@ mod tests {
         assert!(!pipeline_smoke_elf().is_empty());
         assert!(!landing_loop_elf().is_empty());
         assert!(!device_exercise_elf().is_empty());
+        assert!(!hello_elf().is_empty());
     }
 
     #[test]
