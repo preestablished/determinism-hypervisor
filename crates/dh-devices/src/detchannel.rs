@@ -207,7 +207,21 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
     /// guest RAM is already restored — re-attach validates the live
     /// channel header at the recorded GPA, then the NON-RECONSTRUCTIBLE
     /// ring C/I producer seqs are reinstated and the manifest re-read.
-    pub fn restore(&mut self, bytes: &[u8], version: u16) -> Result<(), crate::RestoreError> {
+    ///
+    /// Takes a FRESH `plan`: FaultPlan accumulator state (occurrence
+    /// counters) is never serialized — replay constructs its plan from
+    /// the input log, and a reused slot must not leak the prior tenant's
+    /// counts into inject decisions (review iter-42: that leak CHANGES
+    /// replay outcomes). Metrics and diagnostics reset for the same
+    /// reused-slot reason. Fork (§8.4) note: a CoW child built fresh via
+    /// `new()` + this restore over the child's mem handle gets exactly
+    /// the parent's EVTC state — this pair IS the fork path's seam.
+    pub fn restore(
+        &mut self,
+        bytes: &[u8],
+        version: u16,
+        plan: P,
+    ) -> Result<(), crate::RestoreError> {
         if version != Self::EVTC_VERSION || bytes.len() != Self::EVTC_LEN {
             return Err(crate::RestoreError);
         }
@@ -227,9 +241,6 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             let mut ch = Channel::attach(self.mem.clone(), gpa).map_err(|_| crate::RestoreError)?;
             ch.restore_producer_seqs(seqs);
             let manifest = ch.read_manifest().ok();
-            if manifest.is_none() {
-                self.metrics.manifest_read_failures += 1;
-            }
             (Some(ch), Some(gpa), manifest)
         } else {
             (None, None, None)
@@ -243,6 +254,12 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         self.channel = channel;
         self.channel_gpa = channel_gpa;
         self.manifest = manifest;
+        self.responder = InjectResponder::new(plan);
+        self.last_drain_error = None;
+        self.metrics = DetChannelMetrics::default();
+        if self.channel.is_some() && self.manifest.is_none() {
+            self.metrics.manifest_read_failures = 1;
+        }
         Ok(())
     }
 
@@ -1328,6 +1345,7 @@ mod evtc_tests {
             .restore(
                 &section,
                 DetChannelHost::<SharedMem, LogFaultPlan>::EVTC_VERSION,
+                LogFaultPlan::default(),
             )
             .unwrap();
         assert_eq!(restored.channel_gpa(), Some(BASE));
@@ -1367,12 +1385,24 @@ mod evtc_tests {
         host.snapshot(&mut section);
 
         let mut restored = DetChannelHost::new(channel_page(), LogFaultPlan::default());
-        restored.restore(&section, 1).unwrap();
+        restored
+            .restore(&section, 1, LogFaultPlan::default())
+            .unwrap();
         assert!(restored.channel().is_none());
         assert_eq!(restored.channel_gpa(), None);
 
-        assert!(restored.restore(&section, 2).is_err(), "wrong version");
-        assert!(restored.restore(&section[..10], 1).is_err(), "truncated");
+        assert!(
+            restored
+                .restore(&section, 2, LogFaultPlan::default())
+                .is_err(),
+            "wrong version"
+        );
+        assert!(
+            restored
+                .restore(&section[..10], 1, LogFaultPlan::default())
+                .is_err(),
+            "truncated"
+        );
 
         // Attached flag with a GPA that does not hold a valid channel
         // (zeroed RAM) must refuse loudly, not attach garbage.
@@ -1386,6 +1416,9 @@ mod evtc_tests {
             )))),
             LogFaultPlan::default(),
         );
-        assert!(h2.restore(&bad, 1).is_err(), "bad header at GPA refuses");
+        assert!(
+            h2.restore(&bad, 1, LogFaultPlan::default()).is_err(),
+            "bad header at GPA refuses"
+        );
     }
 }
