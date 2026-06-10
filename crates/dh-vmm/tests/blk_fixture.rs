@@ -41,6 +41,7 @@ fn request(dev: &mut PvBlk, mem: &mut VecGuestMem, cmd: u32, sector: u64, gpa: u
         machine_config_hash: [0; 32],
         clock_num: 1,
         clock_den: 1,
+        encoder_fingerprint: 0,
     });
     let mut ent = NoEntropy;
     let mut irqs = Vec::new();

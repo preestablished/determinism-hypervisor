@@ -124,15 +124,6 @@ impl<'a> DevCtx<'a> {
     }
 
     /// Log an AUX FRAME_MARK at this boundary (pv-pad FRAME_COUNTER write).
-    /// Log the one-time detguest-wire encoder fingerprint (bead 4ld;
-    /// emitted by the detchannel at successful attach).
-    pub fn log_encoder_fingerprint(&mut self, fingerprint: u64) {
-        let r = self
-            .log
-            .encoder_fingerprint(self.icount, self.boundary_rip, fingerprint);
-        self.record(r);
-    }
-
     pub fn log_frame_mark(&mut self, frame_index: u32) {
         let r = self
             .log
@@ -202,6 +193,7 @@ mod tests {
             machine_config_hash: [0; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         })
     }
 

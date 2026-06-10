@@ -328,14 +328,6 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             }
             PORT_INIT_GO => {
                 self.init_status = self.channel_init(value) as u32;
-                if self.init_status == InitStatus::Ok as u32 {
-                    // One-time encoder fingerprint at successful attach
-                    // (bead 4ld): lets a verifier detect SDK-digest
-                    // encoder skew instead of chasing spurious
-                    // divergence. A re-attach re-emits — each record is
-                    // truthful for the encoder that wrote it.
-                    ctx.log_encoder_fingerprint(wire_encoder_fingerprint());
-                }
                 Vec::new()
             }
             PORT_DOORBELL => {
@@ -757,6 +749,7 @@ mod tests {
             machine_config_hash: [0; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         })
     }
 
@@ -1339,6 +1332,7 @@ mod evtc_tests {
             machine_config_hash: [0; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         })
     }
 

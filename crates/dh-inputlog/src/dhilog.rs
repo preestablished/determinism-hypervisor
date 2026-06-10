@@ -42,7 +42,6 @@ pub const KIND_ENTROPY: u8 = 0x40;
 pub const KIND_TIMER_FIRE: u8 = 0x41;
 pub const KIND_SDK_EVENT: u8 = 0x43;
 pub const KIND_FRAME_MARK: u8 = 0x45;
-pub const KIND_ENCODER_FP: u8 = 0x46;
 pub const KIND_END: u8 = 0x7F;
 
 pub const RFLAG_AUX: u8 = 1 << 0;
@@ -66,6 +65,14 @@ pub struct SegmentHeader {
     pub machine_config_hash: [u8; 32],
     pub clock_num: u32,
     pub clock_den: u32,
+    /// The detguest-wire ENCODER FINGERPRINT (bead 4ld): a property of
+    /// the writer, carried per segment in the header (NOT a device
+    /// record — restore/fork segments re-attach without a CHANNEL_INIT
+    /// and must still carry their writer's fingerprint). AUX SDK_EVENT
+    /// digests are computed by re-encoding drained payloads; a verifier
+    /// compares fingerprints before digests to detect encoder skew
+    /// (HEAD-wins sibling dep). Zero ⇒ no SDK digests in this segment.
+    pub encoder_fingerprint: u64,
 }
 
 /// Everything known only at the end boundary.
@@ -234,29 +241,6 @@ impl LogWriter {
         self.record(KIND_SDK_EVENT, RFLAG_AUX, icount, boundary_rip, &payload)
     }
 
-    /// ENCODER_FP (bead 4ld): the detguest-wire encoder fingerprint —
-    /// digest8 over a canonical probe-set encoding, emitted ONCE per
-    /// segment at channel attach. AUX SDK_EVENT digests are computed by
-    /// re-encoding drained payloads; a verifier replaying an old log
-    /// with a changed encoder (HEAD-wins sibling dep) detects the skew
-    /// by comparing fingerprints instead of chasing spurious SDK-digest
-    /// divergence. A wire-format bump is a DHILOG-v1 compatibility
-    /// event, never an in-place rewrite.
-    pub fn encoder_fingerprint(
-        &mut self,
-        icount: u64,
-        boundary_rip: u64,
-        fingerprint: u64,
-    ) -> Result<(), WriteError> {
-        self.record(
-            KIND_ENCODER_FP,
-            RFLAG_AUX,
-            icount,
-            boundary_rip,
-            &fingerprint.to_le_bytes(),
-        )
-    }
-
     /// FRAME_MARK (§3.3): absolute FRAME_COUNTER value F at this segment-
     /// relative icount — the frame table resolving at_frame scheduling.
     pub fn frame_mark(
@@ -304,9 +288,10 @@ impl LogWriter {
         buf[160..168].copy_from_slice(&params.end_icount.to_le_bytes());
         buf[168..176].copy_from_slice(&params.end_vns.to_le_bytes());
         buf[176..208].copy_from_slice(&params.end_state_hash);
+        buf[240..248].copy_from_slice(&h.encoder_fingerprint.to_le_bytes());
         let body_hash = blake3::hash(&buf[HEADER_LEN..]);
         buf[208..240].copy_from_slice(body_hash.as_bytes());
-        // [240..256) reserved, already zeros.
+        // [248..256) reserved, already zeros.
         Ok(self.buf)
     }
 
@@ -365,6 +350,7 @@ mod tests {
             machine_config_hash: [0xCC; 32],
             clock_num: 1,
             clock_den: 1,
+            encoder_fingerprint: 0,
         }
     }
 
