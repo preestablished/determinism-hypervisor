@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]"
     );
     std::process::exit(2);
 }
@@ -31,6 +31,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("caps") | None => println!("{}", dh_vmm::m0_missing_caps_summary()),
         Some("boot") => boot_cmd(&args[1..]),
+        Some("run") => run_cmd(&args[1..]),
         Some("cpuid-diff") => match dh_cli::cpuid::cpuid_diff() {
             Ok(report) => print!("{report}"),
             Err(e) => {
@@ -39,6 +40,65 @@ fn main() {
             }
         },
         _ => usage(),
+    }
+}
+
+fn run_cmd(args: &[String]) {
+    let mut path = None;
+    let mut mem_mib = 16u64;
+    let mut cmdline = String::new();
+    let mut until = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--mem-mib" => {
+                mem_mib = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
+            "--cmdline" => cmdline = it.next().cloned().unwrap_or_else(|| usage()),
+            "--icount-budget" => {
+                let n = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                until = Some(dh_vmm::runctl::Until::IcountBudget(n));
+            }
+            "--vns-budget" => {
+                let n = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
+                until = Some(dh_vmm::runctl::Until::VnsBudget(n));
+            }
+            p if path.is_none() && !p.starts_with("--") => path = Some(p.to_string()),
+            _ => usage(),
+        }
+    }
+    let path = path.unwrap_or_else(|| usage());
+    let until = until.unwrap_or_else(|| usage());
+    let elf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("dh-cli run: read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match dh_cli::run::run(&elf, mem_mib << 20, cmdline.as_bytes(), until) {
+        Ok(r) => println!(
+            "{{\"reason\":\"{}\",\"icount\":{},\"rip\":\"{:#x}\",\"vns\":{},\"state_hash\":\"{}\",\"serial\":\"{}\"}}",
+            r.reason,
+            r.icount,
+            r.rip,
+            r.vns,
+            r.state_hash,
+            json_escape(&r.serial)
+        ),
+        Err(e) => {
+            eprintln!("dh-cli run: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
