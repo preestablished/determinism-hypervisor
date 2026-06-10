@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod preflight;
+
 pub fn preflight_summary() -> String {
     dh_vmm::m0_missing_caps_summary()
 }
