@@ -5,6 +5,7 @@ pub mod blkfile;
 pub mod boot;
 pub mod config;
 pub mod cpuid;
+pub mod hash;
 pub mod kvm;
 pub mod msr;
 pub mod run;
