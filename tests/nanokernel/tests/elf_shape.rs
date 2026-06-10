@@ -145,3 +145,15 @@ fn landing_loop_asm_matches_rust_constants() {
         "loop body drifted from the documented per-iteration count"
     );
 }
+
+/// hello's emitted bytes live in .rodata — the ELF must literally contain
+/// HELLO_SERIAL_OUTPUT, so the constant and the asm string cannot drift.
+#[test]
+fn hello_elf_embeds_the_serial_string() {
+    let elf = hello_elf();
+    let needle = HELLO_SERIAL_OUTPUT;
+    assert!(
+        elf.windows(needle.len()).any(|w| w == needle),
+        "HELLO_SERIAL_OUTPUT not found in hello.elf"
+    );
+}
