@@ -6,9 +6,13 @@
 //! exception, no interrupt shadow — so every replay defers by the
 //! identical number of instructions. The engine lands (§3.2), checks, and
 //! if the window is closed single-steps forward re-checking at every
-//! retirement; `request_interrupt_window` is set while deferring so a
-//! future full-run path exits the moment the window opens (the stepped
-//! path re-checks anyway).
+//! retirement. The stepped re-check IS the deferral mechanism — §3.4's
+//! `request_interrupt_window` flag belongs to a future full-run deferral
+//! optimization and is deliberately NOT set here: with the flag armed, a
+//! mid-deferral STI makes KVM exit IrqWindowOpen instead of Debug and the
+//! landing loop would treat the §3.4 success case as a foreign exit
+//! (live-reproduced in review). IrqWindowOpen is still swallowed as
+//! benign during deferral, defensively.
 //!
 //! KVM_INTERRUPT queues the vector; KVM delivers it on the next KVM_RUN
 //! entry BEFORE any guest instruction retires — so `delivered_icount` is
@@ -52,6 +56,10 @@ pub enum InjectError {
     WindowNeverOpened {
         stepped: u64,
     },
+    /// Vectors 0..=31 are exception vectors, never external interrupts.
+    BadVector {
+        vector: u8,
+    },
 }
 
 impl std::fmt::Display for InjectError {
@@ -61,6 +69,9 @@ impl std::fmt::Display for InjectError {
             InjectError::Kvm(e) => write!(f, "kvm: {e}"),
             InjectError::WindowNeverOpened { stepped } => {
                 write!(f, "interrupt window never opened within {stepped} steps")
+            }
+            InjectError::BadVector { vector } => {
+                write!(f, "vector {vector} is an exception vector (0..=31)")
             }
         }
     }
@@ -81,7 +92,17 @@ pub fn injectable(vcpu: &mut VcpuFd) -> Result<bool, InjectError> {
 
 /// Queue vector `v` for delivery on the next KVM_RUN entry (KVM_INTERRUPT,
 /// userspace irqchip). Caller has verified injectability.
+///
+/// CONTRACT: one queued vector per VM entry — a second KVM_INTERRUPT
+/// before the next KVM_RUN silently OVERWRITES the first on this kernel
+/// (no EEXIST; verified live in review). Run control must enter the guest
+/// between injections.
 pub fn queue_interrupt(vcpu: &VcpuFd, vector: u8) -> Result<(), InjectError> {
+    if vector < 32 {
+        // 0..=31 are exception vectors: never injectable as external
+        // interrupts (KVM accepts them unvalidated — refuse loudly here).
+        return Err(InjectError::BadVector { vector });
+    }
     let irq = kvm_interrupt {
         irq: u32::from(vector),
     };
@@ -113,7 +134,7 @@ pub fn inject_at_boundary(
 ) -> Result<Injection, InjectError> {
     let mut current = *at;
     let mut stepped = 0u64;
-    let result = loop {
+    loop {
         if injectable(vcpu)? {
             queue_interrupt(vcpu, vector)?;
             break Ok(Injection {
@@ -126,16 +147,16 @@ pub fn inject_at_boundary(
         if stepped >= max_defer_steps {
             break Err(InjectError::WindowNeverOpened { stepped });
         }
-        // Harmless while stepping; load-bearing for future full-run
-        // deferral (KVM exits when the window opens).
-        vcpu.get_kvm_run().request_interrupt_window = 1;
-        current = land_at(vcpu, counter, current.icount + 1, margins, on_exit)
+        // Deferral step. IrqWindowOpen is OUR artifact (the window we are
+        // polling for) — benign; everything else is the caller's.
+        let mut wrapped = |exit: VcpuExit| match exit {
+            VcpuExit::IrqWindowOpen => Ok(()),
+            other => on_exit(other),
+        };
+        current = land_at(vcpu, counter, current.icount + 1, margins, &mut wrapped)
             .map_err(InjectError::Boundary)?;
         stepped += 1;
-    };
-    // Never leave the window request armed past the call.
-    vcpu.get_kvm_run().request_interrupt_window = 0;
-    result
+    }
 }
 
 #[cfg(test)]
@@ -207,8 +228,6 @@ mod tests {
             let InjectError::WindowNeverOpened { stepped } = err else {
                 panic!("expected WindowNeverOpened, got {err:?}");
             };
-            // The window request must not leak past the call.
-            assert_eq!(slot.vcpu.get_kvm_run().request_interrupt_window, 0);
             Some((stepped, counter.read().unwrap()))
         };
         let (Some(a), Some(b)) = (run(), run()) else {
@@ -286,5 +305,118 @@ mod tests {
         );
         assert!(r.is_err());
         assert!(saw_shutdown, "queued vector must deliver on next entry");
+    }
+}
+
+#[cfg(test)]
+mod sti_tests {
+    use super::*;
+    use crate::boot::load_and_enter;
+    use crate::boundary::Margins;
+    use crate::kvm::KvmSystem;
+    use crate::run::install_kick_handler;
+    use dh_detclock::counter::NEVER_FIRES_PERIOD;
+
+    fn gettid() -> i32 {
+        // SAFETY: argless syscall.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }
+    }
+
+    fn no_exits(exit: VcpuExit) -> Result<(), BoundaryError> {
+        Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}")))
+    }
+
+    /// THE §3.4 use case (the review's live-reproduced gap): request the
+    /// injection while IF=0, defer through the NOP pad, and deliver at the
+    /// first injectable boundary after STI + its shadow — without the
+    /// deferral dying on a foreign exit.
+    #[test]
+    fn deferral_delivers_when_guest_opens_the_window_live() {
+        let run = || {
+            if !crate::kvm::kvm_usable() {
+                eprintln!("skipping: /dev/kvm not usable");
+                return None;
+            }
+            install_kick_handler().unwrap();
+            let sys = KvmSystem::open().unwrap();
+            let slot = sys.create_slot_vm(16 << 20).unwrap();
+            load_and_enter(&slot, nanokernel::sti_window_elf(), b"").unwrap();
+            let counter = InstRetired::open_for_current_thread().unwrap();
+            counter
+                .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+                .unwrap();
+            counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+            counter.reset().unwrap();
+            counter.enable().unwrap();
+            let mut slot = slot;
+
+            // Land early, inside the IF=0 NOP pad (crt0 + a couple NOPs).
+            let b = land_at(
+                &mut slot.vcpu,
+                &counter,
+                3,
+                &Margins::default(),
+                &mut no_exits,
+            )
+            .unwrap();
+            assert!(!injectable(&mut slot.vcpu).unwrap(), "still IF=0");
+
+            let inj = inject_at_boundary(
+                &mut slot.vcpu,
+                &counter,
+                0x31,
+                &b,
+                &Margins::default(),
+                64,
+                &mut no_exits,
+            )
+            .unwrap();
+            assert!(
+                inj.delivered_icount > inj.requested_icount,
+                "window was closed at request time: delivery must be deferred"
+            );
+
+            // Delivery on the next entry: empty IDT => deterministic triple
+            // fault, never another retired spin iteration.
+            let mut saw_shutdown = false;
+            let r = land_at(
+                &mut slot.vcpu,
+                &counter,
+                inj.delivered_icount + 50,
+                &Margins::default(),
+                &mut |exit| {
+                    if matches!(exit, VcpuExit::Shutdown) {
+                        saw_shutdown = true;
+                        Err(BoundaryError::Exit("triple fault (expected)".into()))
+                    } else {
+                        Err(BoundaryError::Exit(format!("unexpected: {exit:?}")))
+                    }
+                },
+            );
+            assert!(r.is_err());
+            assert!(saw_shutdown);
+            Some((inj.requested_icount, inj.delivered_icount))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "deferred delivery boundary must replay identically");
+    }
+
+    #[test]
+    fn exception_vectors_are_refused() {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(2 << 20).unwrap();
+        assert!(matches!(
+            queue_interrupt(&slot.vcpu, 14),
+            Err(InjectError::BadVector { vector: 14 })
+        ));
     }
 }
