@@ -18,10 +18,10 @@
 ; Region composition (the §3.1 cases the M2 test attributes):
 ;   REP MOVSB, RCX=256  — retires as ONE instruction on completion
 ;   CPUID (leaf 0)      — in-kernel emulated; retires ZERO (measured)
-;   MMIO read           — pv-clock VNS (0xD000_0000+0x08), exits, retires
-;                         once on the completing resume
+;   MMIO read           — pv-clock VNS (0xD000_0000+0x08); exits,
+;                         retires ZERO (measured)
 ;   MMIO write          — debug-serial THR mirror (0xD000_6000+0x08),
-;                         byte 'M', exits, retires once
+;                         byte 'M'; exits, retires ZERO (measured)
 ;   taken jmp/jcc, a not-taken jcc, a 4-iteration dec/jnz loop, and
 ;   single-uop ALU filler for the balance.
 

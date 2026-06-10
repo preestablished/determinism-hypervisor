@@ -230,12 +230,16 @@ guarantee:
   mid-REP**: if refinement lands with `RIP` unchanged across a single-step (REP
   iterating), it keeps stepping until `RIP` advances. `RCX` is recorded in boundary
   diagnostics but is not part of the landing rule.
-- VM-exiting instructions (`CPUID`, `HLT`, PIO, MMIO) retire **zero** guest
-  instructions — MEASURED on the kvm-intel class (counting guest, bit-stable across
-  cold boots/cores/processes/load; see `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`).
-  They exit before retirement and KVM completes them host-side by skipping `RIP`,
-  which an `exclude_host=1` counter never sees. (An earlier revision of this section
-  claimed "retire exactly once, on the completing resume"; the empirics refuted that.)
+- VM-exiting instructions retire **zero** guest instructions. MEASURED in isolation
+  on the kvm-intel class for `CPUID`, PIO `OUT`, MMIO read, and MMIO write (counting
+  guest, bit-stable across cold boots/cores/processes/load; see
+  `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); `HLT` and PIO `IN` are EXPECTED to
+  follow the same mechanism but are not yet isolated (PIO `IN` is constrained by the
+  bit-identical icounts of IN-heavy boots; `HLT` isolation belongs to the
+  counting_semantics acceptance). The mechanism: the instruction exits before
+  retirement and KVM completes it host-side by skipping `RIP`, which an
+  `exclude_host=1` counter never sees. (An earlier revision of this section claimed
+  "retire exactly once, on the completing resume"; the empirics refuted that.)
   The boundary engine treats an instruction that has exited mid-emulation
   (`KVM_EXIT_MMIO` not yet completed) as **never retiring**: the count is the same
   before the exit and after the completing resume. Like the interrupt rule, this is a
@@ -440,8 +444,10 @@ access ⇒ guest fault.
 - `0x10 ICOUNT` (RO, 8B): current icount (for guest-sdk diagnostics).
 - `0x18 TIMER_DEADLINE` (RW, 8B): vns deadline; write 0 disarms. One-shot. The
   deadline is **ABSOLUTE guest vns** (the same clock `VNS_LO/HI` reads), never
-  segment-relative — run control subtracts its segment base internally (mirrors
-  §6.4's `at_frame` convention).
+  segment-relative (mirrors §6.4's `at_frame` convention). Run control's internal
+  `TimerArm` carries counter-space (origin-0) vns; the conversion is the CALLER's
+  subtraction of the segment vns base when reading the device's absolute deadline —
+  a no-op until restore gives segments a nonzero base (see `runctl.rs` `TimerArm`).
 - `0x20 TIMER_VECTOR` (RW, 4B): vector to inject (guest picks, default 0x30).
 - `0x24 FREQ_NUM / 0x28 FREQ_DEN` (RO): clock rational.
 
