@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 dh-inputlog.workspace = true
+rand_chacha = "0.3"
+rand_core = "0.6"

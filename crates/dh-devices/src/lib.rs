@@ -12,6 +12,7 @@
 pub mod bus;
 pub mod clock;
 pub mod ctx;
+pub mod entropy;
 pub mod pad;
 
 pub use bus::{BusError, MmioBus, WINDOW_LEN};
