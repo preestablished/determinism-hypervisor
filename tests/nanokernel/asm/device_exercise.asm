@@ -168,7 +168,7 @@ prog_main:
     mov     dword [rbx + 0x20], 0x10000  ; A offset
     mov     dword [rbx + 0x24], 0x10000  ; A size
     mov     dword [rbx + 0x28], 0x20000  ; W offset
-    ; W size: the guest-sdk ARCHITECTURE layout table prints 0x1E0000, but
+    ; W size: the guest-sdk ARCHITECTURE layout table PRINTED 0x1E0000, but
     ; the same doc's normative rule says ring sizes are POWERS OF TWO
     ; (indices masked by size-1) — 0x1E0000 is not. The largest power of
     ; two fitting 0x20000..0x200000 is 1 MiB; attach rejects anything else

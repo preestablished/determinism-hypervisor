@@ -17,7 +17,7 @@
 ;
 ; Region composition (the §3.1 cases the M2 test attributes):
 ;   REP MOVSB, RCX=256  — retires as ONE instruction on completion
-;   CPUID (leaf 0)      — in-kernel emulated, retires exactly once
+;   CPUID (leaf 0)      — in-kernel emulated; retires ZERO (measured)
 ;   MMIO read           — pv-clock VNS (0xD000_0000+0x08), exits, retires
 ;                         once on the completing resume
 ;   MMIO write          — debug-serial THR mirror (0xD000_6000+0x08),
