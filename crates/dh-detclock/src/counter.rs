@@ -229,9 +229,21 @@ mod tests {
     use super::*;
 
     fn pmu_available() -> bool {
-        // The counter opens only where perf + a free PMU counter exist;
-        // skip elsewhere (aarch64 dev boxes, CI containers).
-        std::path::Path::new("/proc/sys/kernel/perf_event_paranoid").exists()
+        // The counter opens only where perf exists AND policy lets this user
+        // open a guest-filtered counter. Existence of the sysctl file is not
+        // enough: GitHub-hosted runners have it but set paranoid=4, which
+        // denies every unprivileged perf_event_open (EACCES). §7.4 provisions
+        // the lab box at paranoid=1, so anything stricter means "skip", and
+        // a failure to open at <=1 stays a real test failure.
+        let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") else {
+            return false;
+        };
+        // Unparseable level reads as MAX: fail closed into "skip".
+        let level: i32 = s.trim().parse().unwrap_or(i32::MAX);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        #[allow(unsafe_code)]
+        let euid = unsafe { libc::geteuid() };
+        level <= 1 || euid == 0
     }
 
     #[test]

@@ -52,7 +52,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
+      # NOT `cargo fmt --all`: cargo-fmt's --all also formats local path
+      # dependencies, i.e. the sibling checkouts (control-plane, guest-sdk),
+      # whose formatting must not gate this repo's CI. Scope to our members,
+      # fail-closed: at the virtual-manifest root, `cargo fmt --check` with
+      # an empty package list exits 0 having checked nothing.
+      - run: |
+          set -euo pipefail
+          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          test -n "$members"
+          cargo fmt --check $(printf -- '--package %s ' $members)
         working-directory: repo
       - run: cargo clippy ${{ matrix.cargo-args }} --all-targets -- -D warnings
         working-directory: repo
