@@ -44,6 +44,9 @@ jobs:
   # live-KVM tests (vcpu run loops, MSR filter #GP, timer determinism) stop
   # self-skipping and actually exercise the hypervisor.
   kvm-intel:
+    # Public repo + self-hosted runner: never let fork PRs onto the box.
+    # Same-repo pushes and same-repo PRs only.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, kvm-intel]
     steps:
       - uses: actions/checkout@v4
