@@ -11,25 +11,23 @@ fn u64le(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-#[test]
-fn pipeline_smoke_is_a_static_x86_64_exec_at_the_load_addr() {
-    let elf = pipeline_smoke_elf();
-    assert_eq!(&elf[0..4], b"\x7fELF");
-    assert_eq!(elf[4], 2, "ELFCLASS64");
-    assert_eq!(elf[5], 1, "little-endian");
-    assert_eq!(u16le(elf, 16), 2, "ET_EXEC (static, no PIE)");
-    assert_eq!(u16le(elf, 18), 62, "EM_X86_64");
+fn assert_guest_shape(name: &str, elf: &[u8]) {
+    assert_eq!(&elf[0..4], b"\x7fELF", "{name}");
+    assert_eq!(elf[4], 2, "{name}: ELFCLASS64");
+    assert_eq!(elf[5], 1, "{name}: little-endian");
+    assert_eq!(u16le(elf, 16), 2, "{name}: ET_EXEC (static, no PIE)");
+    assert_eq!(u16le(elf, 18), 62, "{name}: EM_X86_64");
     assert_eq!(
         u64le(elf, 24),
         NANOKERNEL_LOAD_ADDR,
-        "e_entry == load addr (crt0 .text.start placed first)"
+        "{name}: e_entry == load addr (crt0 .text.start placed first)"
     );
 
     // At least one PT_LOAD covering the entry address.
     let phoff = u64le(elf, 32) as usize;
     let phentsize = u16le(elf, 54) as usize;
     let phnum = u16le(elf, 56) as usize;
-    assert!(phnum >= 1);
+    assert!(phnum >= 1, "{name}");
     let mut covers_entry = false;
     for i in 0..phnum {
         let at = phoff + i * phentsize;
@@ -43,15 +41,21 @@ fn pipeline_smoke_is_a_static_x86_64_exec_at_the_load_addr() {
             covers_entry = true;
         }
     }
-    assert!(covers_entry, "a PT_LOAD must cover the entry point");
+    assert!(covers_entry, "{name}: a PT_LOAD must cover the entry point");
 
     // "tiny freestanding" (ARCH §1: ~2 KiB of program): the ELF with
     // headers and bss-free file image stays comfortably small.
     assert!(
         elf.len() < 64 * 1024,
-        "nanokernel ELF unexpectedly large: {} bytes",
+        "{name}: nanokernel ELF unexpectedly large: {} bytes",
         elf.len()
     );
+}
+
+#[test]
+fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
+    assert_guest_shape("pipeline_smoke", pipeline_smoke_elf());
+    assert_guest_shape("landing_loop", landing_loop_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines

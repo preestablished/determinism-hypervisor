@@ -34,6 +34,24 @@ pub fn pipeline_smoke_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/pipeline_smoke.elf"))
 }
 
+/// The M2/M3 long-runner (see asm/landing_loop.asm): an LCG loop touching
+/// a 64 KiB ring buffer, 'L' on serial when done. Iteration count comes
+/// from the BootInfo cmdline's leading ASCII decimal digits (no digits or
+/// "0" → [`LANDING_LOOP_DEFAULT_ITERS`]).
+pub fn landing_loop_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/landing_loop.elf"))
+}
+
+/// Loop-body instructions per iteration — the harness computes expected
+/// icounts as `8 * iters + prologue` (prologue/epilogue/crt0 are a few
+/// dozen instructions; harnesses calibrate the exact offset once, it is
+/// deterministic).
+pub const LANDING_LOOP_INSTRS_PER_ITER: u64 = 8;
+
+/// Iterations when the cmdline carries none: 12.5M × 8 = 100M loop
+/// instructions (the M2 landing test budget).
+pub const LANDING_LOOP_DEFAULT_ITERS: u64 = 12_500_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,7 +63,16 @@ mod tests {
     }
 
     #[test]
-    fn elf_is_embedded_and_nonempty() {
+    fn elves_are_embedded_and_nonempty() {
         assert!(!pipeline_smoke_elf().is_empty());
+        assert!(!landing_loop_elf().is_empty());
+    }
+
+    #[test]
+    fn default_iters_hit_the_100m_budget() {
+        assert_eq!(
+            LANDING_LOOP_INSTRS_PER_ITER * LANDING_LOOP_DEFAULT_ITERS,
+            100_000_000
+        );
     }
 }
