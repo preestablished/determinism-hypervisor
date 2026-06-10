@@ -66,6 +66,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             config: &config,
             start_icount: 0,
             injections: &[],
+            timer: None,
             pause: &pause,
         };
         let mut on_exit = |exit: VcpuExit| match exit {

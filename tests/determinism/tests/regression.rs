@@ -77,6 +77,7 @@ fn cold_run(budget: u64) -> (u64, u64, u64, u64, [u8; 32]) {
         config: &config,
         start_icount: 0,
         injections: &[],
+        timer: None,
         pause: &pause,
     };
     let out = run_segment(
