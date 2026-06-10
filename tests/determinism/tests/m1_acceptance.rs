@@ -103,6 +103,11 @@ struct RunOutcome {
     log_records: u64,
     icount: u64,
     state_hash: String,
+    /// Post-run device-model state (every bus device's snapshot section
+    /// plus the detchannel host's): the run-twice comparison must cover
+    /// state the RAM hash cannot see (overlay clusters, entropy stream
+    /// position, channel seqs) — review iteration-48 I-1.
+    device_state: Vec<u8>,
 }
 
 /// One cold boot of device_exercise over the full device surface.
@@ -247,6 +252,24 @@ fn run_m1(base_path: &std::path::Path) -> Result<RunOutcome, String> {
     if outcome.reason != StopReason::GuestHalted {
         return Err(format!("expected GuestHalted, got {:?}", outcome.reason));
     }
+    // No device queued an interrupt: this guest never opens a window
+    // (no sti/lidt), so a populated queue would mean a silently dropped
+    // injection — lock it (review iteration-48 I-2).
+    if !irqs.is_empty() {
+        return Err(format!("undrained irq queue: {irqs:?}"));
+    }
+    // The channel really attached at the donated GPA (the guest's 'D'
+    // proves it transitively; this proves it directly).
+    if channel.channel_gpa() != Some(0x40_0000) {
+        return Err(format!("channel not attached: {:?}", channel.channel_gpa()));
+    }
+    let mut device_state = Vec::new();
+    for (base, dev) in bus.devices() {
+        device_state.extend_from_slice(&base.to_le_bytes());
+        device_state.extend_from_slice(&dev.device_id().to_le_bytes());
+        dev.snapshot(&mut device_state);
+    }
+    channel.snapshot(&mut device_state);
     Ok(RunOutcome {
         serial: serial.take_output(),
         beacons,
@@ -257,6 +280,7 @@ fn run_m1(base_path: &std::path::Path) -> Result<RunOutcome, String> {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
+        device_state,
     })
 }
 
@@ -289,13 +313,10 @@ fn m1_device_exercise_end_to_end() {
         other => panic!("expected Beacon, got {other:?}"),
     }
 
-    // Channel mutations were logged (CHANNEL_INIT pio answers, DEV_EVENTs,
-    // entropy AUX): the DHILOG grew during the run.
-    assert!(
-        out.log_records >= 4,
-        "expected detcall/dev-event/entropy records, got {}",
-        out.log_records
-    );
+    // Channel mutations were logged: exactly 5 records, bit-stable
+    // (review-measured: CHANNEL_INIT pio answers + doorbell DEV_EVENTs +
+    // the entropy AUX record).
+    assert_eq!(out.log_records, 5, "DHILOG record count");
 
     // The guest's sector-0 write landed in the overlay ONLY.
     let meta = std::fs::metadata(&base_path).unwrap();
@@ -315,9 +336,23 @@ fn m1_device_exercise_end_to_end() {
     // everything observable.
     let out2 = run_m1(&base_path).expect("M1 second run");
     assert_eq!(
-        (out.serial, out.icount, out.state_hash, out.log_records),
-        (out2.serial, out2.icount, out2.state_hash, out2.log_records),
-        "M1 run must be bit-identically repeatable"
+        (
+            out.serial,
+            out.icount,
+            out.state_hash,
+            out.log_records,
+            out.device_state,
+            format!("{:?}", out.beacons),
+        ),
+        (
+            out2.serial,
+            out2.icount,
+            out2.state_hash,
+            out2.log_records,
+            out2.device_state,
+            format!("{:?}", out2.beacons),
+        ),
+        "M1 run must be bit-identically repeatable, device state included"
     );
 
     std::fs::remove_file(&base_path).ok();
