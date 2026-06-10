@@ -130,6 +130,15 @@ impl<'a> DevCtx<'a> {
             .frame_mark(self.icount, self.boundary_rip, frame_index);
         self.record(r);
     }
+
+    /// Log an AUX SDK_EVENT at this boundary (detchannel ring drains —
+    /// digest only; the payload travels via the gRPC stream, API.md §3.3).
+    pub fn log_sdk_event(&mut self, stream: u16, len: u32, digest8: u64) {
+        let r = self
+            .log
+            .sdk_event(self.icount, self.boundary_rip, stream, len, digest8);
+        self.record(r);
+    }
 }
 
 /// Simple Vec-backed guest memory for unit tests (and the nanokernel

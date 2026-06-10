@@ -5,12 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+detguest-host.workspace = true
+detguest-wire.workspace = true
 dh-inputlog.workspace = true
 rand_chacha = { version = "0.3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
-
-# Smoke-test-only for now; the detchannel host side (bead nln) promotes these
-# to [dependencies] when crates/dh-devices/src/detchannel* lands.
-[dev-dependencies]
-detguest-host.workspace = true
-detguest-wire.workspace = true
