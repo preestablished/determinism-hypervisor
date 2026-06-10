@@ -19,6 +19,10 @@
 //! Empirics (lab box, 40 runs, periods 100k/10k/1k/100): PMI overshoot is
 //! exactly 18 instructions, zero variance, period-independent — pure
 //! delivery latency, comfortably inside the 8192 skid margin.
+//! (That 18 is the single-instruction `jmp $` spin floor; the dh-cli
+//! `skid` harness measures 27..31 on the landing loop, whose imul-led
+//! dependent chain holds more in-flight retirement at NMI delivery —
+//! same mechanism, workload-dependent constant, both ≪ margin/2.)
 
 use kvm_ioctls::VcpuFd;
 use std::cell::Cell;
