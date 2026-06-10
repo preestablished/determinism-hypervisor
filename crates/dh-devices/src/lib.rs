@@ -10,6 +10,7 @@
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
 
 pub mod bus;
+pub mod clock;
 pub mod ctx;
 
 pub use bus::{BusError, MmioBus, WINDOW_LEN};
