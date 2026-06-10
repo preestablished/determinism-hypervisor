@@ -1,19 +1,35 @@
-#![deny(unsafe_code)] // targeted allows in kvm.rs only (memfd_create, madvise, set_user_memory_region)
+#![deny(unsafe_code)] // targeted allows in the x86_64 KVM modules only (raw ioctls, memfd, madvise)
 
+// Architecture split (bead v5w): the pure determinism math — agenda
+// scheduling, virtual-time rationals, machine config, block fixtures —
+// builds and tests everywhere (the aarch64 CI lane covers it). The
+// KVM-touching modules consume x86_64-only kvm-bindings APIs (MSR
+// filter, CPUID, VMX-shaped exits) and are gated to x86_64.
 pub mod agenda;
 pub mod blkfile;
-pub mod boot;
-pub mod boundary;
 pub mod config;
-pub mod cpuid;
-pub mod hash;
-pub mod inject;
-pub mod kvm;
-pub mod msr;
-pub mod run;
-pub mod runctl;
-pub mod tsc;
 pub mod vt;
+
+#[cfg(target_arch = "x86_64")]
+pub mod boot;
+#[cfg(target_arch = "x86_64")]
+pub mod boundary;
+#[cfg(target_arch = "x86_64")]
+pub mod cpuid;
+#[cfg(target_arch = "x86_64")]
+pub mod hash;
+#[cfg(target_arch = "x86_64")]
+pub mod inject;
+#[cfg(target_arch = "x86_64")]
+pub mod kvm;
+#[cfg(target_arch = "x86_64")]
+pub mod msr;
+#[cfg(target_arch = "x86_64")]
+pub mod run;
+#[cfg(target_arch = "x86_64")]
+pub mod runctl;
+#[cfg(target_arch = "x86_64")]
+pub mod tsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {

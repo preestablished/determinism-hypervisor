@@ -30,12 +30,13 @@ jobs:
         include:
           - runner: ubuntu-latest
             cargo-args: --workspace
-          # dh-vmm consumes x86_64-only kvm-bindings APIs (MSR filter, CPUID)
-          # with no cfg gates, so it and its dependents (dh-worker, dh-cli)
-          # cannot build on aarch64. The arm lane covers the shared crates;
-          # making the agenda/vt math arm-buildable is tracked in beads.
+          # The KVM-touching dh-vmm modules (and dh-cli's lib) are
+          # cfg(target_arch = "x86_64")-gated (bead v5w), so the whole
+          # workspace builds here too: the arm lane tests the pure
+          # determinism math (agenda, vt, config, blkfile) plus all the
+          # shared crates; the live-KVM tests compile to empty.
           - runner: ubuntu-24.04-arm
-            cargo-args: --workspace --exclude dh-vmm --exclude dh-worker --exclude dh-cli --exclude determinism-tests
+            cargo-args: --workspace
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

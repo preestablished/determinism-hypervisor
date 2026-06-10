@@ -11,11 +11,16 @@ dh-inputlog.workspace = true
 dh-proto.workspace = true
 dh-snapshot.workspace = true
 blake3.workspace = true
+
+# KVM plumbing is x86_64-only (bead v5w): kvm-bindings exposes the MSR
+# filter / CPUID symbols only under src/x86_64, and every consumer module
+# is cfg-gated in lib.rs.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 libc = "0.2.186"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vmm-sys-util = "0.15.0"
 
-[dev-dependencies]
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
 nanokernel = { path = "../../tests/nanokernel" }
