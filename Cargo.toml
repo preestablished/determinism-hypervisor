@@ -20,6 +20,12 @@ license = "Apache-2.0"
 [workspace.dependencies]
 blake3 = "1"
 determinism-proto = { path = "../control-plane/crates/determinism-proto", default-features = false }
+# detchannel host side (guest-sdk Ms1): sibling-repo path deps, same pattern
+# as determinism-proto -> ../control-plane. detguest-wire is needed alongside
+# detguest-host because the ChannelWriteSink trait signature takes
+# detguest_wire::RingId, which detguest-host does not re-export.
+detguest-host = { path = "../guest-sdk/crates/detguest-host" }
+detguest-wire = { path = "../guest-sdk/crates/detguest-wire" }
 dh-detclock = { path = "crates/dh-detclock" }
 dh-devices = { path = "crates/dh-devices" }
 dh-inputlog = { path = "crates/dh-inputlog" }

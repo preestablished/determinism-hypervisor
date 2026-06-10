@@ -76,6 +76,17 @@ name = "determinism-proto"
 version = "0.1.0"
 
 [[package]]
+name = "detguest-host"
+version = "0.1.0"
+dependencies = [
+ "detguest-wire",
+]
+
+[[package]]
+name = "detguest-wire"
+version = "0.1.0"
+
+[[package]]
 name = "dh-cli"
 version = "0.1.0"
 dependencies = [
@@ -94,6 +105,8 @@ dependencies = [
 name = "dh-devices"
 version = "0.1.0"
 dependencies = [
+ "detguest-host",
+ "detguest-wire",
  "dh-inputlog",
  "rand_chacha",
  "rand_core",
