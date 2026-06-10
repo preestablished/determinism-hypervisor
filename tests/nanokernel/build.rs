@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Top-level programs: one ELF each. crt0 is shared, not a program.
-const PROGRAMS: &[&str] = &["pipeline_smoke"];
+const PROGRAMS: &[&str] = &["pipeline_smoke", "landing_loop"];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
