@@ -12,11 +12,13 @@
 pub mod bus;
 pub mod clock;
 pub mod ctx;
+pub mod detchannel;
 pub mod entropy;
 pub mod pad;
 
 pub use bus::{BusError, MmioBus, WINDOW_LEN};
 pub use ctx::{DevCtx, EntropySource, GuestMem, IrqRequest, MemError};
+pub use detchannel::{DetChannelHost, DetChannelMetrics};
 
 pub const DEVICE_MODEL_COMPONENT: &str = "dh-devices";
 
