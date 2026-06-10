@@ -4,6 +4,7 @@
 
 use std::sync::atomic::AtomicBool;
 
+use dh_devices::serial::{SERIAL_PIO_BASE, SERIAL_PIO_LEN};
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -63,12 +64,13 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             timer: None,
             pause: &pause,
         };
+        const SERIAL_END: u16 = SERIAL_PIO_BASE + SERIAL_PIO_LEN;
         let mut on_exit = |exit: VcpuExit| match exit {
-            VcpuExit::IoOut(port, data) if (0x3F8..0x400).contains(&port) => {
+            VcpuExit::IoOut(port, data) if (SERIAL_PIO_BASE..SERIAL_END).contains(&port) => {
                 serial.pio_write(port, data);
                 Ok(())
             }
-            VcpuExit::IoIn(port, data) if (0x3F8..0x400).contains(&port) => {
+            VcpuExit::IoIn(port, data) if (SERIAL_PIO_BASE..SERIAL_END).contains(&port) => {
                 serial.pio_read(port, data);
                 Ok(())
             }

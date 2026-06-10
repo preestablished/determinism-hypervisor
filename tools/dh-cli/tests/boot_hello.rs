@@ -55,6 +55,34 @@ fn landing_loop_is_deterministic_across_runs() {
 }
 
 #[test]
+fn run_segment_serves_serial_ins_under_the_landing_loop() {
+    if !kvm_usable() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    // hello polls LSR via IN before every byte, so this drives the
+    // run-loop's serial-IN arm under the PMI/single-step machinery
+    // (boot.rs's debug loop has its own arm; this covers run.rs's).
+    let go = || {
+        dh_cli::run::run(
+            nanokernel::hello_elf(),
+            16 << 20,
+            b"",
+            dh_vmm::runctl::Until::IcountBudget(1_000_000),
+        )
+        .expect("hello must run under run_segment")
+    };
+    let (a, b) = (go(), go());
+    assert_eq!(a.reason, "guest_halted");
+    assert_eq!(a.serial, nanokernel::HELLO_SERIAL_OUTPUT);
+    assert_eq!(
+        (a.icount, a.rip, a.vns, a.state_hash, a.serial),
+        (b.icount, b.rip, b.vns, b.state_hash, b.serial),
+        "serial INs at boundaries must not perturb determinism"
+    );
+}
+
+#[test]
 fn device_exercise_reaches_a_real_mmio_exit() {
     if !kvm_usable() {
         eprintln!("skipping: /dev/kvm not usable");

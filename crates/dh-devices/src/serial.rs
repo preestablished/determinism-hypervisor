@@ -51,6 +51,10 @@ impl DebugSerial {
     }
 
     /// Fixed read value for a 16550 register (output-only model).
+    ///
+    /// Deliberately an associated fn (no `&self`): register reads must
+    /// never depend on device state — that invariant is what keeps the
+    /// model output-only and its reads replay-identical.
     fn reg_read(reg: u16) -> u8 {
         match reg {
             REG_LSR => LSR_ALWAYS_READY,
@@ -60,17 +64,26 @@ impl DebugSerial {
         }
     }
 
-    /// PIO write at `port` (absolute, within 0x3F8..0x400). Only THR
-    /// produces output; everything else is swallowed.
+    /// PIO write at `port`. Caller contract: `port` is within
+    /// `SERIAL_PIO_BASE..SERIAL_PIO_BASE + SERIAL_PIO_LEN` (out-of-range
+    /// ports are swallowed). Only THR produces output; a multi-byte OUT
+    /// at THR logs EVERY byte (real hardware would spread `out dx, ax`
+    /// across THR+IER) — determinism over fidelity, and the JSON log
+    /// keeps the guest's full output.
     pub fn pio_write(&mut self, port: u16, data: &[u8]) {
+        debug_assert!((SERIAL_PIO_BASE..SERIAL_PIO_BASE + SERIAL_PIO_LEN).contains(&port));
         if port == SERIAL_PIO_BASE + REG_THR_RBR {
             self.out.extend_from_slice(data);
         }
     }
 
-    /// PIO read at `port`: fill `data` with the register's fixed value
-    /// (byte registers: every byte of a wider access reads the same).
+    /// PIO read at `port` (same caller contract as `pio_write`): fill
+    /// `data` with the register's fixed value. Every byte of a wider
+    /// access reads the SAME register — real hardware would read
+    /// consecutive registers; we choose determinism over fidelity, and
+    /// no future "fix" should reintroduce position-dependent reads.
     pub fn pio_read(&self, port: u16, data: &mut [u8]) {
+        debug_assert!((SERIAL_PIO_BASE..SERIAL_PIO_BASE + SERIAL_PIO_LEN).contains(&port));
         let reg = port.saturating_sub(SERIAL_PIO_BASE);
         data.fill(Self::reg_read(reg));
     }
@@ -86,6 +99,8 @@ impl DetDevice for DebugSerial {
     }
 
     /// MMIO mirror: register `reg` at window offset `0x08 + reg * 4`.
+    /// Only exact 4-byte slot accesses participate; 8-byte accesses
+    /// (legal on the bus) are not part of the §6.9 mirror and read 0.
     fn mmio_read(&mut self, off: u64, data: &mut [u8], _ctx: &mut DevCtx) {
         if data.len() != 4 || !(0x08..0x28).contains(&off) || !off.is_multiple_of(4) {
             data.fill(0);
@@ -97,10 +112,11 @@ impl DetDevice for DebugSerial {
 
     fn mmio_write(&mut self, off: u64, data: &[u8], _ctx: &mut DevCtx) {
         if data.len() == 4 && off == 0x08 {
-            // THR mirror: low byte transmits.
+            // THR mirror: low byte transmits (one register per 4-byte
+            // slot, so unlike a PIO THR burst only data[0] is output).
             self.out.push(data[0]);
         }
-        // Everything else: swallowed (§6.9).
+        // Everything else, incl. non-4-byte widths: swallowed (§6.9).
     }
 
     /// EMPTY by design: serial state never enters the state hash.
@@ -148,6 +164,19 @@ mod tests {
         s.pio_write(0x3F9, b"X"); // IER write: swallowed
         assert_eq!(s.take_output(), b"HELLO");
         assert_eq!(s.take_output(), b"", "drained");
+    }
+
+    #[test]
+    fn wide_pio_access_reads_one_register_and_logs_every_thr_byte() {
+        let mut s = DebugSerial::new();
+        // Wide IN at LSR: every byte reads the SAME register (determinism
+        // over fidelity — real hardware would read LSR then MSR).
+        let mut w = [0u8; 2];
+        s.pio_read(0x3FD, &mut w);
+        assert_eq!(w, [0x60, 0x60]);
+        // Wide OUT at THR: every byte is output (not spread to IER).
+        s.pio_write(0x3F8, b"AB");
+        assert_eq!(s.take_output(), b"AB");
     }
 
     #[test]
