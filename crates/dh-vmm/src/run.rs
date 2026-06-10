@@ -136,7 +136,7 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress};
 
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        crate::kvm::kvm_usable()
     }
 
     fn gettid() -> i32 {
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn pmi_kick_interrupts_spinning_guest() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         install_kick_handler().unwrap();
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn kick_before_run_returns_immediately() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         install_kick_handler().unwrap();

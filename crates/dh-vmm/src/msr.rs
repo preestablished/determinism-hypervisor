@@ -124,7 +124,7 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress};
 
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        crate::kvm::kvm_usable()
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn denied_rdmsr_exits_to_userspace() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().unwrap();
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn denied_wrmsr_injects_gp() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().unwrap();
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn allowed_msr_does_not_exit() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().unwrap();

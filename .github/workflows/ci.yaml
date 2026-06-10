@@ -91,7 +91,9 @@ jobs:
           repository: ${{ github.repository_owner }}/guest-sdk
           path: guest-sdk
       - uses: dtolnay/rust-toolchain@stable
-      - run: test -c /dev/kvm && test -r /dev/kvm || { echo "::error::/dev/kvm not available/readable on runner"; exit 1; }
+      # rw, matching what Kvm::new() and the test guards need — a read-only
+      # grant would silently skip every live leg while the lane stays green.
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw on runner"; exit 1; }
       - run: cargo build --workspace
         working-directory: repo
       - run: cargo test --workspace

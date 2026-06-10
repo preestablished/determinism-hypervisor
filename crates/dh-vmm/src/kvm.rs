@@ -398,18 +398,39 @@ fn madvise_nohugepage(mem: &GuestMemoryMmap<()>, len: u64) -> Result<(), KvmErro
     Ok(())
 }
 
+/// Test guard: can this process actually open /dev/kvm? Existence is not
+/// enough — GitHub-hosted runners expose the node (nested virt) but deny the
+/// runner user access, so live-KVM tests must skip there and run only where
+/// an rw open succeeds (the lab box, the kvm-intel CI lane).
+#[cfg(test)]
+pub(crate) fn kvm_usable() -> bool {
+    use std::io::ErrorKind;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+    {
+        Ok(_) => true,
+        // Only "not there" / "not allowed" mean skip; anything else (EMFILE,
+        // EINTR, ...) must fail loudly rather than silently shrink coverage
+        // on a box where the live legs are supposed to run.
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => false,
+        Err(e) => panic!("unexpected /dev/kvm probe failure: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        crate::kvm::kvm_usable()
     }
 
     #[test]
     fn caps_gate_passes_on_compliant_host() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().expect("§2.1 caps must hold on the lab box");
@@ -423,7 +444,7 @@ mod tests {
     #[test]
     fn slot_vm_constructs_with_memfd_and_vcpu() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().unwrap();
@@ -444,7 +465,7 @@ mod tests {
     #[test]
     fn mem_above_hole_rejected() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let sys = KvmSystem::open().unwrap();
@@ -460,7 +481,7 @@ mod tests {
     #[test]
     fn forbidden_list_holds_by_construction() {
         if !kvm_available() {
-            eprintln!("skipping: no /dev/kvm");
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         // We never call KVM_CREATE_IRQCHIP/KVM_CREATE_PIT2. Smoke-assert a
