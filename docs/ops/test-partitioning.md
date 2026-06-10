@@ -4,7 +4,9 @@ Two hardware classes run this repo's gates. Everything is part of
 `cargo test --workspace`; the live legs self-skip when `/dev/kvm` is
 not usable (open rw probe), so the same command is correct everywhere.
 
-## Host-runnable (any machine — macOS, aarch64, CI hosted runners)
+## Host-runnable (any machine — Linux/aarch64/CI hosted runners; macOS
+## is EXPECTED to work via the rust-lld linker fallback in
+## tests/nanokernel/build.rs but is not exercised in CI)
 
 | What | Where | Notes |
 |---|---|---|
@@ -13,7 +15,7 @@ not usable (open rw probe), so the same command is correct everywhere.
 | Channel interop (real detguest-host attach/drain) | `cargo test -p nanokernel --test channel_interop` | mock guest memory |
 | ELF shape + asm constant pins | `cargo test -p nanokernel` | needs `nasm` (build.rs assembles the guests; cross-assembles fine on arm) |
 | Drift-check script logic | `bash ci/check-determinism-class.sh` | compares against the LIVE host — only meaningful on the lab box, but parses anywhere |
-| aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated (see CI for the cross-cc env if not on arm) |
+| aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated. On an arm host this just works (CI's arm lane runs natively). On an x86 Linux box you need a cross C toolchain for blake3's NEON C: `sudo apt install gcc-aarch64-linux-gnu` then `CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo clippy --target aarch64-unknown-linux-gnu ...` (plus `rustup target add aarch64-unknown-linux-gnu`) |
 
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 

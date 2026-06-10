@@ -50,14 +50,18 @@ test guests come from `tests/nanokernel`.
 
 ## Measured numbers (lab box: i5-8400, kernel 6.8.0-124, ucode 0xfa)
 
-- **PMI skid**: max 39 over 50,000 samples (typical 18–31); production
-  `skid_margin` 8192 — >200× headroom; gate alerts at margin/2.
+- **PMI skid**: typical 18–31, observed maxima 39–81 across separate
+  50,000-sample runs (stochastic tail); production `skid_margin` 8192 —
+  two orders of magnitude of headroom; gate alerts at margin/2.
 - **TSC restore**: KVM_VCPU_TSC_OFFSET device attr chosen over
-  MSR-write restore — 932 ns vs 1107 ns worst-case alignment error
+  MSR-write restore — 932 vs 1107 ns/call ioctl latency, and the MSR
+  path additionally risks KVM's sync-heuristic value quantization
   (`docs/decisions/tsc-alignment.md`).
 - **Landing**: 10,000 random targets in 100M instructions, zero
-  overshoots, bit-identical across margins 8192 vs 128 (§3.2
-  margin-independence proven live).
+  overshoots; tuples bit-identical across two boots with different
+  margins (first 100 targets at the production 8192 margin and the
+  rest at 256 on boot A; all 10,000 re-landed at 128 on boot B) —
+  §3.2 margin-independence proven live.
 - **Run-twice regression**: 1e9 instructions ×2 from cold boot,
   state-hash chains identical, ~4 s.
 
