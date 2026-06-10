@@ -45,6 +45,8 @@ pub enum StopReason {
     GoalSatisfied,
     HardCap,
     Paused,
+    /// The guest executed a terminal HLT mid-segment (proto GUEST_HALTED).
+    GuestHalted,
 }
 
 /// A finished segment.
@@ -122,6 +124,20 @@ pub fn run_segment(
         resync_slack: u64::from(seg.config.resync_slack),
     };
 
+    // The agenda is computed in counter space: a caller-asserted
+    // start_icount that disagrees with the counter lands every point
+    // wrong. Loud, early.
+    let actual = seg
+        .counter
+        .read()
+        .map_err(|e| RunError::Kvm(format!("counter: {e:?}")))?;
+    if actual != seg.start_icount {
+        return Err(RunError::Kvm(format!(
+            "start_icount {} != counter {actual}",
+            seg.start_icount
+        )));
+    }
+
     let (final_stop, goal_poll_period) = match until {
         Until::IcountBudget(b) => (FinalStop::IcountBudget(b), None),
         Until::VnsBudget(b) => (FinalStop::VnsBudget(b), None),
@@ -140,29 +156,70 @@ pub fn run_segment(
     let inputs = AgendaInputs {
         start_icount: seg.start_icount,
         injections: &injection_icounts,
-        epoch_len: std::num::NonZeroU64::new(seg.config.epoch_len),
+        // FinalOnly drops the epoch HASH grid; the pause roll-forward grid
+        // below is independent config arithmetic either way.
+        epoch_len: match seg.config.hash_epochs {
+            crate::config::HashEpochs::EpochsOn => std::num::NonZeroU64::new(seg.config.epoch_len),
+            crate::config::HashEpochs::FinalOnly => None,
+        },
         goal_poll_period,
         final_stop,
         clock,
     };
     let agenda = compile(&inputs).map_err(RunError::Agenda)?;
 
+    // Terminal HLT (proto GUEST_HALTED) is a STOP, not a fault: the
+    // wrapper flags it and unwinds the landing loop via a sentinel error.
+    let mut halted = false;
+    macro_rules! exits {
+        () => {
+            &mut |exit: VcpuExit| {
+                if matches!(exit, VcpuExit::Hlt) {
+                    halted = true;
+                    return Err(BoundaryError::Exit("guest halted".into()));
+                }
+                on_exit(exit)
+            }
+        };
+    }
+
     let mut delivered = 0u64;
     for point in &agenda {
-        let boundary = land_at(
+        let landed = land_at(
             &mut seg.slot.vcpu,
             seg.counter,
             point.icount,
             &margins,
-            on_exit,
-        )
-        .map_err(RunError::Boundary)?;
+            exits!(),
+        );
+        let boundary = match landed {
+            Ok(b) => b,
+            Err(_) if halted => return finish_halted(seg, clock, delivered),
+            Err(e) => return Err(RunError::Boundary(e)),
+        };
 
-        // Scheduled injections at this point (§3.4; one vector per entry —
-        // inject_at_boundary steps between queued vectors when several
-        // share a boundary, so each gets its own VM entry).
+        // Scheduled injections at this point (§3.4). KVM holds ONE queued
+        // vector, and a second KVM_INTERRUPT before the next entry
+        // silently OVERWRITES it (review, live-proven) — so between
+        // vectors sharing a boundary the guest is entered for exactly one
+        // retirement, delivering the queued vector before the next is
+        // queued ("chained across consecutive entries", agenda docs).
         let mut at = boundary;
-        for idx in &point.injections {
+        for (i, idx) in point.injections.iter().enumerate() {
+            if i > 0 {
+                let stepped = land_at(
+                    &mut seg.slot.vcpu,
+                    seg.counter,
+                    at.icount + 1,
+                    &margins,
+                    exits!(),
+                );
+                at = match stepped {
+                    Ok(b) => b,
+                    Err(_) if halted => return finish_halted(seg, clock, delivered),
+                    Err(e) => return Err(RunError::Boundary(e)),
+                };
+            }
             let inj: Injection = inject_at_boundary(
                 &mut seg.slot.vcpu,
                 seg.counter,
@@ -170,7 +227,7 @@ pub fn run_segment(
                 &at,
                 &margins,
                 seg.config.epoch_len,
-                on_exit,
+                exits!(),
             )
             .map_err(RunError::Inject)?;
             delivered += 1;
@@ -186,14 +243,23 @@ pub fn run_segment(
             .ok_or(RunError::ClockOverflow)?;
 
         if point.epoch_hash {
-            let sections = Vec::new(); // device bus arrives with the M1 loop
             seg.chain
-                .push_final_link(seg.slot, &sections, point.icount, vns)
+                .push_final_link(seg.slot, &[], point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
         }
 
+        // goal() must be a deterministic function of guest state (M6 goal
+        // conditions read guest regions); a wall-clock-dependent closure
+        // breaks replay identity — caller's burden, stated here.
         if point.goal_poll && goal() {
-            return finish(seg, StopReason::GoalSatisfied, boundary, vns, delivered);
+            return finish(
+                seg,
+                StopReason::GoalSatisfied,
+                boundary,
+                vns,
+                delivered,
+                point.epoch_hash,
+            );
         }
 
         if let Some(kind) = point.final_stop {
@@ -201,7 +267,7 @@ pub fn run_segment(
                 StopKind::Budget => StopReason::BudgetReached,
                 StopKind::HardCap => StopReason::HardCap,
             };
-            return finish(seg, reason, boundary, vns, delivered);
+            return finish(seg, reason, boundary, vns, delivered, point.epoch_hash);
         }
 
         // Asynchronous Pause (§3.3): honored at deterministic points only —
@@ -209,14 +275,18 @@ pub fn run_segment(
         if seg.pause.load(Ordering::Relaxed) {
             let epoch = seg.config.epoch_len.max(1);
             let next_epoch = point.icount.div_ceil(epoch).max(1) * epoch;
-            let b = land_at(
+            let rolled = land_at(
                 &mut seg.slot.vcpu,
                 seg.counter,
                 next_epoch,
                 &margins,
-                on_exit,
-            )
-            .map_err(RunError::Boundary)?;
+                exits!(),
+            );
+            let b = match rolled {
+                Ok(b) => b,
+                Err(_) if halted => return finish_halted(seg, clock, delivered),
+                Err(e) => return Err(RunError::Boundary(e)),
+            };
             let vns = clock
                 .vns_from_icount(b.icount)
                 .ok_or(RunError::ClockOverflow)?;
@@ -241,12 +311,16 @@ fn finish(
     boundary: Boundary,
     vns: u64,
     delivered: u64,
+    already_hashed: bool,
 ) -> Result<SegmentOutcome, RunError> {
-    // Every segment ends with a hash link at its stop boundary (§8.5:
-    // "at every final pause").
-    seg.chain
-        .push_final_link(seg.slot, &[], boundary.icount, vns)
-        .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
+    // Every segment ends with a hash link at its stop boundary (§8.5: "at
+    // every final pause") — exactly ONE link per boundary: a stop point
+    // that is also an epoch-hash point was linked in the walk already.
+    if !already_hashed {
+        seg.chain
+            .push_final_link(seg.slot, &[], boundary.icount, vns)
+            .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
+    }
     Ok(SegmentOutcome {
         reason,
         boundary,
@@ -254,6 +328,39 @@ fn finish(
         state_hash: seg.chain.value(),
         injections_delivered: delivered,
     })
+}
+
+/// Terminal HLT: stop where the guest stopped (proto GUEST_HALTED).
+fn finish_halted(
+    seg: &mut Segment<'_>,
+    clock: crate::vt::ClockRatio,
+    delivered: u64,
+) -> Result<SegmentOutcome, RunError> {
+    let icount = seg
+        .counter
+        .read()
+        .map_err(|e| RunError::Kvm(format!("counter: {e:?}")))?;
+    let regs = seg
+        .slot
+        .vcpu
+        .get_regs()
+        .map_err(|e| RunError::Kvm(format!("KVM_GET_REGS: {e}")))?;
+    let boundary = Boundary {
+        icount,
+        rip: regs.rip,
+        rcx: regs.rcx,
+    };
+    let vns = clock
+        .vns_from_icount(icount)
+        .ok_or(RunError::ClockOverflow)?;
+    finish(
+        seg,
+        StopReason::GuestHalted,
+        boundary,
+        vns,
+        delivered,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -442,5 +549,85 @@ mod tests {
             run_segment(&mut seg, Until::FrameBudget(3), &mut never, &mut no_exits),
             Err(RunError::NotYetWired("frame_budget"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod halt_tests {
+    use super::*;
+    use crate::boot::load_and_enter;
+    use crate::kvm::KvmSystem;
+    use crate::run::install_kick_handler;
+    use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+
+    fn gettid() -> i32 {
+        // SAFETY: argless syscall.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }
+    }
+
+    /// pipeline_smoke parks in HLT a few dozen instructions in — a budget
+    /// past the park must stop GUEST_HALTED with the serial output intact,
+    /// never a fatal error (review: the proto defines GUEST_HALTED).
+    #[test]
+    fn terminal_hlt_is_a_stop_not_a_fault_live() {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::pipeline_smoke_elf(), b"").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+
+        let config = {
+            MachineConfig::new(
+                16 << 20,
+                [0; 32],
+                crate::config::BootSpec::Elf {
+                    kernel_hash: [0; 32],
+                    cmdline: Vec::new(),
+                },
+            )
+        };
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut serial = Vec::new();
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            pause: &pause,
+        };
+        let out = run_segment(
+            &mut seg,
+            Until::IcountBudget(1_000_000),
+            &mut || false,
+            &mut |exit| {
+                if let VcpuExit::IoOut(port, data) = exit {
+                    if (0x3F8..0x400).contains(&port) {
+                        serial.extend_from_slice(data);
+                        return Ok(());
+                    }
+                }
+                Err(BoundaryError::Exit(format!("unexpected: {exit:?}")))
+            },
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::GuestHalted);
+        assert_eq!(serial, b"K", "serial captured before the halt survives");
+        assert!(out.boundary.icount < 1_000_000);
     }
 }

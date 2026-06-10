@@ -84,6 +84,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             StopReason::GoalSatisfied => "goal_satisfied",
             StopReason::HardCap => "hard_cap",
             StopReason::Paused => "paused",
+            StopReason::GuestHalted => "guest_halted",
         },
         icount: outcome.boundary.icount,
         rip: outcome.boundary.rip,
