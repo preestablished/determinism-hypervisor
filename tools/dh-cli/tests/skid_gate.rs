@@ -27,3 +27,15 @@ fn measured_skid_stays_under_half_margin() {
     // Sanity on this silicon class: skid is a few dozen instructions.
     assert!(r.histogram.max().unwrap() < 200, "skid order-of-magnitude");
 }
+
+#[test]
+fn phase1_gate_smoke() {
+    if !kvm_usable() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    // The operator command itself, exercised in CI at a smoke count.
+    let (plain, timer) = dh_cli::gate::run_gate(2).expect("gate must run");
+    assert!(plain.passed(), "{}", plain.artifact());
+    assert!(timer.passed(), "{}", timer.artifact());
+}

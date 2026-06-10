@@ -5,6 +5,10 @@
 ;                  reads the delivery table back from guest RAM.
 ;   cmdline "mask" never STI — the IF=0 deferral variant: any injection
 ;                  must defer (WindowNeverOpened under a bounded budget).
+;   cmdline "defer" a FIXED masked window (2000 x 6-instruction busy
+;                  iterations with IF=0), then STI and spin — a deadline
+;                  inside the window defers to the first post-STI
+;                  injectable boundary (§3.4), identically every run.
 ;   cmdline "arm"  the full M3 arming loop (pv-clock TIMER_DEADLINE MMIO
 ;                  every 1ms-vns for 10s-vns) — REQUIRES the device-bus
 ;                  run loop (bead 40q); under today's debug loops an MMIO
@@ -70,6 +74,8 @@ prog_main:
     je      .masked
     cmp     al, 'a'
     je      .arm_mode
+    cmp     al, 'd'
+    je      .defer_mode
 
 .open_window:
     sti
@@ -85,6 +91,22 @@ prog_main:
     add     rdx, 1
     and     rdx, 511
     jmp     .spin
+
+.defer_mode:
+    ; Fixed IF=0 window: 2000 iterations x 6 instructions, then open.
+    lea     r12, [work_buf]
+    xor     rdx, rdx
+    mov     rcx, 2000
+    mov     rax, 0xDEF3
+.masked_work:
+    imul    rax, rax, 13
+    add     rax, 3
+    mov     [r12 + rdx*8], rax
+    add     rdx, 1
+    and     rdx, 511
+    sub     rcx, 1
+    jnz     .masked_work
+    jmp     .open_window
 
 .arm_mode:
     ; The full M3 arming loop (needs the device-bus run loop, bead 40q):

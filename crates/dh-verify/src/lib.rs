@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+pub mod gate;
 pub mod skid;
 
 pub const VERIFY_COMPONENT: &str = "dh-verify";

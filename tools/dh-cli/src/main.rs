@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli skid [--samples N]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli skid [--samples N]\n  dh-cli gate [--runs N]"
     );
     std::process::exit(2);
 }
@@ -32,6 +32,29 @@ fn main() {
         Some("caps") | None => println!("{}", dh_vmm::m0_missing_caps_summary()),
         Some("boot") => boot_cmd(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("gate") => {
+            let runs = args
+                .get(1)
+                .and_then(|a| (a == "--runs").then(|| args.get(2)).flatten())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100);
+            match dh_cli::gate::run_gate(runs) {
+                Ok((plain, timer)) => {
+                    print!("{}", plain.artifact());
+                    print!("{}", timer.artifact());
+                    if plain.passed() && timer.passed() {
+                        println!("PHASE-1 DETERMINISM GATE: PASS ({runs} runs each)");
+                    } else {
+                        eprintln!("PHASE-1 DETERMINISM GATE: FAIL");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dh-cli gate: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("skid") => {
             let samples = args
                 .get(1)
