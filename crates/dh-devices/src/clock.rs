@@ -41,34 +41,59 @@ const SECTION_LEN: usize = 12;
 pub struct PvClock {
     num: u32,
     den: u32,
+    /// Guest-visible vns at segment start (icount 0). Snapshot transparency
+    /// requires CONTINUOUS guest time across segments: icount restarts at 0
+    /// per segment (ARCH §8.1), so the VMM restores this base from the
+    /// snapshot's virtual-time section (which stores vns at capture — NOT
+    /// part of CLKD). With a correct base, the absolute `timer_deadline_vns`
+    /// in CLKD stays meaningful across restore.
+    vns_base: u64,
     timer_deadline_vns: u64,
     timer_vector: u32,
 }
 
 impl PvClock {
     /// `num`/`den` from the validated MachineConfig (both nonzero).
+    /// Fresh-boot base is 0; restore paths call [`Self::set_vns_base`].
     pub fn new(num: u32, den: u32) -> Self {
         Self {
             num,
             den,
+            vns_base: 0,
             timer_deadline_vns: 0,
             timer_vector: DEFAULT_TIMER_VECTOR,
         }
     }
 
-    /// ARCH §4 conversion at this boundary. Saturates at u64::MAX rather
-    /// than wrapping — deterministic, monotone, and unreachable for sane
-    /// rationals within a segment's icount range.
+    /// Restore-time hook (VMM only): vns at the restored segment's start,
+    /// from the snapshot's virtual-time section. Keeps guest time monotone
+    /// across the restore — the guest must not observe time jumping back.
+    pub fn set_vns_base(&mut self, base: u64) {
+        self.vns_base = base;
+    }
+
+    /// Guest-visible vns at this boundary: base + ARCH §4 conversion of the
+    /// segment-relative icount. Saturates at u64::MAX — deterministic and
+    /// monotone. Waiver vs vt::ClockRatio's Option semantics: run control
+    /// computes vns via vt at every boundary and faults the slot on
+    /// overflow, so a guest can only read a saturated value if run control
+    /// already failed; the device must still return SOMETHING deterministic
+    /// on the MMIO path, and capping is the deterministic choice.
     fn vns(&self, icount: u64) -> u64 {
         let v = u128::from(icount) * u128::from(self.num) / u128::from(self.den);
-        u64::try_from(v).unwrap_or(u64::MAX)
+        self.vns_base
+            .saturating_add(u64::try_from(v).unwrap_or(u64::MAX))
     }
 
     /// Armed one-shot deadline for run control's agenda compilation:
-    /// `Some((deadline_vns, vector))` if armed. Run control converts the
-    /// deadline to a target icount (vt::icount_for_vns_target), inserts the
-    /// agenda point, and calls [`Self::disarm`] when the timer fires (it is
-    /// one-shot); it also logs the AUX TIMER_FIRE record at delivery.
+    /// `Some((deadline_vns, vector))` if armed. The deadline is ABSOLUTE
+    /// guest vns (continuous axis, see `vns_base`); run control converts to
+    /// a segment-relative icount target via
+    /// `vt::icount_for_vns_target(deadline - vns_base_of_segment)`, inserts
+    /// the agenda point, and calls [`Self::disarm`] when the timer fires
+    /// (one-shot); it also logs the AUX TIMER_FIRE record at delivery.
+    /// A deadline at or before current vns is the caller's to clamp: the
+    /// fire lands at the next boundary (§3.4 deferral applies either way).
     pub fn armed(&self) -> Option<(u64, u8)> {
         (self.timer_deadline_vns != 0).then_some((self.timer_deadline_vns, self.timer_vector as u8))
     }
@@ -119,12 +144,17 @@ impl DetDevice for PvClock {
 
     fn mmio_write(&mut self, off: u64, data: &[u8], _ctx: &mut DevCtx) {
         match off {
-            // RW: deadline (8B write; write 0 disarms).
+            // RW: deadline. ATOMIC-ARM CONTRACT: 8-byte write only; 4-byte
+            // half-writes are deterministic no-ops (a half-armed garbage
+            // deadline must be unrepresentable; Phase-1 guests are x86_64
+            // and write 64-bit MMIO). Write 0 disarms.
             REG_TIMER_DEADLINE if data.len() == 8 => {
                 self.timer_deadline_vns = u64::from_le_bytes(data.try_into().unwrap());
             }
+            // Masked to u8 on WRITE so read-back, snapshot, armed(), and the
+            // injected vector always agree (§3.4 vectors are 0-255).
             REG_TIMER_VECTOR if data.len() == 4 => {
-                self.timer_vector = u32::from_le_bytes(data.try_into().unwrap());
+                self.timer_vector = u32::from_le_bytes(data.try_into().unwrap()) & 0xFF;
             }
             // RO registers and unknown offsets: writes ignored
             // (deterministic no-op; reads remain pure functions).
@@ -278,6 +308,53 @@ mod tests {
 
         assert_eq!(b.restore(&section, 2), Err(RestoreError));
         assert_eq!(b.restore(&section[..8], SECTION_VERSION), Err(RestoreError));
+    }
+
+    #[test]
+    fn vns_base_keeps_guest_time_continuous_across_restore() {
+        // Segment 1 ends at icount 300 (1:3 clock → vns 100). The restored
+        // segment's icount restarts at 0; with the base set from the
+        // snapshot's virtual-time section, guest-visible vns continues
+        // monotonically and the absolute CLKD deadline stays meaningful.
+        let mut bus = MmioBus::new();
+        let mut clk = PvClock::new(1, 3);
+        clk.set_vns_base(100);
+        bus.register(PV_CLOCK_BASE, Box::new(clk)).unwrap();
+        assert_eq!(read8(&mut bus, B + 0x08, 0), 100); // no backward jump
+        assert_eq!(read8(&mut bus, B + 0x08, 9), 103);
+    }
+
+    #[test]
+    fn vector_writes_masked_to_u8() {
+        let mut bus = bus_with_clock(1, 1);
+        write(&mut bus, B + 0x20, &0x131u32.to_le_bytes());
+        // Read-back agrees with what would be injected (0x31), never 0x131.
+        assert_eq!(read4(&mut bus, B + 0x20, 0), 0x31);
+    }
+
+    #[test]
+    fn deadline_half_writes_are_noops() {
+        // Atomic-arm contract: 4-byte halves cannot arm (or corrupt) the
+        // deadline. The bus allows the access; the device ignores it.
+        let mut bus = bus_with_clock(1, 1);
+        write(&mut bus, B + 0x18, &0xDEAD_BEEFu32.to_le_bytes());
+        write(&mut bus, B + 0x1C, &0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(read8(&mut bus, B + 0x18, 0), 0);
+    }
+
+    #[test]
+    fn vns_saturates_at_u64_max() {
+        // Documented waiver vs vt's Option: the device caps; run control
+        // faults via vt before a guest can normally observe this.
+        let mut bus = bus_with_clock(u32::MAX, 1);
+        let mut clk_bus = MmioBus::new();
+        let mut clk = PvClock::new(u32::MAX, 1);
+        clk.set_vns_base(u64::MAX);
+        clk_bus.register(PV_CLOCK_BASE, Box::new(clk)).unwrap();
+        assert_eq!(read8(&mut clk_bus, B + 0x08, 1), u64::MAX);
+        // Product path saturation too (no base): icount large enough that
+        // icount * (2^32-1) > u64::MAX.
+        assert_eq!(read8(&mut bus, B + 0x08, u64::MAX / 2), u64::MAX);
     }
 
     #[test]
