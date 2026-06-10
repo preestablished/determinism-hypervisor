@@ -43,9 +43,10 @@ pub fn landing_loop_elf() -> &'static [u8] {
 }
 
 /// Loop-body instructions per iteration — the harness computes expected
-/// icounts as `8 * iters + prologue` (prologue/epilogue/crt0 are a few
-/// dozen instructions; harnesses calibrate the exact offset once, it is
-/// deterministic).
+/// icounts as `8 * iters + offset`. The offset (crt0 + prologue + parse +
+/// `align 16` pad NOPs + epilogue) is deterministic but VARIES WITH THE
+/// CMDLINE: the parse loop retires per digit, so calibrate per cmdline
+/// string, not once globally.
 pub const LANDING_LOOP_INSTRS_PER_ITER: u64 = 8;
 
 /// Iterations when the cmdline carries none: 12.5M × 8 = 100M loop

@@ -99,3 +99,47 @@ fn bootinfo_inc_matches_rust_constants() {
     );
     assert_eq!(lookup("BOOTINFO_OFF_CMDLINE"), BOOTINFO_OFF_CMDLINE as u64);
 }
+
+/// Pin the landing loop's harness-facing constants against the asm source
+/// (same drift-protection idea as the bootinfo test): the loop body between
+/// `.loop:` and its closing `jnz .loop` must be exactly
+/// LANDING_LOOP_INSTRS_PER_ITER instructions, and DEFAULT_ITERS must match.
+#[test]
+fn landing_loop_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/landing_loop.asm"))
+        .unwrap();
+
+    // %define DEFAULT_ITERS <n>
+    let default_iters: u64 = asm
+        .lines()
+        .find_map(|l| {
+            let mut t = l.split_whitespace();
+            (t.next() == Some("%define") && t.next() == Some("DEFAULT_ITERS"))
+                .then(|| t.next().unwrap().parse().unwrap())
+        })
+        .expect("missing %define DEFAULT_ITERS");
+    assert_eq!(default_iters, LANDING_LOOP_DEFAULT_ITERS);
+
+    // Count instruction lines between `.loop:` and the `jnz .loop`
+    // (inclusive): non-empty, non-comment, non-label, non-directive.
+    let mut in_loop = false;
+    let mut instrs = 0u64;
+    for line in asm.lines() {
+        let t = line.split(';').next().unwrap().trim();
+        if t == ".loop:" {
+            in_loop = true;
+            continue;
+        }
+        if !in_loop || t.is_empty() || t.ends_with(':') || t.starts_with("align") {
+            continue;
+        }
+        instrs += 1;
+        if t.starts_with("jnz") {
+            break;
+        }
+    }
+    assert_eq!(
+        instrs, LANDING_LOOP_INSTRS_PER_ITER,
+        "loop body drifted from the documented per-iteration count"
+    );
+}

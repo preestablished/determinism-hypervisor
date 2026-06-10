@@ -10,6 +10,13 @@
 ; (e.g. cmdline "12500000"). No digits / empty cmdline -> DEFAULT_ITERS
 ; (12_500_000 iterations = 100M loop instructions). After the loop, 'L'
 ; goes out on the debug serial port and crt0 parks in HLT.
+;
+; Accounting notes for the landing harness: the pre-loop offset is
+; deterministic but varies with the cmdline (the parse loop retires per
+; digit), and `align 16` pads the prologue with retiring NOPs — calibrate
+; per cmdline string. r12 (SysV callee-saved) is clobbered; crt0 never
+; returns to code that cares, but future programs sharing helpers should
+; not assume SysV discipline here.
 
 BITS 64
 
