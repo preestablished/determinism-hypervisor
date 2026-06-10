@@ -3,6 +3,7 @@
 pub mod agenda;
 pub mod config;
 pub mod kvm;
+pub mod msr;
 pub mod run;
 pub mod vt;
 
