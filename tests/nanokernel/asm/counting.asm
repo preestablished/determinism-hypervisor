@@ -41,6 +41,15 @@ BITS 64
     %assign ICOUNT ICOUNT+1
 %endmacro
 
+; VM-exiting region instruction: counted AND tallied separately so the
+; "3 exiting instructions" in nanokernel::COUNTING_EXIT_INSTRS_IN_REGION
+; is build-enforced, not hand-maintained.
+%assign EXITCOUNT 0
+%macro XI 1+
+    I %1
+    %assign EXITCOUNT EXITCOUNT+1
+%endmacro
+
 SECTION .text
 global prog_main
 
@@ -59,13 +68,13 @@ prog_main:
 
     ; CPUID: clobbers eax/ebx/ecx/edx (dx is re-established below).
     I xor     eax, eax
-    I cpuid
+    XI cpuid
 
     ; MMIO: a read that exits (pv-clock VNS) and a write that exits
     ; (debug-serial THR mirror — the byte lands in the serial log).
     I mov     rbx, MMIO_BASE
-    I mov     rax, [rbx + CLOCK_VNS]
-    I mov     dword [rbx + SERIAL_THR], 'M'
+    XI mov     rax, [rbx + CLOCK_VNS]
+    XI mov     dword [rbx + SERIAL_THR], 'M'
 
     ; Branches: taken unconditional, taken conditional, not-taken
     ; conditional — each retires exactly once.
@@ -87,7 +96,8 @@ prog_main:
 %assign ICOUNT ICOUNT + 2 * LOOP_ITERS
 
     ; Re-establish dx (CPUID clobbered it), stage the 'E' marker byte —
-    ; both inside the region (they sit between the marker OUTs).
+    ; both inside the region (they sit between the marker OUTs), so they
+    ; RETIRE INSIDE the measured window; only the E OUT itself is out.
     I mov     dx, SERIAL_PORT
     I mov     al, 'E'
 
@@ -101,9 +111,14 @@ prog_main:
 %if ICOUNT != 1000
 %error counting region must be exactly 1000 instructions
 %endif
+%if EXITCOUNT != 3
+%error region must contain exactly 3 VM-exiting instructions
+%endif
 
     out     dx, al                   ; 'E' marker (NOT counted)
 .never:
+    ; .never doubles as the never-taken jne target and the fall-through:
+    ; nothing can ever sit between the E OUT and this ret.
     ret                              ; crt0 parks in HLT
 
 SECTION .data

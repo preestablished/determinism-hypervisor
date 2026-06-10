@@ -112,8 +112,10 @@ pub const COUNTING_REGION_INSTRS: u64 = 1000;
 /// read, the serial-THR-mirror MMIO write.
 pub const COUNTING_EXIT_INSTRS_IN_REGION: u64 = 3;
 /// Counter delta between the S-OUT exit moment and the E-OUT exit
-/// moment — MEASURED §3.1 EMPIRICS (lab box / kvm-intel class, 15
-/// consecutive cold boots bit-identical):
+/// moment. PER-DETERMINISM-CLASS CONSTANT — measured on the lab box's
+/// kvm-intel class ONLY (15+ cold boots bit-identical, stable across
+/// cores/processes/load); other vendors/microcode may differ and MUST
+/// re-measure, never trust 997 cross-class (§3.1 empirics rule):
 ///
 /// A VM-exiting instruction (PIO OUT, CPUID, MMIO access) exits BEFORE
 /// it retires, and KVM completes it host-side by skipping RIP — with
@@ -133,6 +135,8 @@ pub const COUNTING_MARK_START: u8 = b'S';
 pub const COUNTING_MARK_END: u8 = b'E';
 /// Byte the region's MMIO write stores to the debug-serial THR mirror.
 pub const COUNTING_MMIO_THR_BYTE: u8 = b'M';
+/// GPA of that THR-mirror store (MMIO base + serial window + THR slot).
+pub const COUNTING_MMIO_THR_GPA: u64 = 0xD000_6008;
 /// RCX for the region's REP MOVSB (bytes copied; retires as ONE).
 pub const COUNTING_REP_BYTES: u64 = 256;
 

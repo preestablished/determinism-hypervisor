@@ -86,7 +86,10 @@ fn run_counting() -> Result<(Vec<u8>, u64, u64), String> {
         let mut on_exit = |exit: VcpuExit| match exit {
             VcpuExit::IoOut(0x3F8, data) => {
                 // Counter reads are stable here: the vCPU is out of
-                // guest mode at the exit (§3.1).
+                // guest mode at the exit (§3.1). NOTE: assumes the
+                // guest's single-byte `out dx, al` markers — a batched
+                // marker (rep outsb) would alias both markers onto ONE
+                // counter read and silently measure a zero window.
                 let now = counter_ref
                     .read()
                     .map_err(|e| BoundaryError::Exit(format!("counter read at marker: {e:?}")))?;
@@ -100,9 +103,10 @@ fn run_counting() -> Result<(Vec<u8>, u64, u64), String> {
                 serial.extend_from_slice(data);
                 Ok(())
             }
-            // The region's pv-clock VNS read: deterministic zeros (the
-            // real device bus is the M1 run loop; raw service is fine
-            // for the smoke and keeps the read deterministic).
+            // The region's pv-clock VNS read: deterministic zeros. The
+            // 997 retirement count is independent of the VALUE read —
+            // the real device bus (nonzero monotone vns) is bead gfb's
+            // path and must re-confirm retirement there, not here.
             VcpuExit::MmioRead(_gpa, data) => {
                 data.fill(0);
                 Ok(())
@@ -110,7 +114,7 @@ fn run_counting() -> Result<(Vec<u8>, u64, u64), String> {
             // The region's debug-serial THR mirror write: low byte is
             // the transmitted character (crates/dh-devices serial.rs).
             VcpuExit::MmioWrite(gpa, data) => {
-                if gpa == 0xD000_6008 && !data.is_empty() {
+                if gpa == nanokernel::COUNTING_MMIO_THR_GPA && !data.is_empty() {
                     serial.push(data[0]);
                 }
                 Ok(())
@@ -159,7 +163,13 @@ fn marker_window_is_exactly_the_region_minus_its_exiting_instructions() {
          retire zero; see nanokernel::COUNTING_DELTA_AT_OUT_EXITS)"
     );
 
-    // Cold-boot again: the window must be bit-identical, not just close.
+    // Cold-boot again: BOTH endpoints must be bit-identical, not just
+    // the delta — s drift would mean the crt0/prologue instruction
+    // stream changed underneath the constants.
     let (_, s2, e2) = run_counting().expect("second run");
-    assert_eq!(e2 - s2, e1 - s1, "window must be identical across runs");
+    assert_eq!(
+        (s2, e2),
+        (s1, e1),
+        "endpoints must be identical across runs"
+    );
 }
