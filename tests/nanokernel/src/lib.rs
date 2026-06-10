@@ -53,6 +53,35 @@ pub const LANDING_LOOP_INSTRS_PER_ITER: u64 = 8;
 /// instructions (the M2 landing test budget).
 pub const LANDING_LOOP_DEFAULT_ITERS: u64 = 12_500_000;
 
+/// The M1 acceptance guest (see asm/device_exercise.asm): exercises
+/// pv-clock, pv-entropy, pv-pad, pv-blk, and the detchannel (CHANNEL_INIT
+/// + one ring-W Beacon + doorbell), one serial progress byte per stage.
+pub fn device_exercise_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/device_exercise.elf"))
+}
+
+/// Full-success serial output of the device-exercise guest; a lowercase
+/// stage letter anywhere means that stage failed and the guest parked.
+pub const DEVICE_EXERCISE_OK_SEQUENCE: &[u8] = b"CEPBDX";
+
+/// Channel page GPA the device-exercise guest donates (2 MiB-aligned;
+/// requires mem_size >= this + 2 MiB) and the Beacon id it emits.
+pub const DEVICE_EXERCISE_CHANNEL_GPA: u64 = 0x40_0000;
+pub const DEVICE_EXERCISE_BEACON_ID: u32 = 0xB33F;
+
+/// The ring descriptors the guest writes at header offset 0x10, in C, I,
+/// A, W order as (offset, size). Mirrors the asm dword stores — the
+/// channel_interop test attaches a page built from THESE values through
+/// the real detguest-host code, so a drift here or in the asm fails CI.
+/// (W size is 0x100000, NOT the guest-sdk layout table's 0x1E0000: ring
+/// sizes are normatively powers of two; doc contradiction tracked.)
+pub const DEVICE_EXERCISE_RING_DESCS: [(u32, u32); 4] = [
+    (0x8000, 0x4000),
+    (0xC000, 0x4000),
+    (0x1_0000, 0x1_0000),
+    (0x2_0000, 0x10_0000),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +96,7 @@ mod tests {
     fn elves_are_embedded_and_nonempty() {
         assert!(!pipeline_smoke_elf().is_empty());
         assert!(!landing_loop_elf().is_empty());
+        assert!(!device_exercise_elf().is_empty());
     }
 
     #[test]
