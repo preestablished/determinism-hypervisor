@@ -9,6 +9,12 @@ on:
     - cron: "17 3 * * *" # 03:17 UTC nightly
   workflow_dispatch: {}
 
+# Queue hygiene on the single kvm-intel runner; never cancel in flight —
+# this is the measurement workflow (docs/ops/github-runner.md caveat).
+concurrency:
+  group: kvm-intel-nightly-drift
+  cancel-in-progress: false
+
 jobs:
   determinism-class:
     # Scheduled runs only execute on the default branch; the runner is

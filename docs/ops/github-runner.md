@@ -111,15 +111,14 @@ TOKEN=$(gh api -X POST repos/preestablished/determinism-hypervisor/actions/runne
 - **One KVM job at a time**: the determinism and perf jobs assume a quiesced
   host (4 slot cores, exclusive PMU counters). A single runner instance
   already runs one job at a time — that serialization is automatic. Workflow
-  `concurrency` groups are still wanted for queue hygiene (collapse stale
-  queued runs) and to keep the guarantee if a second `kvm-intel` runner is
-  ever added (determinism-hypervisor-4jq owns the workflow split):
-
-  ```yaml
-  concurrency:
-    group: kvm-intel-${{ github.workflow }}
-    cancel-in-progress: false   # never kill a determinism run mid-measurement
-  ```
+  `concurrency` groups add queue hygiene (collapse stale queued runs) and
+  keep the guarantee if a second `kvm-intel` runner is ever added. AS BUILT:
+  `ci.yaml` uses a per-ref group with `cancel-in-progress: true` — CI runs
+  are stateless (nothing persists from a partial run; the gate re-runs on
+  the next push), so cancelling superseded runs is safe and keeps the box
+  from queueing stale work. `nightly-drift.yaml` — the measurement-flavored
+  workflow — uses `cancel-in-progress: false`: never kill a drift/canary
+  run in flight.
 - The three other runners on this box serve other repos on the housekeeping
   cores; their jobs can add noise to perf gates. Perf-gate flakiness →
   schedule the nightly when the box is quiet before touching margins.
