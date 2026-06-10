@@ -238,6 +238,7 @@ mod tests {
         let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") else {
             return false;
         };
+        // Unparseable level reads as MAX: fail closed into "skip".
         let level: i32 = s.trim().parse().unwrap_or(i32::MAX);
         // SAFETY: geteuid has no preconditions and cannot fail.
         #[allow(unsafe_code)]
