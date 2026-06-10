@@ -53,3 +53,21 @@ fn landing_loop_is_deterministic_across_runs() {
     assert_eq!(run(b"1000"), run(b"1000"));
     assert_eq!(run(b"").0, b"L");
 }
+
+#[test]
+fn device_exercise_reaches_a_real_mmio_exit() {
+    if !kvm_usable() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    // The M1 loader maps the MMIO hole, so the device guest's first
+    // pv-clock read must surface as an MMIO exit at 0xD000_0008 — NOT a
+    // triple fault. The full device run loop is the M1 acceptance bead.
+    let err = dh_cli::boot::boot(nanokernel::device_exercise_elf(), 16 << 20, b"", 10_000)
+        .expect_err("debug loop has no device bus");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("MMIO at 0xd000_0008") || msg.contains("MMIO at 0xd0000008"),
+        "expected the pv-clock VNS MMIO exit, got: {msg}"
+    );
+}
