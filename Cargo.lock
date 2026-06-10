@@ -80,10 +80,12 @@ name = "determinism-tests"
 version = "0.1.0"
 dependencies = [
  "dh-detclock",
+ "dh-verify",
  "dh-vmm",
  "kvm-ioctls",
  "libc",
  "nanokernel",
+ "vm-memory",
 ]
 
 [[package]]

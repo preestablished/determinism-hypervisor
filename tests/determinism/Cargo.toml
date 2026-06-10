@@ -10,7 +10,9 @@ license.workspace = true
 
 [dev-dependencies]
 dh-detclock.workspace = true
+dh-verify.workspace = true
 dh-vmm.workspace = true
 kvm-ioctls = "0.24.0"
 nanokernel = { path = "../nanokernel" }
 libc = "0.2.186"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
