@@ -34,11 +34,19 @@ pub struct IrqRequest {
 }
 
 /// The device execution context for one MMIO dispatch.
+///
+/// Deliberately ABSENT: the clock rational / vns. The rational is per-VM
+/// immutable MachineConfig state (ARCH §4); pv-clock owns its own copy from
+/// construction and computes vns from `icount` itself. The VMM owes this
+/// context exactly one time fact per exit: a correct `icount`.
 pub struct DevCtx<'a> {
     pub icount: u64,
     /// Guest RIP at the exit boundary (recorded into log records).
     pub boundary_rip: u64,
-    pub log: &'a mut LogWriter,
+    /// Private: devices log through the `log_*` wrappers below, which stamp
+    /// `icount`/`boundary_rip` from this context — a device cannot stamp a
+    /// canonical record at the wrong boundary (silent replay divergence).
+    log: &'a mut LogWriter,
     pub mem: &'a mut dyn GuestMem,
     pub entropy: &'a mut dyn EntropySource,
     irq_queue: &'a mut Vec<IrqRequest>,
@@ -67,6 +75,47 @@ impl<'a> DevCtx<'a> {
     /// cannot observe, reorder, or cancel the queue.
     pub fn request_irq(&mut self, vector: u8) {
         self.irq_queue.push(IrqRequest { vector });
+    }
+
+    /// Log a canonical DEV_EVENT at THIS boundary (icount/rip stamped from
+    /// the context — the only way a device may write canonical records).
+    pub fn log_dev_event(
+        &mut self,
+        device_id: u16,
+        event_type: u16,
+        data: &[u8],
+    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
+        self.log
+            .dev_event(self.icount, self.boundary_rip, device_id, event_type, data)
+    }
+
+    /// Log a DEV_EVENT/PIO_ANSWER at this boundary (detcall IN returns).
+    pub fn log_pio_answer(
+        &mut self,
+        port: u16,
+        value: u32,
+    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
+        self.log
+            .pio_answer(self.icount, self.boundary_rip, port, value)
+    }
+
+    /// Log an AUX ENTROPY record at this boundary (pv-entropy serves).
+    pub fn log_entropy(
+        &mut self,
+        len: u32,
+        digest8: u64,
+    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
+        self.log
+            .entropy(self.icount, self.boundary_rip, len, digest8)
+    }
+
+    /// Log an AUX FRAME_MARK at this boundary (pv-pad FRAME_COUNTER write).
+    pub fn log_frame_mark(
+        &mut self,
+        frame_index: u32,
+    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
+        self.log
+            .frame_mark(self.icount, self.boundary_rip, frame_index)
     }
 }
 

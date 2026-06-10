@@ -28,6 +28,10 @@ pub struct RestoreError;
 /// len — API.md §4) is owned by `dh-snapshot`, which wraps these calls when
 /// it lands. `device_id` doubles as the §6.1 MAGIC register value and
 /// `section_version` as VERSION — both are served by the bus, read-only.
+///
+/// NOTE for dh-snapshot: the DHSNAP section tag is a 4-byte ASCII name from
+/// its own section table (e.g. `CLKD`) — it is NOT derived from
+/// `device_id`. The id↔tag mapping lives in dh-snapshot, one place.
 pub trait DetDevice {
     fn device_id(&self) -> u16;
     /// Version of this device's snapshot section layout (and the §6.1
