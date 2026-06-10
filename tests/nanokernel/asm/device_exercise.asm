@@ -168,7 +168,12 @@ prog_main:
     mov     dword [rbx + 0x20], 0x10000  ; A offset
     mov     dword [rbx + 0x24], 0x10000  ; A size
     mov     dword [rbx + 0x28], 0x20000  ; W offset
-    mov     dword [rbx + 0x2C], 0x1E0000 ; W size
+    ; W size: the guest-sdk ARCHITECTURE layout table prints 0x1E0000, but
+    ; the same doc's normative rule says ring sizes are POWERS OF TWO
+    ; (indices masked by size-1) — 0x1E0000 is not. The largest power of
+    ; two fitting 0x20000..0x200000 is 1 MiB; attach rejects anything else
+    ; (doc contradiction tracked in beads).
+    mov     dword [rbx + 0x2C], 0x100000 ; W size
     ; indices and counters: guest RAM starts zeroed; nothing to do.
 
     ; CHANNEL_INIT detcalls

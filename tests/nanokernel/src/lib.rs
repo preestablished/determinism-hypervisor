@@ -69,6 +69,19 @@ pub const DEVICE_EXERCISE_OK_SEQUENCE: &[u8] = b"CEPBDX";
 pub const DEVICE_EXERCISE_CHANNEL_GPA: u64 = 0x40_0000;
 pub const DEVICE_EXERCISE_BEACON_ID: u32 = 0xB33F;
 
+/// The ring descriptors the guest writes at header offset 0x10, in C, I,
+/// A, W order as (offset, size). Mirrors the asm dword stores — the
+/// channel_interop test attaches a page built from THESE values through
+/// the real detguest-host code, so a drift here or in the asm fails CI.
+/// (W size is 0x100000, NOT the guest-sdk layout table's 0x1E0000: ring
+/// sizes are normatively powers of two; doc contradiction tracked.)
+pub const DEVICE_EXERCISE_RING_DESCS: [(u32, u32); 4] = [
+    (0x8000, 0x4000),
+    (0xC000, 0x4000),
+    (0x1_0000, 0x1_0000),
+    (0x2_0000, 0x10_0000),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
