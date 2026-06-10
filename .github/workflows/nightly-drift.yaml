@@ -1,0 +1,47 @@
+# Nightly determinism-class drift check (bead q10) + the determinism
+# canary. Fails if the kvm-intel runner's host tuple drifted from
+# ci/determinism-class.lock without a deliberate, reviewed bump (the
+# apt-mark hold makes drift a deliberate act; the re-baseline procedure
+# lives in docs/ops/host-config-intel-box.md).
+name: nightly-drift
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC nightly
+  workflow_dispatch: {}
+
+jobs:
+  determinism-class:
+    # Scheduled runs only execute on the default branch; the runner is
+    # the lab box itself — exactly the host the lock describes.
+    runs-on: [self-hosted, kvm-intel]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - name: drift check
+        run: bash repo/ci/check-determinism-class.sh
+
+  determinism-canary:
+    # The 1e9-twice regression as the nightly canary: catches a
+    # semantic drift the host tuple cannot (e.g. a KVM behavior change
+    # within the same kernel package).
+    needs: determinism-class
+    runs-on: [self-hosted, kvm-intel]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
+      - name: run-twice determinism regression + counting empirics
+        run: cargo test -p determinism-tests --test regression --test counting_semantics --test counting_smoke
+        working-directory: repo
