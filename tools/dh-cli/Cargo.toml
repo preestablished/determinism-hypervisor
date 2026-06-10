@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dh-detclock.workspace = true
+dh-devices.workspace = true
 dh-verify.workspace = true
 dh-vmm.workspace = true
 kvm-bindings = "0.14.0"

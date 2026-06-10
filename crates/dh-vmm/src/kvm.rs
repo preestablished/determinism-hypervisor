@@ -262,6 +262,13 @@ pub enum ExitEvent {
         port: u16,
         data: Vec<u8>,
     },
+    /// IN-FILL CONTRACT applies (see DetcallIn): this event carries only
+    /// `len` — the mutable kvm_run buffer is gone by the time you hold an
+    /// ExitEvent. A run loop built on classify_exit CANNOT answer serial
+    /// INs through this variant; it must intercept the raw
+    /// `VcpuExit::IoIn` and fill via `DebugSerial::pio_read` before
+    /// re-entry (as dh-cli's debug loops do), or the guest reads stale
+    /// kvm_run bytes — the iter-29 hazard, one layer up.
     SerialIn {
         port: u16,
         len: usize,

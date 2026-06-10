@@ -104,6 +104,7 @@ name = "dh-cli"
 version = "0.1.0"
 dependencies = [
  "dh-detclock",
+ "dh-devices",
  "dh-verify",
  "dh-vmm",
  "kvm-bindings",
