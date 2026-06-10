@@ -1,6 +1,7 @@
 #![deny(unsafe_code)] // targeted allows in kvm.rs only (memfd_create, madvise, set_user_memory_region)
 
 pub mod agenda;
+pub mod blkfile;
 pub mod config;
 pub mod kvm;
 pub mod msr;

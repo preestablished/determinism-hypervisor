@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
 
+pub mod blk;
 pub mod bus;
 pub mod clock;
 pub mod ctx;
