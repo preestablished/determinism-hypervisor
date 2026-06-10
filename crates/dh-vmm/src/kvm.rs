@@ -181,14 +181,17 @@ impl KvmSystem {
         // In-guest vPMU OFF before any vCPU exists (ARCH §7.2): the guest
         // must not see or program performance counters — they are host
         // state, and the host's pinned INST_RETIRED counter (§3.1) must
-        // never contend with a vPMU. Best-effort on kernels without the
-        // cap (the CPUID mask still hides leaf 0xA either way).
+        // never contend with a vPMU. HARD-FAIL per the §2.1 philosophy:
+        // KVM_CAP_PMU_CAPABILITY exists since 5.18, well below the §7.4
+        // kernel baseline, and the CPUID leaf-0xA mask alone does not stop
+        // a guest from poking PMU MSRs blind.
         let mut pmu_cap = kvm_bindings::kvm_enable_cap {
             cap: kvm_bindings::KVM_CAP_PMU_CAPABILITY,
             ..Default::default()
         };
         pmu_cap.args[0] = u64::from(kvm_bindings::KVM_PMU_CAP_DISABLE);
-        let _ = vm.enable_cap(&pmu_cap);
+        vm.enable_cap(&pmu_cap)
+            .map_err(|e| KvmError::VmCreate(format!("KVM_PMU_CAP_DISABLE: {e}")))?;
 
         let vcpu = vm
             .create_vcpu(0)

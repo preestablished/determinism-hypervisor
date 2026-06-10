@@ -25,6 +25,9 @@ const L1_EDX_ACPI: u32 = 1 << 22; // thermal/throttle MSRs
 // Leaf 7 (subleaf 0) EBX
 const L7_EBX_RDSEED: u32 = 1 << 18; // hardware entropy: nondeterministic by definition
 
+// Leaf 7 (subleaf 0) ECX
+const L7_ECX_WAITPKG: u32 = 1 << 5; // UMWAIT/TPAUSE: wall-clock waits in userspace
+
 // Leaf 0x80000001 EDX
 const L8_1_EDX_RDTSCP: u32 = 1 << 27; // RDTSCP: raw TSC + IA32_TSC_AUX reads
 
@@ -67,6 +70,26 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
             }
             (7, 0) => {
                 e.ebx &= !L7_EBX_RDSEED;
+                e.ecx &= !L7_ECX_WAITPKG;
+            }
+            (0x15, _) | (0x16, _) => {
+                // TSC/crystal and processor frequency leaves: host-specific
+                // timing constants. Guests own no wall clock — virtual time
+                // is pv-clock's — and a guest calibrating from these would
+                // bind its behavior to the recording host's silicon. Zeroed
+                // so the table (and its hash) is frequency-blind.
+                e.eax = 0;
+                e.ebx = 0;
+                e.ecx = 0;
+                e.edx = 0;
+            }
+            (0x1A, _) => {
+                // Hybrid core-type leaf: P-core/E-core identity is host
+                // placement, not machine behavior. Zeroed.
+                e.eax = 0;
+                e.ebx = 0;
+                e.ecx = 0;
+                e.edx = 0;
             }
             (0xA, _) => {
                 // Architectural PMU leaf: the in-guest vPMU is disabled
@@ -95,7 +118,7 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
 pub fn cpuid_table_hash(cpuid: &CpuId) -> [u8; 32] {
     let mut entries: Vec<_> = cpuid.as_slice().to_vec();
     entries.sort_by_key(|e| (e.function, e.index));
-    let mut bytes = Vec::with_capacity(entries.len() * 24);
+    let mut bytes = Vec::with_capacity(entries.len() * 28);
     for e in &entries {
         bytes.extend_from_slice(&e.function.to_le_bytes());
         bytes.extend_from_slice(&e.index.to_le_bytes());
@@ -144,7 +167,17 @@ mod tests {
                 (6, _) => {
                     assert_eq!((e.eax, e.ebx, e.ecx, e.edx), (0, 0, 0, 0), "leaf 6");
                 }
-                (7, 0) => assert_eq!(e.ebx & L7_EBX_RDSEED, 0, "RDSEED"),
+                (7, 0) => {
+                    assert_eq!(e.ebx & L7_EBX_RDSEED, 0, "RDSEED");
+                    assert_eq!(e.ecx & L7_ECX_WAITPKG, 0, "WAITPKG");
+                }
+                (0x15, _) | (0x16, _) | (0x1A, _) => {
+                    assert_eq!(
+                        (e.eax, e.ebx, e.ecx, e.edx),
+                        (0, 0, 0, 0),
+                        "freq/hybrid leaves"
+                    );
+                }
                 (0xA, _) => {
                     assert_eq!((e.eax, e.ebx, e.ecx, e.edx), (0, 0, 0, 0), "leaf 0xA");
                 }
