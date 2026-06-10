@@ -97,7 +97,12 @@ where
     let phnum = u16le(56).ok_or_else(|| bad("truncated header"))? as usize;
     let mut any_load = false;
     for i in 0..phnum {
-        let at = phoff + i * phentsize;
+        let at = phoff
+            .checked_add(
+                i.checked_mul(phentsize)
+                    .ok_or_else(|| bad("phdr overflow"))?,
+            )
+            .ok_or_else(|| bad("phdr overflow"))?;
         let p_type = u32::from_le_bytes(
             elf.get(at..at + 4)
                 .ok_or_else(|| bad("truncated phdr"))?
@@ -159,7 +164,9 @@ where
         w(pd + ((gpa % GIB) / PAGE_2M) * 8, gpa | 0b1000_0011)?;
     }
     // The MMIO hole: PTE present so device accesses reach KVM as MMIO
-    // exits (no memslot there), never as guest page faults.
+    // exits (no memslot there), never as guest page faults. The 2 MiB page
+    // over-maps past MMIO_HOLE_LEN (0x7000) — harmless: everything in
+    // 0xD000_0000..0xD020_0000 is memslot-free, so any access exits.
     let hole_pd = PD_BASE_GPA + (MMIO_HOLE_BASE / GIB) * 0x1000;
     w(
         hole_pd + ((MMIO_HOLE_BASE % GIB) / PAGE_2M) * 8,
