@@ -29,7 +29,7 @@ use detguest_host::{
     Channel, ChannelWriteSink, FaultPlan, GuestEvent, GuestMem, InjectResponder, OwnedPayload,
     RegionManifest,
 };
-use detguest_wire::events::{encode_event, encoded_event_len, EventPayload};
+use detguest_wire::events::{encode_event, EventPayload};
 use detguest_wire::header::CHANNEL_SIZE_PAGES;
 use detguest_wire::ports::{
     InitStatus, PORT_DOORBELL, PORT_IDENT, PORT_INIT_GO, PORT_INIT_HI, PORT_INIT_LO, PORT_INJECT,
@@ -39,9 +39,8 @@ use detguest_wire::record::{EventKind, FLAG_REACHABLE_DECL, MAX_RECORD_LEN, RECO
 use detguest_wire::RingId;
 use dh_inputlog::dhilog::{LogWriter, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP, EVENT_RING_PUSH};
 
-/// `IN 0xD370` answer: magic `0xD37E` << 16 | proto version 1 (guest-sdk
-/// API.md §5).
-pub const IDENT_ANSWER: u32 = 0xD37E_0001;
+/// `IN 0xD370` answer (guest-sdk owns this ABI value — single source).
+pub use detguest_wire::ports::IDENT_VALUE as IDENT_ANSWER;
 
 /// `IN 0xD37C` before any INIT_GO commit. The ABI defines only the
 /// post-commit statuses (0..=3); this sentinel is deliberately none of them
@@ -74,6 +73,16 @@ pub struct DetChannelMetrics {
     pub sdk_digest_failures: u64,
 }
 
+impl DetChannelMetrics {
+    /// True when any counter indicates a guest-contract anomaly. Run
+    /// control MUST compare metrics before/after every drain-bearing exit
+    /// (mirroring the `DevCtx::log_fault` check rule) — `FAULTED` is its
+    /// call, not this module's.
+    pub fn any_anomaly(&self) -> bool {
+        self.drain_failures > 0 || self.sdk_digest_failures > 0
+    }
+}
+
 /// A host→guest push failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushChannelError {
@@ -98,10 +107,16 @@ pub struct DetChannelHost<M: GuestMem + Clone, P: FaultPlan> {
     /// Manifest snapshot from attach (capture-engine region resolution).
     manifest: Option<RegionManifest>,
     /// `OUT 0xD384` latch: the iseq the next `IN 0xD384` answers for.
+    /// Boot-scoped BY DESIGN: OUT and IN are separate VM exits, so the
+    /// latch must survive across exits; it persists until consumed by an
+    /// IN. A guest that INs much later still gets "the selected iseq"
+    /// (guest-sdk API.md §5) — deterministically.
     inject_iseq: Option<u32>,
     responder: InjectResponder<P>,
     /// Low 32 bits of the last QUIESCE_ACK token (run control reads this).
     last_quiesce_ack: Option<u32>,
+    /// Last drain failure, kept alongside the count for diagnostics.
+    pub last_drain_error: Option<detguest_host::WireError>,
     pub metrics: DetChannelMetrics,
 }
 
@@ -121,7 +136,24 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             inject_iseq: None,
             responder: InjectResponder::new(plan),
             last_quiesce_ack: None,
+            last_drain_error: None,
             metrics: DetChannelMetrics::default(),
+        }
+    }
+
+    /// Channel ring C/I producer seqs — the NON-RECONSTRUCTIBLE host state
+    /// (guest-sdk channel.rs: the host produces those rings and never
+    /// drains them). The snapshot layer must save these and feed them back
+    /// via [`Self::restore_producer_seqs`] after a restore re-attach.
+    pub fn producer_seqs(&self) -> Option<detguest_host::ProducerSeqs> {
+        self.channel.as_ref().map(|c| c.producer_seqs())
+    }
+
+    /// Restore checkpointed producer seqs after a restore re-attach. Pure
+    /// host state — touches no channel memory, so no sink involvement.
+    pub fn restore_producer_seqs(&mut self, seqs: detguest_host::ProducerSeqs) {
+        if let Some(c) = self.channel.as_mut() {
+            c.restore_producer_seqs(seqs);
         }
     }
 
@@ -132,6 +164,9 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
 
     /// Manifest snapshot taken at attach (None until attached, or if the
     /// manifest was unreadable then — see `metrics.manifest_read_failures`).
+    /// STALE after later guest region registrations: callers needing live
+    /// resolution re-read via `channel().read_manifest()` (it is guest RAM;
+    /// seqlock-consistent at any paused boundary).
     pub fn manifest(&self) -> Option<&RegionManifest> {
         self.manifest.as_ref()
     }
@@ -322,11 +357,14 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             let mut sink = CtxSink { ctx };
             match channel.drain_events(&mut sink) {
                 Ok(events) => events,
-                Err(_) => {
+                Err(e) => {
                     // Wire-level corruption is a deterministic function of
-                    // guest state: count it and surface nothing. The caller
-                    // escalates via metrics (FAULTED is run control's call).
+                    // guest state: count it and surface nothing. Run control
+                    // MUST check metrics after drain-bearing exits (see
+                    // `DetChannelMetrics::any_anomaly`) — FAULTED is its
+                    // call, not this module's.
                     self.metrics.drain_failures += 1;
+                    self.last_drain_error = Some(e);
                     return Vec::new();
                 }
             }
@@ -381,99 +419,120 @@ impl ChannelWriteSink for CtxSink<'_, '_> {
     }
 
     fn pio_answer(&mut self, port: u16, value: u32) {
+        // Sole PIO_ANSWER emitter for the INJECT path (the responder calls
+        // here); IDENT/INIT/RAZ answers log via `DevCtx::log_pio_answer`
+        // directly in `pio_in`. Exactly one record per IN, never doubled.
         self.ctx.log_pio_answer(port, value);
     }
 }
 
-/// The wire EventKind for a drained payload (`stream` field of SDK_EVENT).
-fn event_kind(p: &OwnedPayload) -> Option<EventKind> {
-    Some(match p {
-        OwnedPayload::Hello { .. } => EventKind::Hello,
-        OwnedPayload::NameIntern { .. } => EventKind::NameIntern,
-        OwnedPayload::AssertViolation { .. } => EventKind::AssertViolation,
-        OwnedPayload::Reachable { .. } => EventKind::Reachable,
-        OwnedPayload::Beacon { .. } => EventKind::Beacon,
-        OwnedPayload::InjectQuery { .. } => EventKind::InjectQuery,
-        OwnedPayload::RegionRegister(_) => EventKind::RegionRegister,
-        OwnedPayload::RegionUpdate(_) => EventKind::RegionUpdate,
-        OwnedPayload::WorkloadStarted { .. } => EventKind::WorkloadStarted,
-        OwnedPayload::WorkloadExited { .. } => EventKind::WorkloadExited,
-        OwnedPayload::LogLine { .. } => EventKind::LogLine,
-        OwnedPayload::QuiesceReady { .. } => EventKind::QuiesceReady,
-        OwnedPayload::FrameMark { .. } => EventKind::FrameMark,
-        OwnedPayload::Ready { .. } => EventKind::Ready,
-        // OwnedPayload is non_exhaustive: a future guest-sdk variant this
-        // build does not know cannot be digested — counted, not dropped.
-        _ => return None,
-    })
-}
-
-/// Borrow a drained payload back as the wire payload for re-encoding.
-fn wire_payload(p: &OwnedPayload) -> Option<EventPayload<'_>> {
+/// The wire (kind, payload) pair for a drained event — one match so the
+/// kind and the re-borrowed payload cannot drift apart structurally.
+fn wire_view(p: &OwnedPayload) -> Option<(EventKind, EventPayload<'_>)> {
     Some(match p {
         OwnedPayload::Hello {
             proto_version,
             agent_version,
             capabilities,
-        } => EventPayload::Hello {
-            proto_version: *proto_version,
-            agent_version: *agent_version,
-            capabilities: *capabilities,
-        },
-        OwnedPayload::NameIntern { name_id, name, .. } => EventPayload::NameIntern {
-            name_id: *name_id,
-            name,
-        },
+        } => (
+            EventKind::Hello,
+            EventPayload::Hello {
+                proto_version: *proto_version,
+                agent_version: *agent_version,
+                capabilities: *capabilities,
+            },
+        ),
+        OwnedPayload::NameIntern { name_id, name, .. } => (
+            EventKind::NameIntern,
+            EventPayload::NameIntern {
+                name_id: *name_id,
+                name,
+            },
+        ),
         OwnedPayload::AssertViolation {
             name_id,
             violation_count,
             details,
-        } => EventPayload::AssertViolation {
-            name_id: *name_id,
-            violation_count: *violation_count,
-            details,
-        },
-        OwnedPayload::Reachable { name_id } => EventPayload::Reachable { name_id: *name_id },
-        OwnedPayload::Beacon { beacon_id } => EventPayload::Beacon {
-            beacon_id: *beacon_id,
-        },
-        OwnedPayload::InjectQuery { iseq, name_id } => EventPayload::InjectQuery {
-            iseq: *iseq,
-            name_id: *name_id,
-        },
-        OwnedPayload::RegionRegister(r) => EventPayload::RegionRegister(*r),
-        OwnedPayload::RegionUpdate(r) => EventPayload::RegionUpdate(*r),
-        OwnedPayload::WorkloadStarted { guest_pid, unit } => EventPayload::WorkloadStarted {
-            guest_pid: *guest_pid,
-            unit: *unit,
-        },
+        } => (
+            EventKind::AssertViolation,
+            EventPayload::AssertViolation {
+                name_id: *name_id,
+                violation_count: *violation_count,
+                details,
+            },
+        ),
+        OwnedPayload::Reachable { name_id } => (
+            EventKind::Reachable,
+            EventPayload::Reachable { name_id: *name_id },
+        ),
+        OwnedPayload::Beacon { beacon_id } => (
+            EventKind::Beacon,
+            EventPayload::Beacon {
+                beacon_id: *beacon_id,
+            },
+        ),
+        OwnedPayload::InjectQuery { iseq, name_id } => (
+            EventKind::InjectQuery,
+            EventPayload::InjectQuery {
+                iseq: *iseq,
+                name_id: *name_id,
+            },
+        ),
+        OwnedPayload::RegionRegister(r) => {
+            (EventKind::RegionRegister, EventPayload::RegionRegister(*r))
+        }
+        OwnedPayload::RegionUpdate(r) => (EventKind::RegionUpdate, EventPayload::RegionUpdate(*r)),
+        OwnedPayload::WorkloadStarted { guest_pid, unit } => (
+            EventKind::WorkloadStarted,
+            EventPayload::WorkloadStarted {
+                guest_pid: *guest_pid,
+                unit: *unit,
+            },
+        ),
         OwnedPayload::WorkloadExited {
             guest_pid,
             exit_code,
             term_signal,
-        } => EventPayload::WorkloadExited {
-            guest_pid: *guest_pid,
-            exit_code: *exit_code,
-            term_signal: *term_signal,
-        },
-        OwnedPayload::LogLine { stream, level, msg } => EventPayload::LogLine {
-            stream: *stream,
-            level: *level,
-            msg,
-        },
-        OwnedPayload::QuiesceReady { token } => EventPayload::QuiesceReady { token: *token },
-        OwnedPayload::FrameMark { frame_index } => EventPayload::FrameMark {
-            frame_index: *frame_index,
-        },
+        } => (
+            EventKind::WorkloadExited,
+            EventPayload::WorkloadExited {
+                guest_pid: *guest_pid,
+                exit_code: *exit_code,
+                term_signal: *term_signal,
+            },
+        ),
+        OwnedPayload::LogLine { stream, level, msg } => (
+            EventKind::LogLine,
+            EventPayload::LogLine {
+                stream: *stream,
+                level: *level,
+                msg,
+            },
+        ),
+        OwnedPayload::QuiesceReady { token } => (
+            EventKind::QuiesceReady,
+            EventPayload::QuiesceReady { token: *token },
+        ),
+        OwnedPayload::FrameMark { frame_index } => (
+            EventKind::FrameMark,
+            EventPayload::FrameMark {
+                frame_index: *frame_index,
+            },
+        ),
         OwnedPayload::Ready {
             unit,
             region_count,
             manifest_generation,
-        } => EventPayload::Ready {
-            unit: *unit,
-            region_count: *region_count,
-            manifest_generation: *manifest_generation,
-        },
+        } => (
+            EventKind::Ready,
+            EventPayload::Ready {
+                unit: *unit,
+                region_count: *region_count,
+                manifest_generation: *manifest_generation,
+            },
+        ),
+        // OwnedPayload is non_exhaustive: a future guest-sdk variant this
+        // build does not know cannot be digested — counted, not dropped.
         _ => return None,
     })
 }
@@ -486,9 +545,12 @@ fn wire_payload(p: &OwnedPayload) -> Option<EventPayload<'_>> {
 /// detguest-wire's own encoder — byte-identical to what the guest produced
 /// for every in-cap field, and (load-bearing) computed by this same code on
 /// both record and replay, so verification's digest comparison holds.
+/// ASSUMPTION: record and replay run the SAME build of detguest-wire (the
+/// sibling path dep is HEAD-wins); a verifier replaying an old log with a
+/// changed encoder can see spurious SDK-digest divergence — encoder-skew
+/// fingerprinting is tracked in beads.
 fn sdk_event_digest(ev: &GuestEvent) -> Option<(u16, u32, u64)> {
-    let kind = event_kind(&ev.payload)?;
-    let payload = wire_payload(&ev.payload)?;
+    let (kind, payload) = wire_view(&ev.payload)?;
     let extra_flags = match &ev.payload {
         OwnedPayload::NameIntern {
             reachable_decl: true,
@@ -496,8 +558,11 @@ fn sdk_event_digest(ev: &GuestEvent) -> Option<(u16, u32, u64)> {
         } => FLAG_REACHABLE_DECL,
         _ => 0,
     };
-    let mut buf = vec![0u8; MAX_RECORD_LEN.max(encoded_event_len(&payload))];
+    let mut buf = vec![0u8; MAX_RECORD_LEN];
     let n = encode_event(&mut buf, ev.seq, ev.vnanos, extra_flags, &payload).ok()?;
+    // `len` and the digest cover the record's payload section as framed on
+    // the wire — i.e. INCLUDING its 8-byte-alignment zero padding — by
+    // design (one definition: "the bytes after the record header").
     let payload_bytes = &buf[RECORD_HEADER_LEN..n];
     Some((
         kind as u16,
@@ -581,9 +646,9 @@ mod tests {
         host
     }
 
-    /// Write `events` contiguously into ring W and publish the producer.
-    fn put_ring_w(mem: &SharedMem, events: &[EventPayload<'_>]) {
-        let desc = RingId::W.canonical_desc();
+    /// Write `events` contiguously into `ring` and publish the producer.
+    fn put_ring(mem: &SharedMem, ring: RingId, events: &[EventPayload<'_>]) {
+        let desc = ring.canonical_desc();
         let mut off = 0u32;
         for (seq, ev) in events.iter().enumerate() {
             let mut buf = [0u8; 4096];
@@ -596,8 +661,12 @@ mod tests {
         }
         mem.0
             .borrow_mut()
-            .write(BASE + RingId::W.prod_offset() as u64, &off.to_le_bytes())
+            .write(BASE + ring.prod_offset() as u64, &off.to_le_bytes())
             .unwrap();
+    }
+
+    fn put_ring_w(mem: &SharedMem, events: &[EventPayload<'_>]) {
+        put_ring(mem, RingId::W, events);
     }
 
     /// Decode a sealed DHILOG into (kind, payload) pairs.
@@ -911,5 +980,170 @@ mod tests {
             OwnedPayload::Beacon { beacon_id: 3 }
         ));
         assert_eq!(events[0].ring, RingId::W);
+    }
+
+    #[test]
+    fn inject_latch_survives_across_exits() {
+        // OUT 0xD384 and IN 0xD384 are SEPARATE VM exits; the latch must
+        // carry the selected iseq between them (boot-scoped by design).
+        let mut l = log();
+        let mem = channel_page();
+        let mut host = attached(mem.clone(), &mut l);
+        put_ring_w(
+            &mem,
+            &[
+                EventPayload::NameIntern {
+                    name_id: 1,
+                    name: b"io_read",
+                },
+                EventPayload::InjectQuery {
+                    iseq: 4,
+                    name_id: 1,
+                },
+            ],
+        );
+        with_ctx(&mut l, 70, |ctx| {
+            host.pio_out(PORT_INJECT, 4, ctx);
+        });
+        // Much later, an unrelated exit INs the port: it answers for the
+        // still-latched iseq 4 (LogFaultPlan answers Proceed = 0) and the
+        // query is consumed, so it is not "unmatched".
+        let v = with_ctx(&mut l, 90, |ctx| host.pio_in(PORT_INJECT, ctx));
+        assert_eq!(v, 0);
+        assert_eq!(host.channel().unwrap().unmatched_injects, 0);
+        assert_eq!(host.metrics.inject_in_without_out, 0);
+    }
+
+    #[test]
+    fn truncated_and_non_utf8_events_digest_identically() {
+        use detguest_wire::events::MAX_DETAILS;
+        // An over-cap details field: the SDK-side encoder clips it and sets
+        // TRUNCATED on the wire. Non-UTF-8 name: raw bytes on the wire.
+        let big = vec![0xABu8; MAX_DETAILS + 100];
+        let evs = [
+            EventPayload::NameIntern {
+                name_id: 1,
+                name: &[0xFF, 0xFE, 0x80],
+            },
+            EventPayload::AssertViolation {
+                name_id: 1,
+                violation_count: 1,
+                details: &big,
+            },
+        ];
+
+        let drain_once = || {
+            let mut l = log();
+            let mem = channel_page();
+            let mut host = attached(mem.clone(), &mut l);
+            put_ring_w(&mem, &evs);
+            let events = with_ctx(&mut l, 80, |ctx| host.drain_at_pause(ctx));
+            assert_eq!(host.metrics.sdk_digest_failures, 0);
+            (events, seal(l))
+        };
+        let (events_a, sealed_a) = drain_once();
+        let (events_b, sealed_b) = drain_once();
+
+        // The truncated flag survives the drain; the lossy intern path and
+        // the raw-bytes digest path coexist.
+        assert!(events_a[1].truncated, "over-cap details must be TRUNCATED");
+        assert!(matches!(
+            &events_a[0].payload,
+            OwnedPayload::NameIntern { name, .. } if name == &[0xFF, 0xFE, 0x80]
+        ));
+        assert_eq!(events_a, events_b);
+
+        // Byte-identical guest state -> byte-identical SDK_EVENT records
+        // (stream, len, digest8) on two independent hosts.
+        let sdk = |sealed: &[u8]| -> Vec<Vec<u8>> {
+            records(sealed)
+                .into_iter()
+                .filter(|(k, _)| *k == KIND_SDK_EVENT)
+                .map(|(_, p)| p)
+                .collect()
+        };
+        assert_eq!(sdk(&sealed_a), sdk(&sealed_b));
+        assert_eq!(sdk(&sealed_a).len(), 2);
+    }
+
+    #[test]
+    fn ring_a_drains_before_ring_w_with_correct_ids() {
+        let mut l = log();
+        let mem = channel_page();
+        let mut host = attached(mem.clone(), &mut l);
+        put_ring(
+            &mem,
+            RingId::A,
+            &[EventPayload::Hello {
+                proto_version: 1,
+                agent_version: 1,
+                capabilities: 0,
+            }],
+        );
+        put_ring(&mem, RingId::W, &[EventPayload::Beacon { beacon_id: 9 }]);
+
+        let events = with_ctx(&mut l, 100, |ctx| {
+            host.pio_out(PORT_DOORBELL, DOORBELL_RING_A | DOORBELL_RING_W, ctx)
+        });
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].ring, RingId::A, "ring A drains first");
+        assert_eq!(events[1].ring, RingId::W);
+
+        let recs = records(&seal(l));
+        let cons_ids: Vec<u8> = recs
+            .iter()
+            .filter(|(k, p)| {
+                *k == KIND_DEV_EVENT
+                    && u16::from_le_bytes(p[2..4].try_into().unwrap()) == EVENT_CONS_BUMP
+            })
+            .map(|(_, p)| p[8])
+            .collect();
+        assert_eq!(cons_ids, vec![2, 3], "CONS_BUMP ring ids: A=2 then W=3");
+    }
+
+    #[test]
+    fn corrupt_ring_indices_fail_the_drain_deterministically() {
+        let mut l = log();
+        let mem = channel_page();
+        let mut host = attached(mem.clone(), &mut l);
+        // used = prod - cons > ring size: wire-level corruption.
+        mem.0
+            .borrow_mut()
+            .write(
+                BASE + RingId::W.prod_offset() as u64,
+                &0xFFFF_FFF0u32.to_le_bytes(),
+            )
+            .unwrap();
+        let events = with_ctx(&mut l, 110, |ctx| host.drain_at_pause(ctx));
+        assert!(events.is_empty());
+        assert_eq!(host.metrics.drain_failures, 1);
+        assert!(host.last_drain_error.is_some());
+        assert!(host.metrics.any_anomaly());
+    }
+
+    #[test]
+    fn ring_c_full_surfaces_ring_full_for_pause_retry() {
+        let mut l = log();
+        let mut host = attached(channel_page(), &mut l);
+        let cmd = Command::Quiesce {
+            token: 1,
+            mode: QuiesceMode::Coop,
+        };
+        // Ring C is finite; pushing without the guest consuming must end in
+        // RingFull (the host retries at the next pause, never spins).
+        let mut full = None;
+        for i in 0..100_000 {
+            let r = with_ctx(&mut l, 200 + i, |ctx| host.push_command(&cmd, ctx));
+            if let Err(e) = r {
+                full = Some(e);
+                break;
+            }
+        }
+        assert!(matches!(
+            full,
+            Some(PushChannelError::Push(detguest_host::PushError::RingFull))
+        ));
+        // Producer seqs advanced and are exposed for checkpointing.
+        assert!(host.producer_seqs().unwrap().ring_c > 0);
     }
 }
