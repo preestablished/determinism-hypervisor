@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]"
     );
     std::process::exit(2);
 }
@@ -31,6 +31,13 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("caps") | None => println!("{}", dh_vmm::m0_missing_caps_summary()),
         Some("boot") => boot_cmd(&args[1..]),
+        Some("cpuid-diff") => match dh_cli::cpuid::cpuid_diff() {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("dh-cli cpuid-diff: {e}");
+                std::process::exit(1);
+            }
+        },
         _ => usage(),
     }
 }

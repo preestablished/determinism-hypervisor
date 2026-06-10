@@ -5,3 +5,4 @@
 //! hello.elf live wherever /dev/kvm is usable).
 
 pub mod boot;
+pub mod cpuid;

@@ -178,9 +178,30 @@ impl KvmSystem {
         #[allow(unsafe_code)]
         unsafe { vm.set_user_memory_region(slot) }.map_err(|e| KvmError::Memory(e.to_string()))?;
 
+        // In-guest vPMU OFF before any vCPU exists (ARCH §7.2): the guest
+        // must not see or program performance counters — they are host
+        // state, and the host's pinned INST_RETIRED counter (§3.1) must
+        // never contend with a vPMU. HARD-FAIL per the §2.1 philosophy:
+        // KVM_CAP_PMU_CAPABILITY exists since 5.18, well below the §7.4
+        // kernel baseline, and the CPUID leaf-0xA mask alone does not stop
+        // a guest from poking PMU MSRs blind.
+        let mut pmu_cap = kvm_bindings::kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_PMU_CAPABILITY,
+            ..Default::default()
+        };
+        pmu_cap.args[0] = u64::from(kvm_bindings::KVM_PMU_CAP_DISABLE);
+        vm.enable_cap(&pmu_cap)
+            .map_err(|e| KvmError::VmCreate(format!("KVM_PMU_CAP_DISABLE: {e}")))?;
+
         let vcpu = vm
             .create_vcpu(0)
             .map_err(|e| KvmError::VcpuCreate(e.to_string()))?;
+
+        // The §7.2 determinism mask is part of slot construction: every
+        // vCPU in this hypervisor runs the same fixed, hashed CPUID table.
+        let masked = crate::cpuid::masked_cpuid(&self.kvm)?;
+        vcpu.set_cpuid2(&masked)
+            .map_err(|e| KvmError::VcpuCreate(format!("KVM_SET_CPUID2: {e}")))?;
 
         // TSC offset attribute (the §4.4 restore-normalization mechanism):
         // gated system-wide by KVM_CAP_VCPU_ATTRIBUTES (REQUIRED_RAW_CAPS).
