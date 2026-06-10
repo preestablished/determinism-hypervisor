@@ -140,6 +140,20 @@ impl KvmSystem {
                 .map_err(|e| KvmError::VmCreate(format!("dirty ring enable: {e}")))?;
         }
 
+        // §2.1/§2.2: USER_SPACE_MSR must be ENABLED with
+        // KVM_MSR_EXIT_REASON_FILTER — filter-denied MSR accesses exit to
+        // userspace for deterministic emulation instead of KVM injecting
+        // #GP. Enabled per-VM here so the preflight smoke proves the
+        // combination works on this kernel (the filter itself is the MSR
+        // bead's).
+        let mut msr_cap = kvm_bindings::kvm_enable_cap {
+            cap: kvm_bindings::KVM_CAP_X86_USER_SPACE_MSR,
+            ..Default::default()
+        };
+        msr_cap.args[0] = u64::from(kvm_bindings::KVM_MSR_EXIT_REASON_FILTER);
+        vm.enable_cap(&msr_cap)
+            .map_err(|e| KvmError::VmCreate(format!("USER_SPACE_MSR enable: {e}")))?;
+
         let memfd = memfd_nohuge(mem_bytes)?;
         let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
             GuestAddress(0),

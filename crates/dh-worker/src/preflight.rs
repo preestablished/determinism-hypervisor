@@ -88,9 +88,54 @@ pub fn check_irq_affinity(lists: &[(String, String)]) -> CheckResult {
     }
 }
 
+/// rcu_nocbs has no /sys mirror; /proc/cmdline is authoritative (§7.4).
+pub fn check_rcu_nocbs(cmdline: &str) -> CheckResult {
+    let want = format!("rcu_nocbs={SLOT_CORES}");
+    CheckResult {
+        name: "cmdline.rcu_nocbs",
+        ok: cmdline.split_whitespace().any(|t| t == want),
+        got: cmdline
+            .split_whitespace()
+            .find(|t| t.starts_with("rcu_nocbs="))
+            .unwrap_or("<absent>")
+            .to_string(),
+        want,
+    }
+}
+
+/// Determinism-class identity guard: the §7.4 numbers above only mean
+/// anything on the host class they were decided for (and the IRQ
+/// char-scan's single-digit assumption depends on the 6-CPU count). The
+/// kernel/microcode *lock comparison* is the nightly's job (bead q10).
+pub fn check_host_identity(family: &str, model: &str, present: &str) -> Vec<CheckResult> {
+    vec![
+        check("cpu.family", family, "6"),
+        check("cpu.model", model, "158"),
+        // /sys/devices/system/cpu/present — NOT available_parallelism():
+        // this process runs affinity-masked to the housekeeping cores
+        // (which is the isolation working), so it would see 2, not 6.
+        check("cpu.present", present, "0-5"),
+    ]
+}
+
+fn cpuinfo_field(cpuinfo: &str, key: &str) -> String {
+    cpuinfo
+        .lines()
+        .find(|l| l.starts_with(key))
+        .and_then(|l| l.split(':').nth(1))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "<absent>".into())
+}
+
 /// All §7.4 host checks against live /sys //proc state.
 pub fn host_checks() -> Vec<CheckResult> {
-    let mut out = vec![
+    let cpuinfo = read_trim("/proc/cpuinfo");
+    let mut out = check_host_identity(
+        &cpuinfo_field(&cpuinfo, "cpu family"),
+        &cpuinfo_field(&cpuinfo, "model	"),
+        &read_trim("/sys/devices/system/cpu/present"),
+    );
+    out.extend(vec![
         check(
             "cpu.isolated",
             read_trim("/sys/devices/system/cpu/isolated"),
@@ -121,7 +166,31 @@ pub fn host_checks() -> Vec<CheckResult> {
             read_trim("/proc/sys/kernel/perf_event_paranoid"),
             "1",
         ),
-    ];
+        // Mirror parity with apply-host-config.sh --verify: governor
+        // (frequency drift = perf-gate nondeterminism, runbook decision)
+        // and direct /dev/kvm access for the service user.
+        check(
+            "cpufreq.governor(cpu0)",
+            read_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+            "performance",
+        ),
+    ]);
+    out.push(check_rcu_nocbs(&read_trim("/proc/cmdline")));
+    out.push({
+        let p = std::path::Path::new("/dev/kvm");
+        let rw = p.exists()
+            && fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .is_ok();
+        CheckResult {
+            name: "dev.kvm",
+            ok: rw,
+            got: if rw { "rw".into() } else { "not rw".into() },
+            want: "rw".into(),
+        }
+    });
     out.push(check_thp(&read_trim(
         "/sys/kernel/mm/transparent_hugepage/enabled",
     )));
@@ -225,6 +294,22 @@ mod tests {
         assert!(!check("x", "<unreadable: nope>", "0").ok);
     }
 
+    #[test]
+    fn rcu_nocbs_parser() {
+        assert!(check_rcu_nocbs("ro isolcpus=managed_irq,domain,2-5 rcu_nocbs=2-5 quiet").ok);
+        assert!(!check_rcu_nocbs("ro isolcpus=managed_irq,domain,2-5").ok);
+        assert!(!check_rcu_nocbs("rcu_nocbs=1-3").ok);
+    }
+
+    #[test]
+    fn host_identity_guard() {
+        assert!(check_host_identity("6", "158", "0-5").iter().all(|r| r.ok));
+        assert!(check_host_identity("6", "85", "0-5").iter().any(|r| !r.ok));
+        assert!(check_host_identity("6", "158", "0-31")
+            .iter()
+            .any(|r| !r.ok));
+    }
+
     /// HARDWARE-GATED acceptance: the full preflight passes on the §7.4
     /// box (and would fail loudly on a stock config — the parsers above
     /// prove the failure paths).
@@ -239,6 +324,6 @@ mod tests {
             eprintln!("{r}");
         }
         assert!(ok, "preflight must pass on the configured lab box");
-        assert!(results.len() >= 10);
+        assert!(results.len() >= 15);
     }
 }
