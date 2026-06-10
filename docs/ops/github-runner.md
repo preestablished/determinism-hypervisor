@@ -26,8 +26,10 @@ its version is NOT part of the determinism class — kernel/microcode are, see
 - **`perf_event_open`** — `kernel.perf_event_paranoid=1` set by the §7.4 host
   config ([host-config-intel-box.md](./host-config-intel-box.md)). `--verify`
   checks the sysctl (a proxy — it does not perform an actual
-  `perf_event_open`); the real end-to-end assertion is `dh-workerd
-  --preflight` once it lands.
+  `perf_event_open`); the real end-to-end assertion is
+  `cargo run -p dh-worker --bin dh-workerd -- --preflight`, which opens
+  KVM and constructs a slot VM for real (17/17 checks green as of
+  2026-06-10).
 
 ## Security: public repo + privileged runner
 
@@ -111,8 +113,11 @@ TOKEN=$(gh api -X POST repos/preestablished/determinism-hypervisor/actions/runne
 - **One KVM job at a time**: the determinism and perf jobs assume a quiesced
   host (4 slot cores, exclusive PMU counters). A single runner instance
   already runs one job at a time — that serialization is automatic. Workflow
-  `concurrency` groups add queue hygiene (collapse stale queued runs) and
-  keep the guarantee if a second `kvm-intel` runner is ever added. AS BUILT:
+  `concurrency` groups add queue hygiene (collapse stale queued runs);
+  note they do NOT by themselves preserve one-KVM-job-at-a-time if a
+  second `kvm-intel` runner is ever added (ci.yaml's group is per-REF —
+  two refs run concurrently across two runners; single-runner
+  serialization is the real guarantee today). AS BUILT:
   `ci.yaml` uses a per-ref group with `cancel-in-progress: true` — CI runs
   are stateless (nothing persists from a partial run; the gate re-runs on
   the next push), so cancelling superseded runs is safe and keeps the box
