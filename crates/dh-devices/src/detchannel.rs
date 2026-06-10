@@ -162,6 +162,107 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         self.channel_gpa
     }
 
+    /// DHSNAP `EVTC` section CONTENTS (framing — tag, version, length —
+    /// is dh-snapshot's, same convention as `DetDevice::snapshot`):
+    /// the host-only detchannel state. Layout v1, all LE:
+    ///   init_lo u32 | init_hi u32 | init_status u32
+    ///   | inject_iseq    u8 flag + u32
+    ///   | quiesce_ack    u8 flag + u32
+    ///   | channel        u8 flag + gpa u64 + seq_c u32 + seq_i u32
+    ///
+    /// NOT serialized, by design: the manifest snapshot (guest RAM —
+    /// restore re-reads it at re-attach, INTEGRATION contract) and the
+    /// channel's intern/pending-inject caches (reconstructible from the
+    /// drained event stream, which the ORCHESTRATOR holds — guest-sdk
+    /// channel.rs; until it replays them, post-restore inject-point name
+    /// resolution degrades to None, which FaultPlans must tolerate).
+    pub fn snapshot(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.init_lo.to_le_bytes());
+        out.extend_from_slice(&self.init_hi.to_le_bytes());
+        out.extend_from_slice(&self.init_status.to_le_bytes());
+        out.push(self.inject_iseq.is_some() as u8);
+        out.extend_from_slice(&self.inject_iseq.unwrap_or(0).to_le_bytes());
+        out.push(self.last_quiesce_ack.is_some() as u8);
+        out.extend_from_slice(&self.last_quiesce_ack.unwrap_or(0).to_le_bytes());
+        match (&self.channel, self.channel_gpa) {
+            (Some(c), Some(gpa)) => {
+                let seqs = c.producer_seqs();
+                out.push(1);
+                out.extend_from_slice(&gpa.to_le_bytes());
+                out.extend_from_slice(&seqs.ring_c.to_le_bytes());
+                out.extend_from_slice(&seqs.ring_i.to_le_bytes());
+            }
+            _ => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; 16]);
+            }
+        }
+    }
+
+    /// EVTC section byte length (fixed in v1).
+    pub const EVTC_LEN: usize = 4 + 4 + 4 + 5 + 5 + 1 + 16;
+    pub const EVTC_VERSION: u16 = 1;
+
+    /// Restore from EVTC contents. PRECONDITION (§8.3 restore order):
+    /// guest RAM is already restored — re-attach validates the live
+    /// channel header at the recorded GPA, then the NON-RECONSTRUCTIBLE
+    /// ring C/I producer seqs are reinstated and the manifest re-read.
+    ///
+    /// Takes a FRESH `plan`: FaultPlan accumulator state (occurrence
+    /// counters) is never serialized — replay constructs its plan from
+    /// the input log, and a reused slot must not leak the prior tenant's
+    /// counts into inject decisions (review iter-42: that leak CHANGES
+    /// replay outcomes). Metrics and diagnostics reset for the same
+    /// reused-slot reason. Fork (§8.4) note: a CoW child built fresh via
+    /// `new()` + this restore over the child's mem handle gets exactly
+    /// the parent's EVTC state — this pair IS the fork path's seam.
+    pub fn restore(
+        &mut self,
+        bytes: &[u8],
+        version: u16,
+        plan: P,
+    ) -> Result<(), crate::RestoreError> {
+        if version != Self::EVTC_VERSION || bytes.len() != Self::EVTC_LEN {
+            return Err(crate::RestoreError);
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let init_lo = u32_at(0);
+        let init_hi = u32_at(4);
+        let init_status = u32_at(8);
+        let inject_iseq = (bytes[12] == 1).then(|| u32_at(13));
+        let last_quiesce_ack = (bytes[17] == 1).then(|| u32_at(18));
+
+        let (channel, channel_gpa, manifest) = if bytes[22] == 1 {
+            let gpa = u64::from_le_bytes(bytes[23..31].try_into().unwrap());
+            let seqs = detguest_host::ProducerSeqs {
+                ring_c: u32_at(31),
+                ring_i: u32_at(35),
+            };
+            let mut ch = Channel::attach(self.mem.clone(), gpa).map_err(|_| crate::RestoreError)?;
+            ch.restore_producer_seqs(seqs);
+            let manifest = ch.read_manifest().ok();
+            (Some(ch), Some(gpa), manifest)
+        } else {
+            (None, None, None)
+        };
+
+        self.init_lo = init_lo;
+        self.init_hi = init_hi;
+        self.init_status = init_status;
+        self.inject_iseq = inject_iseq;
+        self.last_quiesce_ack = last_quiesce_ack;
+        self.channel = channel;
+        self.channel_gpa = channel_gpa;
+        self.manifest = manifest;
+        self.responder = InjectResponder::new(plan);
+        self.last_drain_error = None;
+        self.metrics = DetChannelMetrics::default();
+        if self.channel.is_some() && self.manifest.is_none() {
+            self.metrics.manifest_read_failures = 1;
+        }
+        Ok(())
+    }
+
     /// Manifest snapshot taken at attach (None until attached, or if the
     /// manifest was unreadable then — see `metrics.manifest_read_failures`).
     /// STALE after later guest region registrations: callers needing live
@@ -1145,5 +1246,179 @@ mod tests {
         ));
         // Producer seqs advanced and are exposed for checkpointing.
         assert!(host.producer_seqs().unwrap().ring_c > 0);
+    }
+}
+
+#[cfg(test)]
+mod evtc_tests {
+    use super::*;
+    use crate::ctx::test_support::FakeEntropy;
+    use crate::ctx::VecGuestMem;
+    use detguest_host::{LogFaultPlan, MemError, MockGuestMem};
+    use detguest_wire::events::QuiesceMode;
+    use detguest_wire::header::{ChannelHeader, CHANNEL_SIZE, OFF_MANIFEST, OFF_RESERVED};
+    use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
+    use detguest_wire::Command;
+    use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const BASE: u64 = 0x1000_0000;
+
+    #[derive(Clone)]
+    struct SharedMem(Rc<RefCell<MockGuestMem>>);
+    impl GuestMem for SharedMem {
+        fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+            self.0.borrow().read(gpa, buf)
+        }
+        fn write(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError> {
+            self.0.borrow_mut().write(gpa, buf)
+        }
+    }
+
+    fn channel_page() -> SharedMem {
+        let mut gm = MockGuestMem::with_zeroed(BASE, CHANNEL_SIZE);
+        let mut hdr = [0u8; OFF_RESERVED];
+        ChannelHeader::canonical().write_to(&mut hdr).unwrap();
+        gm.write(BASE, &hdr).unwrap();
+        let mut area = vec![0u8; MANIFEST_TOTAL_SIZE];
+        init_manifest(&mut area).unwrap();
+        gm.write(BASE + OFF_MANIFEST as u64, &area).unwrap();
+        SharedMem(Rc::new(RefCell::new(gm)))
+    }
+
+    fn log() -> LogWriter {
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: [0; 32],
+            entropy_seed: [0; 32],
+            machine_config_hash: [0; 32],
+            clock_num: 1,
+            clock_den: 1,
+        })
+    }
+
+    fn with_ctx<R>(l: &mut LogWriter, icount: u64, f: impl FnOnce(&mut DevCtx) -> R) -> R {
+        let mut mem = VecGuestMem(vec![0u8; 16]);
+        let mut ent = FakeEntropy(0);
+        let mut q = Vec::new();
+        let mut ctx = DevCtx::new(icount, 0, l, &mut mem, &mut ent, &mut q);
+        f(&mut ctx)
+    }
+
+    #[test]
+    fn evtc_roundtrips_attached_state_and_seqs() {
+        let mut l = log();
+        let mem = channel_page();
+        let mut host = DetChannelHost::new(mem.clone(), LogFaultPlan::default());
+        with_ctx(&mut l, 10, |ctx| {
+            host.pio_out(PORT_INIT_LO, BASE as u32, ctx);
+            host.pio_out(PORT_INIT_GO, CHANNEL_SIZE_PAGES, ctx);
+            assert_eq!(host.pio_in(PORT_INIT_GO, ctx), 0);
+            // Consume ring C seqs 0 and 1 (two pushes).
+            for token in [1, 2] {
+                host.push_command(
+                    &Command::Quiesce {
+                        token,
+                        mode: QuiesceMode::Coop,
+                    },
+                    ctx,
+                )
+                .unwrap();
+            }
+            host.pio_out(PORT_QUIESCE_ACK, 0xBEEF, ctx);
+            host.pio_out(PORT_INJECT, 7, ctx); // latch an iseq
+        });
+        let seqs_before = host.producer_seqs().unwrap();
+        assert!(seqs_before.ring_c >= 2);
+
+        let mut section = Vec::new();
+        host.snapshot(&mut section);
+        assert_eq!(
+            section.len(),
+            DetChannelHost::<SharedMem, LogFaultPlan>::EVTC_LEN
+        );
+
+        // Fresh host over the SAME guest RAM (the restore precondition:
+        // RAM is already back).
+        let mut restored = DetChannelHost::new(mem, LogFaultPlan::default());
+        restored
+            .restore(
+                &section,
+                DetChannelHost::<SharedMem, LogFaultPlan>::EVTC_VERSION,
+                LogFaultPlan::default(),
+            )
+            .unwrap();
+        assert_eq!(restored.channel_gpa(), Some(BASE));
+        assert_eq!(restored.producer_seqs().unwrap(), seqs_before);
+        assert!(restored.manifest().is_some(), "manifest re-read at attach");
+        assert_eq!(restored.take_quiesce_ack(), Some(0xBEEF));
+        let mut l2 = log();
+        with_ctx(&mut l2, 20, |ctx| {
+            assert_eq!(restored.pio_in(PORT_INIT_LO, ctx), BASE as u32);
+            assert_eq!(restored.pio_in(PORT_INIT_GO, ctx), 0, "status restored");
+        });
+
+        // The next push uses the NEXT seq — never a reused one.
+        let mut l3 = log();
+        with_ctx(&mut l3, 30, |ctx| {
+            restored
+                .push_command(
+                    &Command::Quiesce {
+                        token: 3,
+                        mode: QuiesceMode::Coop,
+                    },
+                    ctx,
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            restored.producer_seqs().unwrap().ring_c,
+            seqs_before.ring_c + 1
+        );
+    }
+
+    #[test]
+    fn evtc_roundtrips_detached_state_and_refuses_bad_input() {
+        let host: DetChannelHost<SharedMem, LogFaultPlan> =
+            DetChannelHost::new(channel_page(), LogFaultPlan::default());
+        let mut section = Vec::new();
+        host.snapshot(&mut section);
+
+        let mut restored = DetChannelHost::new(channel_page(), LogFaultPlan::default());
+        restored
+            .restore(&section, 1, LogFaultPlan::default())
+            .unwrap();
+        assert!(restored.channel().is_none());
+        assert_eq!(restored.channel_gpa(), None);
+
+        assert!(
+            restored
+                .restore(&section, 2, LogFaultPlan::default())
+                .is_err(),
+            "wrong version"
+        );
+        assert!(
+            restored
+                .restore(&section[..10], 1, LogFaultPlan::default())
+                .is_err(),
+            "truncated"
+        );
+
+        // Attached flag with a GPA that does not hold a valid channel
+        // (zeroed RAM) must refuse loudly, not attach garbage.
+        let mut bad = section.clone();
+        bad[22] = 1;
+        bad[23..31].copy_from_slice(&BASE.to_le_bytes());
+        let mut h2: DetChannelHost<SharedMem, LogFaultPlan> = DetChannelHost::new(
+            SharedMem(Rc::new(RefCell::new(MockGuestMem::with_zeroed(
+                BASE,
+                CHANNEL_SIZE,
+            )))),
+            LogFaultPlan::default(),
+        );
+        assert!(
+            h2.restore(&bad, 1, LogFaultPlan::default()).is_err(),
+            "bad header at GPA refuses"
+        );
     }
 }
