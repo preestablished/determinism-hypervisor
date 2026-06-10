@@ -24,6 +24,7 @@ use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::ioctl_iow_nr;
 
 // Allowed architectural MSRs (Intel SDM numbers).
+pub const MSR_SPEC_CTRL: u32 = 0x48;
 pub const MSR_SYSENTER_CS: u32 = 0x174;
 pub const MSR_SYSENTER_ESP: u32 = 0x175;
 pub const MSR_SYSENTER_EIP: u32 = 0x176;
@@ -41,11 +42,18 @@ pub const MSR_TSC_AUX: u32 = 0xC000_0103;
 /// The allow ranges: [base, base+count). Contiguous where the numbering
 /// permits; every other MSR is default-denied.
 const ALLOW_RANGES: &[(u32, u32)] = &[
+    (MSR_SPEC_CTRL, 1), // SPEC_CTRL: §8.1-captured guest state (reset 0, no
+    // host leak — live-verified); Linux writes it at
+    // early boot, so denying breaks the M7 guest.
     (MSR_SYSENTER_CS, 3), // SYSENTER_CS/ESP/EIP
     (MSR_PAT, 1),         // PAT
     (MSR_EFER, 5),        // EFER, STAR, LSTAR, CSTAR, SFMASK
     (MSR_FS_BASE, 4),     // FS_BASE, GS_BASE, KERNEL_GS_BASE, TSC_AUX
 ];
+// DELIBERATELY DENIED despite §8.1 capture-list membership: IA32_TSC (0x10).
+// It is genuinely host-derived (live: 0x19ebc vs 0x18702 on two fresh VMs —
+// the canonical R6 leak) and §4.4 writes it host-side on restore; guest
+// reads go through pv-clock, guest writes #GP by design.
 
 ioctl_iow_nr!(KVM_X86_SET_MSR_FILTER, 0xAE, 0xc6, kvm_msr_filter);
 
@@ -128,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_ranges_cover_exactly_the_spec_list() {
+    fn allow_ranges_cover_exactly_the_chosen_set() {
         let allowed: Vec<u32> = ALLOW_RANGES
             .iter()
             .flat_map(|(base, count)| (*base..*base + *count))
@@ -136,6 +144,7 @@ mod tests {
         assert_eq!(
             allowed,
             vec![
+                MSR_SPEC_CTRL,
                 MSR_SYSENTER_CS,
                 MSR_SYSENTER_ESP,
                 MSR_SYSENTER_EIP,
@@ -181,17 +190,71 @@ mod tests {
         regs.rflags = 2;
         slot.vcpu.set_regs(&regs).unwrap();
 
-        match slot.vcpu.run().unwrap() {
-            VcpuExit::X86Rdmsr(exit) => {
-                assert_eq!(exit.index, 0xE7);
-                assert_eq!(exit.reason, MsrExitReason::Filter);
-            }
-            other => panic!("expected X86Rdmsr exit, got {other:?}"),
+        // Route through the WIRED dispatch path (classify_exit applies the
+        // deterministic policy: data=0, error=0).
+        match crate::kvm::classify_exit(slot.vcpu.run().unwrap()) {
+            crate::kvm::ExitEvent::MsrReadDenied { index } => assert_eq!(index, 0xE7),
+            other => panic!("expected MsrReadDenied, got {other:?}"),
         }
-        // Supply the deterministic value and resume to HLT.
-        // (Data write-back happens via the exit struct on next run entry.)
         let exit = slot.vcpu.run().unwrap();
         assert_eq!(format!("{exit:?}"), "Hlt");
+        // The supplied value is the policy value: EDX:EAX == 0.
+        let regs = slot.vcpu.get_regs().unwrap();
+        assert_eq!(regs.rax & 0xFFFF_FFFF, 0);
+        assert_eq!(regs.rdx & 0xFFFF_FFFF, 0);
+    }
+
+    /// Live: denied WRMSR through the wired path injects #GP — the guest
+    /// never reaches HLT (real mode, no IDT ⇒ the #GP escalates to a
+    /// shutdown/triple-fault exit). Without the error=1 wiring, KVM
+    /// silently acks the write and the guest DOES reach HLT
+    /// (live-verified during review — the R6 violation this test pins).
+    #[test]
+    fn denied_wrmsr_injects_gp() {
+        if !kvm_available() {
+            eprintln!("skipping: no /dev/kvm");
+            return;
+        }
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
+        apply_default_deny_filter(&slot.vm).unwrap();
+
+        // mov ecx, 0xE7; mov eax, 1; xor edx, edx; wrmsr; hlt
+        slot.guest_mem
+            .write_slice(
+                &[
+                    0x66, 0xB9, 0xE7, 0x00, 0x00, 0x00, // mov ecx, 0xE7
+                    0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                    0x66, 0x31, 0xD2, // xor edx, edx
+                    0x0F, 0x30, // wrmsr
+                    0xF4, // hlt
+                ],
+                GuestAddress(0),
+            )
+            .unwrap();
+        let mut sregs = slot.vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        slot.vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = slot.vcpu.get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        slot.vcpu.set_regs(&regs).unwrap();
+
+        match crate::kvm::classify_exit(slot.vcpu.run().unwrap()) {
+            crate::kvm::ExitEvent::MsrWriteDenied { index, data } => {
+                assert_eq!(index, 0xE7);
+                assert_eq!(data, 1);
+            }
+            other => panic!("expected MsrWriteDenied, got {other:?}"),
+        }
+        // #GP armed: the guest must NOT reach HLT.
+        let exit = slot.vcpu.run().unwrap();
+        assert_ne!(
+            format!("{exit:?}"),
+            "Hlt",
+            "denied WRMSR must fault, never silently succeed"
+        );
     }
 
     /// Live: allowed MSR (EFER read) does NOT exit — KVM handles it.
