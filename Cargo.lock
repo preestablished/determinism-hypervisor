@@ -154,6 +154,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "nanokernel",
  "vm-memory",
  "vmm-sys-util",
 ]

@@ -3,6 +3,7 @@
 pub mod agenda;
 pub mod blkfile;
 pub mod boot;
+pub mod boundary;
 pub mod config;
 pub mod cpuid;
 pub mod hash;
