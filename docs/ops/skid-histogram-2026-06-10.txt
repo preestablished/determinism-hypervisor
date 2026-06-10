@@ -1,0 +1,20 @@
+26 1
+27 16665
+30 16666
+31 16665
+44 1
+45 1
+79 1
+# samples=50000 min=26 max=79 sum=1466744
+# TYPE dh_pmi_skid_instructions histogram
+dh_pmi_skid_instructions_bucket{le="26"} 1
+dh_pmi_skid_instructions_bucket{le="27"} 16666
+dh_pmi_skid_instructions_bucket{le="30"} 33332
+dh_pmi_skid_instructions_bucket{le="31"} 49997
+dh_pmi_skid_instructions_bucket{le="44"} 49998
+dh_pmi_skid_instructions_bucket{le="45"} 49999
+dh_pmi_skid_instructions_bucket{le="79"} 50000
+dh_pmi_skid_instructions_bucket{le="+Inf"} 50000
+dh_pmi_skid_instructions_sum 1466744
+dh_pmi_skid_instructions_count 50000
+GATE OK: max skid 79 < skid_margin/2 (4096)
