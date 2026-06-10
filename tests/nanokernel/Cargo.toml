@@ -9,6 +9,7 @@ build = "build.rs"
 # links the freestanding guests) plus the BootInfo ABI constants and the
 # include_bytes! accessors for the built ELFs.
 [dependencies]
+blake3.workspace = true
 
 # Interop test only: attach the exact channel page the device-exercise
 # guest builds through the real host-side code.
