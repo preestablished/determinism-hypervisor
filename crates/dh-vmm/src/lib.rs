@@ -11,6 +11,7 @@ pub mod inject;
 pub mod kvm;
 pub mod msr;
 pub mod run;
+pub mod runctl;
 pub mod vt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

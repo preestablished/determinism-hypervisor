@@ -1,0 +1,99 @@
+//! `dh-cli run` (bead qs4): boot a guest and run one Phase-1 segment via
+//! dh-vmm's run control, printing the outcome — the M3 run-twice-compare
+//! driver (run it twice, diff the JSON).
+
+use std::sync::atomic::AtomicBool;
+
+use dh_vmm::boundary::BoundaryError;
+use dh_vmm::config::{BootSpec, MachineConfig};
+use dh_vmm::hash::StateHashChain;
+use dh_vmm::kvm::KvmSystem;
+use dh_vmm::runctl::{run_segment, Segment, StopReason, Until};
+use kvm_ioctls::VcpuExit;
+
+pub struct RunReport {
+    pub reason: &'static str,
+    pub icount: u64,
+    pub rip: u64,
+    pub vns: u64,
+    pub state_hash: String,
+    pub serial: Vec<u8>,
+}
+
+fn gettid() -> i32 {
+    // dh-cli forbids unsafe; std exposes no gettid, but the thread id via
+    // /proc/self is overkill — the main thread's tid IS the pid.
+    std::process::id() as i32
+}
+
+pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<RunReport, String> {
+    use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+
+    dh_vmm::run::install_kick_handler().map_err(|e| format!("kick handler: {e}"))?;
+    let sys = KvmSystem::open().map_err(|e| format!("{e:?}"))?;
+    let mut slot = sys
+        .create_slot_vm(mem_bytes)
+        .map_err(|e| format!("{e:?}"))?;
+    dh_vmm::boot::load_and_enter(&slot, elf, cmdline).map_err(|e| format!("{e}"))?;
+
+    let counter = InstRetired::open_for_current_thread().map_err(|e| format!("{e:?}"))?;
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .map_err(|e| format!("{e:?}"))?;
+    counter
+        .arm_period(NEVER_FIRES_PERIOD)
+        .map_err(|e| format!("{e:?}"))?;
+    counter.reset().map_err(|e| format!("{e:?}"))?;
+    counter.enable().map_err(|e| format!("{e:?}"))?;
+
+    let config = MachineConfig::new(
+        mem_bytes,
+        [0; 32],
+        BootSpec::Elf {
+            kernel_hash: [0; 32],
+            cmdline: cmdline.to_vec(),
+        },
+    );
+    let mut chain = StateHashChain::new(&[0; 32], &[0; 32]);
+    let pause = AtomicBool::new(false);
+    let mut serial = Vec::new();
+
+    let outcome = {
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            pause: &pause,
+        };
+        let mut on_exit = |exit: VcpuExit| match exit {
+            VcpuExit::IoOut(port, data) if (0x3F8..0x400).contains(&port) => {
+                serial.extend_from_slice(data);
+                Ok(())
+            }
+            other => Err(BoundaryError::Exit(format!("unexpected exit: {other:?}"))),
+        };
+        run_segment(&mut seg, until, &mut || false, &mut on_exit).map_err(|e| format!("{e}"))?
+    };
+
+    Ok(RunReport {
+        reason: match outcome.reason {
+            StopReason::BudgetReached => "budget_reached",
+            StopReason::GoalSatisfied => "goal_satisfied",
+            StopReason::HardCap => "hard_cap",
+            StopReason::Paused => "paused",
+            StopReason::GuestHalted => "guest_halted",
+        },
+        icount: outcome.boundary.icount,
+        rip: outcome.boundary.rip,
+        vns: outcome.vns,
+        state_hash: outcome
+            .state_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        serial,
+    })
+}
