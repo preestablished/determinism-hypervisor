@@ -36,3 +36,20 @@ fn pipeline_smoke_reports_bootinfo_ok() {
         .expect("pipeline_smoke must boot to HLT");
     assert_eq!(out.serial, b"K", "BootInfo magic/version must check out");
 }
+
+#[test]
+fn landing_loop_is_deterministic_across_runs() {
+    if !kvm_usable() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let run = |cmdline: &[u8]| {
+        let out = dh_cli::boot::boot(nanokernel::landing_loop_elf(), 16 << 20, cmdline, 10_000)
+            .expect("landing loop must boot to HLT");
+        (out.serial, out.exits)
+    };
+    // Same cmdline -> identical observable outcome, twice; scaled run too.
+    assert_eq!(run(b""), run(b""));
+    assert_eq!(run(b"1000"), run(b"1000"));
+    assert_eq!(run(b"").0, b"L");
+}

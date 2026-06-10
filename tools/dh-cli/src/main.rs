@@ -3,6 +3,22 @@
 // Local debug CLI (ARCH §1): drives the VMM directly. It must not depend on
 // dh-worker — "nothing depends on dh-worker" is a normative dependency rule.
 
+/// Valid-JSON string escaping (RFC 8259): printable ASCII passes through,
+/// everything else becomes \u00XX — std's ascii::escape_default emits
+/// \xNN, which is NOT legal JSON.
+fn json_escape(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'"' => s.push_str("\\\""),
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7E => s.push(char::from(b)),
+            _ => s.push_str(&format!("\\u{b:04x}")),
+        }
+    }
+    s
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage:\n  dh-cli caps\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]"
@@ -53,13 +69,11 @@ fn boot_cmd(args: &[String]) {
     match dh_cli::boot::boot(&elf, mem_mib << 20, cmdline.as_bytes(), 1_000_000) {
         Ok(out) => {
             if json {
-                let escaped: String = out
-                    .serial
-                    .iter()
-                    .flat_map(|b| std::ascii::escape_default(*b))
-                    .map(char::from)
-                    .collect();
-                println!("{{\"serial\":\"{escaped}\",\"exits\":{}}}", out.exits);
+                println!(
+                    "{{\"serial\":\"{}\",\"exits\":{}}}",
+                    json_escape(&out.serial),
+                    out.exits
+                );
             } else {
                 use std::io::Write;
                 std::io::stdout().write_all(&out.serial).unwrap();

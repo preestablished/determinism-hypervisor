@@ -236,7 +236,9 @@ fn run_until_hlt(mut slot: dh_vmm::kvm::SlotVm, max_exits: u64) -> Result<BootOu
         match exit {
             // INs answered on the raw exit: the kvm_run buffer must be
             // written before re-entry (classify_exit IN-FILL contract).
-            // M0 models every IN in the serial + detcall windows as zeros.
+            // M0 models EVERY IN as zeros — including 16550 status ports,
+            // so an LSR-polling serial driver would spin forever here; the
+            // real device model (bead avm) replaces this. Deterministic.
             VcpuExit::IoIn(_port, data) => data.fill(0),
             VcpuExit::IoOut(port, data) if (SERIAL_BASE..SERIAL_END).contains(&port) => {
                 serial.extend_from_slice(data);
@@ -244,10 +246,22 @@ fn run_until_hlt(mut slot: dh_vmm::kvm::SlotVm, max_exits: u64) -> Result<BootOu
             other => match classify_exit(other) {
                 ExitEvent::Hlt => return Ok(BootOutcome { serial, exits }),
                 ExitEvent::DetcallOut { .. } | ExitEvent::PioIgnored { .. } => {}
+                // Defensive only: the M0 identity map never covers the MMIO
+                // hole, so a device-touching guest #PFs into a triple fault
+                // (Shutdown below) before any MMIO exit can occur. The arm
+                // becomes reachable when a loader maps the hole (bead s0p).
                 ExitEvent::MmioRead { gpa, .. } | ExitEvent::MmioWrite { gpa, .. } => {
                     return Err(BootError::UnexpectedExit(format!(
                         "MMIO at {gpa:#x} (M0 loop has no device bus)"
                     )));
+                }
+                ExitEvent::Shutdown => {
+                    return Err(BootError::UnexpectedExit(
+                        "guest shutdown / triple fault (a device-touching \
+                         guest under the M0 loader page-faults: the MMIO \
+                         hole is unmapped)"
+                            .into(),
+                    ));
                 }
                 ev => {
                     return Err(BootError::UnexpectedExit(format!("{ev:?}")));
