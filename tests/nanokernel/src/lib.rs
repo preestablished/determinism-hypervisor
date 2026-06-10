@@ -60,6 +60,12 @@ pub fn hello_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"))
 }
 
+/// Interrupt-window test guest: five NOPs with IF=0, STI, spin (see
+/// asm/sti_window.asm) — inject.rs's live deferral coverage.
+pub fn sti_window_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/sti_window.elf"))
+}
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 
@@ -108,6 +114,7 @@ mod tests {
         assert!(!landing_loop_elf().is_empty());
         assert!(!device_exercise_elf().is_empty());
         assert!(!hello_elf().is_empty());
+        assert!(!sti_window_elf().is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod boundary;
 pub mod config;
 pub mod cpuid;
 pub mod hash;
+pub mod inject;
 pub mod kvm;
 pub mod msr;
 pub mod run;
