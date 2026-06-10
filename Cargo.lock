@@ -102,9 +102,11 @@ name = "dh-cli"
 version = "0.1.0"
 dependencies = [
  "dh-detclock",
+ "dh-verify",
  "dh-vmm",
  "kvm-bindings",
  "kvm-ioctls",
+ "libc",
  "nanokernel",
  "vm-memory",
 ]

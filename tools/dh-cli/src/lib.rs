@@ -7,3 +7,4 @@
 pub mod boot;
 pub mod cpuid;
 pub mod run;
+pub mod skid;

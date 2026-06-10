@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli skid [--samples N]"
     );
     std::process::exit(2);
 }
@@ -32,6 +32,34 @@ fn main() {
         Some("caps") | None => println!("{}", dh_vmm::m0_missing_caps_summary()),
         Some("boot") => boot_cmd(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("skid") => {
+            let samples = args
+                .get(1)
+                .and_then(|a| (a == "--samples").then(|| args.get(2)).flatten())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200);
+            match dh_cli::skid::measure(samples) {
+                Ok(r) => {
+                    print!("{}", r.histogram.artifact());
+                    print!("{}", r.histogram.prometheus("dh_pmi_skid_instructions"));
+                    match r.gate {
+                        Ok(()) => println!(
+                            "GATE OK: max skid {} < skid_margin/2 ({})",
+                            r.histogram.max().unwrap_or(0),
+                            r.skid_margin / 2
+                        ),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dh-cli skid: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("cpuid-diff") => match dh_cli::cpuid::cpuid_diff() {
             Ok(report) => print!("{report}"),
             Err(e) => {

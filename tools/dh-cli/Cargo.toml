@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 dh-detclock.workspace = true
+dh-verify.workspace = true
 dh-vmm.workspace = true
 kvm-bindings = "0.14.0"
+libc = "0.2.186"
 kvm-ioctls = "0.24.0"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+# The embedded test guests: the debug CLI ships them for boot/run/skid.
+nanokernel = { path = "../../tests/nanokernel" }
 
 [dev-dependencies]
-nanokernel = { path = "../../tests/nanokernel" }

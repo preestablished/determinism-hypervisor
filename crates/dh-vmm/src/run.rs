@@ -122,6 +122,18 @@ impl Drop for KickGuard<'_> {
     }
 }
 
+/// The calling thread's OS tid — what `route_overflow_to_thread` needs.
+/// Lives here so unsafe-free callers (dh-cli) never reach for the pid,
+/// which equals the tid ONLY on the main thread (a worker-thread caller
+/// would silently route its PMI kicks to the wrong thread).
+pub fn current_tid() -> i32 {
+    // SAFETY: argless syscall.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as i32
+    }
+}
+
 /// Clear immediate_exit before re-entering KVM_RUN once the kick has been
 /// consumed (the boundary engine calls this after handling the pause).
 pub fn clear_immediate_exit(vcpu: &mut VcpuFd) {
