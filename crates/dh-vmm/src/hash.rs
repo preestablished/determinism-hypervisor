@@ -257,7 +257,14 @@ pub fn canonical_vcpu_blob(vcpu: &VcpuFd, vns: u64) -> Result<Vec<u8>, KvmError>
     for xmm in &fpu.xmm {
         out.extend_from_slice(xmm);
     }
-    out.extend_from_slice(&fpu.mxcsr.to_le_bytes());
+    // MXCSR — sourced from KVM_GET_XSAVE, NOT kvm_fpu.mxcsr: MEASURED
+    // (iteration 51, kernel 6.8.0-124): KVM_GET_FPU reports mxcsr=0
+    // regardless of the guest's live value, while GET_XSAVE carries the
+    // truth (FXSAVE-area byte offset 24 = region[6]). With CR4.OSFXSR
+    // on (bead ttk) a guest can change its rounding mode; hashing the
+    // lying field would let it escape replay verification.
+    let xsave = vcpu.get_xsave().map_err(kvm_err("KVM_GET_XSAVE"))?;
+    out.extend_from_slice(&xsave.region[6].to_le_bytes());
 
     // VCPU_EVENTS: pending exception/interrupt/NMI/SMI state.
     // exception_has_payload/exception_payload are deliberately omitted in
@@ -349,6 +356,36 @@ mod tests {
 
     const MC: [u8; 32] = [7u8; 32];
     const BASE: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn mxcsr_is_in_the_blob_from_the_truthful_source() {
+        // MEASURED (iteration 51): KVM_GET_FPU reports mxcsr=0 always;
+        // the blob must source it from KVM_GET_XSAVE or the guest's
+        // rounding mode escapes replay verification.
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_err()
+        {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let sys = crate::kvm::KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(2 << 20).unwrap();
+        let a = canonical_vcpu_blob(&slot.vcpu, 0).unwrap();
+        let mut xsave = slot.vcpu.get_xsave().unwrap();
+        xsave.region[6] = 0x7F80; // flip a rounding-control-relevant bit set
+        xsave.region[128] |= 0b10; // XSTATE_BV.SSE: the area is live, not init
+                                   // SAFETY: plain kvm_xsave (no FAM tail in the 0.24 binding); the
+                                   // struct came from GET_XSAVE on this same vCPU.
+        #[allow(unsafe_code)]
+        unsafe {
+            slot.vcpu.set_xsave(&xsave).unwrap();
+        }
+        let b = canonical_vcpu_blob(&slot.vcpu, 0).unwrap();
+        assert_ne!(a, b, "an MXCSR change must change the canonical blob");
+    }
 
     #[test]
     fn h0_is_deterministic_and_input_sensitive() {

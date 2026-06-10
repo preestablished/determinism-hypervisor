@@ -150,7 +150,11 @@ v1 supports two guest types, selected by `MachineConfig.boot`:
 1. **Unikernel / freestanding ELF** (the `nanokernel` tests and the
    `reference-workload` image): `dh-vmm` loads the ELF PT_LOAD segments into guest RAM,
    sets up identity-mapped 4-level page tables in low RAM, enters 64-bit mode directly
-   (CR0/CR4/EFER/GDT set via `KVM_SET_SREGS`), `RIP = e_entry`, `RSI = &BootInfo`
+   (CR0/CR4/EFER/GDT set via `KVM_SET_SREGS`; CR4 carries PAE + OSFXSR/OSXMMEXCPT so
+   compiled guests' baseline SSE2 works — OSXSAVE stays OFF as a determinism decision:
+   no XSAVE/AVX surface exists, so guest FP state is exactly the x87+SSE set that
+   `KVM_GET_FPU` captures into the §8.1 hash blob, and the §7.2 mask clears the
+   XSAVE/AVX feature bits to match), `RIP = e_entry`, `RSI = &BootInfo`
    (a versioned struct at a fixed GPA carrying mem_size, MMIO base, cmdline bytes).
 2. **Minimal Linux bzImage** via the 64-bit boot protocol: load bzImage + initramfs,
    fill `boot_params` (zero page), cmdline forced to a deterministic baseline:

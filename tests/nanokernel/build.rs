@@ -21,6 +21,7 @@ const PROGRAMS: &[&str] = &[
     "timer_guest",
     "counting",
     "rep_loop",
+    "sse_probe",
 ];
 
 fn main() {

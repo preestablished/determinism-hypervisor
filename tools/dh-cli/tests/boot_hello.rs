@@ -87,6 +87,19 @@ fn run_segment_serves_serial_ins_under_the_landing_loop() {
 }
 
 #[test]
+fn sse_probe_proves_osfxsr() {
+    if !kvm_usable() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    // Without CR4.OSFXSR the guest's first movdqa #UDs into a triple
+    // fault (no IDT) — a Shutdown error, never a serial byte.
+    let out = dh_cli::boot::boot(nanokernel::sse_probe_elf(), 16 << 20, b"", 10_000)
+        .expect("SSE guest must boot to HLT");
+    assert_eq!(out.serial, b"V", "SSE2 vector arithmetic must verify");
+}
+
+#[test]
 fn device_exercise_reaches_a_real_mmio_exit() {
     if !kvm_usable() {
         eprintln!("skipping: /dev/kvm not usable");
