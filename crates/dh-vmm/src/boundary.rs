@@ -190,6 +190,12 @@ pub fn land_at(
 /// The same suppression means §3.2 NEAR-approach landings must never
 /// target an icount strictly inside a delivery window — the engine would
 /// overshoot LOUDLY (the M6 scheduler owns avoiding such targets).
+///
+/// PRECONDITION on `on_exit`: it must treat Hlt (and anything else that
+/// re-enters with fresh forward progress) as an ERROR — an Ok-handled
+/// Hlt would re-run and silently chain MULTIPLE logical entries under
+/// one "step" (run_segment's wrapper guarantees this; a future device
+/// run loop caller must too).
 pub fn step_one_entry(
     vcpu: &mut VcpuFd,
     counter: &InstRetired,
@@ -212,6 +218,9 @@ pub fn step_one_entry(
     set_singlestep(&mut guard, false)?;
     result?;
     let icount = counter.read().map_err(BoundaryError::Counter)?;
+    // Forward progress is the one invariant the relaxed (non-targeted)
+    // step keeps: at least one retirement happened.
+    debug_assert!(icount > 0, "step_one_entry made no progress");
     let regs = guard
         .get_regs()
         .map_err(|e| BoundaryError::Kvm(format!("KVM_GET_REGS: {e}")))?;
