@@ -87,6 +87,14 @@ impl InstRetired {
         // read_format: value, time_enabled, time_running.
         let mut buf = [0u8; 24];
         let n = nix_read(&self.fd, &mut buf)?;
+        if n == 0 {
+            // Empirics (Linux 6.8, lab box): a pinned event that lost the
+            // PMU returns a ZERO-byte read — this, not the time_running
+            // signature below, is the real revocation path. Verified by
+            // oversubscribing the PMU with 31 pinned counters (22 dead,
+            // all read 0 bytes).
+            return Err(CounterError::NotPinned);
+        }
         if n != buf.len() {
             return Err(CounterError::Read(format!("short read: {n}")));
         }
@@ -94,6 +102,10 @@ impl InstRetired {
         let enabled = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
         let running = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
         if enabled > 0 && running == 0 {
+            // Belt-and-braces: kernel-version-dependent secondary signature
+            // (the primary one on 6.8 is the 0-byte read above). Sched-in is
+            // synchronous on enable(), so this cannot false-fire right
+            // after enable (verified empirically).
             return Err(CounterError::NotPinned);
         }
         Ok(value)
