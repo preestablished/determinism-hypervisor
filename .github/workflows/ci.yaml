@@ -52,6 +52,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # tests/nanokernel's build.rs assembles the test guests with nasm
+      # (cross-assembles x86 on the arm runner too; linking falls back to
+      # the sysroot rust-lld there). Both host lanes are GitHub-hosted
+      # Ubuntu images: passwordless sudo + apt are part of that contract.
+      - run: which nasm || { sudo apt-get update && sudo apt-get install -y nasm; }
       # NOT `cargo fmt --all`: cargo-fmt's --all also formats local path
       # dependencies, i.e. the sibling checkouts (control-plane, guest-sdk),
       # whose formatting must not gate this repo's CI. Scope to our members,
@@ -94,6 +99,9 @@ jobs:
       # rw, matching what Kvm::new() and the test guards need — a read-only
       # grant would silently skip every live leg while the lane stays green.
       - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw on runner"; exit 1; }
+      # nasm is part of the box's provisioning (bead 6eb docs/ops); fail
+      # loudly here if a reprovision dropped it rather than deep in build.rs.
+      - run: which nasm || { echo "::error::nasm missing on kvm-intel runner (provisioning drift)"; exit 1; }
       - run: cargo build --workspace
         working-directory: repo
       - run: cargo test --workspace
