@@ -32,8 +32,10 @@ use crate::msr::{
 
 pub const PAGE_SIZE: usize = 4096;
 
-/// §8.1 MSR capture list, in hash order. IA32_TSC is deliberately absent
-/// from the GET list — its slot in the blob carries the normalized vns.
+/// §8.1 MSR capture list, in the DOC'S order. IA32_TSC is deliberately
+/// absent from the GET list — its blob slot (normalized vns) is inserted
+/// at the §8.1 position, between TSC_AUX and SPEC_CTRL, so the M4 DHSNAP
+/// codec serializing in doc order produces the same preimage.
 const MSR_CAPTURE_LIST: &[u32] = &[
     MSR_EFER,
     MSR_STAR,
@@ -48,8 +50,13 @@ const MSR_CAPTURE_LIST: &[u32] = &[
     MSR_SYSENTER_EIP,
     MSR_PAT,
     MSR_TSC_AUX,
+    // <-- normalized IA32_TSC slot is inserted here at serialization time
     MSR_SPEC_CTRL,
 ];
+
+/// Index in [`MSR_CAPTURE_LIST`] order BEFORE which the normalized
+/// IA32_TSC slot is emitted (right after TSC_AUX, per §8.1).
+const TSC_SLOT_AT: usize = 13;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateHashChain {
@@ -73,6 +80,13 @@ impl StateHashChain {
         self.value
     }
 
+    /// Resume a chain from a checkpointed value (snapshot restore / fork:
+    /// the child continues the parent's chain — "comparing chains compares
+    /// execution histories" requires the restored chain to keep its past).
+    pub fn from_value(value: [u8; 32]) -> Self {
+        StateHashChain { value }
+    }
+
     /// Append one link from pre-serialized parts. `pages` must come in
     /// strictly ascending index order with exactly PAGE_SIZE bytes each —
     /// violations are a caller bug (panic, not a guest-influenced path).
@@ -86,7 +100,11 @@ impl StateHashChain {
     ) {
         let mut h = blake3::Hasher::new();
         h.update(&self.value);
+        // Length-prefixed: the blob/sections boundary must be unambiguous
+        // in the preimage (preimage discipline while v1 is young).
+        h.update(&(vcpu_blob.len() as u64).to_le_bytes());
         h.update(vcpu_blob);
+        h.update(&(device_sections.len() as u64).to_le_bytes());
         h.update(device_sections);
         let mut last: Option<u64> = None;
         for (idx, bytes) in pages {
@@ -117,7 +135,9 @@ impl StateHashChain {
         let vcpu_blob = canonical_vcpu_blob(&slot.vcpu, vns)?;
         let mut h = blake3::Hasher::new();
         h.update(&self.value);
+        h.update(&(vcpu_blob.len() as u64).to_le_bytes());
         h.update(&vcpu_blob);
+        h.update(&(device_sections.len() as u64).to_le_bytes());
         h.update(device_sections);
         let mut page = [0u8; PAGE_SIZE];
         for idx in 0..slot.mem_bytes / PAGE_SIZE as u64 {
@@ -240,6 +260,10 @@ pub fn canonical_vcpu_blob(vcpu: &VcpuFd, vns: u64) -> Result<Vec<u8>, KvmError>
     out.extend_from_slice(&fpu.mxcsr.to_le_bytes());
 
     // VCPU_EVENTS: pending exception/interrupt/NMI/SMI state.
+    // exception_has_payload/exception_payload are deliberately omitted in
+    // Phase 1: hash points are instruction boundaries with nothing in
+    // flight (the boundary engine guarantees it); the M4 codec revisits
+    // alongside XSAVE.
     out.push(events.exception.injected);
     out.push(events.exception.nr);
     out.push(events.exception.has_error_code);
@@ -280,19 +304,26 @@ pub fn canonical_vcpu_blob(vcpu: &VcpuFd, vns: u64) -> Result<Vec<u8>, KvmError>
         .map_err(|e| KvmError::Open(format!("msr list alloc: {e:?}")))?;
     let n = vcpu.get_msrs(&mut msrs).map_err(kvm_err("KVM_GET_MSRS"))?;
     if n != MSR_CAPTURE_LIST.len() {
+        // get_msrs stops at the first unreadable index — name it. A host
+        // that cannot read a captured MSR cannot hash faithfully; loud
+        // failure is the §2.1 posture.
         return Err(KvmError::Open(format!(
-            "KVM_GET_MSRS returned {n}/{} entries",
-            MSR_CAPTURE_LIST.len()
+            "KVM_GET_MSRS returned {n}/{} entries (first unreadable MSR {:#x})",
+            MSR_CAPTURE_LIST.len(),
+            MSR_CAPTURE_LIST[n]
         )));
     }
-    for e in msrs.as_slice() {
+    for (i, e) in msrs.as_slice().iter().enumerate() {
+        if i == TSC_SLOT_AT {
+            // IA32_TSC, normalized to vns (§8.1 restore rule; raw TSC is
+            // host state until the M2 alignment bead) — at the doc-order
+            // position so the M4 codec preimage matches.
+            out.extend_from_slice(&0x10u32.to_le_bytes());
+            out.extend_from_slice(&vns.to_le_bytes());
+        }
         out.extend_from_slice(&e.index.to_le_bytes());
         out.extend_from_slice(&e.data.to_le_bytes());
     }
-    // IA32_TSC, normalized to vns (§8.1 restore rule; raw TSC is host
-    // state until the M2 alignment bead).
-    out.extend_from_slice(&0x10u32.to_le_bytes());
-    out.extend_from_slice(&vns.to_le_bytes());
 
     Ok(out)
 }
@@ -472,5 +503,47 @@ mod tests {
         let mut c = StateHashChain::new(&MC, &BASE);
         c.push_final_link(&slot, b"", 1, 1).unwrap();
         assert_ne!(a.value(), c.value(), "RAM byte flip must perturb the hash");
+    }
+}
+
+#[cfg(test)]
+mod device_section_tests {
+    use super::*;
+    use dh_devices::blk::{BaseIoError, BlockBase, PvBlk};
+    use dh_devices::pad::PvPad;
+    use dh_devices::MmioBus;
+
+    struct ZeroBase;
+    impl BlockBase for ZeroBase {
+        fn len_bytes(&self) -> u64 {
+            4096
+        }
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<(), BaseIoError> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn device_sections_frame_id_version_len_bytes_in_bus_order() {
+        let mut bus = MmioBus::new();
+        bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
+        bus.register(0xD000_4000, Box::new(PvBlk::new(Box::new(ZeroBase))))
+            .unwrap();
+        let bytes = device_sections(&bus);
+
+        // pv-pad first (lower base): id 0x0003, version 1, len 24.
+        assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), 0x0003);
+        assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), 1);
+        let pad_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        assert_eq!(pad_len, 24);
+        // pv-blk follows immediately after pad's section.
+        let at = 8 + pad_len;
+        assert_eq!(
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()),
+            0x0005
+        );
+        // Deterministic: two harvests are byte-identical.
+        assert_eq!(bytes, device_sections(&bus));
     }
 }
