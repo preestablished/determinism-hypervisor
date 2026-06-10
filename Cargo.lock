@@ -91,6 +91,10 @@ name = "dh-cli"
 version = "0.1.0"
 dependencies = [
  "dh-vmm",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "nanokernel",
+ "vm-memory",
 ]
 
 [[package]]
