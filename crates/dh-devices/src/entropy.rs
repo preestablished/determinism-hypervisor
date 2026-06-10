@@ -34,8 +34,10 @@ pub const STATUS_IDLE: u32 = 0;
 pub const STATUS_OK: u32 = 1;
 pub const STATUS_FAULT: u32 = 2;
 
-/// Single fill cap: one request must fit a u16 DHILOG payload bound's
-/// spirit and any sane guest buffer. Larger LEN faults deterministically.
+/// Single fill cap — bounds the HOST allocation per doorbell (served bytes
+/// never enter the DHILOG; only the digest does). Larger LEN faults
+/// deterministically; raise it if a legitimate guest ever needs more per
+/// draw.
 pub const MAX_FILL: u32 = 1 << 20;
 
 const SECTION_VERSION: u16 = 1;
@@ -83,6 +85,12 @@ impl DetEntropy {
 }
 
 impl EntropySource for DetEntropy {
+    /// WORD-GRANULARITY INVARIANT (rand_chacha 0.3): the stream position is
+    /// granular to 32-bit words. A fill that is not a multiple of 4 bytes
+    /// consumes whole words and DISCARDS the sub-word remainder — a
+    /// 37-byte fill advances word_pos by 10 (40 bytes of stream).
+    /// Deterministic (both replays discard identically) and state() always
+    /// captures a word-aligned position, so ENTR resume is exact.
     fn fill(&mut self, buf: &mut [u8]) {
         self.rng.fill_bytes(buf);
     }
@@ -265,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn len_zero_doorbell_is_ok_and_logs_len_zero() {
+        let mut bus = bus();
+        let mut e = DetEntropy::from_seed([5; 32]);
+        let before = e.state();
+        let (status, mem, _l) = serve(&mut bus, &mut e, 0, 0, 5);
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(mem, vec![0u8; 64]);
+        assert_eq!(e.state(), before, "zero-length fill must not advance");
+    }
+
+    #[test]
     fn oversized_len_faults() {
         let mut bus = bus();
         let mut e = DetEntropy::from_seed([1; 32]);
@@ -275,12 +294,20 @@ mod tests {
     #[test]
     fn state_roundtrip_resumes_stream_exactly() {
         // The M4 ENTR golden property: restore reproduces the next N draws
-        // bit-identically.
+        // bit-identically. Note the position is ALWAYS word-aligned: a
+        // 37-byte fill consumes 10 whole words (40 bytes), discarding the
+        // sub-word remainder — pinned below.
         let mut a = DetEntropy::from_seed([9; 32]);
         let mut burn = [0u8; 37];
-        a.fill(&mut burn); // advance to a word-unaligned position
+        a.fill(&mut burn);
         let state = a.state();
         assert_eq!(state.seed, [9; 32]);
+        assert_eq!(state.word_pos, 10, "37-byte fill quantizes to 10 words");
+        // Same position as a 40-byte fill from the same seed: the
+        // remainder of the 10th word was discarded, not buffered.
+        let mut c = DetEntropy::from_seed([9; 32]);
+        c.fill(&mut [0u8; 40]);
+        assert_eq!(state, c.state());
 
         let mut b = DetEntropy::restore(state);
         let mut next_a = [0u8; 64];

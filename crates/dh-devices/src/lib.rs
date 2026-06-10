@@ -72,6 +72,13 @@ mod deny_list_gate {
             "std::fs",
             "SystemTime",
             "Instant::now",
+            // Host entropy: the seeded ChaCha20 stream is required (ARCH §5),
+            // but OsRng/getrandom must never appear ("rand::" misses
+            // "rand_core::OsRng"). getrandom is also absent from Cargo.lock;
+            // this catches it returning via a feature bump.
+            "OsRng",
+            "getrandom",
+            "thread_rng",
         ];
         let mut hits = Vec::new();
         for entry in std::fs::read_dir(src_dir).unwrap() {

@@ -3,6 +3,10 @@
 # clippy::disallowed_methods)] in src/lib.rs and the no_host_ambient_authority
 # source-grep test.
 disallowed-types = [
+    # allow-invalid: OsRng is intentionally NOT reachable today (getrandom is
+    # absent from the dep tree); this entry is defense-in-depth for the day a
+    # feature bump makes it constructible.
+    { path = "rand_core::OsRng", reason = "no host entropy on the execution path (ARCH §5) — only the seeded ChaCha20 stream", allow-invalid = true },
     { path = "std::time::Instant", reason = "devices must not read host time (ARCH §6)" },
     { path = "std::time::SystemTime", reason = "devices must not read host time (ARCH §6)" },
     { path = "std::net::TcpStream", reason = "no host network on the execution path (ARCH §6)" },
