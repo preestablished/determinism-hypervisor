@@ -83,10 +83,7 @@ message MachineConfig {
   BootSpec boot           = 7;
   uint64 epoch_len        = 8;   // instructions per epoch (default 50_000_000)
   HashEpochs hash_epochs  = 9;   // EPOCHS_ON (default) | FINAL_ONLY
-  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results;
-                                 //   for that reason it is EXCLUDED from the canonical
-                                 //   MachineConfig encoding / machine_config_hash preimage
-                                 //   — landing knobs must not fork snapshot identity)
+  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results)
 }
 message BootSpec {
   oneof kind {
@@ -508,7 +505,7 @@ All integers little-endian. The file is `header || records || (implicit end)` wi
 | 0 | 6 | `magic` | ASCII `DHILOG` |
 | 6 | 2 | `version` | `u16` = `0x0100` (major.minor = 1.0; major in high byte) |
 | 8 | 4 | `header_len` | `u32` = 256 |
-| 12 | 4 | `flags` | bit0 `SEALED` (complete, hashes valid); bit1 `HAS_AUX` (AUX records beyond the terminal `END` present); bit2 `EPOCH_HASHES` (AUX includes EPOCH_HASH records); others 0 |
+| 12 | 4 | `flags` | bit0 `SEALED` (complete, hashes valid); bit1 `HAS_AUX` (AUX records present); bit2 `EPOCH_HASHES` (AUX includes EPOCH_HASH records); others 0 |
 | 16 | 32 | `base_snapshot_id` | snapshot ref this log replays from |
 | 48 | 32 | `end_snapshot_id` | snapshot ref at the end boundary; zeros if no end snapshot was taken |
 | 80 | 32 | `entropy_seed` | ChaCha20 seed for the segment (zeros ⇒ continue base snapshot's PRNG stream) |
@@ -571,7 +568,7 @@ during verification, skippable by minimal replayers:
 | `0x43` | `SDK_EVENT` | `stream: u16, _pad: u16, len: u32, digest8: u64` (`stream` carries the detchannel EventKind, guest-sdk API.md §3.1; payloads live in the gRPC stream, not the log) |
 | `0x44` | `NET_TX` | `len: u32, _pad: u32, digest8: u64` |
 | `0x45` | `FRAME_MARK` | `frame_index: u32, _pad: u32` (the per-segment frame table; `frame_index` is the **absolute** FRAME_COUNTER value, so the table maps absolute F → segment-relative icount — it resolves at_frame scheduling and `frame_budget` stops, and lets replay-renderer find frame boundaries) |
-| `0x7F` | `END` | `stop_reason: u8` (mirrors proto StopReason), `_pad: [u8;7]`, `end_state_hash: [u8;32]` — always last record, always present in sealed logs. Carries `rflags.AUX = 1` and `boundary_rip = 0`: a minimal replayer that skips AUX records still terminates correctly via the header's `end_icount`/`end_state_hash`. `END` does not count toward `flags.HAS_AUX` |
+| `0x7F` | `END` | `stop_reason: u8` (mirrors proto StopReason), `_pad: [u8;7]`, `end_state_hash: [u8;32]` — always last record, always present in sealed logs |
 
 ### 3.4 Semantics (normative)
 

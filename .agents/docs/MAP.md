@@ -151,6 +151,7 @@ and never restate it normatively. On any conflict, the owner doc wins.
 | `.dilog` replay container, render job API | `replay-renderer` |
 | Event envelope + event-type catalog | `observatory` |
 | Resource registry, ExperimentConfig delivery, proto repo layout | `control-plane` |
+| GPU policy-serving gRPC contract (Phase 8, served on the Spark) | `input-synthesizer` (interface owner/consumer; server implementation scheduled with the Phase 8 policy tier) |
 | ExperimentConfig contents, worker-driver composition, bootstrap, commit rules | `exploration-orchestrator` |
 
 ## Capacity planning (read before Phase 8)

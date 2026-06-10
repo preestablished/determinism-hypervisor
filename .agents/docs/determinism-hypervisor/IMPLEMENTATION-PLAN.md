@@ -43,9 +43,7 @@ engine with skid margin + single-step refinement, REP rule, counting-semantics
 empirics.
 **Accept:**
 - `counting_semantics` test: single-step a known 1,000-instruction nanokernel sequence
-  (including REP MOVS, CPUID, MMIO exits); counter delta exactly the region minus its
-  VM-exiting instructions (ARCH §3.1 measured rule: exiting instructions retire zero —
-  997 for the shipped guest, `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); REP retires
+  (including REP MOVS, CPUID, MMIO exits); counter delta exactly 1,000; REP retires
   as 1.
 - Landing test: for 10,000 random targets N in a 100M-instruction nanokernel loop,
   stop at exactly N (`icount == N`, RIP at instruction start) with **zero overshoots**.

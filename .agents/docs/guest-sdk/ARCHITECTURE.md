@@ -150,8 +150,7 @@ All multi-byte fields little-endian. Indices are free-running `u32`, masked by
 0x008000  ring C data (16 KiB)
 0x00C000  ring I data (16 KiB)
 0x010000  ring A data (64 KiB)
-0x020000  ring W data (1,048,576 bytes = 0x100000)
-0x120000  reserved (unused page tail; ring sizes are powers of two)
+0x020000  ring W data (1,966,080 bytes = 0x1E0000)
 0x200000  end
 ```
 
