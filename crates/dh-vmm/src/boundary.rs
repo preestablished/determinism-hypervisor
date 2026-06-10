@@ -169,9 +169,10 @@ pub fn land_at(
                     // exit eats the pending single-step trap — the
                     // emulator completes the instruction and clears TF
                     // without delivering the #DB, so re-entry would
-                    // FREE-RUN past the target (Overshoot). MMIO reads
-                    // and PIO keep the trap. Re-asserting guest_debug
-                    // re-arms TF; harmless where the trap survived.
+                    // FREE-RUN past the target (measured: 991 instrs to
+                    // the next exit; loud Overshoot). MMIO reads and PIO
+                    // keep the trap. Re-asserting guest_debug re-arms
+                    // TF; harmless where the trap survived.
                     set_singlestep(&mut guard, true)?;
                 }
                 Err(e) if e.errno() == libc::EINTR => {

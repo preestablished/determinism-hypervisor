@@ -214,8 +214,16 @@ fn trace_counting() -> Result<Trace, String> {
 /// whose window crosses the MMIO-WRITE instruction. The write exit eats
 /// the single-step trap (emulator clears TF without the #DB); without
 /// boundary.rs re-arming guest_debug after handled exits, the vCPU
-/// free-runs ~700 instructions to the park HLT and the landing dies
+/// free-runs hundreds of instructions (measured: 991 to the next exit)
+/// to the park HLT and the landing dies
 /// with a loud Overshoot.
+///
+/// MARGIN NOTE (review iteration-50): margins 8/8 with target 20 take
+/// the FAR approach (20 > 16) — safe HERE only because the guest's own
+/// exits (S OUT at icount 6, MMIO read/write at 12) chop the far run
+/// into sub-skid segments. If the counting guest's pre-target exit
+/// layout ever changes, revisit these margins (FAR is generally safe
+/// only when the distance exceeds the observed max skid, 39).
 #[test]
 fn landing_across_an_mmio_write_does_not_free_run() {
     if !kvm_usable() {

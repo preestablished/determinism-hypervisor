@@ -271,7 +271,12 @@ loop:
       (REP rule: if RIP unchanged, continue stepping without counting a boundary;
        re-assert guest_debug after every handled exit — an MMIO-WRITE exit eats the
        pending single-step trap: the emulator completes the instruction and clears
-       TF without delivering the #DB, and an un-re-armed step would free-run)
+       TF without delivering the #DB, and an un-re-armed step would free-run.
+       PLATEAU RULE (measured, 240 cold boots): a target on a zero-retirement
+       plateau — several consecutive exiting instructions sharing one icount —
+       always lands at the FIRST (icount, RIP) of the plateau: the engine breaks at
+       the first loop-top count==target observation, which is RIP-deterministic
+       because the instruction stream is; skid variance never moves it)
   if c > N: fatal DivergenceError::Overshoot   # P0: skid margin too small, see risks
 ```
 
