@@ -112,7 +112,10 @@ fn find_linker() -> Linker {
 
 /// Can this linker accept the x86_64 emulation? (--version is cheap and
 /// fails fast on single-target GNU ld without the emulation compiled in —
-/// those reject the -m flag immediately.)
+/// those reject the -m flag immediately. VERIFIED FACT, do not refactor
+/// away: GNU ld validates -m BEFORE honoring --version and exits 1 on an
+/// unsupported emulation, so an aarch64 single-target ld cannot
+/// false-positive here.)
 fn probe(bin: &Path, emu: &[&str]) -> bool {
     Command::new(bin)
         .args(emu)
@@ -147,8 +150,14 @@ fn run(cmd: &mut Command) {
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
+    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| {
+        // Executable regular file — a stray non-executable `nasm`/`ld` on
+        // PATH must fall through, not turn into a spawn panic.
+        p.is_file()
+            && std::fs::metadata(p)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    })
 }

@@ -20,3 +20,17 @@ SECTIONS
 
     /DISCARD/ : { *(.note*) *(.comment) *(.eh_frame*) }
 }
+
+/* Orphans (.got, .init_array, ...): pure-nasm guests produce none, and a
+ * catch-all `*(*)` sink is NOT usable — lld feeds its internal synthetic
+ * sections (.symtab, .strtab, .rela.plt) through it and errors on type
+ * mismatches. GNU ld and lld may place real orphans differently, so the
+ * elf_shape test (e_entry == 0x100000, PT_LOAD covers entry, size budget)
+ * is the deliberate backstop against silent layout drift.
+ */
+
+/* Note: the whole guest intentionally lives in one RWE PT_LOAD — these are
+ * ~2 KiB test guests for a hypervisor that snapshots/replays them; W^X
+ * hardening buys nothing here and extra segments complicate the loader.
+ * The elf_shape test asserting a PT_LOAD covers e_entry is the backstop.
+ */

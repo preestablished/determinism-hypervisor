@@ -60,10 +60,15 @@ fn pipeline_smoke_is_a_static_x86_64_exec_at_the_load_addr() {
 fn bootinfo_inc_matches_rust_constants() {
     let inc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/bootinfo.inc"))
         .unwrap();
+    // Exact-token match: `%define NAME VALUE` split on whitespace, never a
+    // substring search (BOOTINFO_OFF_CMDLINE must not match the _LEN line).
     let lookup = |name: &str| -> u64 {
         let line = inc
             .lines()
-            .find(|l| l.starts_with("%define") && l.contains(name))
+            .find(|l| {
+                let mut t = l.split_whitespace();
+                t.next() == Some("%define") && t.next() == Some(name)
+            })
             .unwrap_or_else(|| panic!("missing %define {name}"));
         let val = line.split_whitespace().nth(2).unwrap();
         if let Some(hex) = val.strip_prefix("0x") {
@@ -72,21 +77,21 @@ fn bootinfo_inc_matches_rust_constants() {
             val.parse().unwrap()
         }
     };
-    assert_eq!(lookup("BOOTINFO_MAGIC "), u64::from(BOOTINFO_MAGIC));
-    assert_eq!(lookup("BOOTINFO_VERSION "), u64::from(BOOTINFO_VERSION));
-    assert_eq!(lookup("BOOTINFO_OFF_MAGIC "), BOOTINFO_OFF_MAGIC as u64);
-    assert_eq!(lookup("BOOTINFO_OFF_VERSION "), BOOTINFO_OFF_VERSION as u64);
+    assert_eq!(lookup("BOOTINFO_MAGIC"), u64::from(BOOTINFO_MAGIC));
+    assert_eq!(lookup("BOOTINFO_VERSION"), u64::from(BOOTINFO_VERSION));
+    assert_eq!(lookup("BOOTINFO_OFF_MAGIC"), BOOTINFO_OFF_MAGIC as u64);
+    assert_eq!(lookup("BOOTINFO_OFF_VERSION"), BOOTINFO_OFF_VERSION as u64);
     assert_eq!(
-        lookup("BOOTINFO_OFF_MEM_SIZE "),
+        lookup("BOOTINFO_OFF_MEM_SIZE"),
         BOOTINFO_OFF_MEM_SIZE as u64
     );
     assert_eq!(
-        lookup("BOOTINFO_OFF_MMIO_BASE "),
+        lookup("BOOTINFO_OFF_MMIO_BASE"),
         BOOTINFO_OFF_MMIO_BASE as u64
     );
     assert_eq!(
-        lookup("BOOTINFO_OFF_CMDLINE_LEN "),
+        lookup("BOOTINFO_OFF_CMDLINE_LEN"),
         BOOTINFO_OFF_CMDLINE_LEN as u64
     );
-    assert_eq!(lookup("BOOTINFO_OFF_CMDLINE "), BOOTINFO_OFF_CMDLINE as u64);
+    assert_eq!(lookup("BOOTINFO_OFF_CMDLINE"), BOOTINFO_OFF_CMDLINE as u64);
 }

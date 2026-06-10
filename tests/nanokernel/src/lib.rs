@@ -1,8 +1,17 @@
 //! Nanokernel test guests (ARCH §1): the built ELF images plus the BootInfo
-//! ABI (ARCH §2.3) shared between dh-vmm's loader and the guests' crt0.
+//! ABI shared between dh-vmm's loader and the guests' crt0.
 //!
-//! The asm side of the ABI lives in include/bootinfo.inc; the integration
-//! test parses that file and fails on any drift from these constants.
+//! THIS MODULE IS THE CANONICAL BootInfo BINARY LAYOUT. ARCH §2.3 names
+//! the struct ("versioned, carrying mem_size, MMIO base, cmdline bytes")
+//! but defines no offsets — the loader (bead s0p: PT_LOAD loader, identity
+//! page tables, direct 64-bit entry) must consume these constants, not
+//! restate them. The asm side lives in include/bootinfo.inc; an
+//! integration test parses that file and fails on any drift.
+//!
+//! LOADER CONTRACT (bead s0p): nanokernel ELFs carry PT_LOAD segments with
+//! p_memsz > p_filesz (.bss holds BOOT_INFO_PTR and the 16 KiB stack) —
+//! the loader MUST zero-fill [filesz, memsz), or crt0's stack and the
+//! guests' zeroed-.bss assumption are garbage.
 
 /// BootInfo magic: "DHBI" as little-endian bytes.
 pub const BOOTINFO_MAGIC: u32 = u32::from_le_bytes(*b"DHBI");
