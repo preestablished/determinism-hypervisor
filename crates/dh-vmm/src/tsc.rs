@@ -36,18 +36,23 @@ ioctl_iow_nr!(KVM_SET_DEVICE_ATTR, 0xAE, 0xe1, kvm_device_attr);
 ioctl_iow_nr!(KVM_GET_DEVICE_ATTR, 0xAE, 0xe2, kvm_device_attr);
 ioctl_iow_nr!(KVM_HAS_DEVICE_ATTR, 0xAE, 0xe3, kvm_device_attr);
 
-fn attr_for(offset_ptr: Option<&u64>) -> kvm_device_attr {
+/// `addr` carries the userspace pointer the kernel reads or WRITES
+/// through — call sites derive it with the correct mutability (a *mut
+/// for GET: the kernel's write target must never be born from a shared
+/// reference, or release builds constant-fold the never-visibly-assigned
+/// local to 0 — live-proven in review).
+fn attr_for(addr: u64) -> kvm_device_attr {
     kvm_device_attr {
         flags: 0,
         group: KVM_VCPU_TSC_CTRL,
         attr: u64::from(KVM_VCPU_TSC_OFFSET),
-        addr: offset_ptr.map_or(0, |p| p as *const u64 as u64),
+        addr,
     }
 }
 
 /// Does this kernel expose the per-vCPU TSC offset attribute?
 pub fn has_tsc_offset_attr(vcpu: &VcpuFd) -> bool {
-    let attr = attr_for(None);
+    let attr = attr_for(0);
     // SAFETY: valid vCPU fd; HAS_DEVICE_ATTR only inspects group/attr.
     #[allow(unsafe_code)]
     let rc = unsafe { ioctl_with_ref(&vcpu.as_raw_fd(), KVM_HAS_DEVICE_ATTR(), &attr) };
@@ -59,7 +64,7 @@ pub fn has_tsc_offset_attr(vcpu: &VcpuFd) -> bool {
 /// mechanism (docs/decisions/tsc-alignment.md).
 pub fn set_tsc_offset(vcpu: &VcpuFd, offset: i64) -> Result<(), KvmError> {
     let raw = offset as u64;
-    let attr = attr_for(Some(&raw));
+    let attr = attr_for(&raw as *const u64 as u64);
     // SAFETY: valid vCPU fd; the kernel reads the u64 through `addr`
     // during the ioctl; `raw` outlives the call.
     #[allow(unsafe_code)]
@@ -75,9 +80,10 @@ pub fn set_tsc_offset(vcpu: &VcpuFd, offset: i64) -> Result<(), KvmError> {
 
 /// Read the current guest-TSC offset back (verification + diagnostics).
 pub fn get_tsc_offset(vcpu: &VcpuFd) -> Result<i64, KvmError> {
-    let raw = 0u64;
-    let attr = attr_for(Some(&raw));
-    // SAFETY: valid vCPU fd; the kernel writes the u64 through `addr`.
+    let mut raw = 0u64;
+    let attr = attr_for(std::ptr::addr_of_mut!(raw) as u64);
+    // SAFETY: valid vCPU fd; the kernel writes the u64 through `addr`,
+    // whose provenance is a *mut — never a shared reference.
     #[allow(unsafe_code)]
     let rc = unsafe { ioctl_with_ref(&vcpu.as_raw_fd(), KVM_GET_DEVICE_ATTR(), &attr) };
     if rc != 0 {
@@ -93,7 +99,7 @@ pub fn get_tsc_offset(vcpu: &VcpuFd) -> Result<i64, KvmError> {
 /// benchmarked for the record; NOT the chosen mechanism (sync-heuristic
 /// hazard, per-entry cost).
 pub fn set_tsc_value_msr(vcpu: &VcpuFd, value: u64) -> Result<(), KvmError> {
-    let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+    let msrs = Msrs::from_entries(&[kvm_msr_entry {
         index: MSR_IA32_TSC,
         data: value,
         ..Default::default()
@@ -102,7 +108,6 @@ pub fn set_tsc_value_msr(vcpu: &VcpuFd, value: u64) -> Result<(), KvmError> {
     let n = vcpu
         .set_msrs(&msrs)
         .map_err(|e| KvmError::Open(format!("KVM_SET_MSRS(IA32_TSC): {e}")))?;
-    let _ = &mut msrs;
     if n != 1 {
         return Err(KvmError::Open("KVM_SET_MSRS wrote 0 entries".into()));
     }
