@@ -20,6 +20,7 @@ const PROGRAMS: &[&str] = &[
     "sti_window",
     "timer_guest",
     "counting",
+    "rep_loop",
 ];
 
 fn main() {
