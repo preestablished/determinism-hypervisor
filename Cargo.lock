@@ -76,6 +76,17 @@ name = "determinism-proto"
 version = "0.1.0"
 
 [[package]]
+name = "determinism-tests"
+version = "0.1.0"
+dependencies = [
+ "dh-detclock",
+ "dh-vmm",
+ "kvm-ioctls",
+ "libc",
+ "nanokernel",
+]
+
+[[package]]
 name = "detguest-host"
 version = "0.1.0"
 dependencies = [

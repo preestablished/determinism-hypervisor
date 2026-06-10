@@ -1,0 +1,16 @@
+[package]
+name = "determinism-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The standing determinism regression suite (ARCH §1 tests/determinism).
+# Live KVM tests gate in the kvm-intel lane and self-skip elsewhere.
+[dependencies]
+
+[dev-dependencies]
+dh-detclock.workspace = true
+dh-vmm.workspace = true
+kvm-ioctls = "0.24.0"
+nanokernel = { path = "../nanokernel" }
+libc = "0.2.186"

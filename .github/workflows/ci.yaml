@@ -35,7 +35,7 @@ jobs:
           # cannot build on aarch64. The arm lane covers the shared crates;
           # making the agenda/vt math arm-buildable is tracked in beads.
           - runner: ubuntu-24.04-arm
-            cargo-args: --workspace --exclude dh-vmm --exclude dh-worker --exclude dh-cli
+            cargo-args: --workspace --exclude dh-vmm --exclude dh-worker --exclude dh-cli --exclude determinism-tests
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

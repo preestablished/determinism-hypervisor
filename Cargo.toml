@@ -8,6 +8,7 @@ members = [
     "crates/dh-verify",
     "crates/dh-vmm",
     "crates/dh-worker",
+    "tests/determinism",
     "tests/nanokernel",
     "tools/dh-cli",
 ]
