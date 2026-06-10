@@ -155,6 +155,13 @@ pub const REP_LOOP_INSTRS_PER_ITER: u64 = 6;
 /// The REP's byte count: RCX at a REP-start boundary; 0 anywhere else.
 pub const REP_LOOP_RCX_AT_REP_START: u64 = 64;
 
+/// The SSE probe (bead ttk): SSE2 integer ops under the loader's
+/// CR4.OSFXSR; prints 'V' on the expected vector result ('v' on a
+/// wrong value; a #UD triple-faults loudly instead).
+pub fn sse_probe_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/sse_probe.elf"))
+}
+
 /// The ring descriptors the guest writes at header offset 0x10, in C, I,
 /// A, W order as (offset, size). Mirrors the asm dword stores — the
 /// channel_interop test attaches a page built from THESE values through

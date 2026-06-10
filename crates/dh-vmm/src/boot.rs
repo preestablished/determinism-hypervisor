@@ -231,7 +231,14 @@ pub fn enter_long_mode(vcpu: &kvm_ioctls::VcpuFd, entry: u64) -> Result<(), Boot
     sregs.gs = data;
     sregs.ss = data;
     sregs.cr3 = PML4_GPA;
-    sregs.cr4 = 1 << 5; // PAE
+    // PAE (long mode) + OSFXSR/OSXMMEXCPT: compiled guests (Rust/C
+    // x86_64 ABI) emit SSE2 by default and would #UD without OSFXSR
+    // (bead ttk). OSXSAVE stays OFF as a determinism decision: no
+    // guest-visible XSAVE/AVX surface, so the FP state that exists
+    // (x87+SSE via FXSAVE) is exactly what KVM_GET_FPU captures into
+    // the 8.1 state-hash blob — nothing outside the hash. The CPUID
+    // mask clears the XSAVE/AVX feature bits to match.
+    sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10); // PAE | OSFXSR | OSXMMEXCPT
     sregs.cr0 = 0x8000_0021; // PG | NE | PE
     sregs.efer = (1 << 8) | (1 << 10); // LME | LMA
     vcpu.set_sregs(&sregs).map_err(kvm_err)?;

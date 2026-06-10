@@ -17,6 +17,11 @@ const L1_ECX_TSC_DEADLINE: u32 = 1 << 24; // TSC-deadline timer: host-clocked in
 const L1_ECX_X2APIC: u32 = 1 << 21; // x2APIC: we run with no in-kernel irqchip
 const L1_ECX_PDCM: u32 = 1 << 15; // perf/debug capability MSRs: vPMU surface
 const L1_ECX_RDRAND: u32 = 1 << 30; // hardware entropy: nondeterministic by definition
+const L1_ECX_FMA: u32 = 1 << 12; // AVX family: unusable with CR4.OSXSAVE off (bead ttk)
+const L1_ECX_XSAVE: u32 = 1 << 26; // XSAVE: not enabled for guests
+const L1_ECX_OSXSAVE: u32 = 1 << 27; // dynamic mirror of CR4.OSXSAVE; masked for stability
+const L1_ECX_AVX: u32 = 1 << 28; // AVX: unusable with CR4.OSXSAVE off
+const L1_ECX_F16C: u32 = 1 << 29; // AVX family
 
 // Leaf 1 EDX
 const L1_EDX_TM: u32 = 1 << 29; // thermal monitor: package-thermal behavior
@@ -24,6 +29,10 @@ const L1_EDX_ACPI: u32 = 1 << 22; // thermal/throttle MSRs
 
 // Leaf 7 (subleaf 0) EBX
 const L7_EBX_RDSEED: u32 = 1 << 18; // hardware entropy: nondeterministic by definition
+const L7_EBX_AVX2: u32 = 1 << 5; // unusable with CR4.OSXSAVE off (bead ttk)
+/// AVX-512 F/DQ/IFMA/PF/ER/CD/BW/VL: same OSXSAVE-off reasoning.
+const L7_EBX_AVX512_GROUP: u32 =
+    (1 << 16) | (1 << 17) | (1 << 21) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 30) | (1 << 31);
 
 // Leaf 7 (subleaf 0) ECX
 const L7_ECX_WAITPKG: u32 = 1 << 5; // UMWAIT/TPAUSE: wall-clock waits in userspace
@@ -57,7 +66,15 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
                     | L1_ECX_TSC_DEADLINE
                     | L1_ECX_X2APIC
                     | L1_ECX_PDCM
-                    | L1_ECX_RDRAND);
+                    | L1_ECX_RDRAND
+                    // CR4.OSXSAVE is OFF (boot.rs, bead ttk): the
+                    // XSAVE/AVX families are unusable, so they must not
+                    // be advertised — compiled guests feature-detect.
+                    | L1_ECX_FMA
+                    | L1_ECX_XSAVE
+                    | L1_ECX_OSXSAVE
+                    | L1_ECX_AVX
+                    | L1_ECX_F16C);
                 e.edx &= !(L1_EDX_TM | L1_EDX_ACPI);
                 // EBX[31:24] is the initial APIC ID: which HOST LP the
                 // ioctl ran on. It flipped the masked-table hash between
@@ -74,8 +91,16 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
                 e.edx = 0;
             }
             (7, 0) => {
-                e.ebx &= !L7_EBX_RDSEED;
+                e.ebx &= !(L7_EBX_RDSEED | L7_EBX_AVX2 | L7_EBX_AVX512_GROUP);
                 e.ecx &= !L7_ECX_WAITPKG;
+            }
+            (0xD, _) => {
+                // XSAVE enumeration: host-specific state-area layout,
+                // and OSXSAVE is off — zeroed like leaves 6/0xA/0xB.
+                e.eax = 0;
+                e.ebx = 0;
+                e.ecx = 0;
+                e.edx = 0;
             }
             (0x15, _) | (0x16, _) => {
                 // TSC/crystal and processor frequency leaves: host-specific
