@@ -65,7 +65,7 @@ capture engine, §6.10), `detguest-host` (guest-sdk's host-side channel library)
 | `KVM_CAP_DIRTY_LOG_RING` (optional, preferred) | per-vCPU dirty ring; fall back to bitmap if absent |
 | `KVM_CAP_X86_MSR_FILTER` | trap all unexpected RDMSR/WRMSR to userspace |
 | `KVM_CAP_X86_USER_SPACE_MSR` (enabled with `KVM_MSR_EXIT_REASON_FILTER`) | makes filter-denied MSR accesses exit to userspace (`KVM_EXIT_X86_RDMSR`/`WRMSR`) instead of KVM injecting #GP directly — required for the deterministic MSR emulation in §2.2 |
-| `KVM_CAP_GET_MSR_FEATURES`, `KVM_CAP_TSC_CONTROL` | TSC normalization on restore |
+| `KVM_CAP_GET_MSR_FEATURES`, `KVM_CAP_VCPU_ATTRIBUTES` (TSC offset vCPU attr) | TSC normalization on restore via OFFSET writes (§4.4). Empirics 2026-06-09: `KVM_CAP_TSC_CONTROL` (TSC *frequency scaling*) was listed here but is absent on the lab Coffee Lake and never needed — single pinned host, no migration |
 | `KVM_CAP_SET_GUEST_DEBUG` | single-step + hardware breakpoints (boundary refinement, bisection) |
 | `KVM_CAP_IMMEDIATE_EXIT` | race-free kick of the vCPU from the PMI signal handler |
 | `KVM_CAP_VCPU_EVENTS`, `KVM_CAP_DEBUGREGS`, `KVM_CAP_XSAVE2`, `KVM_CAP_XCRS` | complete vCPU state capture |
