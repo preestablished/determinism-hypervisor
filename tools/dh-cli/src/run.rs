@@ -50,7 +50,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
     );
     let mut chain = StateHashChain::new(&[0; 32], &[0; 32]);
     let pause = AtomicBool::new(false);
-    let mut serial = Vec::new();
+    let mut serial = dh_devices::DebugSerial::new();
 
     let outcome = {
         let mut seg = Segment {
@@ -65,7 +65,11 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
         };
         let mut on_exit = |exit: VcpuExit| match exit {
             VcpuExit::IoOut(port, data) if (0x3F8..0x400).contains(&port) => {
-                serial.extend_from_slice(data);
+                serial.pio_write(port, data);
+                Ok(())
+            }
+            VcpuExit::IoIn(port, data) if (0x3F8..0x400).contains(&port) => {
+                serial.pio_read(port, data);
                 Ok(())
             }
             other => Err(BoundaryError::Exit(format!("unexpected exit: {other:?}"))),
@@ -89,6 +93,6 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
-        serial,
+        serial: serial.take_output(),
     })
 }

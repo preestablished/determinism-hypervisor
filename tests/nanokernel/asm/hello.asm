@@ -9,6 +9,8 @@
 BITS 64
 
 %define SERIAL_PORT 0x3F8
+%define SERIAL_LSR  0x3FD
+%define LSR_THRE    0x20
 
 SECTION .rodata
 msg:    db  "HELLO", 10
@@ -20,9 +22,17 @@ global prog_main
 prog_main:
     lea     rsi, [msg]
     mov     rcx, MSG_LEN
-    mov     dx, SERIAL_PORT
 .next:
+    ; Real 16550 driver discipline: wait for THR-empty (LSR bit 5) before
+    ; each byte. Under the pre-avm debug loop every IN read zeros, so this
+    ; spun forever (the iter-29 hazard); DebugSerial always reads ready.
+.wait_thre:
+    mov     dx, SERIAL_LSR
+    in      al, dx
+    test    al, LSR_THRE
+    jz      .wait_thre
     lodsb
+    mov     dx, SERIAL_PORT
     out     dx, al
     loop    .next
     ret                             ; crt0 parks in HLT

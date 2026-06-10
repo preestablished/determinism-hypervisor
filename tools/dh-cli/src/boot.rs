@@ -2,19 +2,21 @@
 //! BootInfo, MSR filter, long-mode entry — crates/dh-vmm/src/boot.rs) plus
 //! a debug run-until-HLT loop with a serial sink.
 //!
-//! The loop is the DEBUG one: serial OUT bytes are collected, every IN
-//! reads as zeros (answered on the raw exit — the classify_exit IN-FILL
-//! contract makes post-classify filling impossible; a 16550 LSR-polling
-//! driver would spin here, see bead avm), MMIO errors out (the device-bus
-//! run loop is the M1 acceptance bead), HLT ends the run. Denied MSR
-//! accesses are emulated deterministically by classify_exit itself.
+//! The loop is the DEBUG one: the serial range (0x3F8..0x400) is served
+//! by the real DebugSerial model (bead avm) — OUTs transmit, INs read the
+//! fixed 16550 registers (LSR always ready, so an LSR-polling driver
+//! makes progress), answered on the raw exit per the classify_exit
+//! IN-FILL contract. Non-serial INs read zeros. MMIO errors out (the
+//! device-bus run loop is the M1 acceptance bead), HLT ends the run.
+//! Denied MSR accesses are emulated deterministically by classify_exit.
 
+use dh_devices::serial::{DebugSerial, SERIAL_PIO_BASE, SERIAL_PIO_LEN};
 use dh_vmm::boot::load_and_enter;
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem};
 use kvm_ioctls::VcpuExit;
 
-const SERIAL_BASE: u16 = 0x3F8;
-const SERIAL_END: u16 = 0x400;
+const SERIAL_BASE: u16 = SERIAL_PIO_BASE;
+const SERIAL_END: u16 = SERIAL_PIO_BASE + SERIAL_PIO_LEN;
 
 #[derive(Debug)]
 pub struct BootOutcome {
@@ -62,7 +64,7 @@ pub fn boot(
 }
 
 fn run_until_hlt(mut slot: dh_vmm::kvm::SlotVm, max_exits: u64) -> Result<BootOutcome, BootError> {
-    let mut serial = Vec::new();
+    let mut serial = DebugSerial::new();
     let mut exits = 0u64;
     while exits < max_exits {
         exits += 1;
@@ -71,13 +73,22 @@ fn run_until_hlt(mut slot: dh_vmm::kvm::SlotVm, max_exits: u64) -> Result<BootOu
             .run()
             .map_err(|e| BootError::Kvm(format!("KVM_RUN: {e}")))?;
         match exit {
-            // INs answered on the raw exit (IN-FILL contract): zeros.
+            // INs answered on the raw exit (IN-FILL contract): the serial
+            // model serves its range; everything else reads zeros.
+            VcpuExit::IoIn(port, data) if (SERIAL_BASE..SERIAL_END).contains(&port) => {
+                serial.pio_read(port, data);
+            }
             VcpuExit::IoIn(_port, data) => data.fill(0),
             VcpuExit::IoOut(port, data) if (SERIAL_BASE..SERIAL_END).contains(&port) => {
-                serial.extend_from_slice(data);
+                serial.pio_write(port, data);
             }
             other => match classify_exit(other) {
-                ExitEvent::Hlt => return Ok(BootOutcome { serial, exits }),
+                ExitEvent::Hlt => {
+                    return Ok(BootOutcome {
+                        serial: serial.take_output(),
+                        exits,
+                    })
+                }
                 ExitEvent::DetcallOut { .. } | ExitEvent::PioIgnored { .. } => {}
                 // Denied MSRs are already deterministically emulated by
                 // classify_exit (supply 0 / inject #GP); just continue.
