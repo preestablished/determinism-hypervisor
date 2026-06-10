@@ -398,12 +398,25 @@ fn madvise_nohugepage(mem: &GuestMemoryMmap<()>, len: u64) -> Result<(), KvmErro
     Ok(())
 }
 
+/// Test guard: can this process actually open /dev/kvm? Existence is not
+/// enough — GitHub-hosted runners expose the node (nested virt) but deny the
+/// runner user access, so live-KVM tests must skip there and run only where
+/// an rw open succeeds (the lab box, the kvm-intel CI lane).
+#[cfg(test)]
+pub(crate) fn kvm_usable() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        crate::kvm::kvm_usable()
     }
 
     #[test]

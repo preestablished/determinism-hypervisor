@@ -124,7 +124,7 @@ mod tests {
     use vm_memory::{Bytes, GuestAddress};
 
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        crate::kvm::kvm_usable()
     }
 
     #[test]

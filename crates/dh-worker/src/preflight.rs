@@ -315,8 +315,15 @@ mod tests {
     /// prove the failure paths).
     #[test]
     fn full_preflight_passes_on_configured_host() {
-        if !std::path::Path::new("/dev/kvm").exists() {
-            eprintln!("skipping: no /dev/kvm");
+        // rw-open, not existence: hosted CI runners expose /dev/kvm but deny
+        // access, and this test must only run where the box is §7.4-usable.
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_err()
+        {
+            eprintln!("skipping: /dev/kvm not usable");
             return;
         }
         let (results, ok) = run_preflight();
