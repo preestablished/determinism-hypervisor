@@ -42,7 +42,8 @@ while IFS= read -r line; do
     else
         echo "ok: $key=$want"
     fi
-done < "$LOCK"
+done < <(cat "$LOCK"; echo)  # the echo guards a missing final newline:
+                            # `read` drops an unterminated last line
 
 if [[ "$checked" -eq 0 ]]; then
     echo "::error::lock file parsed to zero keys — comparator or lock is broken"

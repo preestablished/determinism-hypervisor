@@ -21,6 +21,37 @@ check** on `main` (bead 8n7; IMPLEMENTATION-PLAN M3):
   counting-semantics failure on a new kernel/microcode triggers the
   documented BR_INST_RETIRED fallback decision — not a patch-around.
 
+## External (fork) pull requests
+
+This repo is public, but the `kvm-intel` job never runs untrusted fork
+code on the lab box (the workflow's same-repo guard), and `kvm-intel`
+is a required check — so **fork PRs cannot merge as-is by design**. A
+maintainer who wants to land external work pushes the branch to this
+repo (making it same-repo) and opens the PR from there.
+
+## When the kvm box is down
+
+The required `kvm-intel` check never reports while the runner is
+offline, so every PR is unmergeable — that is the intended fail-closed
+posture. The deliberate escape is an ADMIN direct push of work that has
+passed the full suite locally on the box (record it in the PR/commit
+message); bring the runner back before merging anything else. Admin
+bypass works because `enforce_admins` is off — which also means the
+push identity used by the autonomous flow MUST be a repo admin
+(currently `mattsp1290`).
+
+## Branch protection is code
+
+GitHub does not version protection settings; any admin can silently
+remove them. The intended state is committed at
+[`ci/branch-protection.json`](ci/branch-protection.json) — re-apply
+after any drift with:
+
+```bash
+gh api -X PUT repos/preestablished/determinism-hypervisor/branches/main/protection \
+  --input ci/branch-protection.json
+```
+
 ## Host drift
 
 The kvm-intel runner's determinism class (CPU/microcode/kernel tuple)

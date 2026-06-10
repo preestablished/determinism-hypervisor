@@ -45,3 +45,26 @@ jobs:
       - name: run-twice determinism regression + counting empirics
         run: cargo test -p determinism-tests --test regression --test counting_semantics --test counting_smoke
         working-directory: repo
+
+  # A silent-red nightly is the worst outcome for a determinism product:
+  # route failures to a visible issue (updated, not duplicated).
+  alert-on-failure:
+    needs: [determinism-class, determinism-canary]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
+          TITLE="nightly-drift FAILED: determinism class or canary"
+          BODY="Nightly drift/canary failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a canary failure is a P0 determinism divergence."
+          EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY"
+          fi
