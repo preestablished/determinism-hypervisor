@@ -328,6 +328,14 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             }
             PORT_INIT_GO => {
                 self.init_status = self.channel_init(value) as u32;
+                if self.init_status == InitStatus::Ok as u32 {
+                    // One-time encoder fingerprint at successful attach
+                    // (bead 4ld): lets a verifier detect SDK-digest
+                    // encoder skew instead of chasing spurious
+                    // divergence. A re-attach re-emits — each record is
+                    // truthful for the encoder that wrote it.
+                    ctx.log_encoder_fingerprint(wire_encoder_fingerprint());
+                }
                 Vec::new()
             }
             PORT_DOORBELL => {
@@ -650,6 +658,34 @@ fn wire_view(p: &OwnedPayload) -> Option<(EventKind, EventPayload<'_>)> {
 /// sibling path dep is HEAD-wins); a verifier replaying an old log with a
 /// changed encoder can see spurious SDK-digest divergence — encoder-skew
 /// fingerprinting is tracked in beads.
+/// The detguest-wire ENCODER FINGERPRINT (bead 4ld): digest8 over the
+/// canonical encodings of a fixed probe set spanning the header layout
+/// and several payload shapes. Any wire-format change that could skew
+/// the AUX SDK_EVENT digests flips this value; record and replay
+/// compare it before comparing digests.
+pub fn wire_encoder_fingerprint() -> u64 {
+    let mut bytes = Vec::new();
+    let probes: [EventPayload<'_>; 4] = [
+        EventPayload::Pad,
+        EventPayload::Hello {
+            proto_version: 1,
+            agent_version: 0x0001_0000,
+            capabilities: 0,
+        },
+        EventPayload::NameIntern {
+            name_id: 1,
+            name: b"dh-encoder-fp-probe",
+        },
+        EventPayload::Beacon { beacon_id: 0xF1F1 },
+    ];
+    let mut buf = vec![0u8; MAX_RECORD_LEN];
+    for (i, p) in probes.iter().enumerate() {
+        let n = encode_event(&mut buf, i as u32, 7, 0, p).expect("probe set must always encode");
+        bytes.extend_from_slice(&buf[..n]);
+    }
+    LogWriter::digest8(&bytes)
+}
+
 fn sdk_event_digest(ev: &GuestEvent) -> Option<(u16, u32, u64)> {
     let (kind, payload) = wire_view(&ev.payload)?;
     let extra_flags = match &ev.payload {
@@ -817,6 +853,15 @@ mod tests {
         assert_eq!(host.metrics.raz_wi_outs, 1);
         assert_eq!(host.metrics.raz_wi_ins, 1);
         assert_eq!(l.record_count(), 1); // the RAZ IN answer is still canonical
+    }
+
+    #[test]
+    fn encoder_fingerprint_is_deterministic_and_logged_at_attach() {
+        assert_eq!(
+            wire_encoder_fingerprint(),
+            wire_encoder_fingerprint(),
+            "fingerprint must be a pure function of the encoder"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub const KIND_ENTROPY: u8 = 0x40;
 pub const KIND_TIMER_FIRE: u8 = 0x41;
 pub const KIND_SDK_EVENT: u8 = 0x43;
 pub const KIND_FRAME_MARK: u8 = 0x45;
+pub const KIND_ENCODER_FP: u8 = 0x46;
 pub const KIND_END: u8 = 0x7F;
 
 pub const RFLAG_AUX: u8 = 1 << 0;
@@ -231,6 +232,29 @@ impl LogWriter {
         payload[4..8].copy_from_slice(&len.to_le_bytes());
         payload[8..16].copy_from_slice(&digest8.to_le_bytes());
         self.record(KIND_SDK_EVENT, RFLAG_AUX, icount, boundary_rip, &payload)
+    }
+
+    /// ENCODER_FP (bead 4ld): the detguest-wire encoder fingerprint —
+    /// digest8 over a canonical probe-set encoding, emitted ONCE per
+    /// segment at channel attach. AUX SDK_EVENT digests are computed by
+    /// re-encoding drained payloads; a verifier replaying an old log
+    /// with a changed encoder (HEAD-wins sibling dep) detects the skew
+    /// by comparing fingerprints instead of chasing spurious SDK-digest
+    /// divergence. A wire-format bump is a DHILOG-v1 compatibility
+    /// event, never an in-place rewrite.
+    pub fn encoder_fingerprint(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        fingerprint: u64,
+    ) -> Result<(), WriteError> {
+        self.record(
+            KIND_ENCODER_FP,
+            RFLAG_AUX,
+            icount,
+            boundary_rip,
+            &fingerprint.to_le_bytes(),
+        )
     }
 
     /// FRAME_MARK (§3.3): absolute FRAME_COUNTER value F at this segment-

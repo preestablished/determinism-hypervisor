@@ -313,10 +313,11 @@ fn m1_device_exercise_end_to_end() {
         other => panic!("expected Beacon, got {other:?}"),
     }
 
-    // Channel mutations were logged: exactly 5 records, bit-stable
+    // Channel mutations were logged: exactly 6 records, bit-stable
     // (review-measured: CHANNEL_INIT pio answers + doorbell DEV_EVENTs +
-    // the entropy AUX record).
-    assert_eq!(out.log_records, 5, "DHILOG record count");
+    // the entropy AUX record + the one-time encoder fingerprint at
+    // attach, bead 4ld).
+    assert_eq!(out.log_records, 6, "DHILOG record count");
 
     // The guest's sector-0 write landed in the overlay ONLY.
     let meta = std::fs::metadata(&base_path).unwrap();
