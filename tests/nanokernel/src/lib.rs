@@ -14,6 +14,8 @@
 //! guests' zeroed-.bss assumption are garbage.
 
 /// BootInfo magic: "DHBI" as little-endian bytes.
+pub mod image;
+
 pub const BOOTINFO_MAGIC: u32 = u32::from_le_bytes(*b"DHBI");
 pub const BOOTINFO_VERSION: u32 = 1;
 

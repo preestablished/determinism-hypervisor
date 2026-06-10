@@ -22,5 +22,8 @@ libc = "0.2.186"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 vmm-sys-util = "0.15.0"
 
-[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+# Ungated: the live-KVM unit tests that use the guest ELFs sit inside
+# x86_64-gated modules anyway, and the PORTABLE blk fixture test (CoW
+# contract, no KVM) must run on the arm lane too.
+[dev-dependencies]
 nanokernel = { path = "../../tests/nanokernel" }
