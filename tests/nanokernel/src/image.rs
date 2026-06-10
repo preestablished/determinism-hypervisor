@@ -30,18 +30,25 @@ pub const BASE_IMAGE_BLAKE3: [u8; 32] = [
     0xc7, 0x02, 0x54, 0x7f, 0x34, 0xdd, 0x6a, 0x4f, 0xb0, 0x83, 0x59, 0x8c, 0x6c, 0x20, 0xe8, 0x5f,
 ];
 
+/// Base body formula coefficients, public for the M1 asm guest:
+/// `byte[i] = lo8(sector*BASE_MUL_SECTOR + i*BASE_MUL_INDEX + BASE_ADD)`
+/// for i in 8..512 (all math wrapping u64, truncated to the low byte).
+pub const BASE_MUL_SECTOR: u64 = 167;
+pub const BASE_MUL_INDEX: u64 = 13;
+pub const BASE_ADD: u64 = 5;
+
 /// One base sector: bytes 0..8 = LE sector index (a guest checks its
-/// read landed with one qword compare); bytes 8.. follow
-/// `(sector*167 + i*13 + 5) & 0xFF` — two multiplies and an add, cheap
+/// read landed with one qword compare); bytes 8.. follow the
+/// [`BASE_MUL_SECTOR`] formula — two imuls and an add per byte, cheap
 /// to spot-check from asm.
 pub fn base_sector(sector: u64) -> [u8; IMAGE_SECTOR_SIZE] {
     let mut s = [0u8; IMAGE_SECTOR_SIZE];
     s[..8].copy_from_slice(&sector.to_le_bytes());
     for (i, b) in s.iter_mut().enumerate().skip(8) {
         *b = (sector
-            .wrapping_mul(167)
-            .wrapping_add(i as u64 * 13)
-            .wrapping_add(5)) as u8;
+            .wrapping_mul(BASE_MUL_SECTOR)
+            .wrapping_add(i as u64 * BASE_MUL_INDEX)
+            .wrapping_add(BASE_ADD)) as u8;
     }
     s
 }
@@ -72,17 +79,23 @@ pub const OVERLAY_WRITES: &[(u64, u32)] = &[(3, 1), (127, 2), (130, 1), (2040, 8
 /// from OVERLAY_WRITES; hand value here for consumers).
 pub const OVERLAY_EXPECTED_DIRTY_CLUSTERS: usize = 3;
 
+/// Overlay body formula coefficients (same shape as the base formula).
+pub const OVERLAY_MUL_SECTOR: u64 = 89;
+pub const OVERLAY_MUL_INDEX: u64 = 31;
+pub const OVERLAY_ADD: u64 = 11;
+
 /// One overlay-written sector: first 8 bytes = LE bitwise-NOT of the
-/// sector index (cannot collide with any base sector header), the rest
-/// `(sector*89 + i*31 + 11) & 0xFF`.
+/// sector index (the HEADER cannot collide with any base sector's
+/// header — base headers are < BASE_IMAGE_SECTORS; this says nothing
+/// about body bytes), the rest per [`OVERLAY_MUL_SECTOR`].
 pub fn overlay_sector(sector: u64) -> [u8; IMAGE_SECTOR_SIZE] {
     let mut s = [0u8; IMAGE_SECTOR_SIZE];
     s[..8].copy_from_slice(&(!sector).to_le_bytes());
     for (i, b) in s.iter_mut().enumerate().skip(8) {
         *b = (sector
-            .wrapping_mul(89)
-            .wrapping_add(i as u64 * 31)
-            .wrapping_add(11)) as u8;
+            .wrapping_mul(OVERLAY_MUL_SECTOR)
+            .wrapping_add(i as u64 * OVERLAY_MUL_INDEX)
+            .wrapping_add(OVERLAY_ADD)) as u8;
     }
     s
 }

@@ -80,7 +80,10 @@ fn cow_contract_end_to_end() {
     let mut mem = VecGuestMem(vec![0u8; 64 * 1024]);
 
     // ---- phase 1: every sector reads back the known base pattern ----
-    const BATCH: u64 = 64; // 32 KiB per read, fits the guest buffer
+    // 32 KiB per read, fits the guest buffer; the sweep covers every
+    // sector exactly once IFF BATCH divides the sector count.
+    const BATCH: u64 = 64;
+    assert_eq!(image::BASE_IMAGE_SECTORS % BATCH, 0);
     for first in (0..image::BASE_IMAGE_SECTORS).step_by(BATCH as usize) {
         let st = request(&mut dev, &mut mem, CMD_READ, first, 0, BATCH as u32);
         assert_eq!(st, STATUS_OK, "base read at sector {first}");
@@ -123,6 +126,20 @@ fn cow_contract_end_to_end() {
                 "post-write content at sector {sec}"
             );
         }
+    }
+
+    // ---- phase 3b: ONE request spanning a dirty->clean cluster
+    // boundary (cluster 1 has overlay sectors, cluster 2 is untouched):
+    // the device must stitch overlay-chunk + base-chunk in one read ----
+    let st = request(&mut dev, &mut mem, CMD_READ, 250, 0, 16);
+    assert_eq!(st, STATUS_OK, "dirty->clean boundary read");
+    for sec in 250..266u64 {
+        let off = ((sec - 250) as usize) * SECTOR_SIZE;
+        assert_eq!(
+            mem.0[off..off + SECTOR_SIZE],
+            image::expected_sector_after_writes(sec),
+            "boundary-mix content at sector {sec}"
+        );
     }
 
     // ---- phase 4: the base file never changed ----
