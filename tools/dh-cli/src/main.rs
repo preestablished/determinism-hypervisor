@@ -9,6 +9,9 @@ fn main() {
     #[cfg(target_arch = "x86_64")]
     dh_cli::cli::main();
 
+    // Deliberately all-or-nothing: even `caps`/`cpuid-diff` (whose
+    // summary strings are arm-buildable) stay behind the stub — a debug
+    // CLI that can probe nothing would only mislead.
     #[cfg(not(target_arch = "x86_64"))]
     {
         eprintln!("dh-cli requires an x86_64 host (KVM/VMX, ARCH §1)");

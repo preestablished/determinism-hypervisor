@@ -1,4 +1,4 @@
-#![deny(unsafe_code)] // targeted allows in kvm.rs only (memfd_create, madvise, set_user_memory_region)
+#![deny(unsafe_code)] // targeted allows in the x86_64 KVM modules only (raw ioctls, memfd, madvise)
 
 // Architecture split (bead v5w): the pure determinism math — agenda
 // scheduling, virtual-time rationals, machine config, block fixtures —
