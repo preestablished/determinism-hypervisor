@@ -317,14 +317,20 @@ mod tests {
     fn full_preflight_passes_on_configured_host() {
         // rw-open, not existence: hosted CI runners expose /dev/kvm but deny
         // access, and this test must only run where the box is §7.4-usable.
-        if std::fs::OpenOptions::new()
+        // Same skip-vs-fail split as dh-vmm's kvm_usable(): only absence or
+        // permission denial skips; unexpected errnos fail loudly.
+        use std::io::ErrorKind;
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/kvm")
-            .is_err()
         {
-            eprintln!("skipping: /dev/kvm not usable");
-            return;
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+                eprintln!("skipping: /dev/kvm not usable");
+                return;
+            }
+            Err(e) => panic!("unexpected /dev/kvm probe failure: {e}"),
         }
         let (results, ok) = run_preflight();
         for r in &results {
