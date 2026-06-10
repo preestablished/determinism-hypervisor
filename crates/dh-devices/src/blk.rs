@@ -40,6 +40,13 @@ pub const CMD_WRITE: u32 = 2;
 pub const CMD_FLUSH: u32 = 3;
 
 /// STATUS values (this repo's ABI; ARCH §6.5 leaves codes to the model).
+///
+/// PARTIAL-COMPLETION CONTRACT: on a nonzero status the request may have
+/// partially executed — earlier chunks of the guest buffer (reads) or
+/// overlay clusters (writes) are already mutated. That partial state is a
+/// pure function of (registers, base, overlay, guest RAM), so record and
+/// replay mutate identically; STATUS is the only completion signal and
+/// the guest must treat the buffer as undefined on error.
 pub const STATUS_OK: u32 = 0;
 /// Request outside the device (sector range, zero/overflowing count) or an
 /// unknown CMD value.
@@ -56,8 +63,9 @@ pub const STATUS_HOST_IO: u32 = 0xFE;
 
 const SECTION_VERSION: u16 = 1;
 /// Fixed-width section prefix: sector u64 | buf_gpa u64 | count u32 |
-/// status u32 | dirty_cluster_count u32 (then per-cluster entries).
-const SECTION_FIXED: usize = 8 + 8 + 4 + 4 + 4;
+/// status u32 | host_io_errors u64 | dirty_cluster_count u32 (then
+/// per-cluster entries).
+const SECTION_FIXED: usize = 8 + 8 + 4 + 4 + 8 + 4;
 /// Per dirty cluster: idx u64 | blake3 [u8;32] | bytes [u8; CLUSTER_SIZE].
 const SECTION_PER_CLUSTER: usize = 8 + 32 + CLUSTER_SIZE;
 
@@ -245,6 +253,9 @@ impl DetDevice for PvBlk {
         out.extend_from_slice(&self.buf_gpa.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
         out.extend_from_slice(&self.status.to_le_bytes());
+        // host_io_errors travels with status: a restored STATUS_HOST_IO
+        // must keep its nonzero counter or the run-control check breaks.
+        out.extend_from_slice(&self.host_io_errors.to_le_bytes());
         // Sorted: HashMap order must never leak into snapshot bytes.
         let mut idxs: Vec<u64> = self.overlay.keys().copied().collect();
         idxs.sort_unstable();
@@ -265,7 +276,10 @@ impl DetDevice for PvBlk {
         let buf_gpa = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
         let status = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let n = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        let host_io_errors = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        let n = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
+        // Length equality BEFORE any allocation: a hostile n cannot
+        // pre-allocate (n is bounded by the actual byte length here).
         if bytes.len() != SECTION_FIXED + n * SECTION_PER_CLUSTER {
             return Err(RestoreError);
         }
@@ -286,6 +300,7 @@ impl DetDevice for PvBlk {
         self.buf_gpa = buf_gpa;
         self.count = count;
         self.status = status;
+        self.host_io_errors = host_io_errors;
         self.overlay = overlay;
         Ok(())
     }
@@ -600,6 +615,112 @@ mod tests {
         let mut half = [0xFFu8; 4];
         dev.mmio_read(REG_SECTOR, &mut half, &mut ctx);
         assert_eq!(half, [0; 4]);
+    }
+
+    /// Guest memory that faults on any access at or past a cutoff GPA.
+    struct FaultyMem {
+        inner: VecGuestMem,
+        fault_at: u64,
+    }
+    impl crate::ctx::GuestMem for FaultyMem {
+        fn read(&self, gpa: u64, data: &mut [u8]) -> Result<(), crate::ctx::MemError> {
+            if gpa + data.len() as u64 > self.fault_at {
+                return Err(crate::ctx::MemError);
+            }
+            self.inner.read(gpa, data)
+        }
+        fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), crate::ctx::MemError> {
+            if gpa + data.len() as u64 > self.fault_at {
+                return Err(crate::ctx::MemError);
+            }
+            self.inner.write(gpa, data)
+        }
+    }
+
+    fn request_over(
+        dev: &mut PvBlk,
+        mem: &mut dyn crate::ctx::GuestMem,
+        cmd: u32,
+        sector: u64,
+        buf_gpa: u64,
+        count: u32,
+    ) -> u32 {
+        let mut l = log();
+        let mut ent = FakeEntropy(0);
+        let mut q = Vec::new();
+        let mut ctx = DevCtx::new(1, 0, &mut l, mem, &mut ent, &mut q);
+        dev.mmio_write(REG_SECTOR, &sector.to_le_bytes(), &mut ctx);
+        dev.mmio_write(REG_BUF_GPA, &buf_gpa.to_le_bytes(), &mut ctx);
+        dev.mmio_write(REG_COUNT, &count.to_le_bytes(), &mut ctx);
+        dev.mmio_write(REG_CMD, &cmd.to_le_bytes(), &mut ctx);
+        let mut status = [0u8; 4];
+        dev.mmio_read(REG_STATUS, &mut status, &mut ctx);
+        u32::from_le_bytes(status)
+    }
+
+    #[test]
+    fn mid_request_fault_leaves_identical_partial_state_twice() {
+        // A cross-cluster read whose SECOND chunk faults in guest RAM: the
+        // first chunk lands, then MEM_FAULT. Two identical runs must leave
+        // bit-identical guest RAM and device state (the partial-completion
+        // contract).
+        let run = || {
+            let base = patterned_base();
+            let mut dev = PvBlk::new(Box::new(base));
+            let mut mem = FaultyMem {
+                inner: VecGuestMem(vec![0u8; 0x40000]),
+                // Allow exactly the first cluster-bounded chunk (2 sectors
+                // of the 4-sector read start in cluster 0), fault after.
+                fault_at: 0x1000 + 2 * SECTOR_SIZE as u64,
+            };
+            let start = SECTORS_PER_CLUSTER - 2;
+            let s = request_over(&mut dev, &mut mem, CMD_READ, start, 0x1000, 4);
+            assert_eq!(s, STATUS_MEM_FAULT);
+            let mut snap = Vec::new();
+            dev.snapshot(&mut snap);
+            (mem.inner.0, snap)
+        };
+        assert_eq!(run(), run());
+
+        // Same for a cross-cluster WRITE: the first cluster populates and
+        // mutates, the second chunk's guest read faults — deterministic
+        // partial overlay, twice.
+        let run_w = || {
+            let base = patterned_base();
+            let mut dev = PvBlk::new(Box::new(base));
+            let mut mem = FaultyMem {
+                inner: VecGuestMem(vec![0u8; 0x40000]),
+                fault_at: 0x1000 + 2 * SECTOR_SIZE as u64,
+            };
+            let start = SECTORS_PER_CLUSTER - 2;
+            let s = request_over(&mut dev, &mut mem, CMD_WRITE, start, 0x1000, 4);
+            assert_eq!(s, STATUS_MEM_FAULT);
+            assert_eq!(dev.dirty_clusters(), 2, "RMW populated both clusters");
+            let mut snap = Vec::new();
+            dev.snapshot(&mut snap);
+            snap
+        };
+        assert_eq!(run_w(), run_w());
+    }
+
+    #[test]
+    fn restore_then_snapshot_is_byte_identical_and_keeps_host_io_errors() {
+        let base = patterned_base();
+        let mut mem = VecGuestMem(vec![0u8; 0x4000]);
+        let mut a = PvBlk::new(Box::new(base.clone()));
+        mem.0[0x1000..0x1000 + SECTOR_SIZE].fill(0x42);
+        request(&mut a, &mut mem, CMD_WRITE, 3, 0x1000, 1);
+        a.host_io_errors = 7; // pretend an earlier host fault was recorded
+
+        let mut snap_a = Vec::new();
+        a.snapshot(&mut snap_a);
+
+        let mut b = PvBlk::new(Box::new(base));
+        b.restore(&snap_a, 1).unwrap();
+        assert_eq!(b.host_io_errors, 7);
+        let mut snap_b = Vec::new();
+        b.snapshot(&mut snap_b);
+        assert_eq!(snap_a, snap_b, "restore -> snapshot must be identity");
     }
 
     #[test]
