@@ -189,6 +189,13 @@ pub enum ExitEvent {
         data: Vec<u8>,
     },
     /// Detcall window PIO (0xD370..=0xD39F).
+    ///
+    /// IN-FILL CONTRACT (determinism-critical): for DetcallIn/SerialIn the
+    /// kvm_run IO buffer is NOT filled by classify_exit — the caller MUST
+    /// write the deterministic reply into the buffer before re-entering
+    /// KVM_RUN. The buffer is the persistent kvm_run IO data area: leaving
+    /// it untouched hands the guest stale bytes from a previous exit —
+    /// host-visible nondeterminism.
     DetcallIn {
         port: u16,
         len: usize,
