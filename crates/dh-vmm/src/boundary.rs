@@ -93,8 +93,19 @@ impl std::fmt::Display for BoundaryError {
 /// the vCPU is at an instruction boundary.
 ///
 /// `on_exit` services every non-debug, non-kick exit (device MMIO/PIO,
-/// IN-fill, …). Counting is unaffected by servicing — an instruction that
-/// exited mid-emulation has not retired.
+/// IN-fill, …) — INCLUDING `Hlt` and `Shutdown`: whether a halt during a
+/// landing is fatal is run control's call, not this engine's. Counting is
+/// unaffected by servicing — an instruction that exited mid-emulation has
+/// not retired.
+///
+/// Error/result precedence: if the boundary lands but DROPPING single-step
+/// fails, the caller gets that error, not the boundary — a vCPU left in
+/// single-step is R10-fatal and must never be resumed as healthy.
+///
+/// PERIOD semantics this engine relies on (and the live tests prove):
+/// PERF_EVENT_IOC_PERIOD takes effect immediately from the current count
+/// (Linux ≥ 3.14), so arm_period(d − SKID) fires after that many MORE
+/// retirements.
 pub fn land_at(
     vcpu: &mut VcpuFd,
     counter: &InstRetired,
