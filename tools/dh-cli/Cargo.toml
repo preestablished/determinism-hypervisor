@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 dh-vmm.workspace = true
+kvm-bindings = "0.14.0"
+kvm-ioctls = "0.24.0"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+
+[dev-dependencies]
+nanokernel = { path = "../../tests/nanokernel" }
