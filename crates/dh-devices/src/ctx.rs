@@ -50,6 +50,12 @@ pub struct DevCtx<'a> {
     pub mem: &'a mut dyn GuestMem,
     pub entropy: &'a mut dyn EntropySource,
     irq_queue: &'a mut Vec<IrqRequest>,
+    /// Sticky: first log failure in this dispatch. MMIO handlers return ()
+    /// and cannot fault, so the wrappers record failures here and the VMM
+    /// MUST check [`DevCtx::log_fault`] after every dispatch — a dropped
+    /// record (e.g. a FRAME_MARK missing from the frame table) is a
+    /// DATA_LOSS-class slot fault, never silently absorbed.
+    log_fault: Option<dh_inputlog::dhilog::WriteError>,
 }
 
 impl<'a> DevCtx<'a> {
@@ -68,6 +74,7 @@ impl<'a> DevCtx<'a> {
             mem,
             entropy,
             irq_queue,
+            log_fault: None,
         }
     }
 
@@ -77,45 +84,51 @@ impl<'a> DevCtx<'a> {
         self.irq_queue.push(IrqRequest { vector });
     }
 
+    /// First log failure of this dispatch, if any. The VMM checks this
+    /// after every bus dispatch and faults the slot (DATA_LOSS class) on
+    /// `Some` — see the field doc.
+    pub fn log_fault(&self) -> Option<dh_inputlog::dhilog::WriteError> {
+        self.log_fault
+    }
+
+    fn record(&mut self, r: Result<(), dh_inputlog::dhilog::WriteError>) {
+        if let (Err(e), None) = (r, self.log_fault) {
+            self.log_fault = Some(e);
+        }
+    }
+
     /// Log a canonical DEV_EVENT at THIS boundary (icount/rip stamped from
     /// the context — the only way a device may write canonical records).
-    pub fn log_dev_event(
-        &mut self,
-        device_id: u16,
-        event_type: u16,
-        data: &[u8],
-    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
-        self.log
-            .dev_event(self.icount, self.boundary_rip, device_id, event_type, data)
+    /// Failures stick in [`Self::log_fault`]; devices need not handle them.
+    pub fn log_dev_event(&mut self, device_id: u16, event_type: u16, data: &[u8]) {
+        let r = self
+            .log
+            .dev_event(self.icount, self.boundary_rip, device_id, event_type, data);
+        self.record(r);
     }
 
     /// Log a DEV_EVENT/PIO_ANSWER at this boundary (detcall IN returns).
-    pub fn log_pio_answer(
-        &mut self,
-        port: u16,
-        value: u32,
-    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
-        self.log
-            .pio_answer(self.icount, self.boundary_rip, port, value)
+    pub fn log_pio_answer(&mut self, port: u16, value: u32) {
+        let r = self
+            .log
+            .pio_answer(self.icount, self.boundary_rip, port, value);
+        self.record(r);
     }
 
     /// Log an AUX ENTROPY record at this boundary (pv-entropy serves).
-    pub fn log_entropy(
-        &mut self,
-        len: u32,
-        digest8: u64,
-    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
-        self.log
-            .entropy(self.icount, self.boundary_rip, len, digest8)
+    pub fn log_entropy(&mut self, len: u32, digest8: u64) {
+        let r = self
+            .log
+            .entropy(self.icount, self.boundary_rip, len, digest8);
+        self.record(r);
     }
 
     /// Log an AUX FRAME_MARK at this boundary (pv-pad FRAME_COUNTER write).
-    pub fn log_frame_mark(
-        &mut self,
-        frame_index: u32,
-    ) -> Result<(), dh_inputlog::dhilog::WriteError> {
-        self.log
-            .frame_mark(self.icount, self.boundary_rip, frame_index)
+    pub fn log_frame_mark(&mut self, frame_index: u32) {
+        let r = self
+            .log
+            .frame_mark(self.icount, self.boundary_rip, frame_index);
+        self.record(r);
     }
 }
 
@@ -183,6 +196,30 @@ mod tests {
         assert_eq!(out, [1, 2, 3, 4]);
         assert_eq!(mem.read(13, &mut out), Err(MemError));
         assert_eq!(mem.write(u64::MAX, &[0]), Err(MemError));
+    }
+
+    #[test]
+    fn log_failures_stick_in_log_fault() {
+        let mut l = log();
+        // Pre-log at icount 100 so a later dispatch at icount 50 regresses.
+        l.frame_mark(100, 0, 1).unwrap();
+        let mut mem = VecGuestMem(vec![0u8; 4]);
+        let mut ent = FakeEntropy(0);
+        let mut q = Vec::new();
+        let mut ctx = DevCtx::new(50, 0, &mut l, &mut mem, &mut ent, &mut q);
+        assert_eq!(ctx.log_fault(), None);
+        ctx.log_frame_mark(2);
+        assert_eq!(
+            ctx.log_fault(),
+            Some(dh_inputlog::dhilog::WriteError::IcountRegressed)
+        );
+        // First failure sticks even after a later success.
+        ctx.icount = 200;
+        ctx.log_frame_mark(3);
+        assert_eq!(
+            ctx.log_fault(),
+            Some(dh_inputlog::dhilog::WriteError::IcountRegressed)
+        );
     }
 
     #[test]

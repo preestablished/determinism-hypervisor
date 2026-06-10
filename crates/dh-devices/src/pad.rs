@@ -119,12 +119,13 @@ impl DetDevice for PvPad {
             // disables.
             REG_IRQ_VECTOR => self.irq_vector = value & 0xFF,
             // The frame-boundary exit (§6.4/§6.6): record absolute F at
-            // this segment-relative icount. A full log is a fault the VMM
-            // surfaces at the boundary — the write itself stays applied
-            // deterministically either way.
+            // this segment-relative icount. A log failure sticks in
+            // ctx.log_fault(), which the VMM checks after every dispatch
+            // and treats as a DATA_LOSS slot fault — never silently
+            // absorbed. The counter update stays applied deterministically.
             REG_FRAME_COUNTER => {
                 self.frame_counter = value;
-                let _ = ctx.log_frame_mark(value);
+                ctx.log_frame_mark(value);
             }
             // PAD0..3 are RO via MMIO (latch changes only through
             // apply_pad_set); unknown offsets ignored.
