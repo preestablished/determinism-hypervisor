@@ -122,9 +122,9 @@ pub const COUNTING_EXIT_INSTRS_IN_REGION: u64 = 3;
 /// A VM-exiting instruction (PIO OUT, CPUID, MMIO access) exits BEFORE
 /// it retires, and KVM completes it host-side by skipping RIP — with
 /// exclude_host=1 the guest counter therefore retires it ZERO times,
-/// not once. The vendored ARCH §3.1 wording ("retire exactly once, on
-/// the resume that completes them") is contradicted on this class; the
-/// doc reconciliation is tracked in beads. Determinism is unaffected
+/// not once. (ARCH §3.1 originally claimed "retire exactly once, on
+/// the resume that completes them"; the vendored doc now records the
+/// measured rule.) Determinism is unaffected
 /// (the semantics are bit-stable and replay identically); only the
 /// attribution arithmetic changes:
 ///
@@ -146,8 +146,9 @@ pub const COUNTING_REP_BYTES: u64 = 256;
 /// A, W order as (offset, size). Mirrors the asm dword stores — the
 /// channel_interop test attaches a page built from THESE values through
 /// the real detguest-host code, so a drift here or in the asm fails CI.
-/// (W size is 0x100000, NOT the guest-sdk layout table's 0x1E0000: ring
-/// sizes are normatively powers of two; doc contradiction tracked.)
+/// (W size is 0x100000: ring sizes are normatively powers of two; the
+/// guest-sdk layout table once printed 0x1E0000 — fixed in the vendored
+/// copy, upstream tracked.)
 pub const DEVICE_EXERCISE_RING_DESCS: [(u32, u32); 4] = [
     (0x8000, 0x4000),
     (0xC000, 0x4000),
