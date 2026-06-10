@@ -1,7 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // targeted allows in kvm.rs only (memfd_create, madvise, set_user_memory_region)
 
 pub mod agenda;
 pub mod config;
+pub mod kvm;
 pub mod vt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

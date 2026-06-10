@@ -10,3 +10,8 @@ dh-devices.workspace = true
 dh-inputlog.workspace = true
 dh-proto.workspace = true
 dh-snapshot.workspace = true
+kvm-bindings = "0.14.0"
+kvm-ioctls = "0.24.0"
+libc = "0.2.186"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+vmm-sys-util = "0.15.0"
