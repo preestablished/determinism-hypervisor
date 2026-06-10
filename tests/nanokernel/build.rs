@@ -18,6 +18,7 @@ const PROGRAMS: &[&str] = &[
     "device_exercise",
     "hello",
     "sti_window",
+    "timer_guest",
 ];
 
 fn main() {

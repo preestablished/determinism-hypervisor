@@ -180,6 +180,48 @@ pub fn land_at(
     result
 }
 
+/// One guest ENTRY under single-step: enter once, return at the next
+/// debug trap. NOT one retirement — an entry that delivers a pending
+/// interrupt runs the whole handler before the trap fires (event delivery
+/// suppresses the step until the gate sequence + ISR complete), so the
+/// returned boundary can be many retirements ahead. Deterministic; used
+/// to chain same-boundary injections (one queued vector per entry).
+///
+/// The same suppression means §3.2 NEAR-approach landings must never
+/// target an icount strictly inside a delivery window — the engine would
+/// overshoot LOUDLY (the M6 scheduler owns avoiding such targets).
+pub fn step_one_entry(
+    vcpu: &mut VcpuFd,
+    counter: &InstRetired,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+) -> Result<Boundary, BoundaryError> {
+    let mut guard = KickGuard::register(vcpu);
+    set_singlestep(&mut guard, true)?;
+    let result = loop {
+        match guard.run() {
+            Ok(VcpuExit::Debug(_)) => break Ok(()),
+            Ok(exit) => {
+                if let Err(e) = on_exit(exit) {
+                    break Err(e);
+                }
+            }
+            Err(e) if e.errno() == libc::EINTR => clear_immediate_exit(&mut guard),
+            Err(e) => break Err(BoundaryError::Kvm(format!("KVM_RUN: {e}"))),
+        }
+    };
+    set_singlestep(&mut guard, false)?;
+    result?;
+    let icount = counter.read().map_err(BoundaryError::Counter)?;
+    let regs = guard
+        .get_regs()
+        .map_err(|e| BoundaryError::Kvm(format!("KVM_GET_REGS: {e}")))?;
+    Ok(Boundary {
+        icount,
+        rip: regs.rip,
+        rcx: regs.rcx,
+    })
+}
+
 fn set_singlestep(vcpu: &mut VcpuFd, on: bool) -> Result<(), BoundaryError> {
     let control = if on {
         kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_SINGLESTEP

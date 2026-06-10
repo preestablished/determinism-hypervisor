@@ -66,6 +66,17 @@ pub fn sti_window_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/sti_window.elf"))
 }
 
+/// The M3 interrupt guest (see asm/timer_guest.asm): IDT with recording
+/// ISRs for vectors 0x40/0x41, STI by default ("mask" keeps IF=0; "arm"
+/// is the full MMIO arming loop awaiting the device-bus run loop).
+pub fn timer_guest_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/timer_guest.elf"))
+}
+
+/// timer_guest's delivery table GPA: u64 count, then one vector byte per
+/// delivery in order. Mirrors the asm %define (drift-tested).
+pub const TIMER_GUEST_TABLE_GPA: u64 = 0x20_0000;
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 
@@ -115,6 +126,7 @@ mod tests {
         assert!(!device_exercise_elf().is_empty());
         assert!(!hello_elf().is_empty());
         assert!(!sti_window_elf().is_empty());
+        assert!(!timer_guest_elf().is_empty());
     }
 
     #[test]

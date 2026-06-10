@@ -23,6 +23,11 @@ use crate::hash::StateHashChain;
 use crate::inject::{inject_at_boundary, InjectError, Injection};
 use crate::kvm::SlotVm;
 
+/// §3.4 deferral budget per injection: deterministic and loud when the
+/// window never opens, but BOUNDED — each deferral step is a single-step
+/// VM entry, so an epoch-sized budget (50M) would stall for minutes.
+const INJECT_DEFER_BUDGET: u64 = 1 << 16;
+
 /// API.md §2.4 `Run.until`, Phase-1 shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Until {
@@ -263,13 +268,12 @@ pub fn run_segment(
         let mut at = boundary;
         for (i, idx) in point.injections.iter().enumerate() {
             if i > 0 {
-                let stepped = land_at(
-                    &mut seg.slot.vcpu,
-                    seg.counter,
-                    at.icount + 1,
-                    &margins,
-                    exits!(),
-                );
+                // ONE ENTRY, not one retirement: the entry delivering the
+                // previously queued vector runs its whole ISR before the
+                // step trap fires (delivery suppresses the single-step),
+                // so a +1 landing would overshoot loudly.
+                let stepped =
+                    crate::boundary::step_one_entry(&mut seg.slot.vcpu, seg.counter, exits!());
                 at = match stepped {
                     Ok(b) => b,
                     Err(_) if halted => return finish_halted(seg, clock, delivered, timer_fired),
@@ -282,7 +286,7 @@ pub fn run_segment(
                 all_injections[*idx].vector,
                 &at,
                 &margins,
-                seg.config.epoch_len,
+                INJECT_DEFER_BUDGET,
                 exits!(),
             )
             .map_err(RunError::Inject)?;
@@ -858,5 +862,203 @@ mod timer_tests {
         // exact converted boundary, no deferral.
         assert_eq!(fired.delivered_icount, DEADLINE);
         assert_eq!(out.injections_delivered, 1);
+    }
+}
+
+#[cfg(test)]
+mod idt_guest_tests {
+    use super::*;
+    use crate::boot::load_and_enter;
+    use crate::kvm::KvmSystem;
+    use crate::run::install_kick_handler;
+    use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+    use vm_memory::Bytes;
+
+    fn gettid() -> i32 {
+        // SAFETY: argless syscall.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }
+    }
+
+    fn rig(cmdline: &[u8]) -> Option<(crate::kvm::SlotVm, InstRetired)> {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return None;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::timer_guest_elf(), cmdline).unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        Some((slot, counter))
+    }
+
+    fn test_cfg() -> MachineConfig {
+        MachineConfig::new(
+            16 << 20,
+            [0; 32],
+            crate::config::BootSpec::Elf {
+                kernel_hash: [0; 32],
+                cmdline: Vec::new(),
+            },
+        )
+    }
+
+    fn read_table(slot: &crate::kvm::SlotVm) -> (u64, Vec<u8>) {
+        let mut head = [0u8; 8];
+        slot.guest_mem
+            .read_slice(
+                &mut head,
+                vm_memory::GuestAddress(nanokernel::TIMER_GUEST_TABLE_GPA),
+            )
+            .unwrap();
+        let count = u64::from_le_bytes(head);
+        let mut vecs = vec![0u8; count as usize];
+        slot.guest_mem
+            .read_slice(
+                &mut vecs,
+                vm_memory::GuestAddress(nanokernel::TIMER_GUEST_TABLE_GPA + 8),
+            )
+            .unwrap();
+        (count, vecs)
+    }
+
+    fn no_exits(exit: VcpuExit) -> Result<(), BoundaryError> {
+        Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}")))
+    }
+
+    /// THE iter-35 chain coverage: two vectors scheduled at ONE boundary
+    /// must BOTH deliver — observed in the guest's ISR table, in order.
+    #[test]
+    fn two_vectors_at_one_boundary_both_deliver_live() {
+        let run = || {
+            let (mut slot, counter) = rig(b"")?;
+            let cfg = test_cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let injections = [
+                ScheduledInjection {
+                    icount: 50_000,
+                    vector: 0x40,
+                },
+                ScheduledInjection {
+                    icount: 50_000,
+                    vector: 0x41,
+                },
+            ];
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &cfg,
+                start_icount: 0,
+                injections: &injections,
+                timer: None,
+                pause: &pause,
+            };
+            let out = run_segment(
+                &mut seg,
+                Until::IcountBudget(80_000),
+                &mut || false,
+                &mut no_exits,
+            )
+            .unwrap();
+            assert_eq!(out.reason, StopReason::BudgetReached);
+            assert_eq!(out.injections_delivered, 2);
+            let (count, vecs) = read_table(seg.slot);
+            assert_eq!(count, 2, "BOTH handlers must have run (no overwrite)");
+            assert_eq!(vecs, vec![0x40, 0x41], "delivery order is schedule order");
+            Some((out.boundary.rip, out.state_hash, vecs))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "two-vector delivery must replay identically");
+    }
+
+    /// The armed-timer chain with a REAL ISR: TimerFired reported AND the
+    /// handler observably ran.
+    #[test]
+    fn timer_delivery_runs_the_isr_live() {
+        let Some((mut slot, counter)) = rig(b"") else {
+            return;
+        };
+        let cfg = test_cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &cfg,
+            start_icount: 0,
+            injections: &[],
+            timer: Some(TimerArm {
+                deadline_vns: 60_000,
+                vector: 0x41,
+            }),
+            pause: &pause,
+        };
+        let out = run_segment(
+            &mut seg,
+            Until::IcountBudget(100_000),
+            &mut || false,
+            &mut no_exits,
+        )
+        .unwrap();
+        let fired = out.timer_fired.expect("timer fired");
+        assert_eq!(fired.vector, 0x41);
+        let (count, vecs) = read_table(seg.slot);
+        assert_eq!((count, vecs), (1, vec![0x41]), "the ISR recorded delivery");
+    }
+
+    /// The masked variant: IF stays 0 across the deadline — §3.4 deferral
+    /// hits the bounded loud stop, deterministically.
+    #[test]
+    fn masked_variant_defers_forever_live() {
+        let Some((mut slot, counter)) = rig(b"mask") else {
+            return;
+        };
+        let cfg = test_cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let injections = [ScheduledInjection {
+            icount: 30_000,
+            vector: 0x40,
+        }];
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &cfg,
+            start_icount: 0,
+            injections: &injections,
+            timer: None,
+            pause: &pause,
+        };
+        let err = run_segment(
+            &mut seg,
+            Until::IcountBudget(80_000),
+            &mut || false,
+            &mut no_exits,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunError::Inject(crate::inject::InjectError::WindowNeverOpened { .. })
+            ),
+            "masked guest must defer to the bound: {err:?}"
+        );
+        let (count, _) = read_table(seg.slot);
+        assert_eq!(count, 0, "no delivery can have happened with IF=0");
     }
 }
