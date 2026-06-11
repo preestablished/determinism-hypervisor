@@ -186,9 +186,44 @@ pub fn restore_snapshot(
         ));
     }
 
+    // ── 3-6: the RAM-independent half (shared with the fork engine) ──────
+    let applied = apply_dhsnap(slot, bus, machine_config, &blob.bytes, counter, dirty)?;
+    Ok(RestoreOutcome {
+        pages_loaded: total_pages,
+        cumulative_icount: applied.cumulative_icount,
+        vns: applied.vns,
+        epoch_index: applied.epoch_index,
+        chain: applied.chain,
+        entropy: applied.entropy,
+    })
+}
+
+/// The machine state a DHSNAP application yields (everything in
+/// [`RestoreOutcome`] except the RAM accounting).
+pub(crate) struct AppliedMachine {
+    pub cumulative_icount: u64,
+    pub vns: u64,
+    pub epoch_index: u64,
+    pub chain: StateHashChain,
+    pub entropy: DetEntropy,
+}
+
+/// Steps 3–6 of §8.3 — decode the DHSNAP and stuff devices + vCPU into a
+/// slot whose RAM is ALREADY the snapshot's bytes (materialized from the
+/// store on the tier-B path, or CoW-shared with a frozen parent on the
+/// tier-A fork path; the precondition is the caller's because device
+/// restore may validate against live guest RAM).
+pub(crate) fn apply_dhsnap(
+    slot: &SlotVm,
+    bus: &mut dh_devices::MmioBus,
+    machine_config: &dh_vmm::config::MachineConfig,
+    dhsnap_bytes: &[u8],
+    counter: Option<&InstRetired>,
+    dirty: Option<&mut DirtyPageSet>,
+) -> Result<AppliedMachine, RestoreError> {
     // ── 3. DHSNAP decode + the fixed engine sections ──────────────────────
-    let dhsnap =
-        Container::parse(&blob.bytes).map_err(|e| RestoreError::Codec(format!("DHSNAP: {e:?}")))?;
+    let dhsnap = Container::parse(dhsnap_bytes)
+        .map_err(|e| RestoreError::Codec(format!("DHSNAP: {e:?}")))?;
     let section = |t: [u8; 4]| {
         dhsnap.get(t).ok_or_else(|| {
             RestoreError::Codec(format!(
@@ -317,8 +352,7 @@ pub fn restore_snapshot(
         d.clear();
     }
 
-    Ok(RestoreOutcome {
-        pages_loaded: total_pages,
+    Ok(AppliedMachine {
         cumulative_icount: time.cumulative_icount,
         vns: time.vns,
         epoch_index: time.epoch_index,

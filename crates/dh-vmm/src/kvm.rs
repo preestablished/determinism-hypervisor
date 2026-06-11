@@ -122,6 +122,69 @@ impl KvmSystem {
         if mem_bytes > MMIO_HOLE_BASE {
             return Err(KvmError::MemTooLarge);
         }
+        let memfd = memfd_nohuge(mem_bytes)?;
+        let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
+            GuestAddress(0),
+            mem_bytes as usize,
+            Some(FileOffset::new(memfd, 0)),
+        )])
+        .map_err(|e| KvmError::Memory(e.to_string()))?;
+        self.assemble_slot_vm(region, mem_bytes)
+    }
+
+    /// Tier-A CoW fork (ARCH §8.4): a child slot whose RAM is a PRIVATE
+    /// mapping of the FROZEN parent's memfd — reads share the parent's
+    /// page cache, writes CoW into child-private anonymous pages at 4 KiB
+    /// granularity, and the parent's bytes are untouchable from the child
+    /// by construction. Every KVM object (VmFd, vCPU, EPT) is fresh — no
+    /// shared kernel state (R9).
+    ///
+    /// PRECONDITION, enforced here: the parent's memfd carries
+    /// `F_SEAL_FUTURE_WRITE` (`SlotVm::freeze_ram`). Forking an unsealed
+    /// parent would leave the child's "snapshot" mutable by the parent's
+    /// own future writes — fail-closed instead. The kernel-level proof
+    /// that private mappings of a sealed memfd work (and that shared-
+    /// writable ones are denied) is the iteration-66 probe pinned in the
+    /// d2p sealing tests.
+    ///
+    /// The child starts with NO vCPU/device state copied — the fork
+    /// engine stuffs those from the parent's in-memory DHSNAP (the §8.3
+    /// codec, minus the store round-trip).
+    pub fn fork_slot_vm(&self, parent: &SlotVm) -> Result<SlotVm, KvmError> {
+        let seals = parent.ram_seals()?;
+        if seals & libc::F_SEAL_FUTURE_WRITE == 0 {
+            return Err(KvmError::Memory(
+                "fork of an UNFROZEN parent (R9): freeze_ram first — \
+                 F_SEAL_FUTURE_WRITE is not set on the parent memfd"
+                    .into(),
+            ));
+        }
+        let memfd = parent
+            .ram_memfd()?
+            .try_clone()
+            .map_err(|e| KvmError::Memory(format!("memfd dup: {e}")))?;
+        let mapping = vm_memory::MmapRegion::<()>::build(
+            Some(FileOffset::new(memfd, 0)),
+            parent.mem_bytes as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+        )
+        .map_err(|e| KvmError::Memory(format!("CoW mapping: {e}")))?;
+        let region = vm_memory::GuestRegionMmap::new(mapping, GuestAddress(0))
+            .ok_or_else(|| KvmError::Memory("CoW region address overflow".into()))?;
+        let mem = GuestMemoryMmap::<()>::from_regions(vec![region])
+            .map_err(|e| KvmError::Memory(e.to_string()))?;
+        self.assemble_slot_vm(mem, parent.mem_bytes)
+    }
+
+    /// Everything after RAM exists: VM fd with the §2.1/§2.2 cap set,
+    /// the memslot, vPMU-off, vCPU 0 with the §7.2 CPUID mask. Shared by
+    /// fresh slots (shared memfd mapping) and CoW forks (private mapping).
+    fn assemble_slot_vm(
+        &self,
+        region: GuestMemoryMmap<()>,
+        mem_bytes: u64,
+    ) -> Result<SlotVm, KvmError> {
         let vm = self
             .kvm
             .create_vm()
@@ -154,16 +217,10 @@ impl KvmSystem {
         vm.enable_cap(&msr_cap)
             .map_err(|e| KvmError::VmCreate(format!("USER_SPACE_MSR enable: {e}")))?;
 
-        let memfd = memfd_nohuge(mem_bytes)?;
-        let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
-            GuestAddress(0),
-            mem_bytes as usize,
-            Some(FileOffset::new(memfd, 0)),
-        )])
-        .map_err(|e| KvmError::Memory(e.to_string()))?;
-
         // Advise the mapping itself; the memfd flag alone is not enough on
-        // all kernels. 4 KiB-exact dirty granularity is load-bearing (§8.2).
+        // all kernels. 4 KiB-exact dirty granularity is load-bearing (§8.2)
+        // — for CoW children doubly so: a hugepage CoW would copy 2 MiB per
+        // fault and wreck both the <10 ms fork target and dirty accounting.
         madvise_nohugepage(&region, mem_bytes)?;
 
         let slot = kvm_userspace_memory_region {
