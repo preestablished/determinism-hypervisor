@@ -2,6 +2,7 @@
 
 pub mod dhilog;
 pub mod reader;
+pub mod splice;
 pub const DHILOG_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
