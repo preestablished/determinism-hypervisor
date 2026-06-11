@@ -271,20 +271,20 @@ impl<M: GuestMem> DeviceRail<M> {
         Ok(())
     }
 
-    /// Land the epoch links a quantum collected (the
-    /// `run_segment_with_epochs` sink) as AUX EPOCH_HASH records — call
-    /// right after each quantum returns, before the next runs.
-    pub fn log_epoch_hashes(
+    /// Land one epoch link as an AUX EPOCH_HASH record — the
+    /// `run_segment_with_epochs` sink body. MUST be called at the link
+    /// point (the sink fires there) so the record stays inside the
+    /// monotone icount watermark; batching after the quantum regresses
+    /// behind later exit records and the writer rejects it.
+    pub fn log_epoch_hash(
         &mut self,
-        links: &[(u64, u64, [u8; 32])],
-        boundary_rip: u64,
+        epoch_index: u64,
+        icount: u64,
+        chain_value: [u8; 32],
     ) -> Result<(), RecordError> {
-        for (epoch_index, icount, chain_value) in links {
-            self.log
-                .epoch_hash(*icount, boundary_rip, *epoch_index, *chain_value)
-                .map_err(RecordError::Log)?;
-        }
-        Ok(())
+        self.log
+            .epoch_hash(icount, 0, epoch_index, chain_value)
+            .map_err(RecordError::Log)
     }
 
     /// Seal the segment from its outcome (§3.1: SealParams come from the
@@ -599,7 +599,7 @@ mod live_tests {
             },
         );
         config.epoch_len = 30_000; // several epochs inside one quantum
-        let mut rail = DeviceRail::new(
+        let rail = DeviceRail::new(
             MmioBus::new(),
             DetEntropy::from_seed([3; 32]),
             LogWriter::new(SegmentHeader {
@@ -614,6 +614,7 @@ mod live_tests {
         );
         let mut chain = StateHashChain::new(&[0x22; 32], &[0x11; 32]);
         let pause = std::sync::atomic::AtomicBool::new(false);
+        let rail = std::cell::RefCell::new(rail);
         let mut links = Vec::new();
         let out = {
             let mut seg = Segment {
@@ -627,6 +628,7 @@ mod live_tests {
                 pause: &pause,
             };
             let counter_ref = &counter;
+            let links_r = &mut links;
             crate::runctl::run_segment_with_epochs(
                 &mut seg,
                 Until::IcountBudget(100_000),
@@ -635,12 +637,20 @@ mod live_tests {
                     let icount = counter_ref
                         .read()
                         .map_err(|e| crate::boundary::BoundaryError::Exit(format!("{e:?}")))?;
-                    rail.service_exit(icount, exit)
+                    rail.borrow_mut().service_exit(icount, exit)
                 },
-                &mut links,
+                &mut |idx, icount, value| {
+                    links_r.push((idx, icount, value));
+                    rail.borrow_mut()
+                        .log_epoch_hash(idx, icount, value)
+                        .map_err(|e| {
+                            crate::boundary::BoundaryError::Exit(format!("epoch log: {e:?}"))
+                        })
+                },
             )
             .unwrap()
         };
+        let rail = rail.into_inner();
         assert_eq!(out.reason, StopReason::BudgetReached);
         // Epochs at 30k/60k/90k inside the 100k budget.
         assert_eq!(
@@ -652,7 +662,6 @@ mod live_tests {
         );
         assert!(links.iter().all(|(_, _, h)| *h != [0u8; 32]));
 
-        rail.log_epoch_hashes(&links, 0).unwrap();
         let sealed = rail.seal(&out, [0; 32]).unwrap();
         let r = LogReader::parse(&sealed).unwrap();
         assert!(r.header().has_epoch_hashes(), "header flag must be set");

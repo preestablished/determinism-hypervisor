@@ -171,16 +171,21 @@ pub fn run_segment(
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
-    run_segment_with_epochs(seg, until, goal, on_exit, &mut Vec::new())
+    run_segment_with_epochs(seg, until, goal, on_exit, &mut |_, _, _| Ok(()))
 }
 
 /// `run_segment` plus the M5 epoch-link sink (bead y62): every §8.5
 /// chain link pushed AT AN EPOCH-GRID POINT during this quantum is
 /// appended as `(epoch_index, icount, chain_value_after_push)` — the
-/// caller (the recording rail) lands them as AUX EPOCH_HASH records
-/// after the quantum returns (the log cannot be borrowed inside; on_exit
-/// holds it). Final-pause links at NON-epoch boundaries are NOT epoch
-/// hashes — they travel in END.end_state_hash.
+/// caller (the recording rail) lands them as AUX EPOCH_HASH records.
+/// The sink fires AT THE LINK POINT — between exits, in icount order —
+/// because the DHILOG watermark is monotone: batching links after the
+/// quantum would interleave them BEHIND later exit records and the
+/// writer rejects the regression (measured in iteration 88). on_exit
+/// and the sink typically share the recording rail through a RefCell
+/// (single-threaded, never concurrently called). Final-pause links at
+/// NON-epoch boundaries are NOT epoch hashes — they travel in
+/// END.end_state_hash.
 ///
 /// GRID ANCHORING (a5e/39w load-bearing): the epoch grid is ABSOLUTE in
 /// counter space — multiples of `epoch_len` from counter zero, never
@@ -192,7 +197,7 @@ pub fn run_segment_with_epochs(
     until: Until,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    epoch_sink: &mut Vec<(u64, u64, [u8; 32])>,
+    epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {
@@ -341,7 +346,8 @@ pub fn run_segment_with_epochs(
                 .push_final_link(seg.slot, &[], point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             let epoch = seg.config.epoch_len.max(1);
-            epoch_sink.push((point.icount / epoch, point.icount, seg.chain.value()));
+            epoch_sink(point.icount / epoch, point.icount, seg.chain.value())
+                .map_err(RunError::Boundary)?;
         }
 
         // goal() must be a deterministic function of guest state (M6 goal
@@ -405,7 +411,8 @@ pub fn run_segment_with_epochs(
             // stays empty, or a paused FinalOnly log would falsely carry
             // an EPOCH_HASH record + FLAG (iteration-87 review I1).
             if seg.config.hash_epochs == crate::config::HashEpochs::EpochsOn {
-                epoch_sink.push((b.icount / epoch, b.icount, seg.chain.value()));
+                epoch_sink(b.icount / epoch, b.icount, seg.chain.value())
+                    .map_err(RunError::Boundary)?;
             }
             return Ok(SegmentOutcome {
                 reason: StopReason::Paused,
