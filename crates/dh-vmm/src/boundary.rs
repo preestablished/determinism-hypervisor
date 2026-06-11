@@ -163,7 +163,9 @@ pub fn land_at(
                 // One step. The counter re-read at loop top is the ONLY
                 // progress signal (never assume +1; REP rule).
                 //
-                // MEASURED (iteration 83, bead 4a3, kernel 6.8): a Debug
+                // MEASURED (iteration 83, bead 4a3, kernel 6.8 on the
+                // lab box — the exact kernel mechanism may differ on
+                // other versions; the re-arm is correct regardless): a Debug
                 // exit DELIVERED BY THE EMULATOR's completion path (the
                 // singlestep hook that fires when an emulated MMIO
                 // instruction finishes) CONSUMES the guest_debug arming —
@@ -205,6 +207,16 @@ pub fn land_at(
     result
 }
 
+/// CROSS-REFERENCE (iteration 83, bead 4a3): land_at's stepping loop
+/// re-arms guest_debug on every Debug exit because the EMULATOR's
+/// completion-path Debug delivery consumes the arming. This helper has
+/// a different structure — it returns at the FIRST Debug, so a consumed
+/// arming cannot free-run within one call, and callers re-arm per
+/// entry. Do not blindly mirror the land_at re-arm here; the open
+/// question (injection chains stepping ACROSS an emulated MMIO
+/// instruction, reachable once the M5 device run loop delivers
+/// interrupts adjacent to MMIO) is tracked by its own bead.
+///
 /// One guest ENTRY under single-step: enter once, return at the next
 /// debug trap. NOT one retirement — an entry that delivers a pending
 /// interrupt runs the whole handler before the trap fires (event delivery
@@ -426,6 +438,12 @@ mod tests {
         ));
     }
 
+    /// PROBE-AUTHORING LESSON (iteration 83): raw code injected at
+    /// rip=0 runs in REAL MODE — 64-bit encodings misdecode and the
+    /// MMIO hole at 0xD000_1000 is unreachable, so such probes pass
+    /// VACUOUSLY. MMIO-landing probes must boot a long-mode nanokernel
+    /// guest (below).
+    ///
     /// Iteration-83 probe (bead 4a3): land EXACTLY inside the
     /// mmio_stepper guest — a long-mode loop whose body is the doorbell
     /// cluster (imm dword MMIO write, 8-byte reg MMIO write, MMIO read,
@@ -482,8 +500,10 @@ mod tests {
     }
 
     /// Consecutive landings marching THROUGH the MMIO-dense region —
-    /// every step-walk distance from 1 to a full cluster width gets
-    /// exercised against every instruction offset in the body.
+    /// strides 1..=23 against the 18-retirement loop body, so walks of
+    /// every short length start from a spread of body offsets (not a
+    /// full offset×stride product, but far beyond the single shape that
+    /// reproduced the bug).
     #[test]
     fn consecutive_landings_across_mmio_clusters_are_exact_live() {
         let Some((mut slot, counter)) = stepper_rig() else {
