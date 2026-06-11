@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod preflight;
+#[cfg(target_arch = "x86_64")]
+pub mod snapshot_engine;
 
 pub fn preflight_summary() -> String {
     dh_vmm::m0_missing_caps_summary()
