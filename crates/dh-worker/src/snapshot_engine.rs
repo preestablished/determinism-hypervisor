@@ -247,6 +247,12 @@ fn build_dhsnap(
         dev.snapshot(&mut contents);
         let id = dev.device_id();
         if id == 0x0004 {
+            if entropy_regs.is_some() {
+                return Err(EngineError::Codec(
+                    "two pv-entropy devices (0x0004) on the bus — ENTR v2 holds one reg blob"
+                        .into(),
+                ));
+            }
             entropy_regs = Some(contents);
             continue; // folded into ENTR v2 below
         }

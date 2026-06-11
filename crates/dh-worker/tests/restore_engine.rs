@@ -569,6 +569,27 @@ fn restore_preconditions_and_mismatches_fail_loudly() {
         ),
         Err(RestoreError::ConfigMismatch(_))
     ));
+
+    // Two pv-entropy devices: ENTR v2 holds ONE reg blob — ambiguous, and
+    // the section-count arithmetic alone would not catch it.
+    let mut two_entropy = test_bus();
+    two_entropy
+        .register(0xD000_7000, Box::new(PvEntropy::new()))
+        .unwrap();
+    match restore_snapshot(
+        &slot,
+        SlotState::Paused,
+        &mut two_entropy,
+        &config,
+        snap.snapshot_ref.clone(),
+        None,
+        None,
+        &store,
+    ) {
+        Err(RestoreError::Codec(m)) => assert!(m.contains("pv-entropy"), "{m}"),
+        Err(e) => panic!("wrong error class: {e:?}"),
+        Ok(_) => panic!("two entropy devices must be rejected"),
+    }
 }
 
 /// Rebuild a parsed DHSNAP with one mutation applied to its section list.
@@ -700,13 +721,66 @@ fn mis_shaped_containers_are_rejected_loudly() {
     );
 
     // A bus device whose section is missing → loud, names the device.
+    // (Shape arithmetic alone cannot say WHICH device; remove CLKD and add
+    // NETL so the count stays right and the per-device lookup must fire.)
     let r = put(
-        rebuild(&valid_dhsnap, |s| s.retain(|(t, _, _)| *t != tag::CLKD)),
+        rebuild(&valid_dhsnap, |s| {
+            s.retain(|(t, _, _)| *t != tag::CLKD);
+            s.push((tag::NETL, 1, vec![0u8; 4]));
+        }),
         DEVICE_BLOB_FORMAT_DHSNAP,
     );
     let err = restore_err(r);
     assert!(
         matches!(&err, RestoreError::Codec(m) if m.contains("no section")),
+        "{err:?}"
+    );
+
+    // ENTR downgraded to v1 (PRNG-only, 56 bytes): the engine requires the
+    // v2 split — without device regs the pv-entropy device cannot be
+    // restored, so v1 is refused, not partially accepted.
+    let r = put(
+        rebuild(&valid_dhsnap, |s| {
+            let e = s.iter_mut().find(|(t, _, _)| *t == tag::ENTR).unwrap();
+            e.1 = 1;
+            e.2.truncate(56);
+        }),
+        DEVICE_BLOB_FORMAT_DHSNAP,
+    );
+    let err = restore_err(r);
+    assert!(
+        matches!(&err, RestoreError::Codec(m) if m.contains("ENTR")),
+        "{err:?}"
+    );
+
+    // A present-but-malformed device section (wrong length): the DEVICE's
+    // own restore rejects it and the engine names the device.
+    let r = put(
+        rebuild(&valid_dhsnap, |s| {
+            s.iter_mut().find(|(t, _, _)| *t == tag::CLKD).unwrap().2 = vec![0u8; 4];
+        }),
+        DEVICE_BLOB_FORMAT_DHSNAP,
+    );
+    let err = restore_err(r);
+    assert!(
+        matches!(&err, RestoreError::Codec(m) if m.contains("rejected its section")),
+        "{err:?}"
+    );
+
+    // A truncated VCPU section → loud codec error, never a partial vCPU.
+    let r = put(
+        rebuild(&valid_dhsnap, |s| {
+            s.iter_mut()
+                .find(|(t, _, _)| *t == tag::VCPU)
+                .unwrap()
+                .2
+                .truncate(16);
+        }),
+        DEVICE_BLOB_FORMAT_DHSNAP,
+    );
+    let err = restore_err(r);
+    assert!(
+        matches!(&err, RestoreError::Codec(m) if m.contains("VCPU")),
         "{err:?}"
     );
 }

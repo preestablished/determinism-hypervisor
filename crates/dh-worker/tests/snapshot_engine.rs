@@ -360,6 +360,40 @@ fn missing_entropy_device_is_a_loud_codec_error() {
     ));
 }
 
+/// Mirror of the restore engine's exactly-one guard: ENTR v2 holds ONE
+/// device reg blob, so a second pv-entropy device is ambiguous state the
+/// capture engine must refuse to launder into a snapshot.
+#[test]
+fn two_entropy_devices_is_a_loud_codec_error() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let sys = KvmSystem::open().unwrap();
+    let slot = make_slot(&sys);
+    let mut bus = test_bus();
+    bus.register(0xD000_7000, Box::new(PvEntropy::new()))
+        .unwrap(); // second 0x0004
+    let entropy = DetEntropy::from_seed([0x46; 32]);
+    let config = test_config();
+
+    match take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        PageSource::Full,
+        &store,
+    ) {
+        Err(EngineError::Codec(m)) => assert!(m.contains("pv-entropy"), "{m}"),
+        Err(e) => panic!("wrong error class: {e:?}"),
+        Ok(_) => panic!("two entropy devices must be rejected"),
+    }
+}
+
 /// Byte determinism — the property the fork/dedup foundation rests on:
 /// identical state through the WHOLE engine yields the identical ref,
 /// even across two independently constructed slots and buses.

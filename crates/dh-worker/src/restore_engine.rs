@@ -4,9 +4,13 @@
 //! then vCPU** — and re-seed the segment clocks (PvClock `vns_base`, chain
 //! `from_value`, counter re-zero).
 //!
-//! ORDER IS LOAD-BEARING: device restore may validate against live guest
-//! RAM (DetChannelHost's EVTC re-attach reads the channel region — see
-//! detchannel.rs), so RAM populates before any `DetDevice::restore` runs.
+//! ORDER IS LOAD-BEARING: §8.3 fixes RAM → devices → vCPU because device
+//! restore is allowed to validate against live guest RAM. No bus device
+//! exercises that yet — DetChannelHost's EVTC re-attach (detchannel.rs) is
+//! the intended consumer, but it does not implement `DetDevice` today (its
+//! restore needs a fault plan; putting it on the bus is slot-manager
+//! integration, bead ol1) — the engine honors the contract NOW so that
+//! landing never reorders this function.
 //! The vCPU goes last; `vcpu_state::restore` owns the §8.3 KVM_SET_* order
 //! internally (SREGS→REGS→FPU→XCRS→XSAVE→DEBUGREGS→EVENTS→MSRs last,
 //! IA32_TSC ← vns).
@@ -53,6 +57,11 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::snapshot_engine::DEVICE_BLOB_FORMAT_DHSNAP;
 
+/// The engine-owned sections every container carries — MCFG, VCPU, LAPC,
+/// TIME, ENTR (`build_dhsnap`'s fixed layout; capture and restore must
+/// agree, so a change there changes this).
+const FIXED_ENGINE_SECTIONS: usize = 5;
+
 #[derive(Debug)]
 pub enum RestoreError {
     /// Slot must be Paused (created, not running) to be stuffed.
@@ -74,6 +83,9 @@ pub enum RestoreError {
 /// new VMM-owned PRNG. Segment-relative icount is 0 by definition;
 /// `cumulative_icount` is the continuing total for §3.1 accounting.
 pub struct RestoreOutcome {
+    /// Total guest RAM pages materialized — always `guest_ram_bytes / 4096`
+    /// (the server-flattened set covers every page), NOT a wire/delta
+    /// count; compare `TakeSnapshotOutcome::pages_shipped`.
     pub pages_loaded: u64,
     pub cumulative_icount: u64,
     pub vns: u64,
@@ -87,8 +99,15 @@ pub struct RestoreOutcome {
 
 /// One RestoreSnapshot, end to end. On success the slot holds exactly the
 /// snapshot's state, Paused at a boundary with segment-relative icount 0.
-/// On error the slot's contents are UNDEFINED (RAM may be partially
-/// written) — the caller must discard it, never resume it.
+/// On error the slot's contents are UNDEFINED (RAM, devices, or vCPU may
+/// be partially written) — the caller must discard it, never resume it.
+///
+/// PRECONDITION beyond the state check: the slot must be FRESH — created
+/// and never run. `Paused` alone does not prove that: a previously-Running
+/// slot can hold stale KVM dirty-RING entries this engine does not drain
+/// (the host-side RAM writes below bypass KVM's dirty tracking entirely),
+/// which would poison the next incremental snapshot. Same-slot reuse is
+/// the slot manager's job: drain + reset dirty tracking first.
 #[allow(clippy::too_many_arguments)]
 pub fn restore_snapshot(
     slot: &SlotVm,
@@ -130,6 +149,9 @@ pub fn restore_snapshot(
     }
 
     // ── 2. RAM (§8.3 step 2): flattened pages → the live mapping ─────────
+    // mem_bytes is page-multiple by SlotVm construction; keep the
+    // truncating division's invariant loud (mirrors snapshot_engine).
+    debug_assert!(slot.mem_bytes.is_multiple_of(PAGE_SIZE));
     let total_pages = slot.mem_bytes / PAGE_SIZE;
     let resolved = store
         .resolve_pages(snapshot_ref, None, false)
@@ -210,16 +232,45 @@ pub fn restore_snapshot(
         .map_err(|e| RestoreError::Codec(format!("ENTR (engine requires v2): {e:?}")))?;
 
     // ── 4. Devices (§8.3: RAM is live now) ────────────────────────────────
-    let mut device_sections_consumed = 0usize;
-    let mut entropy_device_seen = false;
+    // Shape checks FIRST, before any device mutates: exactly one pv-entropy
+    // device (its regs come out of ENTR v2 — zero means no consumer, two
+    // means an ambiguous one, and the section count cannot catch either),
+    // and the container must carry exactly the sections this bus consumes.
+    // Per-device presence is still checked in the loop; with the count
+    // equality that also rules out sections with no device on this bus
+    // (the parser already rejects duplicate and unknown tags).
+    let entropy_devices = bus
+        .devices()
+        .filter(|(_b, d)| d.device_id() == DEVICE_ID_PV_ENTROPY)
+        .count();
+    if entropy_devices != 1 {
+        return Err(RestoreError::Codec(format!(
+            "bus has {entropy_devices} pv-entropy devices (0x0004), need exactly one"
+        )));
+    }
+    let non_entropy_devices = bus.devices().count() - 1;
+    let total_sections = dhsnap.sections().count();
+    if total_sections != FIXED_ENGINE_SECTIONS + non_entropy_devices {
+        return Err(RestoreError::Codec(format!(
+            "container has {total_sections} sections but this bus consumes {} — \
+             snapshot was taken on a differently-shaped machine",
+            FIXED_ENGINE_SECTIONS + non_entropy_devices
+        )));
+    }
+
     for (_base, dev) in bus.devices_mut() {
         let id = dev.device_id();
         if id == DEVICE_ID_PV_ENTROPY {
             // The 6yl split: device regs come out of ENTR v2, restored at
             // the DEVICE's own section version.
-            dev.restore(&entr.device_regs(), 1)
-                .map_err(|_| RestoreError::Codec("pv-entropy reg restore rejected".into()))?;
-            entropy_device_seen = true;
+            let regs = entr.device_regs();
+            dev.restore(&regs, 1).map_err(|_| {
+                RestoreError::Codec(format!(
+                    "pv-entropy device rejected the ENTR v2 reg blob \
+                     ({} bytes at device sec_version 1)",
+                    regs.len()
+                ))
+            })?;
             continue;
         }
         let dev_tag = dh_snapshot::dhsnap::tag_for_device_id(id)
@@ -236,27 +287,10 @@ pub fn restore_snapshot(
                 s.contents.len()
             ))
         })?;
-        device_sections_consumed += 1;
-    }
-    if !entropy_device_seen {
-        return Err(RestoreError::Codec(
-            "pv-entropy device (0x0004) not on the bus".into(),
-        ));
-    }
-    // Reverse direction of the same shape check: every section in the
-    // container must have found a consumer (5 fixed + one per device).
-    let total_sections = dhsnap.sections().count();
-    if total_sections != 5 + device_sections_consumed {
-        return Err(RestoreError::Codec(format!(
-            "container has {total_sections} sections but this bus consumes {} — \
-             snapshot was taken on a differently-shaped machine",
-            5 + device_sections_consumed
-        )));
-    }
-
-    // PvClock vns_base ← TIME.vns (see the module doc's clock seam note).
-    for (_base, dev) in bus.devices_mut() {
-        if dev.device_id() == DEVICE_ID_PV_CLOCK {
+        // PvClock vns_base ← TIME.vns, right after its own section restore
+        // (see the module doc's clock seam note) — the downcast seam
+        // appears exactly once, on the same walk.
+        if id == DEVICE_ID_PV_CLOCK {
             let clk = dev
                 .as_any_mut()
                 .and_then(|a| a.downcast_mut::<PvClock>())

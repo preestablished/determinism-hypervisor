@@ -61,6 +61,12 @@ pub trait DetDevice {
     /// `PvClock`: its `vns_base` comes from the snapshot's TIME section
     /// (the new segment starts at icount 0, so base = absolute vns at the
     /// boundary) — by design CLKD never carries it. Default: no downcast.
+    ///
+    /// Override ONLY when the restore engine must reach the concrete type,
+    /// and keep the override consistent with the `device_id` the engine
+    /// matches on — the engine keys the downcast by id, so an override on
+    /// an unrelated device is dead code at best and a misdirected downcast
+    /// target at worst.
     fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
         None
     }
