@@ -123,6 +123,15 @@ impl<'a> DevCtx<'a> {
         self.record(r);
     }
 
+    /// Log the AUX NET_TX record at THIS boundary (length + digest8 of
+    /// the transmitted frame; the frame itself never enters the log).
+    pub fn log_net_tx(&mut self, len: u32, digest8: u64) {
+        let r = self
+            .log
+            .net_tx(self.icount, self.boundary_rip, len, digest8);
+        self.record(r);
+    }
+
     /// Log an AUX FRAME_MARK at this boundary (pv-pad FRAME_COUNTER write).
     pub fn log_frame_mark(&mut self, frame_index: u32) {
         let r = self
