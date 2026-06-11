@@ -15,7 +15,27 @@ not usable (open rw probe), so the same command is correct everywhere.
 | Channel interop (real detguest-host attach/drain) | `cargo test -p nanokernel --test channel_interop` | mock guest memory |
 | ELF shape + asm constant pins | `cargo test -p nanokernel` | needs `nasm` (build.rs assembles the guests; cross-assembles fine on arm) |
 | Drift-check script logic | `bash ci/check-determinism-class.sh` | compares against the LIVE host — only meaningful on the lab box, but parses anywhere |
-| aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated. On an arm host this just works (CI's arm lane runs natively). On an x86 Linux box you need a cross C toolchain for the C in the dep tree (blake3 NEON, zstd-sys via snapstore-client): `sudo apt install gcc-aarch64-linux-gnu` then `CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo clippy --target aarch64-unknown-linux-gnu ...` (plus `rustup target add aarch64-unknown-linux-gnu`). No sudo? clang works with user-extracted headers: `apt-get download libc6-dev-arm64-cross linux-libc-dev-arm64-cross`, `dpkg -x` both into `$HOME/.local/aarch64-cross`, then `CC_aarch64_unknown_linux_gnu=clang CFLAGS_aarch64_unknown_linux_gnu="--target=aarch64-unknown-linux-gnu -isystem $HOME/.local/aarch64-cross/usr/aarch64-linux-gnu/include" AR_aarch64_unknown_linux_gnu=llvm-ar-18 cargo clippy --target aarch64-unknown-linux-gnu ...` (clippy only checks, so headers suffice — no cross linker needed) |
+| aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated. On an arm host this just works (CI's arm lane runs natively). On an x86 Linux box you need `rustup target add aarch64-unknown-linux-gnu` plus a cross C toolchain — see "aarch64 cross C toolchain on x86" below |
+
+### aarch64 cross C toolchain on x86
+
+The dep tree has C in it (blake3 NEON; zstd-sys via snapstore-client), so the
+aarch64 cross-check needs a C compiler that can target aarch64:
+
+- **With sudo**: `sudo apt install gcc-aarch64-linux-gnu`, then
+  `CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo clippy --target aarch64-unknown-linux-gnu ...`
+- **Without sudo**: clang + user-extracted glibc headers work because clippy
+  only *checks* — headers suffice, no cross linker needed:
+
+  ```bash
+  apt-get download libc6-dev-arm64-cross linux-libc-dev-arm64-cross
+  dpkg -x libc6-dev-arm64-cross_*.deb  $HOME/.local/aarch64-cross
+  dpkg -x linux-libc-dev-arm64-cross_*.deb $HOME/.local/aarch64-cross
+  CC_aarch64_unknown_linux_gnu=clang \
+  CFLAGS_aarch64_unknown_linux_gnu="--target=aarch64-unknown-linux-gnu -isystem $HOME/.local/aarch64-cross/usr/aarch64-linux-gnu/include" \
+  AR_aarch64_unknown_linux_gnu=llvm-ar-18 \
+  cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+  ```
 
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 

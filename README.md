@@ -34,6 +34,19 @@ Disposition of the initial scaffold-only crates:
 - `dh-smoke` was retired as a crate; its smoke assertion moved into `dh-worker`
   package tests, with `tests/determinism` reserved for end-to-end gates.
 
+## Sibling repos (required checkouts)
+
+The workspace has path dependencies on three sibling repos that must be
+checked out next to this one — every cargo invocation (even `cargo metadata`)
+fails with a path-resolution error without them:
+
+- `../control-plane` (`determinism-proto`)
+- `../guest-sdk` (`detguest-host`, `detguest-wire`)
+- `../snapshot-store` (`snapstore-client`)
+
+Sibling HEAD wins — there is no rev pinning. CI checks all three out in every
+lane (`.github/workflows/ci.yaml`).
+
 ## dh-cli (local debug CLI)
 
 ```text
