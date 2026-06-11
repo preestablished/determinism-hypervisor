@@ -18,7 +18,9 @@ pub const MMIO_HOLE_LEN: u64 = 0x7000;
 /// ARCH §8.2: dirty ring entry count; ring bytes = entries × 16-byte
 /// kvm_dirty_gfn (power of two, as KVM requires).
 pub const DIRTY_RING_ENTRIES: u64 = 65536;
-pub const DIRTY_RING_BYTES: u64 = DIRTY_RING_ENTRIES * 16;
+/// Bytes per `kvm_dirty_gfn` ring entry (the cap arg is entries × this).
+pub const DIRTY_RING_ENTRY_BYTES: u64 = 16;
+pub const DIRTY_RING_BYTES: u64 = DIRTY_RING_ENTRIES * DIRTY_RING_ENTRY_BYTES;
 
 /// PIO map (§2.2): debug serial + the detcall window; all else RAZ/WI.
 pub const PIO_SERIAL_BASE: u16 = 0x3F8;
@@ -119,8 +121,25 @@ impl KvmSystem {
     /// (ARCH §7.4: 4 KiB-exact dirty granularity). No irqchip, no PIT, no
     /// kvmclock — ever (§2.1 forbidden list, by construction).
     pub fn create_slot_vm(&self, mem_bytes: u64) -> Result<SlotVm, KvmError> {
+        self.create_slot_vm_with_ring(mem_bytes, DIRTY_RING_ENTRIES)
+    }
+
+    /// `create_slot_vm` with a CALLER-CHOSEN dirty-ring size (power of
+    /// two). Production always uses [`DIRTY_RING_ENTRIES`]; the chaos
+    /// acceptance (bead 28i) forces tiny rings so harvest-on-full fires
+    /// constantly and proves ring-full servicing loss-free (R8).
+    pub fn create_slot_vm_with_ring(
+        &self,
+        mem_bytes: u64,
+        ring_entries: u64,
+    ) -> Result<SlotVm, KvmError> {
         if mem_bytes > MMIO_HOLE_BASE {
             return Err(KvmError::MemTooLarge);
+        }
+        if !ring_entries.is_power_of_two() {
+            return Err(KvmError::VmCreate(format!(
+                "dirty ring entries must be a power of two, got {ring_entries}"
+            )));
         }
         let memfd = memfd_nohuge(mem_bytes)?;
         let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
@@ -129,7 +148,7 @@ impl KvmSystem {
             Some(FileOffset::new(memfd, 0)),
         )])
         .map_err(|e| KvmError::Memory(e.to_string()))?;
-        self.assemble_slot_vm(region, mem_bytes, false)
+        self.assemble_slot_vm(region, mem_bytes, false, ring_entries)
     }
 
     /// Tier-A CoW fork (ARCH §8.4): a child slot whose RAM is a PRIVATE
@@ -189,7 +208,7 @@ impl KvmSystem {
             .ok_or_else(|| KvmError::Memory("CoW region address overflow".into()))?;
         let mem = GuestMemoryMmap::<()>::from_regions(vec![region])
             .map_err(|e| KvmError::Memory(e.to_string()))?;
-        self.assemble_slot_vm(mem, parent.mem_bytes, true)
+        self.assemble_slot_vm(mem, parent.mem_bytes, true, DIRTY_RING_ENTRIES)
     }
 
     /// Everything after RAM exists: VM fd with the §2.1/§2.2 cap set,
@@ -200,6 +219,7 @@ impl KvmSystem {
         region: GuestMemoryMmap<()>,
         mem_bytes: u64,
         ram_is_cow: bool,
+        ring_entries: u64,
     ) -> Result<SlotVm, KvmError> {
         let vm = self
             .kvm
@@ -214,7 +234,7 @@ impl KvmSystem {
                 cap: kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL,
                 ..Default::default()
             };
-            cap.args[0] = DIRTY_RING_BYTES;
+            cap.args[0] = ring_entries * DIRTY_RING_ENTRY_BYTES;
             vm.enable_cap(&cap)
                 .map_err(|e| KvmError::VmCreate(format!("dirty ring enable: {e}")))?;
         }
@@ -289,6 +309,7 @@ impl KvmSystem {
             guest_mem: region,
             mem_bytes,
             ram_is_cow,
+            dirty_ring_entries: ring_entries,
         })
     }
 }
@@ -308,6 +329,10 @@ pub struct SlotVm {
     /// through the store: TakeSnapshot, then restore into a fresh slot
     /// (whose RAM IS its own memfd) and freeze that.
     pub ram_is_cow: bool,
+    /// The dirty-ring size this VM was created with (entries; power of
+    /// two). `DirtyRing::map` sizes the mmap and its cursor mask from
+    /// this — a mismatch would mis-mask the free-running cursor.
+    pub dirty_ring_entries: u64,
 }
 
 impl SlotVm {

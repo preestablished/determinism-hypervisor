@@ -289,7 +289,7 @@ fn delta_chain_restore_materializes_the_full_state() {
     }
 
     // Dirty three pages from inside the guest, then snapshot the delta.
-    let mut ring = DirtyRing::map(&slot_a.vcpu).expect("ring");
+    let mut ring = DirtyRing::map(&slot_a).expect("ring");
     let mut dirty = DirtyPageSet::new(slot_a.mem_bytes);
     enable_dirty_logging(&slot_a).expect("logging on");
     slot_a

@@ -653,7 +653,10 @@ the canonical form to `KVM_SET_XSAVE`; equality of blobs then implies equality o
 logical state and vice versa. The state hash uses the canonical form.
 
 ### 8.2 Dirty-page tracking
-- Primary: **dirty ring** (`KVM_CAP_DIRTY_LOG_RING_ACQ_REL`, ring size 65536 entries)
+- Primary: **dirty ring** (`KVM_CAP_DIRTY_LOG_RING_ACQ_REL`, ring size 65536 entries;
+  EMPIRICS, iteration 84: the kernel reserves 64 + 512 (PML) entries on x86 and
+  rejects rings below that floor — 1024 is the smallest legal ring on the lab box,
+  which is what the 28i chaos acceptance forces, not the originally-sketched 512)
   drained at every pause; entries are reset with `KVM_RESET_DIRTY_RINGS` after harvest.
   Ring-full causes a guest exit (`KVM_EXIT_DIRTY_RING_FULL`) which we service and
   resume — this exit is *host-visible only* and does not perturb guest state (verified

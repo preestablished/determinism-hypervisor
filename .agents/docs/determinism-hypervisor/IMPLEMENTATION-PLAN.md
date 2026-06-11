@@ -76,7 +76,7 @@ fork, tier-B mmap restore.
   property; an instruction-count or device-state leak shows up here).
 - Fork transparency: same test with a tier-A fork in the middle; and parent frozen →
   child diverges → parent's second child re-run matches first child given same inputs.
-- Dirty-ring-full forced (ring size 512) — hashes unchanged vs large ring.
+- Dirty-ring-full forced (smallest legal ring — 1024 on the lab box; the kernel's 64+512 PML reserved floor EINVALs 512) — snapshot refs unchanged vs large ring.
 - ENTR golden test: snapshot → restore reproduces the **next N (= 1024) entropy
   draws bit-identically** (exercises the `{seed, stream, word_pos}` round trip,
   API.md §4).

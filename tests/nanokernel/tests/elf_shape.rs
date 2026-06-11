@@ -66,6 +66,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pad_echo", pad_echo_elf());
     assert_guest_shape("entropy_draw", entropy_draw_elf());
     assert_guest_shape("mmio_stepper", mmio_stepper_elf());
+    assert_guest_shape("page_dirtier", page_dirtier_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -321,4 +322,29 @@ fn entropy_draw_asm_matches_rust_constants() {
         dh_devices::entropy::STATUS_OK
     );
     assert_eq!(define("ENT_BASE"), 0xD000_3000);
+}
+
+/// Same drift pin for page_dirtier (bead 28i): the chaos arithmetic
+/// (pages vs ring size) and the table start the harness reads.
+#[test]
+fn page_dirtier_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/page_dirtier.asm"))
+        .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("START_GPA"), PAGE_DIRTIER_START_GPA);
+    assert_eq!(define("PAGES"), PAGE_DIRTIER_PAGES);
 }

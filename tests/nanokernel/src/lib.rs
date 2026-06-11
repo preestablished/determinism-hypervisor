@@ -129,6 +129,15 @@ pub fn mmio_stepper_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/mmio_stepper.elf"))
 }
 
+/// page_dirtier (bead 28i): writes one byte to each of 3072 consecutive
+/// pages starting at the GPA below, then parks in HLT — the dirty-ring
+/// chaos load (3x a 1024-entry ring).
+pub fn page_dirtier_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/page_dirtier.elf"))
+}
+pub const PAGE_DIRTIER_START_GPA: u64 = 0x20_0000;
+pub const PAGE_DIRTIER_PAGES: u64 = 3072;
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 

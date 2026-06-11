@@ -25,6 +25,7 @@ const PROGRAMS: &[&str] = &[
     "pad_echo",
     "entropy_draw",
     "mmio_stepper",
+    "page_dirtier",
 ];
 
 fn main() {

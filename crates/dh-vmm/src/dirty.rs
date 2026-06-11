@@ -19,7 +19,7 @@
 //! smaller and simpler than a roaring dep. The API is shaped so swapping
 //! the representation later is invisible to the snapshot engine.
 
-use crate::kvm::{KvmError, SlotVm, DIRTY_RING_ENTRIES};
+use crate::kvm::{KvmError, SlotVm};
 use kvm_bindings::{kvm_dirty_gfn, kvm_userspace_memory_region, KVM_DIRTY_LOG_PAGE_OFFSET};
 use kvm_ioctls::{VcpuFd, VmFd};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -43,6 +43,9 @@ pub struct DirtyRing {
     ring: *mut kvm_dirty_gfn,
     map_len: usize,
     next_harvest: u64,
+    /// Ring size in entries; the cursor mask (must match the size the VM
+    /// enabled the ring with — see `map_sized`).
+    entries: u64,
 }
 
 // SAFETY: the mapping is private to this struct (single owner); entries are
@@ -55,9 +58,19 @@ impl DirtyRing {
     /// mmap the vCPU's dirty ring (`KVM_DIRTY_LOG_PAGE_OFFSET` pages into
     /// the vCPU fd). The VM must have been created with the dirty ring
     /// enabled (kvm.rs does this before any vCPU exists).
-    pub fn map(vcpu: &VcpuFd) -> Result<Self, KvmError> {
+    /// Maps THE SLOT'S ring: the mmap length and the cursor mask MUST
+    /// match the size passed at `KVM_CAP_DIRTY_LOG_RING_ACQ_REL` enable
+    /// time, so the entries come from `SlotVm::dirty_ring_entries` — by
+    /// construction, never from a caller-supplied number (iteration-84
+    /// review: a mismatched map would silently lose dirty pages, the
+    /// exact R8 failure this module exists to prevent).
+    pub fn map(slot: &SlotVm) -> Result<Self, KvmError> {
+        Self::map_sized(&slot.vcpu, slot.dirty_ring_entries)
+    }
+
+    fn map_sized(vcpu: &VcpuFd, entries: u64) -> Result<Self, KvmError> {
         use std::os::fd::AsRawFd;
-        let map_len = (DIRTY_RING_ENTRIES as usize) * std::mem::size_of::<kvm_dirty_gfn>();
+        let map_len = (entries as usize) * std::mem::size_of::<kvm_dirty_gfn>();
         #[allow(unsafe_code)]
         let p = unsafe {
             libc::mmap(
@@ -79,6 +92,7 @@ impl DirtyRing {
             ring: p.cast::<kvm_dirty_gfn>(),
             map_len,
             next_harvest: 0,
+            entries,
         })
     }
 
@@ -96,7 +110,7 @@ impl DirtyRing {
     pub fn harvest_into(&mut self, set: &mut DirtyPageSet) -> Result<u32, KvmError> {
         let mut harvested = 0u32;
         loop {
-            let idx = (self.next_harvest % DIRTY_RING_ENTRIES) as usize;
+            let idx = (self.next_harvest % self.entries) as usize;
             // SAFETY: idx < DIRTY_RING_ENTRIES bounds the mapping; the
             // flags word is accessed atomically per the ACQ_REL contract
             // (KVM writes it concurrently from the vCPU side).
@@ -321,7 +335,7 @@ mod live_tests {
         }
         let sys = KvmSystem::open().unwrap();
         let slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
-        let mut ring = DirtyRing::map(&slot.vcpu).expect("ring mmap");
+        let mut ring = DirtyRing::map(&slot).expect("ring mmap");
         let mut set = DirtyPageSet::new(slot.mem_bytes);
         let stats = harvest_at_boundary(&mut ring, &slot.vm, &mut set).unwrap();
         assert_eq!(stats, HarvestStats::default());
@@ -339,7 +353,7 @@ mod live_tests {
         }
         let sys = KvmSystem::open().unwrap();
         let mut slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
-        let mut ring = DirtyRing::map(&slot.vcpu).expect("ring mmap");
+        let mut ring = DirtyRing::map(&slot).expect("ring mmap");
         let mut set = DirtyPageSet::new(slot.mem_bytes);
         enable_dirty_logging(&slot).expect("memslot dirty logging on");
 

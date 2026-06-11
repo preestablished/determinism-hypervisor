@@ -116,7 +116,7 @@ fn refs_survive_a_server_restart_and_restore_byte_identically() {
 
     // Dirty three pages from INSIDE the guest (the ring only sees guest
     // writes), then ship the delta — the chain the restart must preserve.
-    let mut ring = DirtyRing::map(&slot_a.vcpu).expect("ring");
+    let mut ring = DirtyRing::map(&slot_a).expect("ring");
     let mut dirty = DirtyPageSet::new(slot_a.mem_bytes);
     enable_dirty_logging(&slot_a).expect("logging on");
     slot_a
