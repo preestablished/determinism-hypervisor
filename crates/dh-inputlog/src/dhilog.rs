@@ -2,11 +2,13 @@
 //!
 //! One DHILOG describes one segment; `base snapshot + DHILOG ⇒ bit-identical
 //! re-execution`. This module writes the versioned 256-byte header, the
-//! Phase-1 canonical records (PAD_SET, DEV_EVENT incl. the PIO_ANSWER
-//! detchannel encoding) and AUX records (ENTROPY, TIMER_FIRE, SDK_EVENT,
-//! FRAME_MARK), and seals the log (END record, body_hash). The full codec —
-//! reader, golden-bytes fixtures, fuzzing, NET_RX/NET_TX/EPOCH_HASH — is M5;
-//! the format version field is how M5 extends without breaking us.
+//! canonical records (PAD_SET, DEV_EVENT incl. the PIO_ANSWER detchannel
+//! encoding, NET_RX) and AUX records (ENTROPY, TIMER_FIRE, SDK_EVENT,
+//! FRAME_MARK), and seals the log (END record, body_hash). The validating
+//! reader lives in [`crate::reader`]; the v1.0 layout is FROZEN by the
+//! golden-bytes fixtures (tests/golden.rs, bead bp9). NET_TX/EPOCH_HASH
+//! emission is M5; the format version field is how M5 extends without
+//! breaking us.
 //!
 //! Code is no_std-compatible by construction (core + alloc idioms only);
 //! flipping the crate to `#![no_std]` later only needs blake3's `std`
@@ -176,6 +178,21 @@ impl LogWriter {
         payload.extend_from_slice(&data_len.to_le_bytes());
         payload.extend_from_slice(data);
         self.record(KIND_DEV_EVENT, 0, icount, boundary_rip, &payload)
+    }
+
+    /// NET_RX (§3.3): a received raw frame; the payload IS the frame bytes
+    /// (no preamble), capped at 2048. Landed with the bp9 format freeze so
+    /// the golden fixtures cover every canonical v1 kind.
+    pub fn net_rx(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        frame: &[u8],
+    ) -> Result<(), WriteError> {
+        if frame.len() > MAX_NET_RX_FRAME {
+            return Err(WriteError::PayloadTooLong);
+        }
+        self.record(KIND_NET_RX, 0, icount, boundary_rip, frame)
     }
 
     /// DEV_EVENT/PIO_ANSWER (§3.3): the value returned by an `IN` detcall.
