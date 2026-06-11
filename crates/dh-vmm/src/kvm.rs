@@ -227,6 +227,63 @@ pub struct SlotVm {
     pub mem_bytes: u64,
 }
 
+impl SlotVm {
+    /// The guest-RAM memfd (held inside the region's `FileOffset`).
+    fn ram_memfd(&self) -> Result<&std::fs::File, KvmError> {
+        use vm_memory::GuestMemoryBackend;
+        self.guest_mem
+            .find_region(GuestAddress(0))
+            .and_then(|r| r.file_offset())
+            .map(|fo| fo.file())
+            .ok_or_else(|| KvmError::Memory("guest RAM region has no backing memfd".into()))
+    }
+
+    /// Freeze the RAM memfd for fork (ARCH §8.4, risk R9):
+    /// `F_SEAL_FUTURE_WRITE` blocks every NEW writable mapping — CoW
+    /// children and any other process can only map the parent's RAM
+    /// read-only from this point on. `F_SEAL_SHRINK | F_SEAL_GROW` ride
+    /// along: resizing a frozen parent's RAM is never legitimate, and a
+    /// truncate would rip pages out from under the children.
+    ///
+    /// `F_SEAL_WRITE` is deliberately NOT applied — it is unavailable while
+    /// the parent's own KVM mapping exists (the kernel refuses to seal a
+    /// memfd with live writable mappings). The parent's existing mapping
+    /// therefore stays writable at the kernel level; the SOFTWARE Frozen
+    /// state (`SlotState::ensure_write_path`, lib.rs) is the guard for that
+    /// half. Idempotent: re-applying the same seals is a kernel no-op
+    /// (which is also why `F_SEAL_SEAL` is not added).
+    pub fn freeze_ram(&self) -> Result<(), KvmError> {
+        use std::os::fd::AsRawFd;
+        let fd = self.ram_memfd()?.as_raw_fd();
+        let seals = libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) };
+        if rc != 0 {
+            return Err(KvmError::Memory(format!(
+                "F_ADD_SEALS(FUTURE_WRITE|SHRINK|GROW): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Current seal set on the RAM memfd (`F_GET_SEALS`), for tests and the
+    /// preflight probe (bead aup).
+    pub fn ram_seals(&self) -> Result<i32, KvmError> {
+        use std::os::fd::AsRawFd;
+        let fd = self.ram_memfd()?.as_raw_fd();
+        #[allow(unsafe_code)]
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(KvmError::Memory(format!(
+                "F_GET_SEALS: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(seals)
+    }
+}
+
 /// What one KVM_RUN exit means to run control — the dispatch skeleton.
 /// Carriers only; handling (device dispatch, detcall, logging) is run
 /// control's job and lands with the boundary-engine beads.
@@ -467,6 +524,94 @@ mod tests {
         // And the TSC offset attribute (probed at vCPU creation) must hold:
         sys.create_slot_vm(2 * 1024 * 1024)
             .expect("slot VM incl. TSC offset attr");
+    }
+
+    #[test]
+    fn freeze_ram_seals_future_writes_but_not_the_live_mapping() {
+        if !kvm_available() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(4 * 1024 * 1024).unwrap();
+
+        // Pre-freeze: no FUTURE_WRITE seal yet; a new writable mapping works.
+        let seals = slot.ram_seals().unwrap();
+        assert_eq!(seals & libc::F_SEAL_FUTURE_WRITE, 0);
+
+        slot.freeze_ram().expect("freeze");
+        let seals = slot.ram_seals().unwrap();
+        assert_ne!(seals & libc::F_SEAL_FUTURE_WRITE, 0);
+        assert_ne!(seals & libc::F_SEAL_SHRINK, 0);
+        assert_ne!(seals & libc::F_SEAL_GROW, 0);
+        assert_eq!(seals & libc::F_SEAL_SEAL, 0); // idempotence depends on this
+
+        // Idempotent: re-freeze is a kernel no-op.
+        slot.freeze_ram().expect("re-freeze");
+
+        // NEW writable mapping is denied (EPERM) — the R9 hardware half.
+        let fd = slot
+            .guest_mem
+            .find_region(GuestAddress(0))
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .as_raw_fd();
+        #[allow(unsafe_code)]
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_eq!(p, libc::MAP_FAILED, "writable mmap must be sealed off");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        );
+
+        // A new READ-ONLY mapping still works (children read the baseline).
+        #[allow(unsafe_code)]
+        let ro = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ro, libc::MAP_FAILED, "read-only mapping must survive");
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::munmap(ro, 4096)
+        };
+
+        // The parent's own EXISTING mapping stays writable at the kernel
+        // level (F_SEAL_WRITE is unavailable while it lives) — exactly why
+        // the software Frozen guard exists.
+        slot.guest_mem
+            .write_slice(&[0x5A; 4], GuestAddress(0x2000))
+            .expect("existing mapping must remain writable post-seal");
+
+        // Truncation is sealed off too.
+        let file = slot
+            .guest_mem
+            .find_region(GuestAddress(0))
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file();
+        assert!(file.set_len(1024).is_err(), "SHRINK must be sealed");
     }
 
     #[test]
