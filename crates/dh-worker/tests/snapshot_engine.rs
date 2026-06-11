@@ -3,10 +3,12 @@
 //! TakeSnapshot path end to end, both FULL and incremental.
 #![cfg(target_arch = "x86_64")]
 
+mod common;
+
+use common::{kvm_available, spawn_store_blocking, test_bus};
 use dh_devices::clock::PvClock;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_devices::serial::DebugSerial;
 use dh_devices::MmioBus;
 use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, TimeSection};
 use dh_vmm::config::{BootSpec, MachineConfig};
@@ -16,71 +18,8 @@ use dh_vmm::{vcpu_state, SlotState};
 use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, EngineError, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
-use snapstore_client::blocking::SnapstoreClient as BlockingClient;
-use snapstore_client::Transport;
-use snapstore_server::build_server::{serve_for_tests, ServerHandle};
-use snapstore_server::config::ServerConfig;
-use tempfile::TempDir;
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
-
-fn kvm_available() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
-/// Real store on a side runtime; the engine itself stays synchronous and
-/// reaches it via the blocking facade (the production shape).
-fn spawn_store_blocking() -> (
-    tokio::runtime::Runtime,
-    ServerHandle,
-    BlockingClient,
-    TempDir,
-) {
-    let rt = tokio::runtime::Runtime::new().expect("rt");
-    let dir = TempDir::new().expect("tempdir");
-    let data_root = dir.path().to_path_buf();
-    let config = ServerConfig {
-        data_root: data_root.clone(),
-        grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
-        grpc_uds_path: Some(data_root.join("snapstore.sock")),
-        page_channel_path: None,
-        http_addr: "127.0.0.1:0".parse().expect("addr"),
-        pagestore: Default::default(),
-        meta: Default::default(),
-        page_channel: Default::default(),
-    };
-    let (handle, uds) = rt
-        .block_on(serve_for_tests(config))
-        .expect("serve_for_tests");
-    // Readiness probe (same shape as tests/determinism/store_joint.rs).
-    let mut client = None;
-    for _ in 0..50 {
-        match BlockingClient::connect(Transport::Uds(uds.clone())) {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-    (rt, handle, client.expect("store ready"), dir)
-}
-
-fn test_bus() -> MmioBus {
-    let mut bus = MmioBus::new();
-    bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
-    bus.register(0xD000_2000, Box::new(PvClock::new(1, 1)))
-        .unwrap();
-    bus.register(0xD000_3000, Box::new(PvEntropy::new()))
-        .unwrap();
-    bus.register(0xD000_6000, Box::new(DebugSerial::new()))
-        .unwrap();
-    bus
-}
 
 fn test_config() -> MachineConfig {
     MachineConfig::new(
