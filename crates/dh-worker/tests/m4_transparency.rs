@@ -54,11 +54,13 @@ use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
-use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, Until};
+use dh_vmm::runctl::{run_segment, ScheduledInjection, Segment, SegmentOutcome, StopReason, Until};
 use dh_vmm::SlotState;
+use dh_worker::fork_engine::fork_slot;
 use dh_worker::restore_engine::restore_snapshot;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
+use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
 const HALF: u64 = 100_000_000; // epoch grid (50M) point — all legs link here
@@ -86,12 +88,21 @@ fn config() -> MachineConfig {
     )
 }
 
-/// Cold-boot a landing-loop slot with its own counter, ready to run.
-fn boot() -> (SlotVm, InstRetired, MachineConfig, StateHashChain) {
+/// Cold-boot a guest slot with its own counter, ready to run.
+#[allow(clippy::type_complexity)]
+fn boot(
+    elf: &[u8],
+) -> (
+    KvmSystem,
+    SlotVm,
+    InstRetired,
+    MachineConfig,
+    StateHashChain,
+) {
     dh_vmm::run::install_kick_handler().unwrap();
     let sys = KvmSystem::open().unwrap();
     let slot = sys.create_slot_vm(MEM).unwrap();
-    dh_vmm::boot::load_and_enter(&slot, nanokernel::landing_loop_elf(), ITERS_CMDLINE).unwrap();
+    dh_vmm::boot::load_and_enter(&slot, elf, ITERS_CMDLINE).unwrap();
     let counter = InstRetired::open_for_current_thread().unwrap();
     counter
         .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
@@ -100,6 +111,7 @@ fn boot() -> (SlotVm, InstRetired, MachineConfig, StateHashChain) {
     counter.reset().unwrap();
     counter.enable().unwrap();
     (
+        sys,
         slot,
         counter,
         config(),
@@ -114,6 +126,7 @@ fn run_more(
     chain: &mut StateHashChain,
     config: &MachineConfig,
     more: u64,
+    injections: &[ScheduledInjection],
 ) -> SegmentOutcome {
     let start = counter.read().unwrap();
     let pause = AtomicBool::new(false);
@@ -123,7 +136,7 @@ fn run_more(
         chain,
         config,
         start_icount: start,
-        injections: &[],
+        injections,
         timer: None,
         pause: &pause,
     };
@@ -148,9 +161,9 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     }
 
     // ── Control leg: 1e8 + pause + 1e8, no snapshot machinery ────────────
-    let (mut slot, counter, cfg, mut chain) = boot();
-    let c1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF);
-    let c2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF);
+    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let c1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
+    let c2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF, &[]);
     let h2 = c2.state_hash;
     drop(slot);
 
@@ -158,8 +171,8 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     //    epoch grid still links at 50/100/150/200M, so the chain is
     //    comparable — H3 == H2 pins that the segment SPLIT is invisible,
     //    isolating what H1 == H2 then attributes to the snapshot detour. ──
-    let (mut slot, counter, cfg, mut chain) = boot();
-    let u = run_more(&mut slot, &counter, &mut chain, &cfg, FULL);
+    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let u = run_more(&mut slot, &counter, &mut chain, &cfg, FULL, &[]);
     assert_eq!(
         u.state_hash, h2,
         "H3 != H2: pausing at 1e8 is itself visible — segment-split bug, \
@@ -168,8 +181,8 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     drop(slot);
 
     // ── Roundtrip leg: 1e8 + TakeSnapshot + destroy + restore + 1e8 ──────
-    let (mut slot, counter, cfg, mut chain) = boot();
-    let r1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF);
+    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let r1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
 
     // Cold-boot determinism (the M3 property) must hold first — otherwise
     // any H1/H2 mismatch below would be ambiguous.
@@ -230,7 +243,7 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
 
     // Second half on the restored slot, chain resumed from TIME.
     let mut chain = outcome.chain;
-    let r2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF);
+    let r2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF, &[]);
 
     // ── The milestone property ────────────────────────────────────────────
     let h1 = r2.state_hash;
@@ -242,4 +255,156 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     // Full outcome equality (reason, boundary tuple, vns, hash, delivery
     // counts) — anything the segment reports must match, not just the hash.
     assert_eq!(r2, c2, "segment outcomes diverged");
+}
+
+/// M4 ACCEPT leg 2 (bead a6s, first half): the same H1 == H2 property
+/// with a TIER-A FORK in the middle instead of a store round-trip. The
+/// parent freezes at 1e8; the child's RAM is a CoW view, its vCPU and
+/// devices arrive through the in-memory DHSNAP — and the chain must not
+/// be able to tell. Same counter-axis convention as the restore leg
+/// (`counter: None`, see the module doc).
+#[test]
+fn fork_roundtrip_is_invisible_to_the_hash_chain() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+
+    // Control: 1e8 + pause + 1e8 (identical to the restore leg's control).
+    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let c1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
+    let c2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF, &[]);
+    drop(slot);
+
+    // Fork leg: 1e8, freeze, fork, run the CHILD 1e8 more.
+    let (sys, mut parent, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let r1 = run_more(&mut parent, &counter, &mut chain, &cfg, HALF, &[]);
+    assert_eq!(r1, c1, "the legs diverged BEFORE the fork");
+
+    parent.freeze_ram().expect("freeze parent");
+    let bus_p = test_bus();
+    let entropy_p = DetEntropy::from_seed([9; 32]);
+    let mut bus_c = test_bus();
+    let outcome = fork_slot(
+        &sys,
+        &parent,
+        SlotState::Frozen,
+        &bus_p,
+        &entropy_p,
+        &cfg,
+        BoundaryState {
+            icount: r1.boundary.icount,
+            vns: r1.vns,
+            epoch_index: r1.boundary.icount / cfg.epoch_len,
+            hash_chain: chain.value(),
+            agenda_empty: true,
+        },
+        &mut bus_c,
+        None, // keep the shared counter axis — see the module doc note
+    )
+    .expect("fork at the 1e8 boundary");
+    assert_eq!(outcome.cumulative_icount, HALF);
+    assert_eq!(outcome.chain.value(), r1.state_hash);
+
+    let mut child = outcome.child;
+    let mut chain = outcome.chain;
+    let r2 = run_more(&mut child, &counter, &mut chain, &cfg, FULL - HALF, &[]);
+
+    assert_eq!(
+        r2.state_hash, c2.state_hash,
+        "H1 != H2: the fork detour is VISIBLE in the state-hash chain"
+    );
+    assert_eq!(r2, c2, "segment outcomes diverged across the fork");
+}
+
+/// M4 ACCEPT leg 2 (bead a6s, second half): frozen-parent second-child
+/// reproducibility. Child A runs with inputs X (scheduled vector
+/// injections the timer guest's ISRs record); child B — forked AFTER A
+/// ran and diverged — replays the same X and must match A EXACTLY
+/// (chain value = full-RAM + vCPU walk, plus the guest-visible ISR
+/// delivery table). Children run on the §3.1 reset counter axis
+/// (`counter: Some` in the fork), so both share an identical 0-based
+/// agenda for X.
+#[test]
+fn frozen_parent_children_replay_identical_inputs_identically() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    const PARENT_RUN: u64 = 2_000_000;
+    const CHILD_RUN: u64 = 2_000_000;
+    let inputs_x: Vec<ScheduledInjection> = vec![
+        ScheduledInjection {
+            icount: 500_000,
+            vector: 0x40,
+        },
+        ScheduledInjection {
+            icount: 1_000_000,
+            vector: 0x41,
+        },
+        ScheduledInjection {
+            icount: 1_500_000,
+            vector: 0x40,
+        },
+    ];
+
+    let (sys, mut parent, counter, cfg, mut chain) = boot(nanokernel::timer_guest_elf());
+    let r_parent = run_more(&mut parent, &counter, &mut chain, &cfg, PARENT_RUN, &[]);
+    parent.freeze_ram().expect("freeze parent");
+    let bus_p = test_bus();
+    let entropy_p = DetEntropy::from_seed([0x33; 32]);
+    let fork_boundary = BoundaryState {
+        icount: r_parent.boundary.icount,
+        vns: r_parent.vns,
+        epoch_index: r_parent.boundary.icount / cfg.epoch_len,
+        hash_chain: chain.value(),
+        agenda_empty: true,
+    };
+
+    let run_child = |label: &str| {
+        let mut bus_c = test_bus();
+        let outcome = fork_slot(
+            &sys,
+            &parent,
+            SlotState::Frozen,
+            &bus_p,
+            &entropy_p,
+            &cfg,
+            fork_boundary,
+            &mut bus_c,
+            Some(&counter), // §3.1: each child's segment counts from 0
+        )
+        .unwrap_or_else(|e| panic!("fork {label}: {e:?}"));
+        let mut child = outcome.child;
+        let mut chain = outcome.chain;
+        let out = run_more(&mut child, &counter, &mut chain, &cfg, CHILD_RUN, &inputs_x);
+
+        // The guest-visible record of X: the timer guest's ISR table.
+        let mut head = [0u8; 8];
+        child
+            .guest_mem
+            .read_slice(&mut head, GuestAddress(nanokernel::TIMER_GUEST_TABLE_GPA))
+            .unwrap();
+        let count = u64::from_le_bytes(head);
+        let mut vectors = vec![0u8; count as usize];
+        child
+            .guest_mem
+            .read_slice(
+                &mut vectors,
+                GuestAddress(nanokernel::TIMER_GUEST_TABLE_GPA + 8),
+            )
+            .unwrap();
+        (out, count, vectors)
+    };
+
+    let (out_a, count_a, vec_a) = run_child("A");
+    // Child A diverged (it ran with X); child B forks AFTER that and must
+    // reproduce A bit-for-bit from the frozen base.
+    let (out_b, count_b, vec_b) = run_child("B");
+
+    assert_eq!(out_a.injections_delivered, 3, "inputs X did not all land");
+    assert_eq!(count_a, 3, "guest table disagrees with delivery count");
+    assert_eq!(vec_a, vec![0x40, 0x41, 0x40], "guest saw the wrong vectors");
+    assert_eq!(out_a, out_b, "second child diverged from the first");
+    assert_eq!((count_a, &vec_a), (count_b, &vec_b));
 }
