@@ -39,6 +39,77 @@ pub enum SlotState {
     Frozen,
 }
 
+/// Slot-state machine violation (risk R9). Loud by design: a write-path
+/// call on a Frozen slot is the software half of the fork-parent guard —
+/// the memfd seal (kvm.rs `SlotVm::freeze_ram`) blocks NEW writable
+/// mappings, but the parent's own existing KVM mapping stays writable
+/// (F_SEAL_WRITE is unavailable while it exists, ARCH §8.4), so THIS check
+/// is the only thing standing between a stray engine call and corrupting
+/// every CoW child's shared baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotStateError {
+    InvalidTransition {
+        from: SlotState,
+        to: SlotState,
+    },
+    /// A write-path API was invoked on a Frozen slot (R9).
+    FrozenWriteDenied {
+        api: &'static str,
+    },
+    /// A write-path API was invoked on an Empty slot.
+    EmptyWriteDenied {
+        api: &'static str,
+    },
+}
+
+impl SlotState {
+    /// The §2.2/§8.4 transition relation:
+    ///
+    /// - `Empty → Paused`: CreateVm / RestoreSnapshot land paused.
+    /// - `Paused ⇄ Running`: Run / Pause (boundary engine).
+    /// - `Paused → Frozen`: Fork freezes the parent (§8.4).
+    /// - `Frozen → Paused`: freeing the last child unfreezes the parent
+    ///   (§2.2 DestroyVm semantics).
+    /// - `Paused → Empty`, `Frozen → Empty`: DestroyVm. A Running slot must
+    ///   pause first — destroying mid-run has no deterministic boundary.
+    ///
+    /// Everything else (including self-transitions) is a state-machine bug
+    /// and errors loudly rather than being silently absorbed.
+    pub fn can_transition(self, to: SlotState) -> bool {
+        use SlotState::*;
+        matches!(
+            (self, to),
+            (Empty, Paused)
+                | (Paused, Running)
+                | (Running, Paused)
+                | (Paused, Frozen)
+                | (Frozen, Paused)
+                | (Paused, Empty)
+                | (Frozen, Empty)
+        )
+    }
+
+    pub fn transition(self, to: SlotState) -> Result<SlotState, SlotStateError> {
+        if self.can_transition(to) {
+            Ok(to)
+        } else {
+            Err(SlotStateError::InvalidTransition { from: self, to })
+        }
+    }
+
+    /// Gate every API that can mutate guest RAM, vCPU state, or device
+    /// state (run, inject, restore-into, MMIO dispatch, RAM writes).
+    /// `api` names the caller for the loud error. Paused and Running slots
+    /// are writable; Frozen is the R9 denial; Empty has nothing to write.
+    pub fn ensure_write_path(self, api: &'static str) -> Result<(), SlotStateError> {
+        match self {
+            SlotState::Paused | SlotState::Running => Ok(()),
+            SlotState::Frozen => Err(SlotStateError::FrozenWriteDenied { api }),
+            SlotState::Empty => Err(SlotStateError::EmptyWriteDenied { api }),
+        }
+    }
+}
+
 pub fn initial_slot_state() -> SlotState {
     SlotState::Empty
 }
@@ -108,5 +179,87 @@ mod tests {
     #[test]
     fn m0_summary_format_is_stable() {
         assert_eq!(m0_missing_caps_summary(), "kvm_m0_missing_caps=0");
+    }
+}
+
+#[cfg(test)]
+mod slot_state_tests {
+    use super::SlotState::*;
+    use super::*;
+
+    const ALL: [SlotState; 4] = [Empty, Running, Paused, Frozen];
+
+    #[test]
+    fn transition_matrix_is_exactly_the_spec_relation() {
+        let allowed = [
+            (Empty, Paused),
+            (Paused, Running),
+            (Running, Paused),
+            (Paused, Frozen),
+            (Frozen, Paused),
+            (Paused, Empty),
+            (Frozen, Empty),
+        ];
+        for from in ALL {
+            for to in ALL {
+                let expect = allowed.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition(to),
+                    expect,
+                    "transition {from:?} -> {to:?}: expected allowed={expect}"
+                );
+                match from.transition(to) {
+                    Ok(next) => {
+                        assert!(expect);
+                        assert_eq!(next, to);
+                    }
+                    Err(SlotStateError::InvalidTransition { from: f, to: t }) => {
+                        assert!(!expect);
+                        assert_eq!((f, t), (from, to));
+                    }
+                    Err(other) => panic!("wrong error kind: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_self_transitions() {
+        for s in ALL {
+            assert!(!s.can_transition(s), "{s:?} -> {s:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn running_cannot_be_destroyed_or_frozen_directly() {
+        assert!(!Running.can_transition(Empty)); // pause first
+        assert!(!Running.can_transition(Frozen)); // fork requires Paused parent
+    }
+
+    #[test]
+    fn frozen_denies_every_write_path_loudly() {
+        assert_eq!(
+            Frozen.ensure_write_path("inject_inputs"),
+            Err(SlotStateError::FrozenWriteDenied {
+                api: "inject_inputs"
+            })
+        );
+        assert_eq!(
+            Empty.ensure_write_path("run"),
+            Err(SlotStateError::EmptyWriteDenied { api: "run" })
+        );
+        assert_eq!(Paused.ensure_write_path("restore"), Ok(()));
+        assert_eq!(Running.ensure_write_path("mmio"), Ok(()));
+    }
+
+    #[test]
+    fn fork_lifecycle_walk() {
+        // Empty -> Paused -> Frozen (fork) -> Paused (last child freed)
+        // -> Frozen (re-fork) -> Empty (destroy parent).
+        let mut s = initial_slot_state();
+        for to in [Paused, Frozen, Paused, Frozen, Empty] {
+            s = s.transition(to).unwrap();
+        }
+        assert_eq!(s, Empty);
     }
 }
