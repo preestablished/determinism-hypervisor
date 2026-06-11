@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dhilog;
+pub mod reader;
 pub const DHILOG_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
