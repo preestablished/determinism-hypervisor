@@ -143,11 +143,45 @@ mod tests {
             goal
         );
 
-        // §2.4 StopReason / §2.8 SlotState: the PAUSED_S disambiguation is
-        // load-bearing (C++ scoping; see proto/hypervisor.proto).
+        // Enum number pins — a silent renumber must fail HERE, not on the
+        // wire. The PAUSED_S disambiguation is load-bearing (C++ scoping;
+        // see proto/hypervisor.proto).
+        assert_eq!(v1::HashEpochs::Unspecified as i32, 0);
+        assert_eq!(v1::HashEpochs::EpochsOn as i32, 1);
+        assert_eq!(v1::HashEpochs::FinalOnly as i32, 2);
+        assert_eq!(v1::PixelFormat::PfUnspecified as i32, 0);
+        assert_eq!(v1::PixelFormat::Xrgb8888 as i32, 1);
+        assert_eq!(v1::PixelFormat::Rgb565 as i32, 2);
+        assert_eq!(v1::StopReason::StopUnspecified as i32, 0);
+        assert_eq!(v1::StopReason::BudgetReached as i32, 1);
+        assert_eq!(v1::StopReason::GoalSatisfied as i32, 2);
+        assert_eq!(v1::StopReason::NextSdkEvent as i32, 3);
+        assert_eq!(v1::StopReason::HardCap as i32, 4);
         assert_eq!(v1::StopReason::Paused as i32, 5);
+        assert_eq!(v1::StopReason::GuestHalted as i32, 6);
+        assert_eq!(v1::StopReason::Faulted as i32, 7);
+        assert_eq!(v1::SlotState::SlotUnspecified as i32, 0);
+        assert_eq!(v1::SlotState::Empty as i32, 1);
         assert_eq!(v1::SlotState::PausedS as i32, 2);
+        assert_eq!(v1::SlotState::Running as i32, 3);
+        assert_eq!(v1::SlotState::Frozen as i32, 4);
         assert_eq!(v1::SlotState::FaultedS as i32, 5);
+        assert_eq!(v1::QuiesceMode::Unspecified as i32, 0);
+        assert_eq!(v1::QuiesceMode::Coop as i32, 1);
+        assert_eq!(v1::QuiesceMode::Forced as i32, 2);
+        assert_eq!(v1::mem_predicate::Op::Unspecified as i32, 0);
+        assert_eq!(v1::mem_predicate::Op::Eq as i32, 1);
+        assert_eq!(v1::mem_predicate::Op::Ne as i32, 2);
+        assert_eq!(v1::mem_predicate::Op::Ge as i32, 3);
+        assert_eq!(v1::mem_predicate::Op::Le as i32, 4);
+
+        // frame_budget rides wire tag 8 (varint key 0x40) — pinned at the
+        // byte level since the non-contiguous number is easy to "tidy".
+        let only_frame_budget = v1::RunRequest {
+            until: Some(run_request::Until::FrameBudget(60)),
+            ..Default::default()
+        };
+        assert_eq!(only_frame_budget.encode_to_vec(), vec![0x40, 60]);
 
         // §2.7 VerifyReplayProgress oneof: divergence is terminal/P0.
         let prog = v1::VerifyReplayProgress {

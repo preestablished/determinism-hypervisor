@@ -405,8 +405,12 @@ message SlotInfo {
 }
 // PAUSED_S follows FAULTED_S: proto enum values use C++ scoping (siblings of
 // the package, not the enum), so SlotState values must not collide with
-// StopReason's PAUSED/FAULTED. API.md §2.8 wrote PAUSED here — an oversight
-// of the same rule its own FAULTED_S works around (codegen rejects it).
+// StopReason's PAUSED/FAULTED. API.md §2.8 originally wrote a bare PAUSED
+// (protoc rejects it); both files now carry the _S form.
+//
+// CONVENTION for future enum authors in this package: enum VALUE names are
+// package-global. Before adding a value, grep this file for the bare name;
+// on collision, suffix with an enum-distinguishing letter (the _S pattern).
 enum SlotState { SLOT_UNSPECIFIED = 0; EMPTY = 1; PAUSED_S = 2; RUNNING = 3;
                  FROZEN = 4; FAULTED_S = 5; }
 message WatchSlotsRequest {}
