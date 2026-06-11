@@ -187,7 +187,11 @@ pub fn take_snapshot(
 /// DHSNAP assembly in the canonical §4 table order (byte-determinism: the
 /// container is part of the snapshot-ref preimage, so section order is
 /// fixed HERE, not left to bus iteration order).
-fn build_dhsnap(
+///
+/// `pub(crate)`: the tier-A fork engine builds the parent's IN-MEMORY
+/// DHSNAP through this exact assembler (§8.4 "decode the parent's
+/// in-memory DHSNAP") — one codec, never a parallel fork-only encoding.
+pub(crate) fn build_dhsnap(
     slot: &SlotVm,
     bus: &dh_devices::MmioBus,
     entropy: &dh_devices::entropy::DetEntropy,
