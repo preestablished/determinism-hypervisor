@@ -10,22 +10,24 @@ use dh_inputlog::reader::LogReader;
 use dh_proto::v1::StopReason;
 
 /// Every proto StopReason value must fit the END record's u8 slot —
-/// the mirror claim is meaningless otherwise.
+/// the mirror claim is meaningless otherwise. prost's `TryFrom<i32>` is
+/// CLOSED over the generated set, so a count pin scanned over 0..=255
+/// would never even SEE a future variant numbered ≥256 (the exact kind
+/// that breaks the mirror) — pin the maximum wire number over a wide
+/// scan instead. Residual blind spot: a value above u16::MAX; proto
+/// enum numbers that large would also have to dodge dh-proto's
+/// per-variant pin test, where every new value is added by convention.
 #[test]
 fn every_proto_stop_reason_fits_the_u8_slot() {
-    let mut seen = 0;
-    for raw in 0..=255i32 {
-        if let Ok(v) = StopReason::try_from(raw) {
-            assert!(
-                u8::try_from(v as i32).is_ok(),
-                "{v:?} = {raw} does not fit u8"
-            );
-            seen += 1;
-        }
-    }
-    // 0..=7 today (UNSPECIFIED..FAULTED); a new proto value extends this
-    // count and must keep fitting the byte.
-    assert_eq!(seen, 8, "proto StopReason variant count moved");
+    let known: Vec<i32> = (0..=i32::from(u16::MAX))
+        .filter(|raw| StopReason::try_from(*raw).is_ok())
+        .collect();
+    assert_eq!(
+        known.last().copied(),
+        Some(7),
+        "max StopReason wire number moved — re-prove it fits the END u8"
+    );
+    assert_eq!(known, (0..=7).collect::<Vec<_>>(), "set is 0..=7, gapless");
 }
 
 /// The golden fixtures' frozen END bytes decode to the INTENDED proto
