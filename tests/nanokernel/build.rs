@@ -23,6 +23,7 @@ const PROGRAMS: &[&str] = &[
     "rep_loop",
     "sse_probe",
     "pad_echo",
+    "entropy_draw",
 ];
 
 fn main() {
