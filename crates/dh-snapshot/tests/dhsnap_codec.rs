@@ -105,6 +105,25 @@ fn empty_container_is_just_header() {
 }
 
 #[test]
+fn known_tags_table_is_complete_and_unique() {
+    assert_eq!(KNOWN_TAGS.len(), 11);
+    for (i, a) in KNOWN_TAGS.iter().enumerate() {
+        assert!(std::str::from_utf8(a)
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_uppercase()));
+        for b in &KNOWN_TAGS[i + 1..] {
+            assert_ne!(a, b, "duplicate tag in KNOWN_TAGS");
+        }
+    }
+    // Every mapped device tag is in the table.
+    for id in 0x0001..=0x0007u16 {
+        let t = tag_for_device_id(id).unwrap();
+        assert!(KNOWN_TAGS.contains(&t));
+    }
+}
+
+#[test]
 fn device_id_tag_map_is_total_over_known_devices() {
     assert_eq!(tag_for_device_id(0x0001), Some(tag::EVTC));
     assert_eq!(tag_for_device_id(0x0002), Some(tag::CLKD));

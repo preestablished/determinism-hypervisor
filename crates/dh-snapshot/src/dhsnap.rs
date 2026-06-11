@@ -68,15 +68,26 @@ pub const KNOWN_TAGS: [[u8; 4]; 11] = [
 
 /// The device-id↔tag mapping (ONE place, per the `DetDevice` trait doc).
 /// Ids are the §6.1 MAGIC register values served by the bus.
+///
+/// LANDMINE the snapshot engine must not step on (bead 6yl): §4's `ENTR`
+/// contents are the 56-byte VMM-owned PRNG state ([`EntrSection`]), but the
+/// pv-entropy DEVICE's `DetDevice::snapshot` emits its 16-byte MMIO regs
+/// `{buf_gpa, len, status}` — naively framing that as `ENTR` produces a
+/// spec-invalid section (`EntrSection::decode` ⇒ `BadLength{16}`). The
+/// engine special-cases 0x0004: `ENTR` is built from the PRNG state, and
+/// 6yl decides where the reg blob lands (likely an `ENTR` sec_version-2
+/// layout carrying both, since §4 has no separate tag for the regs).
 pub fn tag_for_device_id(device_id: u16) -> Option<[u8; 4]> {
     match device_id {
         0x0001 => Some(tag::EVTC), // detchannel (dh-inputlog DEVICE_ID_DETCHANNEL)
         0x0002 => Some(tag::CLKD), // pv-clock
         0x0003 => Some(tag::PADD), // pv-pad
-        0x0004 => Some(tag::ENTR), // pv-entropy (PRNG state; see EntrSection)
+        0x0004 => Some(tag::ENTR), // pv-entropy — see LANDMINE above
         0x0005 => Some(tag::BLKO), // pv-blk overlay
         0x0006 => Some(tag::SERL), // debug-serial (empty section rule)
-        0x0007 => Some(tag::NETL), // pv-net loopback (bead mmv)
+        // ANTICIPATED: pv-net lands with bead mmv, which must define
+        // DEVICE_ID_PV_NET = 0x0007 to match (the bead is annotated).
+        0x0007 => Some(tag::NETL),
         _ => None,
     }
 }
