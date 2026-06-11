@@ -15,6 +15,7 @@ pub mod clock;
 pub mod ctx;
 pub mod detchannel;
 pub mod entropy;
+pub mod net;
 pub mod pad;
 pub mod serial;
 

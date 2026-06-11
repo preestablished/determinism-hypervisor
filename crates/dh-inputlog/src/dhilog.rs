@@ -231,6 +231,23 @@ impl LogWriter {
         self.record(KIND_ENTROPY, RFLAG_AUX, icount, boundary_rip, &payload)
     }
 
+    /// AUX NET_TX (§3.3): the guest transmitted a frame — length +
+    /// digest8 of the exact frame bytes, the ENTROPY/SDK_EVENT payload
+    /// convention. The frame itself never enters the log (output, not
+    /// input); subscribers read it from guest RAM at the doorbell exit.
+    pub fn net_tx(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        len: u32,
+        digest8: u64,
+    ) -> Result<(), WriteError> {
+        let mut payload = [0u8; 16];
+        payload[0..4].copy_from_slice(&len.to_le_bytes());
+        payload[8..16].copy_from_slice(&digest8.to_le_bytes());
+        self.record(KIND_NET_TX, RFLAG_AUX, icount, boundary_rip, &payload)
+    }
+
     /// TIMER_FIRE (§3.3): delivery may defer past the arm target per the
     /// §3.4 injectability rule, hence both the armed deadline and the
     /// actually-delivered icount.
