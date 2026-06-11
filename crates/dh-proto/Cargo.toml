@@ -5,4 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-determinism-proto = { workspace = true, features = ["hypervisor"] }
+# Cross-repo facade for the shared non-hypervisor contract types. The
+# hypervisor::v1 placeholder structs in determinism-proto are superseded by
+# the local codegen below (docs/decisions/proto-seam.md).
+determinism-proto = { workspace = true, features = ["common"] }
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-build.workspace = true

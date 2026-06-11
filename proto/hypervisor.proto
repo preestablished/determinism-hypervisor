@@ -1,7 +1,48 @@
+// determinism-hypervisor gRPC contract — CODEGEN SKELETON (bead v8p).
+//
+// This file is the canonical home of the `determinism.hypervisor.v1` schema
+// (docs/decisions/proto-seam.md): codegen lives in this repo (dh-proto's
+// build.rs, vendored protoc), NOT in control-plane's determinism-proto, whose
+// hypervisor module is a hand-written placeholder superseded for this repo.
+//
+// SKELETON SCOPE: only the §2.1 common-type core and the §2.8 GetWorkerInfo
+// leg are defined — enough to prove tonic/prost codegen end-to-end on both
+// x86_64 and aarch64. Bead bcb ("Proto schema v1") fills in the full API.md
+// §2 surface. Message/field shapes below are normative API.md §2 text.
+
 syntax = "proto3";
 
 package determinism.hypervisor.v1;
 
-// Canonical schema placeholder for the hypervisor surface until the
-// control-plane determinism-proto path dependency owns generated code.
-service Hypervisor {}
+// Served by dh-workerd on 0.0.0.0:7400 (TCP) and /run/dh/grpc.sock (UDS).
+//
+// SKELETON: one rpc to anchor service codegen. The full v1 method set
+// (slot lifecycle, execution, introspection, verification, watch) lands
+// with bead bcb — see API.md §2 for the committed surface.
+service HypervisorWorker {
+  // ---- worker / health (API.md §2.8) ----
+  rpc GetWorkerInfo (GetWorkerInfoRequest) returns (GetWorkerInfoResponse);
+}
+
+// ---- common types (API.md §2.1, core subset) ----
+
+message SnapshotRef   { bytes hash = 1; }  // 32 bytes, BLAKE3 of manifest
+message StateHash     { bytes hash = 1; }  // 32 bytes, chain value (ARCHITECTURE §8.5)
+message Lease         { uint64 slot_id = 1; bytes token = 2; }  // token: 16 random bytes
+
+// ---- worker / health (API.md §2.8) ----
+
+message GetWorkerInfoRequest {}
+message GetWorkerInfoResponse {
+  string worker_id = 1;                // stable host id
+  uint32 slots_total = 2;
+  uint32 slots_free  = 3;
+  DeterminismClass class = 4;
+  string version = 5;                  // dh-workerd semver
+}
+message DeterminismClass {             // ARCH §7.4; embedded in manifests too
+  string cpu_model    = 1;             // e.g. family/model/stepping string
+  string microcode    = 2;
+  string host_kernel  = 3;
+  string vmm_version  = 4;             // dh-vmm crate version
+}
