@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod dhsnap;
+
 pub const DHSNAP_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
