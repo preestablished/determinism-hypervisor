@@ -181,6 +181,12 @@ pub fn run_segment(
 /// after the quantum returns (the log cannot be borrowed inside; on_exit
 /// holds it). Final-pause links at NON-epoch boundaries are NOT epoch
 /// hashes — they travel in END.end_state_hash.
+///
+/// GRID ANCHORING (a5e/39w load-bearing): the epoch grid is ABSOLUTE in
+/// counter space — multiples of `epoch_len` from counter zero, never
+/// from a quantum's `start_icount` (agenda.rs compiles the grid that
+/// way) — so record and replay runs quantized DIFFERENTLY still produce
+/// the identical EPOCH_HASH set.
 pub fn run_segment_with_epochs(
     seg: &mut Segment<'_>,
     until: Until,
@@ -393,8 +399,14 @@ pub fn run_segment_with_epochs(
                 .push_final_link(seg.slot, &[], b.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             // The roll-forward lands ON the epoch grid by construction —
-            // this link IS an epoch hash (b.icount is a grid multiple).
-            epoch_sink.push((b.icount / epoch, b.icount, seg.chain.value()));
+            // this link IS an epoch hash (b.icount is a grid multiple) —
+            // but only EpochsOn configs RECORD epoch hashes: under
+            // FinalOnly the link still seeds the chain while the sink
+            // stays empty, or a paused FinalOnly log would falsely carry
+            // an EPOCH_HASH record + FLAG (iteration-87 review I1).
+            if seg.config.hash_epochs == crate::config::HashEpochs::EpochsOn {
+                epoch_sink.push((b.icount / epoch, b.icount, seg.chain.value()));
+            }
             return Ok(SegmentOutcome {
                 reason: StopReason::Paused,
                 boundary: b,
