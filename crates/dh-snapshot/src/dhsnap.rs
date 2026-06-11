@@ -72,20 +72,20 @@ pub const KNOWN_TAGS: [[u8; 4]; 11] = [
 /// The device-id↔tag mapping (ONE place, per the `DetDevice` trait doc).
 /// Ids are the §6.1 MAGIC register values served by the bus.
 ///
-/// LANDMINE the snapshot engine must not step on (bead 6yl): §4's `ENTR`
-/// contents are the 56-byte VMM-owned PRNG state ([`EntrSection`]), but the
-/// pv-entropy DEVICE's `DetDevice::snapshot` emits its 16-byte MMIO regs
-/// `{buf_gpa, len, status}` — naively framing that as `ENTR` produces a
-/// spec-invalid section (`EntrSection::decode` ⇒ `BadLength{16}`). The
-/// engine special-cases 0x0004: `ENTR` is built from the PRNG state, and
-/// 6yl decides where the reg blob lands (likely an `ENTR` sec_version-2
-/// layout carrying both, since §4 has no separate tag for the regs).
+/// RESOLVED (bead 6yl): §4's `ENTR` v1 contents are the 56-byte VMM-owned
+/// PRNG state ([`EntrSection`]) — but the pv-entropy DEVICE also carries
+/// 16 bytes of guest-visible MMIO regs `{buf_gpa, len, status}` with no §4
+/// tag of their own. The engine therefore writes `ENTR` at sec_version 2
+/// ([`EntrSectionV2`], 72 bytes = PRNG state ‖ regs) by combining
+/// `DetEntropy::state()` with the device's `DetDevice::snapshot` — NEVER
+/// by framing the device blob alone (that is the original landmine:
+/// `EntrSection::decode` ⇒ `BadLength{16}`).
 pub fn tag_for_device_id(device_id: u16) -> Option<[u8; 4]> {
     match device_id {
         0x0001 => Some(tag::EVTC), // detchannel (dh-inputlog DEVICE_ID_DETCHANNEL)
         0x0002 => Some(tag::CLKD), // pv-clock
         0x0003 => Some(tag::PADD), // pv-pad
-        0x0004 => Some(tag::ENTR), // pv-entropy — see LANDMINE above
+        0x0004 => Some(tag::ENTR), // pv-entropy — sec_version 2, see RESOLVED above
         0x0005 => Some(tag::BLKO), // pv-blk overlay
         0x0006 => Some(tag::SERL), // debug-serial (empty section rule)
         // ANTICIPATED: pv-net lands with bead mmv, which must define
@@ -356,6 +356,86 @@ impl EntrSection {
             seed: bytes[0..32].try_into().unwrap(),
             stream: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
             word_pos: u128::from_le_bytes(bytes[40..56].try_into().unwrap()),
+        })
+    }
+}
+
+/// `ENTR` section, sec_version 2 (bead 6yl): the v1 PRNG state PLUS the
+/// pv-entropy device's guest-visible MMIO regs — 72 bytes total. v1 (56
+/// bytes, PRNG only) remains decodable for spec-exact producers; the
+/// snapshot engine WRITES v2 so the device regs travel with the snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntrSectionV2 {
+    pub seed: [u8; 32],
+    pub stream: u64,
+    pub word_pos: u128,
+    pub buf_gpa: u64,
+    pub len: u32,
+    pub status: u32,
+}
+
+impl EntrSectionV2 {
+    pub const LEN: usize = 72;
+    pub const VERSION: u16 = 2;
+
+    pub fn prng(&self) -> EntrSection {
+        EntrSection {
+            seed: self.seed,
+            stream: self.stream,
+            word_pos: self.word_pos,
+        }
+    }
+
+    /// Combine the VMM-owned PRNG state with the device's 16-byte
+    /// `DetDevice::snapshot` reg blob (buf_gpa u64 ‖ len u32 ‖ status u32).
+    pub fn from_parts(prng: EntrSection, device_regs: &[u8]) -> Result<Self, SectionError> {
+        if device_regs.len() != 16 {
+            return Err(SectionError::BadLength {
+                found: device_regs.len(),
+            });
+        }
+        Ok(Self {
+            seed: prng.seed,
+            stream: prng.stream,
+            word_pos: prng.word_pos,
+            buf_gpa: u64::from_le_bytes(device_regs[0..8].try_into().expect("8")),
+            len: u32::from_le_bytes(device_regs[8..12].try_into().expect("4")),
+            status: u32::from_le_bytes(device_regs[12..16].try_into().expect("4")),
+        })
+    }
+
+    /// The device-reg half, in the exact `DetDevice::restore` layout.
+    pub fn device_regs(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&self.buf_gpa.to_le_bytes());
+        out[8..12].copy_from_slice(&self.len.to_le_bytes());
+        out[12..16].copy_from_slice(&self.status.to_le_bytes());
+        out
+    }
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..32].copy_from_slice(&self.seed);
+        out[32..40].copy_from_slice(&self.stream.to_le_bytes());
+        out[40..56].copy_from_slice(&self.word_pos.to_le_bytes());
+        out[56..72].copy_from_slice(&self.device_regs());
+        out
+    }
+
+    pub fn decode(bytes: &[u8], sec_version: u16) -> Result<Self, SectionError> {
+        if sec_version != Self::VERSION {
+            return Err(SectionError::BadVersion { found: sec_version });
+        }
+        if bytes.len() != Self::LEN {
+            return Err(SectionError::BadLength { found: bytes.len() });
+        }
+        Ok(Self {
+            seed: bytes[0..32].try_into().expect("32"),
+            stream: u64::from_le_bytes(bytes[32..40].try_into().expect("8")),
+            word_pos: u128::from_le_bytes(bytes[40..56].try_into().expect("16")),
+            buf_gpa: u64::from_le_bytes(bytes[56..64].try_into().expect("8")),
+            len: u32::from_le_bytes(bytes[64..68].try_into().expect("4")),
+            status: u32::from_le_bytes(bytes[68..72].try_into().expect("4")),
         })
     }
 }
