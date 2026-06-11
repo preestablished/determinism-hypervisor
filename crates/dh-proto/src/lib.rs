@@ -24,6 +24,9 @@ pub mod v1 {
 pub use determinism_proto::common;
 pub use determinism_proto::PROTO_VERSION;
 
+/// Wire-up smoke fixture retained from the placeholder-facade era: proves a
+/// generated message constructs with the documented shapes. In-crate test use
+/// only today; whether it stays public is a bead-bcb call.
 pub fn sample_lease() -> v1::Lease {
     v1::Lease {
         slot_id: 1,

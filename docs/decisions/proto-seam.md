@@ -25,13 +25,17 @@ schema; `dh-proto`'s build.rs compiles it with tonic-build and a vendored
 protoc (`protoc-bin-vendored`), exposing the result as `dh_proto::v1`.
 `dh-proto` keeps re-exporting `determinism_proto::common` as the cross-repo
 facade for non-hypervisor shared types; determinism-proto's placeholder
-`hypervisor` feature is no longer consumed by this workspace.
+`hypervisor` feature is no longer consumed by this workspace, and its
+placeholder hypervisor structs must not be extended — schema changes happen
+only in `proto/hypervisor.proto`.
 
 Rationale:
 
 - **Sibling precedent.** snapshot-store faced the same seam and solved it
   the same way: `snapstore-client` generates `determinism.snapstore.v1`
-  in-repo from its own `proto/snapshot_store.proto`, with a documented
+  in-repo from its own `proto/snapshot_store.proto`
+  (`../snapshot-store/crates/snapstore-client/build.rs` and `src/lib.rs`
+  are the mirror of this repo's `crates/dh-proto/` pair), with a documented
   single-module re-export seam for a future control-plane adoption
   ("adopt-snapstore-proto-v1"). Diverging from that pattern would give the
   two service repos two different contract mechanics for no benefit.
