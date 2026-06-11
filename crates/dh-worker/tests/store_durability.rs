@@ -5,14 +5,21 @@
 //! m4_transparency.rs (every one against the real in-process server,
 //! never a mock) and tests/determinism/store_joint.rs (the R12 wire
 //! pins). What this file adds is the half no live-server test had: the
-//! DURABILITY of the receipt. A ref handed out by `take_snapshot` must
-//! survive the server process dying — a NEW server instance over the
-//! same data root must serve the full chain (root + delta) back to a
-//! byte-identical restore.
+//! DURABILITY of the receipt: a NEW server instance over the same data
+//! root must rebuild its world from the persisted bytes and serve the
+//! full chain (root + delta) back to a byte-identical restore.
 //!
-//! If this fails, the store acked before persisting (or persisted
-//! somewhere the next instance cannot see) and every ref the engine ever
-//! returned was a lie — exactly the R12 failure mode.
+//! SCOPE HONESTY (iteration-76 review): both instances live in one OS
+//! process, so this proves RE-OPEN FIDELITY — the on-disk layout is
+//! complete and the recovery scan rebuilds the index from it — not
+//! crash/power-loss durability (the shared page cache would mask a
+//! missing fsync here). The fsync half of R12 is the store's own
+//! contract: `put_snapshot` group-commits (fdatasync of dirty packs +
+//! manifest/shard-dir fsync) BEFORE returning the ref, pinned by the
+//! store's unit tests; fault injection is the chaos bead (v1n). Notably
+//! `ServerHandle::shutdown` is a fire-and-forget stop with no flush or
+//! drain — instance 2 sees only what put-time persistence wrote, which
+//! is as close to a hard kill as one process can get.
 //!
 //! HARDWARE-GATED: kvm-intel lane + lab box; self-skips elsewhere.
 
@@ -42,6 +49,25 @@ fn test_config() -> MachineConfig {
             cmdline: b"console=none".to_vec(),
         },
     )
+}
+
+/// Files under a directory, recursively — the cheap "bytes actually hit
+/// the data root before shutdown" probe.
+fn walkdir_count(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let ty = entry.file_type().expect("file_type");
+            if ty.is_dir() {
+                stack.push(entry.path());
+            } else if ty.is_file() {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 fn boundary() -> BoundaryState {
@@ -171,13 +197,23 @@ fn refs_survive_a_server_restart_and_restore_byte_identically() {
     .expect("re-snapshot against instance 1")
     .snapshot_ref;
 
+    // The receipts must already be ON DISK — every put returned before
+    // this line (the blocking client makes each call fully synchronous),
+    // and shutdown() flushes nothing.
+    let files_before = walkdir_count(dir.path());
+    assert!(
+        files_before > 0,
+        "store returned refs but data_root holds no files"
+    );
+
     // ── KILL the server. Drop the client and its runtime too: nothing of
     //    instance 1 survives but the bytes under data_root. ───────────────
     drop(store1);
     handle1.shutdown();
     drop(rt1);
 
-    // ── Instance 2: same data root, fresh process state ──────────────────
+    // ── Instance 2: same data root, fresh server state (the kept _rt2/
+    //    _handle2 bindings hold the instance alive for the whole leg) ─────
     let (_rt2, _handle2, store2) = spawn_store_at(data_root, "second.sock");
 
     // The receipt must still resolve: manifest, flattened chain, restore.
@@ -196,7 +232,9 @@ fn refs_survive_a_server_restart_and_restore_byte_identically() {
     .expect("restore against the RESTARTED store — the ref must be durable");
 
     // Byte-identical machine: guest-dirtied delta pages, pre-delta RAM,
-    // and the full vCPU state all match the live source slot.
+    // and the full vCPU state all match the live source slot (slot_a is
+    // deliberately kept alive and untouched since the delta — it IS the
+    // ground truth the store must reproduce).
     for (gpa, want) in [(0x2000u64, 0x42u8), (0x5000, 0x43), (0x9000, 0x44)] {
         let mut b = [0u8; 1];
         slot_b2
@@ -218,9 +256,11 @@ fn refs_survive_a_server_restart_and_restore_byte_identically() {
     );
     assert_eq!(outcome2.chain.value(), outcome1.chain.value());
 
-    // The strongest form: re-snapshot through the restarted instance and
-    // the ref is the SAME 32 bytes instance 1 issued — content-addressed
-    // identity carried entirely by the persisted bytes.
+    // Belt-and-braces: the load-bearing durability check is the delta-ref
+    // restore above (it cannot succeed without instance-1's persisted
+    // chain). The ref equality below adds the content-addressed identity
+    // pin — the restarted instance derives the SAME 32 bytes for the same
+    // machine state, so refs stay stable across server generations.
     let ref_b2 = take_snapshot(
         &slot_b2,
         SlotState::Paused,
