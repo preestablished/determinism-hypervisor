@@ -43,6 +43,9 @@ pub struct DirtyRing {
     ring: *mut kvm_dirty_gfn,
     map_len: usize,
     next_harvest: u64,
+    /// Ring size in entries; the cursor mask (must match the size the VM
+    /// enabled the ring with — see `map_sized`).
+    entries: u64,
 }
 
 // SAFETY: the mapping is private to this struct (single owner); entries are
@@ -56,8 +59,16 @@ impl DirtyRing {
     /// the vCPU fd). The VM must have been created with the dirty ring
     /// enabled (kvm.rs does this before any vCPU exists).
     pub fn map(vcpu: &VcpuFd) -> Result<Self, KvmError> {
+        Self::map_sized(vcpu, DIRTY_RING_ENTRIES)
+    }
+
+    /// `map` for a VM created with a non-default ring size (bead 28i
+    /// chaos acceptance): the mmap length and the cursor mask MUST match
+    /// the size passed at `KVM_CAP_DIRTY_LOG_RING_ACQ_REL` enable time
+    /// (`SlotVm::dirty_ring_entries`).
+    pub fn map_sized(vcpu: &VcpuFd, entries: u64) -> Result<Self, KvmError> {
         use std::os::fd::AsRawFd;
-        let map_len = (DIRTY_RING_ENTRIES as usize) * std::mem::size_of::<kvm_dirty_gfn>();
+        let map_len = (entries as usize) * std::mem::size_of::<kvm_dirty_gfn>();
         #[allow(unsafe_code)]
         let p = unsafe {
             libc::mmap(
@@ -79,6 +90,7 @@ impl DirtyRing {
             ring: p.cast::<kvm_dirty_gfn>(),
             map_len,
             next_harvest: 0,
+            entries,
         })
     }
 
@@ -96,7 +108,7 @@ impl DirtyRing {
     pub fn harvest_into(&mut self, set: &mut DirtyPageSet) -> Result<u32, KvmError> {
         let mut harvested = 0u32;
         loop {
-            let idx = (self.next_harvest % DIRTY_RING_ENTRIES) as usize;
+            let idx = (self.next_harvest % self.entries) as usize;
             // SAFETY: idx < DIRTY_RING_ENTRIES bounds the mapping; the
             // flags word is accessed atomically per the ACQ_REL contract
             // (KVM writes it concurrently from the vCPU side).

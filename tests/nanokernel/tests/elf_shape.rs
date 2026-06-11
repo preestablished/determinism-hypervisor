@@ -66,6 +66,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pad_echo", pad_echo_elf());
     assert_guest_shape("entropy_draw", entropy_draw_elf());
     assert_guest_shape("mmio_stepper", mmio_stepper_elf());
+    assert_guest_shape("page_dirtier", page_dirtier_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
