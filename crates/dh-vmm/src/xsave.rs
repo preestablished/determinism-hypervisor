@@ -36,6 +36,10 @@ pub enum XsaveError {
     TooShort { len: usize },
     /// An extended component's area falls outside the buffer.
     ComponentOutOfBounds { bit: u32 },
+    /// XCOMP_BV bit 63 set: a COMPACTED-format area. The fixed offsets
+    /// here are standard-format only; KVM returns standard form, so a
+    /// compacted area means the caller fed something else (55f guard).
+    CompactedFormat,
 }
 
 pub const XSAVE_HEADER_OFFSET: usize = 512;
@@ -63,6 +67,10 @@ pub fn xstate_bv(area: &[u8]) -> Result<u64, XsaveError> {
 /// extended.
 pub fn canonicalize(area: &mut [u8], extended: &[XsaveComponent]) -> Result<(), XsaveError> {
     let bv = xstate_bv(area)?;
+    let xcomp_bv = u64::from_le_bytes(area[520..528].try_into().expect("checked length"));
+    if xcomp_bv >> 63 != 0 {
+        return Err(XsaveError::CompactedFormat);
+    }
     if bv & 1 == 0 {
         area[0..24].fill(0); // FCW/FSW/FTW/FOP/FIP/FDP
         area[32..160].fill(0); // ST0..7
@@ -160,6 +168,13 @@ mod tests {
         let mut a = area_with(0b111, 0xEE);
         canonicalize(&mut a, &[avx]).unwrap();
         assert!(a[576..832].iter().all(|&b| b == 0xEE));
+    }
+
+    #[test]
+    fn compacted_format_is_rejected() {
+        let mut a = area_with(0, 0);
+        a[520..528].copy_from_slice(&(1u64 << 63).to_le_bytes());
+        assert_eq!(canonicalize(&mut a, &[]), Err(XsaveError::CompactedFormat));
     }
 
     #[test]
