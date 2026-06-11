@@ -44,6 +44,13 @@ pub enum SlotState {
     Running,
     Paused,
     Frozen,
+    /// The slot violated a determinism contract (guest-contract fault
+    /// mid-run, log DATA_LOSS at a boundary, divergence detected — proto
+    /// FAULTED_S / StopReason::FAULTED). Terminal short of `Destroy`:
+    /// API.md §2.4 "slot needs Destroy/Restore", and Restore means
+    /// destroy-then-restore-into-a-fresh-slot — a faulted machine's state
+    /// is by definition not trustworthy enough to resume or fork.
+    Faulted,
 }
 
 /// Slot-state machine violation (risk R9). Loud by design: a write-path
@@ -67,6 +74,11 @@ pub enum SlotStateError {
     EmptyWriteDenied {
         api: &'static str,
     },
+    /// A write-path API was invoked on a Faulted slot — its state is
+    /// untrustworthy by definition; the only exits are Destroy.
+    FaultedWriteDenied {
+        api: &'static str,
+    },
 }
 
 impl SlotState {
@@ -79,6 +91,16 @@ impl SlotState {
     ///   (§2.2 DestroyVm semantics).
     /// - `Paused → Empty`, `Frozen → Empty`: DestroyVm. A Running slot must
     ///   pause first — destroying mid-run has no deterministic boundary.
+    /// - `Running → Faulted`: a determinism-contract violation mid-run
+    ///   (guest-contract fault, log DATA_LOSS, counter revocation).
+    /// - `Paused → Faulted`: faults detected AT a boundary (hash
+    ///   divergence, failed device restore on a live slot) — run control
+    ///   pauses first whenever it can, so this edge carries most faults.
+    /// - `Faulted → Empty`: DestroyVm, the ONLY exit (§2.4 "needs
+    ///   Destroy/Restore" — restore lands in a fresh slot). Deliberately
+    ///   ABSENT: `Frozen → Faulted` (a frozen parent executes nothing and
+    ///   accepts no writes, so nothing can fault it; a child faulting is
+    ///   the CHILD's state) and any `Faulted → Paused/Running` resurrection.
     ///
     /// Everything else (including self-transitions) is a state-machine bug
     /// and errors loudly rather than being silently absorbed.
@@ -93,6 +115,9 @@ impl SlotState {
                 | (Frozen, Paused)
                 | (Paused, Empty)
                 | (Frozen, Empty)
+                | (Running, Faulted)
+                | (Paused, Faulted)
+                | (Faulted, Empty)
         )
     }
 
@@ -118,6 +143,7 @@ impl SlotState {
             SlotState::Paused | SlotState::Running => Ok(()),
             SlotState::Frozen => Err(SlotStateError::FrozenWriteDenied { api }),
             SlotState::Empty => Err(SlotStateError::EmptyWriteDenied { api }),
+            SlotState::Faulted => Err(SlotStateError::FaultedWriteDenied { api }),
         }
     }
 }
@@ -199,7 +225,7 @@ mod slot_state_tests {
     use super::SlotState::*;
     use super::*;
 
-    const ALL: [SlotState; 4] = [Empty, Running, Paused, Frozen];
+    const ALL: [SlotState; 5] = [Empty, Running, Paused, Frozen, Faulted];
 
     #[test]
     fn transition_matrix_is_exactly_the_spec_relation() {
@@ -211,6 +237,9 @@ mod slot_state_tests {
             (Frozen, Paused),
             (Paused, Empty),
             (Frozen, Empty),
+            (Running, Faulted),
+            (Paused, Faulted),
+            (Faulted, Empty),
         ];
         for from in ALL {
             for to in ALL {
@@ -262,6 +291,22 @@ mod slot_state_tests {
         );
         assert_eq!(Paused.ensure_write_path("restore"), Ok(()));
         assert_eq!(Running.ensure_write_path("mmio"), Ok(()));
+        assert_eq!(
+            Faulted.ensure_write_path("run"),
+            Err(SlotStateError::FaultedWriteDenied { api: "run" })
+        );
+    }
+
+    #[test]
+    fn faulted_is_terminal_short_of_destroy() {
+        // The only exit is Empty (Destroy); no resurrection, no freezing,
+        // and a frozen parent can never fault (it executes nothing).
+        for to in [Running, Paused, Frozen, Faulted] {
+            assert!(!Faulted.can_transition(to), "Faulted -> {to:?}");
+        }
+        assert!(Faulted.can_transition(Empty));
+        assert!(!Frozen.can_transition(Faulted));
+        assert!(!Empty.can_transition(Faulted));
     }
 
     #[test]
