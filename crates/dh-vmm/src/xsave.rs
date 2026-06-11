@@ -66,7 +66,11 @@ pub fn xstate_bv(area: &[u8]) -> Result<u64, XsaveError> {
 /// the hour). Canonical form = everything zero EXCEPT:
 ///
 /// - MXCSR/MXCSR_MASK `[24, 32)` — always-valid live state, not governed
-///   by an XSTATE_BV bit;
+///   by an XSTATE_BV bit. RESTORE-SAFETY INVARIANT (55f): keeping these
+///   bytes unconditionally is what makes the canonical form exact under
+///   XRSTOR — MXCSR loads from the memory image whenever RFBM covers
+///   SSE/AVX, INDEPENDENT of XSTATE_BV[1], so clearing an init SSE bit
+///   never resets a live MXCSR. Do not gate these bytes on a bit;
 /// - the x87 area `[0, 24) ∪ [32, 160)` iff NORMALIZED bit 0 is set;
 /// - XMM0..15 `[160, 416)` iff normalized bit 1 is set;
 /// - each extended component's area iff its normalized bit is set;
@@ -86,13 +90,15 @@ pub fn canonicalize(area: &mut [u8], extended: &[XsaveComponent]) -> Result<(), 
         return Err(XsaveError::CompactedFormat);
     }
 
-    // INIT-STATE NORMALIZATION first (the iteration-68/69 flake, measured
-    // under parallel-suite load): for logically-init component state, KVM
-    // nondeterministically reports either bit CLEAR (init optimization,
-    // area undefined) or bit SET with the architectural init-pattern bytes
-    // — depending on whether the guest FPU was live in registers or
-    // already saved at ioctl time (host preemption decides). Both encode
-    // the SAME logical state; canonical form is bit clear + zero area.
+    // INIT-STATE NORMALIZATION: for logically-init component state the
+    // kernel ABI permits either encoding — bit CLEAR (init optimization,
+    // area undefined) or bit SET with the architectural init-pattern
+    // bytes — and which one arrives may vary across kernels and fpstate
+    // paths (this box's 6.8 consistently reports x87-init as bit-set;
+    // the measured iteration-68 flake driver was the OTHER hole, gap
+    // garbage — e.g. the real 128-byte non-component gap [832,960) on
+    // this host. Both holes are closed here). Both encodings are the
+    // SAME logical state; canonical form is bit clear + zero area.
     let mut canon_bv = bv;
     if bv & 1 != 0 && is_x87_init(area) {
         canon_bv &= !1;
@@ -120,8 +126,16 @@ pub fn canonicalize(area: &mut [u8], extended: &[XsaveComponent]) -> Result<(), 
             .filter(|&e| e <= area.len())
             .ok_or(XsaveError::ComponentOutOfBounds { bit: c.bit })?;
         if bv & (1u64 << c.bit) != 0 {
-            if area[c.offset..end].iter().all(|&b| b == 0) {
-                canon_bv &= !(1u64 << c.bit); // all-zero ⇒ init for bits ≥ 2
+            // all-zero ⇒ init holds for the SSE-like register components
+            // (AVX YMM_Hi, AVX-512 ZMM halves/opmask) but NOT for every
+            // architectural component — restrict normalization to the
+            // bits where it is known-true; others keep their encoding.
+            // Phase 1 masks all extended state, so this list is ahead of
+            // need; 55f extends it deliberately, never by default.
+            const ZERO_INIT_BITS: u64 = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7);
+            if ZERO_INIT_BITS & (1u64 << c.bit) != 0 && area[c.offset..end].iter().all(|&b| b == 0)
+            {
+                canon_bv &= !(1u64 << c.bit);
             } else {
                 keep.push((c.offset, end));
             }
@@ -133,7 +147,9 @@ pub fn canonicalize(area: &mut [u8], extended: &[XsaveComponent]) -> Result<(), 
         canon[a..b].copy_from_slice(&area[a..b]);
     }
     canon[512..520].copy_from_slice(&canon_bv.to_le_bytes());
-    canon[520..528].copy_from_slice(&xcomp_bv.to_le_bytes());
+    // XCOMP_BV: standard form is 0 (bit63 already rejected above); write
+    // the canonical zero rather than passing through whatever arrived.
+    canon[520..528].copy_from_slice(&0u64.to_le_bytes());
     area.copy_from_slice(&canon);
     Ok(())
 }
