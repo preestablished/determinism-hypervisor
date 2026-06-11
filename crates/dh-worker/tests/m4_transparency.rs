@@ -77,13 +77,13 @@ fn gettid() -> i32 {
     }
 }
 
-fn config() -> MachineConfig {
+fn config(cmdline: &[u8]) -> MachineConfig {
     MachineConfig::new(
         MEM,
         [7; 32], // fixed seed material — identical across all legs
         BootSpec::Elf {
             kernel_hash: [7; 32],
-            cmdline: ITERS_CMDLINE.to_vec(),
+            cmdline: cmdline.to_vec(),
         },
     )
 }
@@ -92,6 +92,7 @@ fn config() -> MachineConfig {
 #[allow(clippy::type_complexity)]
 fn boot(
     elf: &[u8],
+    cmdline: &[u8],
 ) -> (
     KvmSystem,
     SlotVm,
@@ -102,7 +103,7 @@ fn boot(
     dh_vmm::run::install_kick_handler().unwrap();
     let sys = KvmSystem::open().unwrap();
     let slot = sys.create_slot_vm(MEM).unwrap();
-    dh_vmm::boot::load_and_enter(&slot, elf, ITERS_CMDLINE).unwrap();
+    dh_vmm::boot::load_and_enter(&slot, elf, cmdline).unwrap();
     let counter = InstRetired::open_for_current_thread().unwrap();
     counter
         .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
@@ -114,7 +115,7 @@ fn boot(
         sys,
         slot,
         counter,
-        config(),
+        config(cmdline),
         StateHashChain::new(&[7; 32], &[7; 32]),
     )
 }
@@ -161,7 +162,8 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     }
 
     // ── Control leg: 1e8 + pause + 1e8, no snapshot machinery ────────────
-    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let (_sys, mut slot, counter, cfg, mut chain) =
+        boot(nanokernel::landing_loop_elf(), ITERS_CMDLINE);
     let c1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
     let c2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF, &[]);
     let h2 = c2.state_hash;
@@ -171,7 +173,8 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     //    epoch grid still links at 50/100/150/200M, so the chain is
     //    comparable — H3 == H2 pins that the segment SPLIT is invisible,
     //    isolating what H1 == H2 then attributes to the snapshot detour. ──
-    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let (_sys, mut slot, counter, cfg, mut chain) =
+        boot(nanokernel::landing_loop_elf(), ITERS_CMDLINE);
     let u = run_more(&mut slot, &counter, &mut chain, &cfg, FULL, &[]);
     assert_eq!(
         u.state_hash, h2,
@@ -181,7 +184,8 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     drop(slot);
 
     // ── Roundtrip leg: 1e8 + TakeSnapshot + destroy + restore + 1e8 ──────
-    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let (_sys, mut slot, counter, cfg, mut chain) =
+        boot(nanokernel::landing_loop_elf(), ITERS_CMDLINE);
     let r1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
 
     // Cold-boot determinism (the M3 property) must hold first — otherwise
@@ -271,13 +275,15 @@ fn fork_roundtrip_is_invisible_to_the_hash_chain() {
     }
 
     // Control: 1e8 + pause + 1e8 (identical to the restore leg's control).
-    let (_sys, mut slot, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let (_sys, mut slot, counter, cfg, mut chain) =
+        boot(nanokernel::landing_loop_elf(), ITERS_CMDLINE);
     let c1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF, &[]);
     let c2 = run_more(&mut slot, &counter, &mut chain, &cfg, FULL - HALF, &[]);
     drop(slot);
 
     // Fork leg: 1e8, freeze, fork, run the CHILD 1e8 more.
-    let (sys, mut parent, counter, cfg, mut chain) = boot(nanokernel::landing_loop_elf());
+    let (sys, mut parent, counter, cfg, mut chain) =
+        boot(nanokernel::landing_loop_elf(), ITERS_CMDLINE);
     let r1 = run_more(&mut parent, &counter, &mut chain, &cfg, HALF, &[]);
     assert_eq!(r1, c1, "the legs diverged BEFORE the fork");
 
@@ -324,7 +330,10 @@ fn fork_roundtrip_is_invisible_to_the_hash_chain() {
 /// (chain value = full-RAM + vCPU walk, plus the guest-visible ISR
 /// delivery table). Children run on the §3.1 reset counter axis
 /// (`counter: Some` in the fork), so both share an identical 0-based
-/// agenda for X.
+/// agenda for X — and the chain links' vns is pure counter-space too
+/// (vt.rs has no vns_base term; PvClock's base only feeds guest MMIO
+/// reads, which this guest never does), so A and B are comparable by
+/// construction, not by accident.
 #[test]
 fn frozen_parent_children_replay_identical_inputs_identically() {
     if !kvm_available() {
@@ -348,7 +357,7 @@ fn frozen_parent_children_replay_identical_inputs_identically() {
         },
     ];
 
-    let (sys, mut parent, counter, cfg, mut chain) = boot(nanokernel::timer_guest_elf());
+    let (sys, mut parent, counter, cfg, mut chain) = boot(nanokernel::timer_guest_elf(), b"");
     let r_parent = run_more(&mut parent, &counter, &mut chain, &cfg, PARENT_RUN, &[]);
     parent.freeze_ram().expect("freeze parent");
     let bus_p = test_bus();
@@ -361,7 +370,7 @@ fn frozen_parent_children_replay_identical_inputs_identically() {
         agenda_empty: true,
     };
 
-    let run_child = |label: &str| {
+    let run_child = |label: &str, injections: &[ScheduledInjection]| {
         let mut bus_c = test_bus();
         let outcome = fork_slot(
             &sys,
@@ -377,7 +386,10 @@ fn frozen_parent_children_replay_identical_inputs_identically() {
         .unwrap_or_else(|e| panic!("fork {label}: {e:?}"));
         let mut child = outcome.child;
         let mut chain = outcome.chain;
-        let out = run_more(&mut child, &counter, &mut chain, &cfg, CHILD_RUN, &inputs_x);
+        assert_eq!(outcome.cumulative_icount, PARENT_RUN);
+        let out = run_more(
+            &mut child, &counter, &mut chain, &cfg, CHILD_RUN, injections,
+        );
 
         // The guest-visible record of X: the timer guest's ISR table.
         let mut head = [0u8; 8];
@@ -397,14 +409,47 @@ fn frozen_parent_children_replay_identical_inputs_identically() {
         (out, count, vectors)
     };
 
-    let (out_a, count_a, vec_a) = run_child("A");
+    let (out_a, count_a, vec_a) = run_child("A", &inputs_x);
     // Child A diverged (it ran with X); child B forks AFTER that and must
     // reproduce A bit-for-bit from the frozen base.
-    let (out_b, count_b, vec_b) = run_child("B");
+    let (out_b, count_b, vec_b) = run_child("B", &inputs_x);
 
     assert_eq!(out_a.injections_delivered, 3, "inputs X did not all land");
     assert_eq!(count_a, 3, "guest table disagrees with delivery count");
     assert_eq!(vec_a, vec![0x40, 0x41, 0x40], "guest saw the wrong vectors");
     assert_eq!(out_a, out_b, "second child diverged from the first");
     assert_eq!((count_a, &vec_a), (count_b, &vec_b));
+
+    // Divergence sensitivity (the test CAN fail): a third child with
+    // DIFFERENT inputs Y must produce a different hash and table.
+    let inputs_y: Vec<ScheduledInjection> = vec![
+        ScheduledInjection {
+            icount: 600_000,
+            vector: 0x41,
+        },
+        ScheduledInjection {
+            icount: 1_100_000,
+            vector: 0x40,
+        },
+    ];
+    let (out_y, count_y, vec_y) = run_child("Y", &inputs_y);
+    assert_eq!(out_y.injections_delivered, 2);
+    assert_ne!(out_y.state_hash, out_a.state_hash, "X vs Y must diverge");
+    assert_ne!((count_y, &vec_y), (count_a, &vec_a));
+
+    // The frozen parent stayed pristine through three children: its ISR
+    // table never recorded a delivery.
+    let mut parent_head = [0u8; 8];
+    parent
+        .guest_mem
+        .read_slice(
+            &mut parent_head,
+            GuestAddress(nanokernel::TIMER_GUEST_TABLE_GPA),
+        )
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(parent_head),
+        0,
+        "child deliveries leaked into the frozen parent's table"
+    );
 }
