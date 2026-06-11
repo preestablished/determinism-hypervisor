@@ -122,6 +122,14 @@ impl MmioBus {
     pub fn devices(&self) -> impl Iterator<Item = (u64, &dyn DetDevice)> {
         self.devices.iter().map(|(b, d)| (*b, d.as_ref()))
     }
+
+    /// Mutable device pass for the restore engine (ARCH §8.3 device-restore
+    /// step). Same deterministic base order as [`Self::devices`].
+    pub fn devices_mut<'a>(
+        &'a mut self,
+    ) -> impl Iterator<Item = (u64, &'a mut (dyn DetDevice + 'static))> + 'a {
+        self.devices.iter_mut().map(|(b, d)| (*b, d.as_mut()))
+    }
 }
 
 #[cfg(test)]

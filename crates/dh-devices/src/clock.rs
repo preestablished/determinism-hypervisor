@@ -175,6 +175,12 @@ impl DetDevice for PvClock {
         self.timer_vector = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         Ok(())
     }
+
+    /// The restore engine sets `vns_base` from the TIME section (§8.3) —
+    /// CLKD deliberately never carries it (see [`Self::set_vns_base`]).
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]

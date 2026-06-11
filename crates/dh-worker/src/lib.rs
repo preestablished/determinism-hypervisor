@@ -2,6 +2,8 @@
 
 pub mod preflight;
 #[cfg(target_arch = "x86_64")]
+pub mod restore_engine;
+#[cfg(target_arch = "x86_64")]
 pub mod snapshot_engine;
 
 pub fn preflight_summary() -> String {

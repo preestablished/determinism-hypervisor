@@ -55,6 +55,15 @@ pub trait DetDevice {
     /// `section_version`). Must be a pure function of device state.
     fn snapshot(&self, out: &mut Vec<u8>);
     fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError>;
+    /// Restore-engine downcast seam (ARCH §8.3). A device whose restore
+    /// needs engine-supplied state that is NOT in its own DHSNAP section
+    /// overrides this to expose its concrete type. Today that is exactly
+    /// `PvClock`: its `vns_base` comes from the snapshot's TIME section
+    /// (the new segment starts at icount 0, so base = absolute vns at the
+    /// boundary) — by design CLKD never carries it. Default: no downcast.
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        None
+    }
 }
 
 pub fn input_payload_digest(payload: &[u8]) -> [u8; 32] {
