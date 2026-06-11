@@ -162,7 +162,21 @@ pub fn land_at(
             match guard.run() {
                 // One step. The counter re-read at loop top is the ONLY
                 // progress signal (never assume +1; REP rule).
-                Ok(VcpuExit::Debug(_)) => {}
+                //
+                // MEASURED (iteration 83, bead 4a3, kernel 6.8): a Debug
+                // exit DELIVERED BY THE EMULATOR's completion path (the
+                // singlestep hook that fires when an emulated MMIO
+                // instruction finishes) CONSUMES the guest_debug arming —
+                // without the re-assert below, the entry after such a
+                // Debug exit free-runs to the next natural exit (the
+                // mmio_stepper probe measured +18, the iteration-82
+                // goal-poll overshoot +74). Hardware-delivered #DBs do
+                // not need it, but the two are indistinguishable here
+                // and the re-assert is idempotent — re-arm on EVERY
+                // step.
+                Ok(VcpuExit::Debug(_)) => {
+                    set_singlestep(&mut guard, true)?;
+                }
                 Ok(exit) => {
                     on_exit(exit)?;
                     // MEASURED (iteration 50, kernel 6.8): an MMIO-WRITE
@@ -410,5 +424,83 @@ mod tests {
                 counted: 50_000
             }
         ));
+    }
+
+    /// Iteration-83 probe (bead 4a3): land EXACTLY inside the
+    /// mmio_stepper guest — a long-mode loop whose body is the doorbell
+    /// cluster (imm dword MMIO write, 8-byte reg MMIO write, MMIO read,
+    /// 16 nops). The single-step walk must cross hundreds of emulated
+    /// MMIO exits without losing the trap; the iteration-82 goal-poll
+    /// overshoot (target 4096, counted 4170) is THIS path. Targets are
+    /// chosen deep in the loop so the walk spans many clusters; with
+    /// production margins every landing here is pure stepping.
+    fn stepper_rig() -> Option<(crate::kvm::SlotVm, InstRetired)> {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return None;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::mmio_stepper_elf(), b"").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        Some((slot, counter))
+    }
+
+    fn ack_mmio(exit: VcpuExit) -> Result<(), BoundaryError> {
+        match exit {
+            VcpuExit::MmioWrite(_, _) => Ok(()),
+            VcpuExit::MmioRead(_, data) => {
+                data.fill(0);
+                Ok(())
+            }
+            other => Err(BoundaryError::Exit(format!("unexpected exit {other:?}"))),
+        }
+    }
+
+    /// The iteration-82 repro shape: one landing at 4096, mid-loop.
+    #[test]
+    fn landing_at_4096_across_mmio_clusters_is_exact_live() {
+        let Some((mut slot, counter)) = stepper_rig() else {
+            return;
+        };
+        let b = land_at(
+            &mut slot.vcpu,
+            &counter,
+            4096,
+            &Margins::default(),
+            &mut ack_mmio,
+        )
+        .expect("landing across MMIO clusters");
+        assert_eq!(b.icount, 4096);
+    }
+
+    /// Consecutive landings marching THROUGH the MMIO-dense region —
+    /// every step-walk distance from 1 to a full cluster width gets
+    /// exercised against every instruction offset in the body.
+    #[test]
+    fn consecutive_landings_across_mmio_clusters_are_exact_live() {
+        let Some((mut slot, counter)) = stepper_rig() else {
+            return;
+        };
+        let mut target = 100;
+        for k in 0..120 {
+            target += 1 + (k % 23);
+            let b = land_at(
+                &mut slot.vcpu,
+                &counter,
+                target,
+                &Margins::default(),
+                &mut ack_mmio,
+            )
+            .unwrap_or_else(|e| panic!("landing {k} at {target}: {e:?}"));
+            assert_eq!(b.icount, target, "landing {k}");
+        }
     }
 }
