@@ -721,6 +721,79 @@ mod halt_tests {
         assert_eq!(serial, b"K", "serial captured before the halt survives");
         assert!(out.boundary.icount < 1_000_000);
     }
+
+    /// Resume-after-HLT across SEGMENTS (iteration-82 review): the
+    /// batched-guest pattern (entropy_draw HLTs every batch and the
+    /// harness re-runs) rests on KVM advancing RIP past the HLT before
+    /// the exit, so the next segment resumes AFTER it — pin that at the
+    /// VMM layer. pipeline_smoke parks in a hlt spin: every re-entered
+    /// segment must halt again, strictly further along, never fault or
+    /// re-deliver stale state.
+    #[test]
+    fn segments_resume_past_a_halt_live() {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::pipeline_smoke_elf(), b"").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+
+        let config = MachineConfig::new(
+            16 << 20,
+            [0; 32],
+            crate::config::BootSpec::Elf {
+                kernel_hash: [0; 32],
+                cmdline: Vec::new(),
+            },
+        );
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut last_icount = 0u64;
+        for round in 0..3 {
+            let start = counter.read().unwrap();
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: start,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+            };
+            let out = run_segment(
+                &mut seg,
+                Until::IcountBudget(1_000_000),
+                &mut || false,
+                &mut |exit| {
+                    if let VcpuExit::IoOut(port, _) = exit {
+                        if (0x3F8..0x400).contains(&port) {
+                            return Ok(());
+                        }
+                    }
+                    Err(BoundaryError::Exit(format!("unexpected: {exit:?}")))
+                },
+            )
+            .unwrap();
+            assert_eq!(out.reason, StopReason::GuestHalted, "round {round}");
+            assert!(
+                out.boundary.icount > last_icount,
+                "round {round}: did not resume past the previous halt \
+                 ({} <= {last_icount})",
+                out.boundary.icount
+            );
+            last_icount = out.boundary.icount;
+        }
+    }
 }
 
 #[cfg(test)]

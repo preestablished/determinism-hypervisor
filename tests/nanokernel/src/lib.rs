@@ -102,6 +102,24 @@ pub const PAD_ECHO_TABLE_CAPACITY: u64 = 1 << 16;
 /// asm %define (drift-tested).
 pub const PAD_ECHO_PACE_ITERS: u64 = 64;
 
+/// entropy_draw (bead dy8): the M4 ENTR-golden guest — an infinite loop
+/// of 16-byte draws through the real pv-entropy MMIO doorbell path,
+/// raw output ringed at the table below. STATUS!=OK halts loudly.
+pub fn entropy_draw_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/entropy_draw.elf"))
+}
+
+/// entropy_draw's ring GPA: u64 MONOTONE count, then CAPACITY slots of
+/// DRAW_BYTES raw draw output; draw i at slot (i & (CAPACITY-1)).
+/// Mirrors the asm %defines (drift-tested).
+pub const ENTROPY_DRAW_TABLE_GPA: u64 = 0x50_0000;
+pub const ENTROPY_DRAW_BYTES: u64 = 16;
+pub const ENTROPY_DRAW_RING_CAPACITY: u64 = 1 << 15;
+/// Draws per batch: the guest HLTs after each batch (an exact, zero-skid
+/// exit), so the harness never needs a PMI landing inside MMIO-dense
+/// code. Mirrors the asm %define (drift-tested).
+pub const ENTROPY_DRAW_BATCH: u64 = 256;
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 

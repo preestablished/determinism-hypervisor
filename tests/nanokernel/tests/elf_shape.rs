@@ -64,6 +64,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("rep_loop", rep_loop_elf());
     assert_guest_shape("sse_probe", sse_probe_elf());
     assert_guest_shape("pad_echo", pad_echo_elf());
+    assert_guest_shape("entropy_draw", entropy_draw_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -282,4 +283,41 @@ fn pad_echo_asm_matches_rust_constants() {
         }
     }
     assert_eq!(instrs, 7, "pace-loop body drifted");
+}
+
+/// Same drift pin for entropy_draw (bead dy8).
+#[test]
+fn entropy_draw_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/entropy_draw.asm"))
+        .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("TABLE_GPA"), ENTROPY_DRAW_TABLE_GPA);
+    assert_eq!(define("RING_MASK"), ENTROPY_DRAW_RING_CAPACITY - 1);
+    assert_eq!(define("DRAW_BYTES"), ENTROPY_DRAW_BYTES);
+    assert_eq!(define("BATCH_DRAWS"), ENTROPY_DRAW_BATCH);
+    // Device-side truth: register offsets from dh-devices; the window
+    // base matches the joint-test bus convention (0xD000_3000).
+    assert_eq!(define("REG_BUF_GPA"), dh_devices::entropy::REG_BUF_GPA);
+    assert_eq!(define("REG_LEN"), dh_devices::entropy::REG_LEN);
+    assert_eq!(define("REG_DOORBELL"), dh_devices::entropy::REG_DOORBELL);
+    assert_eq!(define("REG_STATUS"), dh_devices::entropy::REG_STATUS);
+    assert_eq!(
+        u32::try_from(define("STATUS_OK")).unwrap(),
+        dh_devices::entropy::STATUS_OK
+    );
+    assert_eq!(define("ENT_BASE"), 0xD000_3000);
 }
