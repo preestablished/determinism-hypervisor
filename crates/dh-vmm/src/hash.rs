@@ -8,10 +8,11 @@
 //! Phase-1 scoping (M4 extends, never replaces — same harvest order):
 //! - the page walk is FULL MEMORY (every page, ascending); the dirty-ring
 //!   delta arrives with M4's snapshot codec;
-//! - the vCPU blob is the §8.1 non-XSAVE subset (REGS/SREGS2/FPU/
-//!   VCPU_EVENTS/DEBUGREGS + the explicit MSR list), serialized
-//!   field-by-field little-endian below — XSAVE canonicalization is
-//!   deferred to M4 (sequencing guard);
+//! - the vCPU blob is the §8.1 subset (REGS/SREGS2/FPU/VCPU_EVENTS/
+//!   DEBUGREGS + the explicit MSR list) serialized field-by-field
+//!   little-endian below, PLUS the full XSAVE area in §8.1 CANONICAL form
+//!   (clear-XSTATE_BV components zeroed — crate::xsave, bead ec4; the
+//!   Phase-1 deferral is resolved);
 //! - IA32_TSC is hashed in NORMALIZED form (vns), matching §8.1's restore
 //!   rule — the raw captured TSC is host state until the M2 alignment
 //!   bead lands.
@@ -265,6 +266,18 @@ pub fn canonical_vcpu_blob(vcpu: &VcpuFd, vns: u64) -> Result<Vec<u8>, KvmError>
     // lying field would let it escape replay verification.
     let xsave = vcpu.get_xsave().map_err(kvm_err("KVM_GET_XSAVE"))?;
     out.extend_from_slice(&xsave.region[6].to_le_bytes());
+
+    // Full XSAVE area, CANONICALIZED (ARCH §8.1, risk R7, bead ec4): each
+    // component whose XSTATE_BV bit is clear is zeroed, so logically-equal
+    // state hashes equal. The M4 deferral in this module's doc is resolved
+    // here for the hash path; the DHSNAP vCPU section reuses the same
+    // transform (bead 55f). MXCSR above stays as its own pinned field —
+    // the canonical area INCLUDES it, the duplication is two bytes of
+    // belt-and-braces, not a second source of truth.
+    let mut xsave_bytes: Vec<u8> = xsave.region.iter().flat_map(|w| w.to_le_bytes()).collect();
+    crate::xsave::canonicalize(&mut xsave_bytes, &crate::xsave::host_component_layout())
+        .map_err(|e| KvmError::Open(format!("XSAVE canonicalization: {e:?}")))?;
+    out.extend_from_slice(&xsave_bytes);
 
     // VCPU_EVENTS: pending exception/interrupt/NMI/SMI state.
     // exception_has_payload/exception_payload are deliberately omitted in
