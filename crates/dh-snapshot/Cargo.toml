@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dev-dependencies]
+# ENTR round-trip integration (tests/entr_roundtrip.rs, bead 6yl).
+dh-devices.workspace = true
 # Golden-fixture hash pins (tests/golden.rs, bead 9tl).
 blake3.workspace = true
 # M4 store-integration readiness gate (bead 4nj): pins the sibling

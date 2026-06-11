@@ -312,6 +312,7 @@ name = "dh-snapshot"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "dh-devices",
  "snapstore-client",
 ]
 

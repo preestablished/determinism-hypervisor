@@ -350,3 +350,40 @@ mod tests {
         assert_eq!(u32::from_le_bytes(v), STATUS_IDLE); // write ignored
     }
 }
+
+#[cfg(test)]
+mod kat_tests {
+    use super::*;
+    use crate::EntropySource;
+
+    /// Known-answer pins for the ChaCha20 stream (review iteration 71):
+    /// rand_chacha is caret-ranged ("0.3"), and ENTR resume depends on its
+    /// exact stream semantics — a dep upgrade that changes the bytes or
+    /// the stream/word_pos interpretation must fail HERE, loudly, not as
+    /// a silent cross-version replay divergence.
+    #[test]
+    fn chacha_stream_known_answers_are_pinned() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        let mut e = DetEntropy::from_seed([0x42; 32]);
+        let mut buf = [0u8; 32];
+        e.fill(&mut buf);
+        assert_eq!(
+            hex(&buf),
+            "a4ddf31f7f32ba696f14ce50ecf3f21e3e100e83bdf47966e7b07468e9500b6e"
+        );
+
+        // Nonzero stream + word_pos (the restore path's parameter space).
+        let mut e2 = DetEntropy::restore(EntropyState {
+            seed: [0x42; 32],
+            stream: 7,
+            word_pos: 100,
+        });
+        let mut buf2 = [0u8; 32];
+        e2.fill(&mut buf2);
+        assert_eq!(
+            hex(&buf2),
+            "65293f16d9340772bc58bcfabb3ef8331b3dffec0ea4cd3d01af0346bc70ff0c"
+        );
+    }
+}
