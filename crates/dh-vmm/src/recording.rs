@@ -271,6 +271,22 @@ impl<M: GuestMem> DeviceRail<M> {
         Ok(())
     }
 
+    /// Land the epoch links a quantum collected (the
+    /// `run_segment_with_epochs` sink) as AUX EPOCH_HASH records — call
+    /// right after each quantum returns, before the next runs.
+    pub fn log_epoch_hashes(
+        &mut self,
+        links: &[(u64, u64, [u8; 32])],
+        boundary_rip: u64,
+    ) -> Result<(), RecordError> {
+        for (epoch_index, icount, chain_value) in links {
+            self.log
+                .epoch_hash(*icount, boundary_rip, *epoch_index, *chain_value)
+                .map_err(RecordError::Log)?;
+        }
+        Ok(())
+    }
+
     /// Seal the segment from its outcome (§3.1: SealParams come from the
     /// boundary outcome, the END stop_reason mirrors proto StopReason).
     /// Errors if any device-queued vector was never drained — a dropped
@@ -549,6 +565,111 @@ mod live_tests {
             self.0
                 .write_slice(data, GuestAddress(gpa))
                 .map_err(|_| dh_devices::ctx::MemError)
+        }
+    }
+
+    /// The y62 live proof: epoch links collected by the sink land as AUX
+    /// EPOCH_HASH records with the right indices, and the sealed header
+    /// carries FLAG_EPOCH_HASHES. Small epoch grid so one quantum crosses
+    /// several epochs.
+    #[test]
+    fn epoch_hashes_flow_from_quantum_to_sealed_log() {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::landing_loop_elf(), b"1000000000").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+
+        let mut config = crate::config::MachineConfig::new(
+            16 << 20,
+            [0x66; 32],
+            crate::config::BootSpec::Elf {
+                kernel_hash: [0x66; 32],
+                cmdline: b"1000000000".to_vec(),
+            },
+        );
+        config.epoch_len = 30_000; // several epochs inside one quantum
+        let mut rail = DeviceRail::new(
+            MmioBus::new(),
+            DetEntropy::from_seed([3; 32]),
+            LogWriter::new(SegmentHeader {
+                base_snapshot_id: [0x11; 32],
+                entropy_seed: [0; 32],
+                machine_config_hash: [0x22; 32],
+                clock_num: 1,
+                clock_den: 1,
+                encoder_fingerprint: 0,
+            }),
+            VmMem(slot.guest_mem.clone()),
+        );
+        let mut chain = StateHashChain::new(&[0x22; 32], &[0x11; 32]);
+        let pause = std::sync::atomic::AtomicBool::new(false);
+        let mut links = Vec::new();
+        let out = {
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+            };
+            let counter_ref = &counter;
+            crate::runctl::run_segment_with_epochs(
+                &mut seg,
+                Until::IcountBudget(100_000),
+                &mut || false,
+                &mut |exit| {
+                    let icount = counter_ref
+                        .read()
+                        .map_err(|e| crate::boundary::BoundaryError::Exit(format!("{e:?}")))?;
+                    rail.service_exit(icount, exit)
+                },
+                &mut links,
+            )
+            .unwrap()
+        };
+        assert_eq!(out.reason, StopReason::BudgetReached);
+        // Epochs at 30k/60k/90k inside the 100k budget.
+        assert_eq!(
+            links
+                .iter()
+                .map(|(idx, ic, _)| (*idx, *ic))
+                .collect::<Vec<_>>(),
+            vec![(1, 30_000), (2, 60_000), (3, 90_000)]
+        );
+        assert!(links.iter().all(|(_, _, h)| *h != [0u8; 32]));
+
+        rail.log_epoch_hashes(&links, 0).unwrap();
+        let sealed = rail.seal(&out, [0; 32]).unwrap();
+        let r = LogReader::parse(&sealed).unwrap();
+        assert!(r.header().has_epoch_hashes(), "header flag must be set");
+        let eh: Vec<_> = r
+            .aux()
+            .filter_map(|rec| match rec.body() {
+                RecordBody::EpochHash {
+                    epoch_index,
+                    chain_value,
+                } => Some((rec.icount(), epoch_index, chain_value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(eh.len(), 3);
+        for ((idx, ic, h), (rec_ic, rec_idx, rec_h)) in links.iter().zip(eh.iter()) {
+            assert_eq!((idx, ic), (rec_idx, rec_ic));
+            assert_eq!(h, rec_h);
         }
     }
 

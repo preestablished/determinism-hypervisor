@@ -116,6 +116,7 @@ pub struct LogWriter {
     record_count: u64,
     last_icount: u64,
     has_aux: bool,
+    wrote_epoch_hash: bool,
 }
 
 impl LogWriter {
@@ -126,6 +127,7 @@ impl LogWriter {
             record_count: 0,
             last_icount: 0,
             has_aux: false,
+            wrote_epoch_hash: false,
         }
     }
 
@@ -248,6 +250,25 @@ impl LogWriter {
         self.record(KIND_NET_TX, RFLAG_AUX, icount, boundary_rip, &payload)
     }
 
+    /// AUX EPOCH_HASH (§3.3, the M5 writer): the §8.5 chain value just
+    /// pushed at an epoch-grid boundary — `epoch_index u64 ‖ chain_value
+    /// [u8;32]` (40 bytes, the reader's frozen decode shape). Sealing a
+    /// log that carried any of these sets FLAG_EPOCH_HASHES.
+    pub fn epoch_hash(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        epoch_index: u64,
+        chain_value: [u8; 32],
+    ) -> Result<(), WriteError> {
+        let mut payload = [0u8; 40];
+        payload[0..8].copy_from_slice(&epoch_index.to_le_bytes());
+        payload[8..40].copy_from_slice(&chain_value);
+        self.record(KIND_EPOCH_HASH, RFLAG_AUX, icount, boundary_rip, &payload)?;
+        self.wrote_epoch_hash = true;
+        Ok(())
+    }
+
     /// TIMER_FIRE (§3.3): delivery may defer past the arm target per the
     /// §3.4 injectability rule, hence both the armed deadline and the
     /// actually-delivered icount.
@@ -318,7 +339,13 @@ impl LogWriter {
         buf[0..6].copy_from_slice(b"DHILOG");
         buf[6..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
-        let flags = FLAG_SEALED | if self.has_aux { FLAG_HAS_AUX } else { 0 };
+        let flags = FLAG_SEALED
+            | if self.has_aux { FLAG_HAS_AUX } else { 0 }
+            | if self.wrote_epoch_hash {
+                FLAG_EPOCH_HASHES
+            } else {
+                0
+            };
         buf[12..16].copy_from_slice(&flags.to_le_bytes());
         buf[16..48].copy_from_slice(&h.base_snapshot_id);
         buf[48..80].copy_from_slice(&params.end_snapshot_id);

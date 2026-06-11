@@ -171,6 +171,23 @@ pub fn run_segment(
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
+    run_segment_with_epochs(seg, until, goal, on_exit, &mut Vec::new())
+}
+
+/// `run_segment` plus the M5 epoch-link sink (bead y62): every §8.5
+/// chain link pushed AT AN EPOCH-GRID POINT during this quantum is
+/// appended as `(epoch_index, icount, chain_value_after_push)` — the
+/// caller (the recording rail) lands them as AUX EPOCH_HASH records
+/// after the quantum returns (the log cannot be borrowed inside; on_exit
+/// holds it). Final-pause links at NON-epoch boundaries are NOT epoch
+/// hashes — they travel in END.end_state_hash.
+pub fn run_segment_with_epochs(
+    seg: &mut Segment<'_>,
+    until: Until,
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    epoch_sink: &mut Vec<(u64, u64, [u8; 32])>,
+) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {
         skid_margin: u64::from(seg.config.skid_margin),
@@ -317,6 +334,8 @@ pub fn run_segment(
             seg.chain
                 .push_final_link(seg.slot, &[], point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
+            let epoch = seg.config.epoch_len.max(1);
+            epoch_sink.push((point.icount / epoch, point.icount, seg.chain.value()));
         }
 
         // goal() must be a deterministic function of guest state (M6 goal
@@ -373,6 +392,9 @@ pub fn run_segment(
             seg.chain
                 .push_final_link(seg.slot, &[], b.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
+            // The roll-forward lands ON the epoch grid by construction —
+            // this link IS an epoch hash (b.icount is a grid multiple).
+            epoch_sink.push((b.icount / epoch, b.icount, seg.chain.value()));
             return Ok(SegmentOutcome {
                 reason: StopReason::Paused,
                 boundary: b,
