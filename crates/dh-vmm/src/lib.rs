@@ -35,6 +35,8 @@ pub mod run;
 pub mod runctl;
 #[cfg(target_arch = "x86_64")]
 pub mod tsc;
+#[cfg(target_arch = "x86_64")]
+pub mod vcpu_state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
