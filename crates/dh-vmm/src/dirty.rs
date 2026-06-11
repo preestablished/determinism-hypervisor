@@ -9,7 +9,9 @@
 //! free-running cursor (`next_harvest`) never rewinds: ring slots are
 //! consumed strictly in order, so a harvest at a pause boundary plus the
 //! same call on `KVM_EXIT_DIRTY_RING_FULL` is loss-free by construction —
-//! KVM cannot overwrite an un-RESET entry; it exits ring-full instead.
+//! KVM never overwrites an un-RESET entry: it exits ring-full (at the
+//! kernel's soft-full watermark, which leaves headroom for in-flight
+//! dirtying) and the vCPU cannot re-enter until a reset frees slots.
 //!
 //! The dirty set itself is a dense per-slot bitmap ([`DirtyPageSet`]).
 //! ARCHITECTURE §8.2 sketches `RoaringBitmap<page_idx>`; v1 guests are
@@ -22,6 +24,9 @@ use kvm_bindings::{kvm_dirty_gfn, kvm_userspace_memory_region, KVM_DIRTY_LOG_PAG
 use kvm_ioctls::{VcpuFd, VmFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// 4 KiB pages — the §7.4 MADV_NOHUGEPAGE invariant makes this exact.
+/// (hash.rs carries a usize twin for its slice math; both are pinned to
+/// the architectural page size, not tunable.)
 pub const PAGE_SIZE: u64 = 4096;
 
 // kvm_dirty_gfn.flags bits (kernel ABI; kvm-bindings 0.14 exports only
@@ -81,6 +86,13 @@ impl DirtyRing {
     /// the number harvested. Caller follows up with [`reset_dirty_rings`]
     /// (per ARCH §8.2: drain → reset) — entries are not reusable by KVM
     /// until then.
+    ///
+    /// ERROR CONTRACT (for the snapshot engine, bead qmp): a mid-harvest
+    /// error (unexpected memslot, out-of-range GFN) is TERMINAL for the
+    /// slot — it means KVM and our memory model disagree. Do not build a
+    /// retry-the-boundary loop on it; destroy/restore the slot. (Entries
+    /// already marked RESET before the error are reaped by the kernel on
+    /// the next reset ioctl; nothing is stranded — verified empirically.)
     pub fn harvest_into(&mut self, set: &mut DirtyPageSet) -> Result<u32, KvmError> {
         let mut harvested = 0u32;
         loop {
