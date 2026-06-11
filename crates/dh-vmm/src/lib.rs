@@ -98,9 +98,14 @@ impl SlotState {
     ///   pauses first whenever it can, so this edge carries most faults.
     /// - `Faulted → Empty`: DestroyVm, the ONLY exit (§2.4 "needs
     ///   Destroy/Restore" — restore lands in a fresh slot). Deliberately
-    ///   ABSENT: `Frozen → Faulted` (a frozen parent executes nothing and
-    ///   accepts no writes, so nothing can fault it; a child faulting is
-    ///   the CHILD's state) and any `Faulted → Paused/Running` resurrection.
+    ///   ABSENT: `Frozen → Faulted` — scoped to GUEST-CONTRACT faults,
+    ///   which cannot originate in a slot that executes nothing and
+    ///   accepts no writes (a child faulting is the CHILD's state);
+    ///   host-side integrity failures on a frozen parent (seal read
+    ///   error, KVM fd death) route to Destroy via the existing
+    ///   `Frozen → Empty`. Also absent: any `Faulted → Paused/Running`
+    ///   resurrection. (This relation is pure in-memory code — adding an
+    ///   edge later is one match arm, nothing stored migrates.)
     ///
     /// Everything else (including self-transitions) is a state-machine bug
     /// and errors loudly rather than being silently absorbed.
@@ -295,6 +300,27 @@ mod slot_state_tests {
             Faulted.ensure_write_path("run"),
             Err(SlotStateError::FaultedWriteDenied { api: "run" })
         );
+    }
+
+    /// Structural properties stated INDEPENDENTLY of the edge list (the
+    /// matrix test mirrors the list, which only catches drift): exactly
+    /// the executing-or-executable states can fault, and every state can
+    /// reach Empty (no slot is ever stuck beyond Destroy).
+    #[test]
+    fn structural_properties_hold() {
+        for s in ALL {
+            assert_eq!(
+                s.can_transition(Faulted),
+                matches!(s, Running | Paused),
+                "{s:?} fault reachability"
+            );
+            let reaches_empty = s == Empty
+                || s.can_transition(Empty)
+                || ALL
+                    .iter()
+                    .any(|mid| s.can_transition(*mid) && mid.can_transition(Empty));
+            assert!(reaches_empty, "{s:?} cannot reach Empty");
+        }
     }
 
     #[test]
