@@ -36,3 +36,9 @@ dh-snapshot = { path = "crates/dh-snapshot" }
 dh-verify = { path = "crates/dh-verify" }
 dh-vmm = { path = "crates/dh-vmm" }
 dh-worker = { path = "crates/dh-worker" }
+# snapshot-store M4 integration seam (gate bead 4nj): third sibling-repo path
+# dep, same pattern as determinism-proto/detguest-host. Until the M4 store
+# integration lands a runtime consumer, the only consumer is dh-snapshot's
+# snapstore_readiness dev-dep surface-pin test. CI lanes must check out
+# ../snapshot-store (path deps resolve at cargo-metadata time).
+snapstore-client = { path = "../snapshot-store/crates/snapstore-client" }
