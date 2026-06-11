@@ -517,7 +517,8 @@ All integers little-endian. The file is `header || records || (implicit end)` wi
 | 168 | 8 | `end_vns` | `u64` |
 | 176 | 32 | `end_state_hash` | chain value at end boundary (zeros if unsealed) |
 | 208 | 32 | `body_hash` | BLAKE3 of all record bytes `[256, EOF)` (zeros if unsealed) |
-| 240 | 16 | `reserved` | zeros; readers MUST reject nonzero (reserved-means-zero rule) |
+| 240 | 8 | `encoder_fingerprint` | `u64` detguest-wire encoder fingerprint (bead 4ld); zero ⇒ no SDK digests in this segment. Verifiers compare fingerprints before SDK_EVENT digests to detect encoder skew |
+| 248 | 8 | `reserved` | zeros; readers MUST reject nonzero (reserved-means-zero rule) |
 
 ### 3.2 Record framing — fixed 24-byte record header + padded payload
 

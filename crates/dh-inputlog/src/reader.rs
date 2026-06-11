@@ -69,7 +69,11 @@ pub enum ReadError {
     EndNotLast,
     /// END payload disagrees with the header (`end_icount`/`end_state_hash`)
     /// or violates the END ruling (`boundary_rip = 0`, zero pad bytes).
-    EndMismatch,
+    /// `what` names the failed check for forensic/divergence tooling.
+    EndMismatch { what: &'static str },
+    /// `clock_den == 0`: not a §3.1 rule, but an untrusted log must not be
+    /// able to smuggle a divide-by-zero into a downstream replayer.
+    BadClock,
     /// `flags.HAS_AUX` disagrees with the records (END does not count).
     HasAuxFlagMismatch,
     /// `flags.EPOCH_HASHES` disagrees with the presence of EPOCH_HASH records.
@@ -109,24 +113,47 @@ impl Header {
 }
 
 /// One record, borrowed from the validated byte image (§3.2).
+///
+/// Fields are private so the ONLY construction path is the validated
+/// iterator — [`Record::body`]'s infallibility is true by construction, not
+/// by caller discipline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record<'a> {
-    pub kind: u8,
-    pub rflags: u8,
-    pub seq: u32,
-    pub icount: u64,
-    pub boundary_rip: u64,
-    pub payload: &'a [u8],
+    kind: u8,
+    rflags: u8,
+    seq: u32,
+    icount: u64,
+    boundary_rip: u64,
+    payload: &'a [u8],
 }
 
 impl<'a> Record<'a> {
+    pub fn kind(&self) -> u8 {
+        self.kind
+    }
+    pub fn rflags(&self) -> u8 {
+        self.rflags
+    }
+    pub fn seq(&self) -> u32 {
+        self.seq
+    }
+    pub fn icount(&self) -> u64 {
+        self.icount
+    }
+    pub fn boundary_rip(&self) -> u64 {
+        self.boundary_rip
+    }
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
     pub fn is_aux(&self) -> bool {
         self.rflags & RFLAG_AUX != 0
     }
 
-    /// Typed view of the payload. Infallible: `LogReader::parse` already
-    /// validated every known layout, and unknown kinds (AUX-only) surface
-    /// as [`RecordBody::Unknown`].
+    /// Typed view of the payload. Infallible: records only come out of a
+    /// `LogReader` whose `parse` validated every known layout, and unknown
+    /// kinds (AUX-only) surface as [`RecordBody::Unknown`].
     pub fn body(&self) -> RecordBody<'a> {
         let p = self.payload;
         let u16at = |o: usize| u16::from_le_bytes(p[o..o + 2].try_into().unwrap());
@@ -351,6 +378,9 @@ fn parse_header(bytes: &[u8]) -> Result<Header, ReadError> {
     if bytes[248..256] != [0u8; 8] {
         return Err(ReadError::ReservedNonzero);
     }
+    if u32::from_le_bytes(bytes[148..152].try_into().unwrap()) == 0 {
+        return Err(ReadError::BadClock);
+    }
     Ok(Header {
         version,
         flags,
@@ -426,12 +456,29 @@ fn validate_records(header: &Header, body: &[u8]) -> Result<(), ReadError> {
         match kind {
             KIND_END => {
                 // §3.3 END ruling: AUX-flagged, boundary_rip = 0, zero pad
-                // bytes, payload cross-checked against the header.
-                let pad_zero = payload[1..8] == [0u8; 7];
-                let icount_ok = icount == header.end_icount;
-                let hash_ok = payload[8..40] == header.end_state_hash;
-                if boundary_rip != 0 || !pad_zero || !icount_ok || !hash_ok {
-                    return Err(ReadError::EndMismatch);
+                // bytes, payload cross-checked against the header. The
+                // stop_reason byte (payload[0]) is intentionally NOT range-
+                // checked: it mirrors proto StopReason, which grows without a
+                // format bump (forward-compatible by design).
+                if boundary_rip != 0 {
+                    return Err(ReadError::EndMismatch {
+                        what: "boundary_rip != 0",
+                    });
+                }
+                if payload[1..8] != [0u8; 7] {
+                    return Err(ReadError::EndMismatch {
+                        what: "nonzero pad bytes",
+                    });
+                }
+                if icount != header.end_icount {
+                    return Err(ReadError::EndMismatch {
+                        what: "icount != header.end_icount",
+                    });
+                }
+                if payload[8..40] != header.end_state_hash {
+                    return Err(ReadError::EndMismatch {
+                        what: "end_state_hash != header.end_state_hash",
+                    });
                 }
                 saw_end = true;
             }
@@ -484,11 +531,15 @@ fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), Re
                 && u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize
                     == payload.len() - 8
         }
+        // §3.3 gives NET_RX no lower bound: a zero-length frame is accepted
+        // by design (land a minimum in API.md first if one is ever wanted).
         KIND_NET_RX => payload.len() <= MAX_NET_RX_FRAME,
         KIND_ENTROPY | KIND_SDK_EVENT | KIND_NET_TX => payload.len() == 16,
         KIND_TIMER_FIRE => payload.len() == 20,
         KIND_EPOCH_HASH | KIND_END => payload.len() == 40,
         KIND_FRAME_MARK => payload.len() == 8,
+        // Unreachable: unknown kinds returned above (Ok for AUX, Err for
+        // canonical), so `kind` is a known kind here. Kept total anyway.
         _ => true,
     };
     if !layout_ok {

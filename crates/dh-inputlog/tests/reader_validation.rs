@@ -83,10 +83,10 @@ fn iterates_all_records_in_order_with_typed_bodies() {
     let records: Vec<_> = r.records().collect();
     assert_eq!(records.len(), 8);
     assert_eq!(
-        records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        records.iter().map(|r| r.seq()).collect::<Vec<_>>(),
         (0..8).collect::<Vec<_>>()
     );
-    assert!(records.windows(2).all(|w| w[0].icount <= w[1].icount));
+    assert!(records.windows(2).all(|w| w[0].icount() <= w[1].icount()));
 
     match records[0].body() {
         RecordBody::PadSet {
@@ -130,11 +130,11 @@ fn iterates_all_records_in_order_with_typed_bodies() {
 fn canonical_iterator_implements_aux_skipping_contract() {
     let log = full_log();
     let r = LogReader::parse(&log).unwrap();
-    let kinds: Vec<u8> = r.canonical().map(|r| r.kind).collect();
+    let kinds: Vec<u8> = r.canonical().map(|r| r.kind()).collect();
     // Canonical = the three inputs; ENTROPY/TIMER_FIRE/SDK_EVENT/FRAME_MARK
     // and END (AUX-flagged) are all skipped.
     assert_eq!(kinds, vec![KIND_PAD_SET, KIND_DEV_EVENT, KIND_DEV_EVENT]);
-    let aux_kinds: Vec<u8> = r.aux().map(|r| r.kind).collect();
+    let aux_kinds: Vec<u8> = r.aux().map(|r| r.kind()).collect();
     assert_eq!(
         aux_kinds,
         vec![
@@ -319,9 +319,9 @@ fn rejects_unknown_canonical_kind_accepts_unknown_aux() {
     let entropy_seq = LogReader::parse(&log)
         .unwrap()
         .records()
-        .find(|r| r.kind == KIND_ENTROPY)
+        .find(|r| r.kind() == KIND_ENTROPY)
         .unwrap()
-        .seq;
+        .seq();
     let mut o = HEADER_LEN;
     for _ in 0..entropy_seq {
         let plen = u16::from_le_bytes(log[o + 2..o + 4].try_into().unwrap()) as usize;
@@ -405,20 +405,61 @@ fn rejects_missing_end_and_record_after_end() {
 }
 
 #[test]
-fn rejects_end_mismatch() {
+fn rejects_end_mismatch_all_four_causes() {
     // END's end_state_hash diverges from the header's.
     let mut log = full_log();
     let end_payload_off = log.len() - 40; // END payload is the last 40 bytes
     log[end_payload_off + 8] ^= 0xFF;
     reseal(&mut log);
-    assert_eq!(LogReader::parse(&log).unwrap_err(), ReadError::EndMismatch);
+    assert_eq!(
+        LogReader::parse(&log).unwrap_err(),
+        ReadError::EndMismatch {
+            what: "end_state_hash != header.end_state_hash"
+        }
+    );
 
     // END's icount diverges from header.end_icount.
     let mut log = full_log();
     let end_rec_off = log.len() - 64;
     log[end_rec_off + 8..end_rec_off + 16].copy_from_slice(&4999u64.to_le_bytes());
     reseal(&mut log);
-    assert_eq!(LogReader::parse(&log).unwrap_err(), ReadError::EndMismatch);
+    assert_eq!(
+        LogReader::parse(&log).unwrap_err(),
+        ReadError::EndMismatch {
+            what: "icount != header.end_icount"
+        }
+    );
+
+    // END's boundary_rip must be 0 (§3.3 END ruling).
+    let mut log = full_log();
+    let end_rec_off = log.len() - 64;
+    log[end_rec_off + 16..end_rec_off + 24].copy_from_slice(&1u64.to_le_bytes());
+    reseal(&mut log);
+    assert_eq!(
+        LogReader::parse(&log).unwrap_err(),
+        ReadError::EndMismatch {
+            what: "boundary_rip != 0"
+        }
+    );
+
+    // END's stop_reason pad bytes must be zero.
+    let mut log = full_log();
+    let end_payload_off = log.len() - 40;
+    log[end_payload_off + 3] = 0xFF;
+    reseal(&mut log);
+    assert_eq!(
+        LogReader::parse(&log).unwrap_err(),
+        ReadError::EndMismatch {
+            what: "nonzero pad bytes"
+        }
+    );
+}
+
+#[test]
+fn rejects_zero_clock_den() {
+    let mut log = full_log();
+    log[148..152].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(LogReader::parse(&log).unwrap_err(), ReadError::BadClock);
 }
 
 #[test]
@@ -444,6 +485,183 @@ fn rejects_epoch_hashes_flag_mismatch() {
         LogReader::parse(&log).unwrap_err(),
         ReadError::EpochHashesFlagMismatch
     );
+}
+
+// ---- spec kinds the writer does not emit yet (NET_RX, EPOCH_HASH) -----------
+
+/// Frame one raw §3.2 record.
+fn make_record(kind: u8, rflags: u8, seq: u32, icount: u64, rip: u64, payload: &[u8]) -> Vec<u8> {
+    let mut r = Vec::new();
+    r.push(kind);
+    r.push(rflags);
+    r.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    r.extend_from_slice(&seq.to_le_bytes());
+    r.extend_from_slice(&icount.to_le_bytes());
+    r.extend_from_slice(&rip.to_le_bytes());
+    r.extend_from_slice(payload);
+    r.extend_from_slice(&[0u8; 8][..(8 - payload.len() % 8) % 8]);
+    r
+}
+
+/// Insert hand-framed records before END in an empty sealed log, fixing
+/// END's seq, record_count, flags, and the body hash.
+fn splice_before_end(records: &[Vec<u8>], flags: u32) -> Vec<u8> {
+    let base = LogWriter::new(header()).seal(seal_params()).unwrap();
+    let mut log = base[..HEADER_LEN].to_vec();
+    for r in records {
+        log.extend_from_slice(r);
+    }
+    let mut end = base[HEADER_LEN..].to_vec(); // the END record (64 bytes)
+    end[4..8].copy_from_slice(&(records.len() as u32).to_le_bytes());
+    log.extend_from_slice(&end);
+    log[12..16].copy_from_slice(&flags.to_le_bytes());
+    log[152..160].copy_from_slice(&(records.len() as u64 + 1).to_le_bytes());
+    reseal(&mut log);
+    log
+}
+
+#[test]
+fn net_rx_frame_boundaries() {
+    // 2048 exactly: accepted; the typed body is the raw frame.
+    let frame = vec![0xAB; MAX_NET_RX_FRAME];
+    let rec = make_record(KIND_NET_RX, 0, 0, 10, 0x1000, &frame);
+    let log = splice_before_end(&[rec], FLAG_SEALED);
+    let r = LogReader::parse(&log).unwrap();
+    let first = r.canonical().next().unwrap();
+    match first.body() {
+        RecordBody::NetRx { frame: f } => assert_eq!(f, &frame[..]),
+        other => panic!("expected NetRx, got {other:?}"),
+    }
+
+    // Zero-length frame: §3.3 gives no lower bound — accepted by design.
+    let rec = make_record(KIND_NET_RX, 0, 0, 10, 0x1000, &[]);
+    assert!(LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED)).is_ok());
+
+    // 2049: rejected.
+    let rec = make_record(
+        KIND_NET_RX,
+        0,
+        0,
+        10,
+        0x1000,
+        &vec![0u8; MAX_NET_RX_FRAME + 1],
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED)).unwrap_err(),
+        ReadError::BadPayloadLayout {
+            kind: KIND_NET_RX,
+            seq: 0
+        }
+    );
+}
+
+#[test]
+fn epoch_hash_positive_path() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u64.to_le_bytes());
+    payload.extend_from_slice(&[0x5A; 32]);
+    let rec = make_record(KIND_EPOCH_HASH, RFLAG_AUX, 0, 10, 0, &payload);
+    // EPOCH_HASH is AUX, so both flags must be set for consistency.
+    let log = splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX | FLAG_EPOCH_HASHES);
+    let r = LogReader::parse(&log).unwrap();
+    assert!(r.header().has_epoch_hashes());
+    let first = r.aux().next().unwrap();
+    match first.body() {
+        RecordBody::EpochHash {
+            epoch_index,
+            chain_value,
+        } => {
+            assert_eq!(epoch_index, 3);
+            assert_eq!(chain_value, [0x5A; 32]);
+        }
+        other => panic!("expected EpochHash, got {other:?}"),
+    }
+}
+
+// ---- golden bytes (layout pinned against coordinated writer/reader drift) ----
+
+#[test]
+fn golden_bytes_decode_pinned() {
+    // A minimal hand-pinned log: header + one PAD_SET + END. Round-trips
+    // alone cannot catch wrong-but-symmetric layouts; these bytes can.
+    let mut log = Vec::new();
+    log.extend_from_slice(b"DHILOG"); // magic
+    log.extend_from_slice(&[0x00, 0x01]); // version 1.0 LE
+    log.extend_from_slice(&256u32.to_le_bytes()); // header_len
+    log.extend_from_slice(&1u32.to_le_bytes()); // flags: SEALED
+    log.extend_from_slice(&[0x11; 32]); // base_snapshot_id
+    log.extend_from_slice(&[0x22; 32]); // end_snapshot_id
+    log.extend_from_slice(&[0x33; 32]); // entropy_seed
+    log.extend_from_slice(&[0x44; 32]); // machine_config_hash
+    log.extend_from_slice(&1u32.to_le_bytes()); // clock_num
+    log.extend_from_slice(&1u32.to_le_bytes()); // clock_den
+    log.extend_from_slice(&2u64.to_le_bytes()); // record_count
+    log.extend_from_slice(&777u64.to_le_bytes()); // end_icount
+    log.extend_from_slice(&999u64.to_le_bytes()); // end_vns
+    log.extend_from_slice(&[0x55; 32]); // end_state_hash
+    log.extend_from_slice(&[0u8; 32]); // body_hash (resealed below)
+    log.extend_from_slice(&0xFEED_FACE_CAFE_BEEFu64.to_le_bytes()); // fingerprint
+    log.extend_from_slice(&[0u8; 8]); // reserved
+    assert_eq!(log.len(), 256);
+
+    // PAD_SET: port 2, buttons 0x0000_0010, frame_hint 5, at icount 42.
+    let mut pad = [0u8; 12];
+    pad[0] = 2;
+    pad[4..8].copy_from_slice(&0x10u32.to_le_bytes());
+    pad[8..12].copy_from_slice(&5u32.to_le_bytes());
+    log.extend_from_slice(&make_record(
+        KIND_PAD_SET,
+        0,
+        0,
+        42,
+        0xFFFF_8000_0000_1000,
+        &pad,
+    ));
+
+    let mut end = [0u8; 40];
+    end[0] = 1; // stop_reason
+    end[8..40].copy_from_slice(&[0x55; 32]);
+    log.extend_from_slice(&make_record(KIND_END, RFLAG_AUX, 1, 777, 0, &end));
+    reseal(&mut log);
+
+    let r = LogReader::parse(&log).expect("golden bytes must parse");
+    let h = r.header();
+    assert_eq!(h.encoder_fingerprint, 0xFEED_FACE_CAFE_BEEF);
+    assert_eq!(h.end_icount, 777);
+    let first = r.records().next().unwrap();
+    assert_eq!(first.icount(), 42);
+    assert_eq!(first.boundary_rip(), 0xFFFF_8000_0000_1000);
+    match first.body() {
+        RecordBody::PadSet {
+            port,
+            buttons,
+            frame_hint,
+        } => {
+            assert_eq!((port, buttons, frame_hint), (2, 0x10, 5));
+        }
+        other => panic!("expected PadSet, got {other:?}"),
+    }
+    // And the writer produces these exact bytes for the same inputs (the
+    // bp9 golden-fixture direction, pinned here at minimal scale).
+    let mut w = LogWriter::new(SegmentHeader {
+        base_snapshot_id: [0x11; 32],
+        entropy_seed: [0x33; 32],
+        machine_config_hash: [0x44; 32],
+        clock_num: 1,
+        clock_den: 1,
+        encoder_fingerprint: 0xFEED_FACE_CAFE_BEEF,
+    });
+    w.pad_set(42, 0xFFFF_8000_0000_1000, 2, 0x10, 5).unwrap();
+    let written = w
+        .seal(SealParams {
+            end_snapshot_id: [0x22; 32],
+            end_icount: 777,
+            end_vns: 999,
+            end_state_hash: [0x55; 32],
+            stop_reason: 1,
+        })
+        .unwrap();
+    assert_eq!(written, log);
 }
 
 // ---- totality smoke (precursor to the 1j4 fuzz target) -----------------------
