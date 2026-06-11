@@ -359,3 +359,109 @@ fn missing_entropy_device_is_a_loud_codec_error() {
         Err(EngineError::Codec(_))
     ));
 }
+
+/// Byte determinism — the property the fork/dedup foundation rests on:
+/// identical state through the WHOLE engine yields the identical ref,
+/// even across two independently constructed slots and buses.
+#[test]
+fn identical_state_yields_identical_refs_across_vms() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let sys = KvmSystem::open().unwrap();
+    let config = test_config();
+
+    let mut refs = Vec::new();
+    for _ in 0..2 {
+        let slot = make_slot(&sys);
+        let bus = test_bus();
+        let entropy = DetEntropy::from_seed([0x77; 32]);
+        let outcome = take_snapshot(
+            &slot,
+            SlotState::Paused,
+            &bus,
+            &entropy,
+            &config,
+            boundary(),
+            PageSource::Full,
+            &store,
+        )
+        .expect("take_snapshot");
+        refs.push(outcome.snapshot_ref);
+    }
+    assert_eq!(
+        refs[0], refs[1],
+        "cross-VM identical state must dedup to one ref"
+    );
+}
+
+/// The engine's canonical ordering claim, made non-vacuous: a bus whose
+/// registration order DISAGREES with §4 table order (blk at a low base)
+/// still produces KNOWN_TAGS-ordered sections, and PvBlk's contents ride
+/// along intact.
+#[test]
+fn section_order_is_engine_fixed_not_bus_order() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    use dh_devices::blk::{BaseIoError, BlockBase, PvBlk};
+    struct ZeroBase;
+    impl BlockBase for ZeroBase {
+        fn len_bytes(&self) -> u64 {
+            4096
+        }
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<(), BaseIoError> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let sys = KvmSystem::open().unwrap();
+    let slot = make_slot(&sys);
+    // blk FIRST by base address (aligned window below the others) — §4
+    // order puts BLKO near the end.
+    let mut bus = MmioBus::new();
+    bus.register(0xD000_0000, Box::new(PvBlk::new(Box::new(ZeroBase))))
+        .unwrap();
+    bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
+    bus.register(0xD000_2000, Box::new(PvClock::new(1, 1)))
+        .unwrap();
+    bus.register(0xD000_3000, Box::new(PvEntropy::new()))
+        .unwrap();
+    let entropy = DetEntropy::from_seed([0x78; 32]);
+    let config = test_config();
+
+    let outcome = take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        PageSource::Full,
+        &store,
+    )
+    .expect("take_snapshot");
+    let container = store.get_snapshot(outcome.snapshot_ref).expect("get");
+    let manifest = snapstore_manifest::Manifest::decode(&container).expect("manifest");
+    let dhsnap = Container::parse(&manifest.device_blob.bytes).expect("parse");
+    let tags: Vec<[u8; 4]> = dhsnap.sections().map(|s| s.tag).collect();
+    assert_eq!(
+        tags,
+        vec![
+            tag::MCFG,
+            tag::VCPU,
+            tag::LAPC,
+            tag::TIME,
+            tag::ENTR,
+            tag::CLKD,
+            tag::PADD,
+            tag::BLKO
+        ]
+    );
+    assert!(!dhsnap.get(tag::BLKO).unwrap().contents.is_empty());
+}

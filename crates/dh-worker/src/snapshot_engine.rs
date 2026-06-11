@@ -148,17 +148,16 @@ pub fn take_snapshot(
     }
     let pages_shipped = pages.len() as u64;
 
-    // ── 3. Ship bare page bytes (server hashes + dedups; client
-    //       cross-checks batch_blake3) ─────────────────────────────────────
-    store
-        .put_pages(pages.clone())
-        .map_err(|e| EngineError::Store(format!("put_pages: {e}")))?;
-
-    // ── 4. Assemble DHSNAP ────────────────────────────────────────────────
+    // ── 3. Assemble DHSNAP ────────────────────────────────────────────────
     let dhsnap = build_dhsnap(slot, bus, entropy, machine_config, &boundary)?;
 
-    // ── 5. Manifest + PutSnapshot: the returned ref is the durability
-    //       receipt (R12) ─────────────────────────────────────────────────
+    // ── 4. Ship + manifest + PutSnapshot in one seam: the client's
+    //       put_snapshot_from_parts uploads the bare page bytes FIRST
+    //       (server hashes + dedups, client cross-checks batch_blake3 —
+    //       the §8.2 order), then builds and puts the container. The
+    //       returned ref is the durability receipt (R12). An empty
+    //       incremental (no guest writes since the parent) is a VALID
+    //       zero-page DELTA, not an error — verified against the store. ──
     let snapshot_ref = store
         .put_snapshot_from_parts(
             parent.as_ref(),
@@ -173,7 +172,7 @@ pub fn take_snapshot(
         )
         .map_err(|e| EngineError::Store(format!("put_snapshot: {e}")))?;
 
-    // ── 6. Only now: clear the dirty set (§8.2's last step) ───────────────
+    // ── 5. Only now: clear the dirty set (§8.2's last step) ───────────────
     if let Some(dirty) = dirty_to_clear {
         dirty.clear();
     }
