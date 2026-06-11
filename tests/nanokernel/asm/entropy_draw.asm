@@ -82,7 +82,10 @@ prog_main:
     jmp     .batch
 
 .fault:
-    mov     dword [r8 + REG_LEN], 0xDEAD ; poison: harness count check trips
+    ; Inert marker only (0xDEAD < MAX_FILL, and no doorbell ever rings
+    ; again) — what actually trips the harness is the COUNT SHORTFALL:
+    ; the batch never completes, so the exact-count assert fails.
+    mov     dword [r8 + REG_LEN], 0xDEAD
 .fault_spin:
     hlt
     jmp     .fault_spin
