@@ -24,6 +24,7 @@ const PROGRAMS: &[&str] = &[
     "sse_probe",
     "pad_echo",
     "entropy_draw",
+    "mmio_stepper",
 ];
 
 fn main() {

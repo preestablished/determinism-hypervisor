@@ -162,7 +162,23 @@ pub fn land_at(
             match guard.run() {
                 // One step. The counter re-read at loop top is the ONLY
                 // progress signal (never assume +1; REP rule).
-                Ok(VcpuExit::Debug(_)) => {}
+                //
+                // MEASURED (iteration 83, bead 4a3, kernel 6.8 on the
+                // lab box — the exact kernel mechanism may differ on
+                // other versions; the re-arm is correct regardless): a Debug
+                // exit DELIVERED BY THE EMULATOR's completion path (the
+                // singlestep hook that fires when an emulated MMIO
+                // instruction finishes) CONSUMES the guest_debug arming —
+                // without the re-assert below, the entry after such a
+                // Debug exit free-runs to the next natural exit (the
+                // mmio_stepper probe measured +18, the iteration-82
+                // goal-poll overshoot +74). Hardware-delivered #DBs do
+                // not need it, but the two are indistinguishable here
+                // and the re-assert is idempotent — re-arm on EVERY
+                // step.
+                Ok(VcpuExit::Debug(_)) => {
+                    set_singlestep(&mut guard, true)?;
+                }
                 Ok(exit) => {
                     on_exit(exit)?;
                     // MEASURED (iteration 50, kernel 6.8): an MMIO-WRITE
@@ -191,6 +207,16 @@ pub fn land_at(
     result
 }
 
+/// CROSS-REFERENCE (iteration 83, bead 4a3): land_at's stepping loop
+/// re-arms guest_debug on every Debug exit because the EMULATOR's
+/// completion-path Debug delivery consumes the arming. This helper has
+/// a different structure — it returns at the FIRST Debug, so a consumed
+/// arming cannot free-run within one call, and callers re-arm per
+/// entry. Do not blindly mirror the land_at re-arm here; the open
+/// question (injection chains stepping ACROSS an emulated MMIO
+/// instruction, reachable once the M5 device run loop delivers
+/// interrupts adjacent to MMIO) is tracked by its own bead.
+///
 /// One guest ENTRY under single-step: enter once, return at the next
 /// debug trap. NOT one retirement — an entry that delivers a pending
 /// interrupt runs the whole handler before the trap fires (event delivery
@@ -410,5 +436,91 @@ mod tests {
                 counted: 50_000
             }
         ));
+    }
+
+    /// PROBE-AUTHORING LESSON (iteration 83): raw code injected at
+    /// rip=0 runs in REAL MODE — 64-bit encodings misdecode and the
+    /// MMIO hole at 0xD000_1000 is unreachable, so such probes pass
+    /// VACUOUSLY. MMIO-landing probes must boot a long-mode nanokernel
+    /// guest (below).
+    ///
+    /// Iteration-83 probe (bead 4a3): land EXACTLY inside the
+    /// mmio_stepper guest — a long-mode loop whose body is the doorbell
+    /// cluster (imm dword MMIO write, 8-byte reg MMIO write, MMIO read,
+    /// 16 nops). The single-step walk must cross hundreds of emulated
+    /// MMIO exits without losing the trap; the iteration-82 goal-poll
+    /// overshoot (target 4096, counted 4170) is THIS path. Targets are
+    /// chosen deep in the loop so the walk spans many clusters; with
+    /// production margins every landing here is pure stepping.
+    fn stepper_rig() -> Option<(crate::kvm::SlotVm, InstRetired)> {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return None;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::mmio_stepper_elf(), b"").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        Some((slot, counter))
+    }
+
+    fn ack_mmio(exit: VcpuExit) -> Result<(), BoundaryError> {
+        match exit {
+            VcpuExit::MmioWrite(_, _) => Ok(()),
+            VcpuExit::MmioRead(_, data) => {
+                data.fill(0);
+                Ok(())
+            }
+            other => Err(BoundaryError::Exit(format!("unexpected exit {other:?}"))),
+        }
+    }
+
+    /// The iteration-82 repro shape: one landing at 4096, mid-loop.
+    #[test]
+    fn landing_at_4096_across_mmio_clusters_is_exact_live() {
+        let Some((mut slot, counter)) = stepper_rig() else {
+            return;
+        };
+        let b = land_at(
+            &mut slot.vcpu,
+            &counter,
+            4096,
+            &Margins::default(),
+            &mut ack_mmio,
+        )
+        .expect("landing across MMIO clusters");
+        assert_eq!(b.icount, 4096);
+    }
+
+    /// Consecutive landings marching THROUGH the MMIO-dense region —
+    /// strides 1..=23 against the 18-retirement loop body, so walks of
+    /// every short length start from a spread of body offsets (not a
+    /// full offset×stride product, but far beyond the single shape that
+    /// reproduced the bug).
+    #[test]
+    fn consecutive_landings_across_mmio_clusters_are_exact_live() {
+        let Some((mut slot, counter)) = stepper_rig() else {
+            return;
+        };
+        let mut target = 100;
+        for k in 0..120 {
+            target += 1 + (k % 23);
+            let b = land_at(
+                &mut slot.vcpu,
+                &counter,
+                target,
+                &Margins::default(),
+                &mut ack_mmio,
+            )
+            .unwrap_or_else(|e| panic!("landing {k} at {target}: {e:?}"));
+            assert_eq!(b.icount, target, "landing {k}");
+        }
     }
 }

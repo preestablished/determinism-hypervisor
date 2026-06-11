@@ -120,6 +120,15 @@ pub const ENTROPY_DRAW_RING_CAPACITY: u64 = 1 << 15;
 /// code. Mirrors the asm %define (drift-tested).
 pub const ENTROPY_DRAW_BATCH: u64 = 256;
 
+/// mmio_stepper (bead 4a3): the landing-vs-MMIO probe guest — 400
+/// iterations of {imm dword MMIO write, 8-byte reg MMIO write, MMIO
+/// read, 16 nops} then a hlt park. 18 retirements per iteration — the
+/// 16 nops plus sub+jnz; the three MMIO instructions are emulated and
+/// never retire.
+pub fn mmio_stepper_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/mmio_stepper.elf"))
+}
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 
