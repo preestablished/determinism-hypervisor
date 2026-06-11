@@ -101,6 +101,11 @@ impl SlotState {
     /// state (run, inject, restore-into, MMIO dispatch, RAM writes).
     /// `api` names the caller for the loud error. Paused and Running slots
     /// are writable; Frozen is the R9 denial; Empty has nothing to write.
+    ///
+    /// INTEGRATION (not yet wired): no engine code calls this yet — the
+    /// slot table (bead ol1), CoW fork (9e4) and snapshot engine (qmp) are
+    /// the intended call sites. If those land without adopting this guard,
+    /// that is a review failure, not a design change.
     pub fn ensure_write_path(self, api: &'static str) -> Result<(), SlotStateError> {
         match self {
             SlotState::Paused | SlotState::Running => Ok(()),
