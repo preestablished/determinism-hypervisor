@@ -29,11 +29,24 @@ async fn spawn_store() -> (ServerHandle, SnapstoreClient, TempDir) {
         page_channel: Default::default(),
     };
     let (handle, uds_path) = serve_for_tests(config).await.expect("serve_for_tests");
-    // Same settle delay the sibling's own tests use.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let client = SnapstoreClient::connect(Transport::Uds(uds_path))
-        .await
-        .expect("connect over UDS");
+    // Readiness probe instead of a fixed settle sleep: retry the connect
+    // briefly (cold parallel startup can outlive any fixed delay).
+    let mut client = None;
+    for _ in 0..50 {
+        match SnapstoreClient::connect(Transport::Uds(uds_path.clone())).await {
+            Ok(c) => {
+                client = Some(c);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+    let client = client.expect("server did not become ready within 500ms");
+    // LIFETIME NOTES for engine authors (qmp/6hg): dropping `ServerHandle`
+    // initiates graceful shutdown — keep it alive for the test's duration;
+    // same for the TempDir (it owns the store). The synchronous KVM engine
+    // should use snapstore_client::blocking::SnapstoreClient (the sibling's
+    // sync-async bridge for vCPU worker loops) rather than going async.
     (handle, client, dir)
 }
 
@@ -77,10 +90,14 @@ async fn put_pages_put_snapshot_get_snapshot_roundtrip() {
         .enumerate()
         .map(|(i, p)| (i as u64, p.to_vec()))
         .collect();
-    // Tuple is (pages_new, pages_deduped). The SPLIT is not assertable:
-    // the client transparently retries transient errors and a retried
-    // upload reports everything deduped (content-idempotent). The SUM is
-    // the invariant.
+    // Tuple is (pages_new, pages_deduped). The SPLIT is not assertable on
+    // a fresh put: the client wraps the content-idempotent upload in
+    // with_retry (Transport/Unavailable/DeadlineExceeded), and a retry
+    // after a server-side commit reports everything deduped. Observed
+    // exactly once — (0, 3) on this fresh put during a COLD parallel
+    // first run; 246 warm attempts could not reproduce it (iteration-72
+    // review), so treat the flip as rare-but-real. The SUM is the
+    // invariant.
     let (new, deduped) = client.put_pages(wire).await.expect("put_pages");
     assert_eq!(new + deduped, 3, "every page accounted for");
 

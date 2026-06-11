@@ -70,3 +70,9 @@ snapshot-engine bead (qmp) and M4 ACCEPT (6hg) build on this helper.
 - A future load/perf concern (server per test vs shared) is a test-suite
   refactor, not an ops change — `serve_for_tests_with_metrics` exists if
   shared-registry variants are ever needed.
+- The SYNCHRONOUS KVM engine (qmp) does not go async to talk to the
+  store: `snapstore_client::blocking::SnapstoreClient` is the sibling's
+  sync-async bridge built exactly for vCPU worker loops. The in-process
+  server still needs a tokio runtime in the test process — the test
+  harness owns it (#[tokio::test]), the engine under test stays sync via
+  the blocking facade.
