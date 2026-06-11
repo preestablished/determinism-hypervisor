@@ -74,6 +74,28 @@ mod tests {
         assert_eq!(lying_casts, 4, "the order-divergence trap moved");
     }
 
+    /// Cross-pin: the DHILOG END byte (dh_vmm::recording::stop_reason_u8,
+    /// which cannot see dh-proto) must agree with the proto mapping for
+    /// every variant — the §3.3 "mirrors proto StopReason" coupling.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn recording_end_byte_agrees_with_the_proto_mapping() {
+        use dh_vmm::runctl::StopReason as R;
+        for r in [
+            R::BudgetReached,
+            R::GoalSatisfied,
+            R::HardCap,
+            R::Paused,
+            R::GuestHalted,
+        ] {
+            assert_eq!(
+                i32::from(dh_vmm::recording::stop_reason_u8(r)),
+                stop_reason_to_proto(r) as i32,
+                "{r:?}"
+            );
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn stop_reason_wire_numbers_are_pinned() {

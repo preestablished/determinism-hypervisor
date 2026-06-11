@@ -30,6 +30,8 @@ pub mod kvm;
 #[cfg(target_arch = "x86_64")]
 pub mod msr;
 #[cfg(target_arch = "x86_64")]
+pub mod recording;
+#[cfg(target_arch = "x86_64")]
 pub mod run;
 #[cfg(target_arch = "x86_64")]
 pub mod runctl;

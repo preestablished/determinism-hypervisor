@@ -223,6 +223,11 @@ impl DetDevice for PvNet {
         self.rx_vector = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
         Ok(())
     }
+    /// Run-control downcast seam (recording layer): NET_RX deliveries
+    /// and TX drains go through the concrete methods, keyed by device id.
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]
