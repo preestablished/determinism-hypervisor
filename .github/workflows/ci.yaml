@@ -16,8 +16,9 @@ concurrency:
   cancel-in-progress: true
 
 # Both jobs need the sibling repos next to this checkout: the workspace has
-# path deps on ../control-plane (determinism-proto) and ../guest-sdk
-# (detguest-host, detguest-wire). Sibling HEAD wins — there is no rev pinning.
+# path deps on ../control-plane (determinism-proto), ../guest-sdk
+# (detguest-host, detguest-wire), and ../snapshot-store (snapstore-client).
+# Sibling HEAD wins — there is no rev pinning.
 jobs:
   # Host-runnable lane: fmt, clippy, build, and the unit-layer tests. Runs on
   # x86_64 and aarch64 — Spark-side devs touch shared code, so the shared
@@ -50,6 +51,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/guest-sdk
           path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -96,6 +101,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/guest-sdk
           path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
       - uses: dtolnay/rust-toolchain@stable
       # rw, matching what Kvm::new() and the test guards need — a read-only
       # grant would silently skip every live leg while the lane stays green.

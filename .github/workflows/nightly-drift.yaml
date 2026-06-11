@@ -45,6 +45,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/guest-sdk
           path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
       - uses: dtolnay/rust-toolchain@stable
       - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
       - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
