@@ -113,13 +113,17 @@ impl PvNet {
     }
 
     /// Run control's frame-recovery seam (y78): the TX registers as of
-    /// the doorbell exit — `(tx_buf_gpa, tx_len)`. The loopback path
-    /// re-reads the frame bytes from guest RAM through these AT THE SAME
-    /// EXIT that rang the doorbell (drain per exit — the guest may
-    /// overwrite its buffer the moment it runs again), then lands them
-    /// as a canonical NET_RX record.
-    pub fn tx_regs(&self) -> (u64, u32) {
-        (self.tx_buf_gpa, self.tx_len)
+    /// the doorbell exit — `(tx_buf_gpa, tx_len, tx_status)`. The
+    /// loopback path re-reads the frame bytes from guest RAM through
+    /// these AT THE SAME EXIT that rang the doorbell (drain per exit —
+    /// the guest may overwrite its buffer the moment it runs again),
+    /// then lands them as a canonical NET_RX record. CONSUMERS MUST
+    /// GATE ON `tx_status == STATUS_OK`: after a faulted doorbell the
+    /// gpa/len are last-programmed garbage and no NET_TX record exists
+    /// — draining them would mint an unlogged frame (iteration-86
+    /// review, critical).
+    pub fn tx_regs(&self) -> (u64, u32, u32) {
+        (self.tx_buf_gpa, self.tx_len, self.tx_status)
     }
 
     /// Run-control entry point: a canonical NET_RX record landed at its

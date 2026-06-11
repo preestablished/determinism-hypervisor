@@ -10,9 +10,11 @@
 //! serial, the slot's DetEntropy, the segment LogWriter, the guest-mem
 //! adapter, and the pending-IRQ queue. `service_exit` is the on_exit
 //! body; the `apply_*` methods are run control's canonical-input entry
-//! points, PAIRING the device-state mutation with the record landing so
-//! the two can never drift (an applied-but-unrecorded input is a replay
-//! divergence by construction). `seal` consumes the rail at segment end.
+//! points, PAIRING the device-state mutation with the record landing.
+//! The pair is not atomic — a log failure after the device mutated HAS
+//! drifted — so the contract is FAIL-FATAL: every `RecordError` is
+//! slot-fatal (destroy, never resume, never seal); under that rule the
+//! drift is unobservable. `seal` consumes the rail at segment end.
 //!
 //! NOT HERE: the detcall PIO window (detchannel) — `DetChannelHost` is
 //! generic over its memory/fault plan and the demo guests do not attach
@@ -58,12 +60,17 @@ pub enum RecordError {
     /// The bus has no device with the id the input targets, or it does
     /// not downcast to the expected concrete type.
     NoDevice(&'static str),
+    /// Sealing was attempted with device-queued vectors never drained —
+    /// a dropped injection must never seal as a healthy segment.
+    UndrainedIrqs(usize),
 }
 
-/// One segment's device rail. Build it fresh per segment (the LogWriter
-/// carries the §3.1 segment header), feed `service_exit` to
-/// `run_segment`'s on_exit, apply canonical inputs at their landed
-/// boundaries, then `seal` with the outcome.
+/// One DHILOG segment's device rail — "segment" in the §3.1 LOG sense
+/// (snapshot to snapshot), which typically spans MANY `run_segment`
+/// calls (each a run quantum between boundaries; the live test runs
+/// three under one rail). Build it fresh per log segment, feed
+/// `service_exit` to every quantum's on_exit, apply canonical inputs at
+/// their landed boundaries, then `seal` once with the final outcome.
 pub struct DeviceRail<M: GuestMem> {
     pub bus: MmioBus,
     pub serial: DebugSerial,
@@ -205,19 +212,54 @@ impl<M: GuestMem> DeviceRail<M> {
     /// calls this AT THAT EXIT (the guest may overwrite its buffer the
     /// moment it runs again) and decides what to do with the frame —
     /// in the loopback config, land it back via [`Self::apply_net_rx`].
+    ///
+    /// GATED ON TX_STATUS == OK (iteration-86 review, critical): a
+    /// faulted doorbell logged no NET_TX, so its last-programmed
+    /// gpa/len must never mint a frame — that would be an unlogged
+    /// input, a replay divergence by construction. The length is also
+    /// re-capped defensively; a post-OK read fault is LOUD (the RAM the
+    /// device just read cannot have vanished).
     pub fn drain_net_tx(&mut self) -> Result<Option<Vec<u8>>, RecordError> {
-        let (gpa, len) = {
+        let (gpa, len, status) = {
             let net: &mut PvNet = self.device_mut(DEVICE_ID_PV_NET, "pv-net")?;
             net.tx_regs()
         };
-        if len == 0 {
+        if status != dh_devices::net::STATUS_OK || len == 0 {
             return Ok(None);
         }
-        let mut frame = vec![0u8; len as usize];
-        if self.mem.read(gpa, &mut frame).is_err() {
-            return Ok(None); // the doorbell already faulted; nothing sent
+        if len > dh_devices::net::MAX_FRAME {
+            // STATUS_OK with an oversize len is unreachable (the doorbell
+            // faults first) — refuse rather than allocate from a guest u32.
+            return Err(RecordError::Net(NetRxError::FrameTooBig));
         }
+        let mut frame = vec![0u8; len as usize];
+        self.mem
+            .read(gpa, &mut frame)
+            .map_err(|_| RecordError::Net(NetRxError::MemFault))?;
         Ok(Some(frame))
+    }
+
+    /// Pair the AUX TIMER_FIRE record with the one-shot disarm (§3.4 /
+    /// clock.rs: the caller logs the fire AND disarms; pairing them here
+    /// keeps the two from drifting, same as the apply_* methods).
+    pub fn log_timer_fired(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        fired: &crate::runctl::TimerFired,
+    ) -> Result<(), RecordError> {
+        let clk: &mut PvClock =
+            self.device_mut(dh_devices::clock::DEVICE_ID_PV_CLOCK, "pv-clock")?;
+        clk.disarm();
+        self.log
+            .timer_fire(
+                icount,
+                boundary_rip,
+                fired.vector,
+                fired.armed_deadline_vns,
+                fired.delivered_icount,
+            )
+            .map_err(RecordError::Log)
     }
 
     /// Restore-time clock reseed passthrough (the §8.3 vns_base seam) —
@@ -239,7 +281,7 @@ impl<M: GuestMem> DeviceRail<M> {
         end_snapshot_id: [u8; 32],
     ) -> Result<Vec<u8>, RecordError> {
         if !self.irqs.is_empty() {
-            return Err(RecordError::NoDevice("undrained irq queue at seal"));
+            return Err(RecordError::UndrainedIrqs(self.irqs.len()));
         }
         self.log
             .seal(SealParams {
@@ -353,6 +395,123 @@ mod tests {
         let (stop, end_hash) = r.end();
         assert_eq!(stop, 1); // BudgetReached
         assert_eq!(end_hash, [0xAB; 32]);
+    }
+
+    /// drain_net_tx is GATED on TX_STATUS (iteration-86 critical): a
+    /// faulted doorbell must never mint a frame; an OK doorbell drains
+    /// the exact bytes; an idle device drains nothing.
+    #[test]
+    fn drain_net_tx_gates_on_status() {
+        let mut bus = MmioBus::new();
+        bus.register(dh_devices::net::PV_NET_BASE, Box::new(PvNet::new()))
+            .unwrap();
+        let mut rail = DeviceRail::new(
+            bus,
+            DetEntropy::from_seed([7; 32]),
+            LogWriter::new(header()),
+            VecGuestMem(vec![0u8; 4096]),
+        );
+        let base = dh_devices::net::PV_NET_BASE;
+
+        // Idle: nothing to drain.
+        assert!(rail.drain_net_tx().unwrap().is_none());
+
+        // Faulted doorbell (oversize len): regs hold garbage, status is
+        // FAULT — drain must return None, not a minted frame.
+        let len = (dh_devices::net::MAX_FRAME + 1).to_le_bytes();
+        rail.service_exit(
+            5,
+            VcpuExit::MmioWrite(base + dh_devices::net::REG_TX_LEN, &len),
+        )
+        .unwrap();
+        rail.service_exit(
+            6,
+            VcpuExit::MmioWrite(base + dh_devices::net::REG_TX_DOORBELL, &1u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert!(rail.drain_net_tx().unwrap().is_none());
+
+        // OK doorbell: the exact frame comes back.
+        rail.mem.0[0x300..0x310].copy_from_slice(&[0x5C; 16]);
+        let gpa = 0x300u64.to_le_bytes();
+        rail.service_exit(
+            7,
+            VcpuExit::MmioWrite(base + dh_devices::net::REG_TX_BUF_GPA, &gpa),
+        )
+        .unwrap();
+        let len16 = 16u32.to_le_bytes();
+        rail.service_exit(
+            8,
+            VcpuExit::MmioWrite(base + dh_devices::net::REG_TX_LEN, &len16),
+        )
+        .unwrap();
+        rail.service_exit(
+            9,
+            VcpuExit::MmioWrite(base + dh_devices::net::REG_TX_DOORBELL, &1u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(rail.drain_net_tx().unwrap().unwrap(), vec![0x5C; 16]);
+    }
+
+    /// log_timer_fired pairs the AUX record with the one-shot disarm.
+    #[test]
+    fn log_timer_fired_disarms_and_records() {
+        let mut bus = MmioBus::new();
+        bus.register(0xD000_2000, Box::new(PvClock::new(1, 1)))
+            .unwrap();
+        let mut rail = DeviceRail::new(
+            bus,
+            DetEntropy::from_seed([7; 32]),
+            LogWriter::new(header()),
+            VecGuestMem(vec![0u8; 64]),
+        );
+        // Arm via MMIO (8-byte deadline write).
+        let deadline = 9_999u64.to_le_bytes();
+        rail.service_exit(
+            3,
+            VcpuExit::MmioWrite(
+                0xD000_2000 + dh_devices::clock::REG_TIMER_DEADLINE,
+                &deadline,
+            ),
+        )
+        .unwrap();
+        let fired = crate::runctl::TimerFired {
+            vector: 0x41,
+            armed_deadline_vns: 9_999,
+            delivered_icount: 10_240,
+        };
+        rail.log_timer_fired(10_240, 0, &fired).unwrap();
+        // Disarmed: the clock reports no armed deadline.
+        let clk: &mut PvClock = rail
+            .device_mut(dh_devices::clock::DEVICE_ID_PV_CLOCK, "pv-clock")
+            .unwrap();
+        assert_eq!(clk.armed(), None);
+
+        // And vns_base passthrough works on the same rail.
+        rail.set_clock_vns_base(5_000_000).unwrap();
+        let sealed = rail
+            .seal(
+                &SegmentOutcome {
+                    reason: StopReason::Paused,
+                    boundary: crate::boundary::Boundary {
+                        icount: 11_000,
+                        rip: 0,
+                        rcx: 0,
+                    },
+                    vns: 11_000,
+                    state_hash: [0; 32],
+                    injections_delivered: 1,
+                    timer_fired: None,
+                },
+                [0; 32],
+            )
+            .unwrap();
+        let r = LogReader::parse(&sealed).unwrap();
+        let fires = r
+            .aux()
+            .filter(|rec| matches!(rec.body(), RecordBody::TimerFire { .. }))
+            .count();
+        assert_eq!(fires, 1);
     }
 }
 
