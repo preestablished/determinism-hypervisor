@@ -3,6 +3,7 @@
 #[cfg(target_arch = "x86_64")]
 pub mod fork_engine;
 pub mod preflight;
+pub mod proto_map;
 #[cfg(target_arch = "x86_64")]
 pub mod restore_engine;
 #[cfg(target_arch = "x86_64")]

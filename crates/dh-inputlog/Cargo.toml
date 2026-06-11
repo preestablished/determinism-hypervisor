@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+
+[dev-dependencies]
+# stop_reason u8 <-> proto StopReason mirror pin (bead sr5): API.md s3.3
+# says the END record's stop_reason "mirrors proto StopReason"; the
+# cross-crate test makes that a checked fact, not a comment.
+dh-proto.workspace = true
