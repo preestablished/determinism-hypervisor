@@ -63,6 +63,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("counting", counting_elf());
     assert_guest_shape("rep_loop", rep_loop_elf());
     assert_guest_shape("sse_probe", sse_probe_elf());
+    assert_guest_shape("pad_echo", pad_echo_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -221,4 +222,30 @@ fn hello_elf_embeds_the_serial_string() {
         elf.windows(needle.len()).any(|w| w == needle),
         "HELLO_SERIAL_OUTPUT not found in hello.elf"
     );
+}
+
+/// Same drift pin for pad_echo (bead 29a): the table GPA and the fixed
+/// frame pacing the M5 acceptance schedules against.
+#[test]
+fn pad_echo_asm_matches_rust_constants() {
+    let asm =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/pad_echo.asm")).unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("TABLE_GPA"), PAD_ECHO_TABLE_GPA);
+    assert_eq!(define("PACE_ITERS"), PAD_ECHO_PACE_ITERS);
+    assert_eq!(define("PAD_BASE"), 0xD000_1000); // dh_devices pad::PV_PAD_BASE
 }

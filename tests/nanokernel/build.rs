@@ -22,6 +22,7 @@ const PROGRAMS: &[&str] = &[
     "counting",
     "rep_loop",
     "sse_probe",
+    "pad_echo",
 ];
 
 fn main() {
