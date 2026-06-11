@@ -42,3 +42,10 @@ dh-worker = { path = "crates/dh-worker" }
 # snapstore_readiness dev-dep surface-pin test. CI lanes must check out
 # ../snapshot-store (path deps resolve at cargo-metadata time).
 snapstore-client = { path = "../snapshot-store/crates/snapstore-client" }
+# proto codegen for the API.md §2 surface (docs/decisions/proto-seam.md):
+# versions track ../snapshot-store's workspace so the lockfile shares one
+# tonic/prost closure. protoc is vendored — no runner provisioning needed.
+prost = "0.13"
+protoc-bin-vendored = "3"
+tonic = "0.12"
+tonic-build = "0.12"

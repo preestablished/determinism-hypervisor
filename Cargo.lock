@@ -301,6 +301,10 @@ name = "dh-proto"
 version = "0.1.0"
 dependencies = [
  "determinism-proto",
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
