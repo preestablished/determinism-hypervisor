@@ -620,7 +620,7 @@ authoritative struct definitions live in `dh-snapshot::dhsnap` with golden tests
 | `PADD` | pv-pad latches `[u32;4]`, irq vector, frame_counter |
 | `EVTC` | detchannel attach state: channel base GPA `u64` (0 = not attached). All ring, manifest, and index state lives in guest RAM and travels with the pages (guest-sdk ARCHITECTURE §2); the host re-attaches at this GPA after restore |
 | `BLKO` | pv-blk overlay: `cluster_count u32`, then `(cluster_idx u32, blake3 [u8;32])*` for clusters dirty **since the parent snapshot**, followed by the cluster bytes; plus `total_overlay_clusters u32` for integrity |
-| `NETL` | pv-net regs + pending-RX state (must be empty at snapshot; enforced) |
+| `NETL` | pv-net registers only (36 bytes: tx_buf_gpa u64, tx_len u32, tx_status u32, rx_buf_gpa u64, rx_cap u32, rx_len u32, rx_vector u32). The original "pending-RX state (must be empty at snapshot; enforced)" is satisfied BY CONSTRUCTION: the device buffers no frames (TX is drained per exit by run control; RX delivery is immediate at record landing), so no pending state exists to serialize — iteration-85 amendment |
 | `SERL` | debug-serial (empty section; serial is stateless for hashing) |
 
 ---

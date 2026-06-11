@@ -17,6 +17,12 @@
 //! (`apply_net_rx`, the PAD_SET-style run-control entry point) copies
 //! the recorded frame into the guest-published RX buffer immediately and
 //! returns the edge vector to inject per §3.4.
+//!
+//! Contracts run control inherits: TX_STATUS is STICKY (valid until the
+//! next doorbell — reg writes do not reset it); TX frames must be
+//! drained PER EXIT via [`PvNet::tx_regs`]; back-to-back NET_RX
+//! deliveries overwrite the RX buffer and RX_LEN silently — frame loss
+//! is the GUEST's pacing problem and identical in record and replay.
 
 use crate::ctx::{DevCtx, GuestMem};
 use crate::{DetDevice, RestoreError};
@@ -106,6 +112,16 @@ impl PvNet {
         self.tx_status = STATUS_OK;
     }
 
+    /// Run control's frame-recovery seam (y78): the TX registers as of
+    /// the doorbell exit — `(tx_buf_gpa, tx_len)`. The loopback path
+    /// re-reads the frame bytes from guest RAM through these AT THE SAME
+    /// EXIT that rang the doorbell (drain per exit — the guest may
+    /// overwrite its buffer the moment it runs again), then lands them
+    /// as a canonical NET_RX record.
+    pub fn tx_regs(&self) -> (u64, u32) {
+        (self.tx_buf_gpa, self.tx_len)
+    }
+
     /// Run-control entry point: a canonical NET_RX record landed at its
     /// icount. Copies the frame into the guest-published RX buffer, sets
     /// RX_LEN, and returns the edge vector to inject (per §3.4) if the
@@ -116,12 +132,23 @@ impl PvNet {
         frame: &[u8],
         mem: &mut dyn GuestMem,
     ) -> Result<Option<u8>, NetRxError> {
-        let len = u32::try_from(frame.len()).map_err(|_| NetRxError::FrameTooBig)?;
-        if len == 0 || len > MAX_FRAME || len > self.rx_cap {
-            return Err(NetRxError::FrameTooBig);
-        }
+        // ABI: RX_BUF_GPA = 0 means "unpublished" (the reset default).
+        // GPA 0 is real guest RAM, so a guest CANNOT publish an RX buffer
+        // at page zero — a deliberate reservation this device makes (the
+        // pv-entropy TX-direction doorbell has no such sentinel; its
+        // buf_gpa is guest-OUTPUT, not a host-write target gate).
+        // Checked FIRST so an unpublished buffer is never masked by a
+        // size error.
         if self.rx_buf_gpa == 0 {
             return Err(NetRxError::NoRxBuffer);
+        }
+        let len = u32::try_from(frame.len()).map_err(|_| NetRxError::FrameTooBig)?;
+        // len == 0 rejected here while the DHILOG codec accepts empty
+        // NET_RX records — the cross-layer zero-length policy is its own
+        // bead (filed iteration 85); until it lands, recording never
+        // produces an empty frame so the asymmetry is unreachable.
+        if len == 0 || len > MAX_FRAME || len > self.rx_cap {
+            return Err(NetRxError::FrameTooBig);
         }
         mem.write(self.rx_buf_gpa, frame)
             .map_err(|_| NetRxError::MemFault)?;
@@ -195,6 +222,15 @@ impl DetDevice for PvNet {
         self.rx_len = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
         self.rx_vector = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl PvNet {
+    fn snapshot_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.snapshot(&mut v);
+        v
     }
 }
 
@@ -335,10 +371,11 @@ mod tests {
     fn apply_net_rx_rejects_bad_frames_loudly() {
         let (_log, mut mem, _ent, _irqs) = harness();
         let mut dev = PvNet::new();
-        // No RX buffer published.
+        // No RX buffer published — reported as such, never masked by
+        // the (also-zero) cap.
         assert_eq!(
             dev.apply_net_rx(&[1, 2, 3], &mut mem),
-            Err(NetRxError::FrameTooBig) // cap is 0 — too big before buffer check
+            Err(NetRxError::NoRxBuffer)
         );
         // Buffer published, frame over cap.
         let (mut log, mut mem, mut ent, mut irqs) = harness();
@@ -368,6 +405,30 @@ mod tests {
             dev3.apply_net_rx(&[1; 16], &mut mem3),
             Err(NetRxError::MemFault)
         );
+    }
+
+    #[test]
+    fn bus_dispatch_at_the_canonical_window_works() {
+        let (mut log, mut mem, mut ent, mut irqs) = harness();
+        let frame = [0x3C; 32];
+        mem.0[0x400..0x420].copy_from_slice(&frame);
+        let mut bus = crate::MmioBus::new();
+        bus.register(PV_NET_BASE, Box::new(PvNet::new())).unwrap();
+        let mut c = ctx(&mut log, &mut mem, &mut ent, &mut irqs);
+        bus.write(
+            PV_NET_BASE + REG_TX_BUF_GPA,
+            &0x400u64.to_le_bytes(),
+            &mut c,
+        )
+        .unwrap();
+        bus.write(PV_NET_BASE + REG_TX_LEN, &32u32.to_le_bytes(), &mut c)
+            .unwrap();
+        bus.write(PV_NET_BASE + REG_TX_DOORBELL, &1u32.to_le_bytes(), &mut c)
+            .unwrap();
+        let mut st = [0u8; 4];
+        bus.read(PV_NET_BASE + REG_TX_STATUS, &mut st, &mut c)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(st), STATUS_OK);
     }
 
     #[test]
@@ -409,14 +470,5 @@ mod tests {
         let mut sect = Vec::new();
         dev.snapshot(&mut sect);
         assert_eq!(sect, PvNet::new().snapshot_bytes());
-    }
-}
-
-#[cfg(test)]
-impl PvNet {
-    fn snapshot_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::new();
-        self.snapshot(&mut v);
-        v
     }
 }
