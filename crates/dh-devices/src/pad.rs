@@ -152,6 +152,11 @@ impl DetDevice for PvPad {
         self.frame_counter = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
         Ok(())
     }
+    /// Run-control downcast seam (recording layer): PAD_SET applications
+    /// go through the concrete `apply_pad_set`, keyed by device id.
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]
