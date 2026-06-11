@@ -21,6 +21,7 @@ use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
 use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
+use dh_verify::verify::VerifyProgress;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -30,6 +31,7 @@ use dh_vmm::runctl::{run_segment_with_epochs, Segment, SegmentOutcome, StopReaso
 use dh_vmm::SlotState;
 use dh_worker::replay_engine::{replay_segment, ReplayError};
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
+use dh_worker::verify_replay::verify_replay;
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -351,5 +353,100 @@ fn replay_refuses_foreign_headers_and_reports_divergence() {
         Err(ReplayError::HeaderMismatch(what)) => assert_eq!(what, "machine_config_hash"),
         Err(e) => panic!("wrong error class: {e:?}"),
         Ok(_) => panic!("foreign config must be refused"),
+    }
+}
+
+/// The 1py library harness: a good recording verifies end-to-end with
+/// one EpochOk per recorded epoch and a Done carrying the END identity;
+/// a machine-mismatched recording yields a Divergence verdict (an Ok
+/// report, NOT an infrastructure error) naming the first bad epoch.
+#[test]
+fn verify_replay_reports_done_and_divergence() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+
+    // Good recording → verified.
+    let rec = record(&store, false);
+    let sys = KvmSystem::open().unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    let rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: rec.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: rec.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    );
+    let report = verify_replay(
+        &mut slot,
+        rail,
+        &rec.cfg,
+        rec.snapshot_ref.clone(),
+        &counter,
+        &store,
+        &rec.log,
+    )
+    .expect("verification ran");
+    assert!(report.verified());
+    assert_eq!(report.epochs_ok(), 10);
+    let (total, end_hash) = report.done().unwrap();
+    assert_eq!(total, 3 * QUANTUM);
+    assert_ne!(end_hash, [0u8; 32]);
+
+    // Poisoned recording → a DIVERGENCE VERDICT, not an error.
+    let poisoned = record(&store, true);
+    let mut slot2 = sys.create_slot_vm(MEM).unwrap();
+    let rail2 = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: poisoned.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: poisoned.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot2.guest_mem.clone()),
+    );
+    let report2 = verify_replay(
+        &mut slot2,
+        rail2,
+        &poisoned.cfg,
+        poisoned.snapshot_ref.clone(),
+        &counter,
+        &store,
+        &poisoned.log,
+    )
+    .expect("verification ran");
+    assert!(!report2.verified());
+    match report2.divergence().unwrap() {
+        VerifyProgress::Divergence {
+            first_bad_epoch,
+            what,
+            expected,
+            got,
+            ..
+        } => {
+            assert_eq!(*first_bad_epoch, 1, "the very first epoch diverges");
+            assert!(what.contains("EPOCH_HASH"));
+            assert_ne!(expected, got);
+        }
+        other => panic!("wrong event: {other:?}"),
     }
 }

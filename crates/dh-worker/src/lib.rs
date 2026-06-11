@@ -10,6 +10,8 @@ pub mod replay_engine;
 pub mod restore_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod snapshot_engine;
+#[cfg(target_arch = "x86_64")]
+pub mod verify_replay;
 
 pub fn preflight_summary() -> String {
     dh_vmm::m0_missing_caps_summary()
