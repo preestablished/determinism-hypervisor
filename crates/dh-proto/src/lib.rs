@@ -6,8 +6,10 @@
 //!
 //! Codegen home decision: docs/decisions/proto-seam.md. The schema lives in
 //! this repo at `proto/hypervisor.proto` and is compiled by this crate's
-//! build.rs (tonic-build + vendored protoc). Currently a SKELETON — the full
-//! API.md §2 surface lands with bead bcb.
+//! build.rs (tonic-build + vendored protoc). Covers the full API.md §2
+//! surface (bead bcb): slot lifecycle, input injection, Run/Pause,
+//! snapshots, introspection, verification, frame capture, worker/health,
+//! the §2.9 ErrorDetail, and §2.10 Quiesce.
 
 /// Generated `determinism.hypervisor.v1` types and service stubs.
 ///
@@ -37,6 +39,150 @@ pub fn sample_lease() -> v1::Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full-surface rpc pin (bead bcb): every API.md §2 method exists on the
+    /// generated client with its request type (method names + request types
+    /// ARE the contract surface; a proto rename breaks compilation here, not
+    /// in dh-worker). Never called — the call SHAPES are the assertion;
+    /// tonic's `impl IntoRequest<T>` args rule out plain fn-item pins.
+    async fn _all_seventeen_rpcs(
+        c: &mut v1::hypervisor_worker_client::HypervisorWorkerClient<tonic::transport::Channel>,
+    ) {
+        // Slot lifecycle (§2.2).
+        let _ = c.create_vm(v1::CreateVmRequest::default()).await;
+        let _ = c
+            .restore_snapshot(v1::RestoreSnapshotRequest::default())
+            .await;
+        let _ = c.fork(v1::ForkRequest::default()).await;
+        let _ = c.destroy_vm(v1::DestroyVmRequest::default()).await;
+        // Execution (§2.3–§2.5, §2.10).
+        let _ = c.inject_inputs(v1::InjectInputsRequest::default()).await;
+        let _ = c.run(v1::RunRequest::default()).await;
+        let _ = c.pause(v1::PauseRequest::default()).await;
+        let _ = c.take_snapshot(v1::TakeSnapshotRequest::default()).await;
+        let _ = c.quiesce(v1::QuiesceRequest::default()).await;
+        // Introspection (§2.6).
+        let _ = c
+            .read_guest_memory(v1::ReadGuestMemoryRequest::default())
+            .await;
+        let _ = c
+            .get_framebuffer(v1::GetFramebufferRequest::default())
+            .await;
+        let _ = c
+            .stream_guest_events(v1::StreamGuestEventsRequest::default())
+            .await;
+        // Verification & rendering (§2.7).
+        let _ = c.verify_replay(v1::VerifyReplayRequest::default()).await;
+        let _ = c
+            .run_with_frame_capture(v1::RunWithFrameCaptureRequest::default())
+            .await;
+        // Worker / health (§2.8).
+        let _ = c.get_worker_info(v1::GetWorkerInfoRequest::default()).await;
+        let _ = c.list_slots(v1::ListSlotsRequest::default()).await;
+        let _ = c.watch_slots(v1::WatchSlotsRequest::default()).await;
+    }
+
+    #[test]
+    fn all_seventeen_rpcs_are_generated() {
+        // The assertion is that _all_seventeen_rpcs compiles; reference it
+        // so it cannot be deleted as dead code.
+        let _ = _all_seventeen_rpcs;
+    }
+
+    /// Message-shape pins across the §2 surface: oneofs, nested enums, and
+    /// round-trips for the load-bearing request/response pairs.
+    #[test]
+    fn full_surface_message_shapes() {
+        use prost::Message;
+        use v1::{run_request, scheduled_event, verify_replay_progress};
+
+        // §2.3 ScheduledEvent: both oneofs.
+        let ev = v1::ScheduledEvent {
+            at: Some(scheduled_event::At::AtFrame(7)),
+            event: Some(scheduled_event::Event::PadSet(v1::PadSet {
+                port: 0,
+                buttons: 0xF0,
+            })),
+        };
+        let back = v1::ScheduledEvent::decode(ev.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(ev, back);
+
+        // §2.4 RunRequest: frame_budget arm (field 8) + capture + hard cap.
+        let req = v1::RunRequest {
+            lease: Some(sample_lease()),
+            until: Some(run_request::Until::FrameBudget(60)),
+            hard_icount_cap: 0,
+            capture: Some(v1::CaptureSpec {
+                ranges: vec![v1::ExtractRange {
+                    region: "FRAMEBUFFER".into(),
+                    layout_version: 1,
+                    offset: 0,
+                    len: 4096,
+                }],
+                framebuffer: true,
+            }),
+        };
+        assert_eq!(
+            v1::RunRequest::decode(req.encode_to_vec().as_slice()).unwrap(),
+            req
+        );
+
+        // §2.4 GoalCondition with the nested MemPredicate::Op enum.
+        let goal = v1::GoalCondition {
+            all_of: vec![v1::MemPredicate {
+                gpa: 0x1000,
+                width: 4,
+                mask: 0xFF,
+                op: v1::mem_predicate::Op::Eq as i32,
+                value: 1,
+            }],
+            poll_period: 1_000_000,
+        };
+        assert_eq!(
+            v1::GoalCondition::decode(goal.encode_to_vec().as_slice()).unwrap(),
+            goal
+        );
+
+        // §2.4 StopReason / §2.8 SlotState: the PAUSED_S disambiguation is
+        // load-bearing (C++ scoping; see proto/hypervisor.proto).
+        assert_eq!(v1::StopReason::Paused as i32, 5);
+        assert_eq!(v1::SlotState::PausedS as i32, 2);
+        assert_eq!(v1::SlotState::FaultedS as i32, 5);
+
+        // §2.7 VerifyReplayProgress oneof: divergence is terminal/P0.
+        let prog = v1::VerifyReplayProgress {
+            msg: Some(verify_replay_progress::Msg::Divergence(v1::Divergence {
+                first_bad_epoch: 3,
+                icount_lo: 100,
+                icount_hi: 1124,
+                rip_expected: 0xFFFF_8000_0000_1000,
+                rip_actual: 0xFFFF_8000_0000_1004,
+                reg_diff: vec![],
+                diff_page_idx: vec![1, 2, 3],
+                suspected_cause: "RDTSC at divergent RIP".into(),
+            })),
+        };
+        assert_eq!(
+            v1::VerifyReplayProgress::decode(prog.encode_to_vec().as_slice()).unwrap(),
+            prog
+        );
+
+        // §2.6 NextSdkEvent: proto3 optional ⇒ Option<u32>.
+        let any = v1::NextSdkEvent { stream: None };
+        let filt = v1::NextSdkEvent { stream: Some(9) };
+        assert_ne!(any.encode_to_vec(), filt.encode_to_vec());
+
+        // §2.9 ErrorDetail.
+        let detail = v1::ErrorDetail {
+            slot_id: 4,
+            icount: 1_000_000,
+            code: "stale_lease".into(),
+        };
+        assert_eq!(
+            v1::ErrorDetail::decode(detail.encode_to_vec().as_slice()).unwrap(),
+            detail
+        );
+    }
 
     /// Codegen skeleton end-to-end pin (bead v8p): prost message round-trip
     /// plus existence of both generated service halves.

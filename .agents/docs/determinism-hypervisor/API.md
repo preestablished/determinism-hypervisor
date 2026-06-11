@@ -438,8 +438,11 @@ message SlotInfo {
   SnapshotRef base = 4;                // base snapshot of current segment (if any)
   uint32 live_children = 5;            // for Frozen parents
 }
-enum SlotState { SLOT_UNSPECIFIED = 0; EMPTY = 1; PAUSED = 2; RUNNING = 3;
+enum SlotState { SLOT_UNSPECIFIED = 0; EMPTY = 1; PAUSED_S = 2; RUNNING = 3;
                  FROZEN = 4; FAULTED_S = 5; }
+// PAUSED_S (like FAULTED_S): proto enum values use C++ scoping — siblings of
+// the package, not the enum — so SlotState values must not collide with
+// StopReason's PAUSED/FAULTED. protoc rejects a bare PAUSED here.
 message WatchSlotsRequest {}
 message SlotEvent { SlotInfo slot = 1; }   // emitted on every state transition
 ```

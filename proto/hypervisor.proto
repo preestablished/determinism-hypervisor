@@ -1,36 +1,383 @@
-// determinism-hypervisor gRPC contract — CODEGEN SKELETON (bead v8p).
+// determinism-hypervisor gRPC contract — the full API.md §2 surface (bead bcb).
 //
 // This file is the canonical home of the `determinism.hypervisor.v1` schema
 // (docs/decisions/proto-seam.md): codegen lives in this repo (dh-proto's
 // build.rs, vendored protoc), NOT in control-plane's determinism-proto, whose
 // hypervisor module is a hand-written placeholder superseded for this repo.
 //
-// SKELETON SCOPE: only the §2.1 common-type core and the §2.8 GetWorkerInfo
-// leg are defined — enough to prove tonic/prost codegen end-to-end on both
-// x86_64 and aarch64. Bead bcb ("Proto schema v1") fills in the full API.md
-// §2 surface. Message/field shapes below are normative API.md §2 text.
+// Message/field shapes and numbers are normative API.md §2 text, transcribed
+// exactly — the §2.1/§2.8 subset landed first (bead v8p) and this fill-in is
+// purely additive (no renumbering). The inline semantic comments are ported
+// from API.md §2; keep both in sync when either changes.
 
 syntax = "proto3";
 
 package determinism.hypervisor.v1;
 
 // Served by dh-workerd on 0.0.0.0:7400 (TCP) and /run/dh/grpc.sock (UDS).
-//
-// SKELETON: one rpc to anchor service codegen. The full v1 method set
-// (slot lifecycle, execution, introspection, verification, watch) lands
-// with bead bcb — see API.md §2 for the committed surface.
 service HypervisorWorker {
-  // ---- worker / health (API.md §2.8) ----
-  rpc GetWorkerInfo (GetWorkerInfoRequest) returns (GetWorkerInfoResponse);
+  // ---- slot lifecycle (§2.2) ----
+  rpc CreateVm        (CreateVmRequest)        returns (CreateVmResponse);
+  rpc RestoreSnapshot (RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+  rpc Fork            (ForkRequest)            returns (ForkResponse);
+  rpc DestroyVm       (DestroyVmRequest)       returns (DestroyVmResponse);
+
+  // ---- execution (§2.3, §2.4, §2.5) ----
+  rpc InjectInputs    (InjectInputsRequest)    returns (InjectInputsResponse);
+  rpc Run             (RunRequest)             returns (RunResponse);
+  rpc Pause           (PauseRequest)           returns (PauseResponse);   // see §2.9
+  rpc TakeSnapshot    (TakeSnapshotRequest)    returns (TakeSnapshotResponse);
+  // Phase 8, optional (guest-sdk Ms6); not part of the v1 exploration loop. §2.10.
+  rpc Quiesce         (QuiesceRequest)         returns (QuiesceResponse);
+
+  // ---- introspection (slot must be Paused) (§2.6) ----
+  rpc ReadGuestMemory (ReadGuestMemoryRequest) returns (ReadGuestMemoryResponse);
+  rpc GetFramebuffer  (GetFramebufferRequest)  returns (GetFramebufferResponse);
+  rpc StreamGuestEvents (StreamGuestEventsRequest) returns (stream GuestEvent);
+
+  // ---- verification & rendering (§2.7) ----
+  rpc VerifyReplay    (VerifyReplayRequest)    returns (stream VerifyReplayProgress);
+  // Required by replay-renderer (Phase 7); not part of the v1 exploration loop. §2.7.
+  rpc RunWithFrameCapture (RunWithFrameCaptureRequest) returns (stream FrameCaptureEvent);
+
+  // ---- worker / health (§2.8) ----
+  rpc GetWorkerInfo   (GetWorkerInfoRequest)   returns (GetWorkerInfoResponse);
+  rpc ListSlots       (ListSlotsRequest)       returns (ListSlotsResponse);
+  rpc WatchSlots      (WatchSlotsRequest)      returns (stream SlotEvent);
 }
 
-// ---- common types (API.md §2.1, core subset) ----
+// ---- common types (API.md §2.1) ----
 
 message SnapshotRef   { bytes hash = 1; }  // 32 bytes, BLAKE3 of manifest
 message StateHash     { bytes hash = 1; }  // 32 bytes, chain value (ARCHITECTURE §8.5)
 message Lease         { uint64 slot_id = 1; bytes token = 2; }  // token: 16 random bytes
 
-// ---- worker / health (API.md §2.8) ----
+message MachineConfig {
+  uint32 version          = 1;   // config schema version, currently 1
+  uint64 mem_bytes        = 2;   // multiple of 2 MiB
+  uint32 vcpus            = 3;   // MUST be 1 in v1
+  uint32 clock_num        = 4;   // virtual ns per instruction, rational (default 1)
+  uint32 clock_den        = 5;   // (default 1)
+  bytes  base_image_hash  = 6;   // BLAKE3 of the base disk image (must be in image cache)
+  BootSpec boot           = 7;
+  uint64 epoch_len        = 8;   // instructions per epoch (default 50_000_000)
+  HashEpochs hash_epochs  = 9;   // EPOCHS_ON (default) | FINAL_ONLY
+  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results)
+}
+message BootSpec {
+  oneof kind {
+    ElfBoot     elf     = 1;     // unikernel / freestanding ELF
+    BzImageBoot bzimage = 2;     // minimal Linux
+  }
+}
+message ElfBoot     { bytes kernel_hash = 1; bytes cmdline = 2; }
+message BzImageBoot { bytes kernel_hash = 1; bytes initramfs_hash = 2;
+                      bytes cmdline = 3; }  // APPEND-ONLY extras; the worker forces the
+                                            //   canonical deterministic baseline and accepts
+                                            //   only whitelisted extra flags (ARCH §2.3)
+enum HashEpochs { HASH_EPOCHS_UNSPECIFIED = 0; EPOCHS_ON = 1; FINAL_ONLY = 2; }
+
+// ---- capture engine (ARCHITECTURE §6.10) ----
+// This service owns the per-step feature/framebuffer capture path (MAP.md dataflow
+// step 4) and is explicitly FEATURE-MAP-AGNOSTIC: it never parses feature maps. The
+// orchestrator compiles the experiment's feature map (reference-workload schema) into
+// this flat extraction list once at experiment start; ranges address regions in the
+// guest-sdk region manifest by name (resolved at CHANNEL_INIT and re-resolved after
+// every restore — ARCHITECTURE §6.6).
+message CaptureSpec {
+  repeated ExtractRange ranges = 1;  // packed into feature_bytes in request order
+  bool framebuffer = 2;              // also return the lz4-compressed framebuffer
+}
+message ExtractRange {
+  string region         = 1;  // guest-sdk region-manifest name
+  uint32 layout_version = 2;  // must match the manifest entry, else FAILED_PRECONDITION
+  uint64 offset         = 3;  // bytes into the (logically concatenated) region
+  uint32 len            = 4;
+}
+message FbInfo {
+  uint32 width = 1; uint32 height = 2; uint32 stride = 3;
+  PixelFormat format = 4;
+  uint32 frame_counter = 5;          // pv-pad FRAME_COUNTER at capture
+}
+
+// ---- slot lifecycle (§2.2) ----
+
+message CreateVmRequest {            // cold boot from base image (rare: root creation)
+  MachineConfig config   = 1;
+  bytes entropy_seed     = 2;        // 32 bytes; DHILOG header seed for the boot segment
+}
+message CreateVmResponse {
+  Lease lease            = 1;
+  uint64 icount          = 2;        // 0
+}
+
+message RestoreSnapshotRequest {
+  SnapshotRef snapshot   = 1;        // resolved via snapshot-store by the worker
+  bytes entropy_seed     = 2;        // 32 bytes; empty ⇒ continue snapshot's PRNG stream
+}
+message RestoreSnapshotResponse {
+  Lease lease            = 1;
+  MachineConfig config   = 2;        // recovered from the manifest's machine config
+  StateHash state_hash   = 3;        // chain value at the restored boundary
+  uint32 frame_counter   = 4;        // ABSOLUTE pv-pad FRAME_COUNTER at the restored
+                                     //   boundary (DHSNAP PADD) — the base callers use
+                                     //   to schedule at_frame = frame_counter + offset (§2.3)
+}
+
+message ForkRequest {
+  Lease parent           = 1;        // parent must be Paused; becomes Frozen
+  uint32 count           = 2;        // 1..=remaining free slots
+  repeated bytes entropy_seeds = 3;  // count × 32 bytes (one per child; required —
+                                     //   forks exist to diversify, seeds make it explicit)
+}
+message ForkResponse {
+  repeated Lease children = 1;       // tier-A CoW forks (ARCHITECTURE §8.4)
+}
+
+message DestroyVmRequest  { Lease lease = 1; }
+message DestroyVmResponse { }        // freeing the last child unfreezes/frees the parent
+
+// ---- input injection (§2.3) ----
+
+message InjectInputsRequest {
+  Lease lease                     = 1;
+  repeated ScheduledEvent events  = 2;   // must all be in the future (>= current icount)
+}
+message ScheduledEvent {
+  oneof at {                             // when it lands (converted to icount, ARCH §3.3)
+    uint64 at_icount  = 1;               // absolute, segment-relative
+    uint64 at_vns     = 2;               // virtual ns → icount via clock rational
+    uint32 at_frame   = 3;               // the ABSOLUTE guest FRAME_COUNTER value (pv-pad,
+                                         //   ARCH §6.4) — NEVER segment-relative. The counter
+                                         //   persists across snapshot/restore (DHSNAP PADD) and
+                                         //   is strictly increasing along a lineage; each
+                                         //   segment's FRAME_MARK table maps absolute F →
+                                         //   segment-relative icount. Callers schedule
+                                         //   at_frame = frame_counter + offset, reading the
+                                         //   base from RestoreSnapshotResponse /
+                                         //   TakeSnapshotResponse (§2.2/§2.5).
+  }
+  oneof event {
+    PadSet      pad_set   = 4;           // the demo path: controller bitmask
+    DeviceEvent dev_event = 5;           // generic device event
+    NetRx       net_rx    = 6;           // loopback packet delivery
+  }
+}
+message PadSet      { uint32 port = 1; uint32 buttons = 2; }   // port 0..3; bitmask
+message DeviceEvent { uint32 device_id = 1; uint32 event_type = 2; bytes payload = 3; } // ≤ 4 KiB
+message NetRx       { bytes frame = 1; }                       // ≤ 2048 bytes
+message InjectInputsResponse { uint32 scheduled = 1; }
+
+// ---- run / pause (§2.4) ----
+
+message RunRequest {
+  Lease lease = 1;
+  oneof until {
+    uint64 icount_budget   = 2;   // run this many MORE instructions
+    uint64 vns_budget      = 3;   // run this much MORE virtual time
+    uint32 frame_budget    = 8;   // run until the frame-boundary exit (the pv-pad
+                                  //   FRAME_COUNTER MMIO write, ARCH §6.6) of the Nth
+                                  //   FrameMark since run start, then pause. The
+                                  //   platform's ONLY frame-quantized stop condition;
+                                  //   deterministic via the frame table. "Run N frames"
+                                  //   in any caller doc means frame_budget = N — never
+                                  //   vns arithmetic: virtual time stays a pure function
+                                  //   of icount (ARCH §4). Reports BUDGET_REACHED.
+    NextSdkEvent next_sdk_event = 4;  // stop at the next matching SDK event
+    GoalCondition goal     = 5;   // stop when predicate holds (polled, see below)
+  }
+  uint64 hard_icount_cap   = 6;   // safety net for goal/sdk/frame waits; 0 ⇒ worker default (10e9)
+  CaptureSpec capture      = 7;   // optional: extract features/framebuffer at the stop
+                                  //   boundary (capture engine, ARCHITECTURE §6.10)
+}
+message NextSdkEvent {
+  optional uint32 stream = 1;     // detchannel EventKind filter (guest-sdk API.md §3.1);
+                                  // unset ⇒ stop at the next SDK event of ANY kind.
+                                  // e.g. set to FRAME_MARK's kind for frame-grid stepping;
+                                  // non-matching events are forwarded but don't stop the run.
+}
+message GoalCondition {
+  repeated MemPredicate all_of = 1;     // AND of predicates
+  uint64 poll_period           = 2;     // instructions between polls (default 1_000_000).
+                                        // Polling happens at deterministic agenda points,
+                                        // so the stop boundary is reproducible.
+}
+message MemPredicate {
+  uint64 gpa    = 1;
+  uint32 width  = 2;                    // 1|2|4|8
+  uint64 mask   = 3;                    // applied before compare (0 ⇒ no mask)
+  enum Op { OP_UNSPECIFIED = 0; EQ = 1; NE = 2; GE = 3; LE = 4; }
+  Op op         = 4;
+  uint64 value  = 5;
+}
+
+message RunResponse {
+  StopReason reason      = 1;
+  uint64 icount          = 2;          // boundary where we stopped
+  uint64 vns             = 3;
+  StateHash state_hash   = 4;          // chain value at the stop boundary
+  uint64 frames_elapsed  = 5;          // FRAME_MARK count during this Run
+                                       //   (== frame_budget when a frame_budget run
+                                       //   stops with BUDGET_REACHED)
+  GuestEvent sdk_event   = 6;          // set when reason == NEXT_SDK_EVENT
+  // Capture engine output, set iff request.capture was present. Capture is
+  // read-only at the pause boundary and never perturbs execution, the DHILOG,
+  // or the state hash (ARCHITECTURE §6.10 C5).
+  bytes feature_bytes    = 7;          // ranges packed in request order
+  bytes fb_lz4           = 8;          // lz4-compressed framebuffer pixels
+  FbInfo fb_info         = 9;
+}
+enum StopReason {
+  STOP_UNSPECIFIED = 0; BUDGET_REACHED = 1; GOAL_SATISFIED = 2; NEXT_SDK_EVENT = 3;
+  HARD_CAP = 4; PAUSED = 5;            // external Pause rolled forward to epoch boundary
+  GUEST_HALTED = 6;                    // guest executed terminal HLT / triple fault
+  FAULTED = 7;                         // guest-contract violation; slot needs Destroy/Restore
+}
+
+message PauseRequest  { Lease lease = 1; }
+message PauseResponse { uint64 icount = 1; uint64 vns = 2; StateHash state_hash = 3; }
+// Semantics: "pause soon at a deterministic point" — the engine stops at the NEXT EPOCH
+// BOUNDARY (≤ epoch_len instructions away), never mid-grid. See ARCHITECTURE §3.3.
+
+// ---- snapshots (§2.5) ----
+
+message TakeSnapshotRequest {
+  Lease lease = 1;
+  bool seal_input_log = 2;     // true (default): close + store the segment's DHILOG in
+                               // snapshot-store, reference it in the response
+  CaptureSpec capture = 3;     // optional: extract features/framebuffer at the same
+                               //   boundary (capture engine, ARCHITECTURE §6.10)
+}
+message TakeSnapshotResponse {
+  SnapshotRef snapshot   = 1;  // issued by snapshot-store (PutSnapshot)
+  bytes input_log_id     = 2;  // snapshot-store log_id of the sealed DHILOG (32 bytes)
+  uint64 icount          = 3;
+  uint64 vns             = 4;
+  StateHash state_hash   = 5;
+  uint32 dirty_pages     = 6;  // delta size vs parent (observability)
+  bytes machine_config_hash          = 7;  // BLAKE3 of canonical MachineConfig
+  DeterminismClass determinism_class = 8;  // this host's tuple (§2.8)
+  // The store's .spm manifest carries NO metadata section (§5.1): the orchestrator
+  // persists state_hash / machine_config_hash / determinism_class from this response
+  // into the lineage node's attrs at commit time, and input_log_id into the node row
+  // (a native NodeMeta column). Restore-time gating reads node attrs — see §5.2.
+  bytes feature_bytes    = 9;  // capture engine output, iff request.capture set
+  bytes fb_lz4           = 10;
+  FbInfo fb_info         = 11;
+  uint32 frame_counter   = 12; // ABSOLUTE pv-pad FRAME_COUNTER at the snapshot boundary
+                               //   (always set, capture or not) — the at_frame base for
+                               //   the child segment (§2.3)
+}
+
+// ---- introspection (§2.6) ----
+
+message ReadGuestMemoryRequest {
+  Lease lease = 1;
+  repeated GpaRange ranges = 2;        // raw-GPA mode; total ≤ 16 MiB per call
+  // By-name mode (debug/ad-hoc convenience; the exploration capture path uses
+  // CaptureSpec instead): resolved through the guest-sdk region manifest,
+  // delegating to detguest-host's Channel::read_region (guest-sdk API.md §2).
+  repeated RegionRange region_ranges = 3;
+}
+message GpaRange    { uint64 gpa = 1; uint64 len = 2; }
+message RegionRange { string region = 1; uint32 layout_version = 2;
+                      uint64 offset = 3; uint64 len = 4; }
+message ReadGuestMemoryResponse {
+  repeated bytes chunks = 1;           // 1:1 with ranges, then region_ranges
+  uint64 icount = 2;                   // boundary the read is consistent with
+}
+
+message GetFramebufferRequest { Lease lease = 1; }
+message GetFramebufferResponse {
+  uint32 width = 1; uint32 height = 2; uint32 stride = 3;
+  PixelFormat format = 4;
+  uint32 frame_counter = 5;            // pv-pad FRAME_COUNTER (ARCHITECTURE §6.4)
+  uint64 icount = 6;
+  bytes pixels = 7;                    // stride*height bytes
+}
+enum PixelFormat { PF_UNSPECIFIED = 0; XRGB8888 = 1; RGB565 = 2; }
+
+message StreamGuestEventsRequest {
+  Lease lease = 1;
+  repeated uint32 streams = 2;         // detchannel EventKind values
+                                       // (guest-sdk API.md §3.1); empty ⇒ all
+}
+message GuestEvent {
+  uint32 stream = 1;                   // the record's detchannel EventKind
+  uint64 icount = 2;                   // doorbell icount (deterministic)
+  uint64 vns    = 3;
+  bytes payload = 4;                   // record payload; framing owned by guest-sdk
+}
+
+// ---- verification (§2.7) ----
+
+message VerifyReplayRequest {
+  SnapshotRef base       = 1;
+  oneof log {
+    bytes input_log      = 2;          // inline DHILOG bytes — ≤ 4 MiB per segment
+                                       // (the cap is snapshot-store's
+                                       // input_log_max_bytes, the single source for
+                                       // this number; spliced .dilog containers are
+                                       // exempt — they live in control-plane's
+                                       // artifact registry, not the store, and are
+                                       // verified segment-by-segment anyway)
+    bytes input_log_id   = 3;          // fetch from snapshot-store
+  }
+  bool bisect_on_divergence = 4;       // default true
+}
+message VerifyReplayProgress {
+  oneof msg {
+    EpochOk    epoch_ok   = 1;         // streamed per epoch
+    VerifyDone done       = 2;
+    Divergence divergence = 3;         // terminal; P0
+  }
+}
+message EpochOk   { uint64 epoch_index = 1; uint64 icount = 2; }
+message VerifyDone {
+  uint64 total_icount = 1;
+  StateHash end_state_hash = 2;        // matched the log's end_state_hash
+}
+message Divergence {                   // diagnostics from dh-verify bisection
+  uint64 first_bad_epoch   = 1;
+  uint64 icount_lo         = 2;        // diverging instruction range after bisection
+  uint64 icount_hi         = 3;        // (hi - lo ≤ 1024, or ≤ 1 if single-step compare ran)
+  uint64 rip_expected      = 4;
+  uint64 rip_actual        = 5;
+  bytes  reg_diff          = 6;        // postcard-encoded Vec<RegDiff{name, expected, actual}>
+  repeated uint64 diff_page_idx = 7;   // first ≤ 64 differing page indices
+  string suspected_cause   = 8;        // decoder hint, e.g. "RDTSC at divergent RIP"
+}
+
+// ---- RunWithFrameCapture (required by replay-renderer, Phase 7) ----
+// Server-streaming frame extraction during a run: one CapturedFrame per FRAME_MARK
+// observed, then a terminal RunResponse. Capture-neutral (normative): the capture
+// MUST NOT perturb execution, the DHILOG, or the state hash — a capture run and a
+// no-capture run of the same (snapshot, inputs) produce identical refs and epoch
+// hashes (CI-tested). Backpressure: if the stream consumer stalls, the worker holds
+// the vCPU paused at the FRAME_MARK boundary; it never drops frames.
+message RunWithFrameCaptureRequest {
+  Lease lease = 1;
+  oneof until {
+    uint64 icount_budget = 2;
+    uint64 vns_budget    = 3;
+  }
+  uint64 hard_icount_cap = 4;          // 0 ⇒ worker default
+}
+message FrameCaptureEvent {
+  oneof msg {
+    CapturedFrame frame = 1;           // streamed per FRAME_MARK
+    RunResponse   done  = 2;           // terminal
+  }
+}
+message CapturedFrame {
+  uint32 frame_index = 1;              // the FRAME_MARK's frame index (absolute
+                                       //   FRAME_COUNTER value, §2.3)
+  uint64 icount      = 2;              // the FRAME_COUNTER frame-boundary exit
+  bytes  fb_lz4      = 3;              // lz4-compressed framebuffer pixels
+  FbInfo fb_info     = 4;
+}
+
+// ---- worker / health (§2.8) ----
 
 message GetWorkerInfoRequest {}
 message GetWorkerInfoResponse {
@@ -45,4 +392,52 @@ message DeterminismClass {             // ARCH §7.4; embedded in manifests too
   string microcode    = 2;
   string host_kernel  = 3;
   string vmm_version  = 4;             // dh-vmm crate version
+}
+
+message ListSlotsRequest {}
+message ListSlotsResponse { repeated SlotInfo slots = 1; }
+message SlotInfo {
+  uint64 slot_id = 1;
+  SlotState state = 2;
+  uint64 icount = 3;
+  SnapshotRef base = 4;                // base snapshot of current segment (if any)
+  uint32 live_children = 5;            // for Frozen parents
+}
+// PAUSED_S follows FAULTED_S: proto enum values use C++ scoping (siblings of
+// the package, not the enum), so SlotState values must not collide with
+// StopReason's PAUSED/FAULTED. API.md §2.8 wrote PAUSED here — an oversight
+// of the same rule its own FAULTED_S works around (codegen rejects it).
+enum SlotState { SLOT_UNSPECIFIED = 0; EMPTY = 1; PAUSED_S = 2; RUNNING = 3;
+                 FROZEN = 4; FAULTED_S = 5; }
+message WatchSlotsRequest {}
+message SlotEvent { SlotInfo slot = 1; }   // emitted on every state transition
+
+// ---- error model (§2.9) ----
+// gRPC status codes: FAILED_PRECONDITION (wrong slot state / stale lease),
+// NOT_FOUND (unknown snapshot ref / image hash), RESOURCE_EXHAUSTED (no free
+// slots), INVALID_ARGUMENT (schema violations, past-icount injection),
+// DATA_LOSS — reserved exclusively for determinism violations; callers treat
+// it as P0 and page a human. Status details carry this ErrorDetail (API.md
+// §2.9 writes it as `dh.ErrorDetail`; it lives in this package — field
+// numbers are pinned here, not in API.md).
+message ErrorDetail {
+  uint64 slot_id = 1;
+  uint64 icount  = 2;
+  string code    = 3;                  // machine-readable
+}
+
+// ---- quiesce (§2.10, Phase 8, optional) ----
+// Host-facing initiator for guest-sdk's quiesce protocol (its ARCHITECTURE §6
+// owns the in-guest relay, token echo, and ring-C Quiesce command encoding).
+// Not part of the v1 exploration loop; lands with guest-sdk Ms6 in Phase 8.
+message QuiesceRequest {
+  Lease lease            = 1;
+  uint64 token           = 2;   // host-chosen; echoed by QuiesceReady / QUIESCE_ACK
+                                //   (guest-sdk ARCHITECTURE §6)
+  QuiesceMode mode       = 3;
+  uint64 hard_icount_cap = 4;   // 0 ⇒ worker default
+}
+enum QuiesceMode { QUIESCE_MODE_UNSPECIFIED = 0; COOP = 1; FORCED = 2; }
+message QuiesceResponse {       // slot is Paused at the ack boundary
+  uint64 icount = 1; uint64 vns = 2; StateHash state_hash = 3;
 }
