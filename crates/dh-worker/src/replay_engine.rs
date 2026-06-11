@@ -46,6 +46,10 @@ use std::sync::atomic::AtomicBool;
 
 use crate::restore_engine::{restore_snapshot, RestoreError};
 
+/// The structured divergence captured by the epoch sink:
+/// `(what, at_icount, expected, got)`.
+type DivergenceCell = std::cell::Cell<Option<(&'static str, u64, [u8; 32], [u8; 32])>>;
+
 #[derive(Debug)]
 pub enum ReplayError {
     Restore(RestoreError),
@@ -155,86 +159,104 @@ pub fn replay_segment<M: GuestMem>(
     // LINK POINT (the sink) and re-landed in the replay's own log; a
     // mismatch aborts the quantum loudly through the sink error.
     let verified = std::cell::Cell::new(0usize);
-    let run_to =
-        |slot: &mut SlotVm, chain: &mut StateHashChain, target: u64| -> Result<(), ReplayError> {
-            let start = counter
-                .read()
-                .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
-            if target < start {
-                return Err(ReplayError::Apply(format!(
-                    "record icount {target} is behind the replay position {start} — \
+    let divergence: DivergenceCell = std::cell::Cell::new(None);
+    let run_to = |slot: &mut SlotVm,
+                  chain: &mut StateHashChain,
+                  target: u64|
+     -> Result<Option<dh_vmm::runctl::SegmentOutcome>, ReplayError> {
+        let start = counter
+            .read()
+            .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+        if target < start {
+            return Err(ReplayError::Apply(format!(
+                "record icount {target} is behind the replay position {start} — \
                  records must be monotone"
-                )));
-            }
-            if target == start {
-                return Ok(());
-            }
-            let out = {
-                let mut seg = Segment {
-                    slot,
-                    counter,
-                    chain,
-                    config: machine_config,
-                    start_icount: start,
-                    injections: &[],
-                    timer: None,
-                    pause: &pause,
-                };
-                run_segment_with_epochs(
-                    &mut seg,
-                    Until::IcountBudget(target - start),
-                    &mut || false,
-                    &mut |exit| {
-                        let icount = counter
-                            .read()
-                            .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
-                        rail.borrow_mut().service_exit(icount, exit)
-                    },
-                    &mut |idx, icount, value| {
-                        let i = verified.get();
-                        match expected_epochs.get(i) {
-                            Some((e_idx, e_icount, e_value))
-                                if *e_idx == idx && *e_icount == icount && *e_value == value => {}
-                            Some((_, _, e_value)) => {
-                                return Err(BoundaryError::Exit(format!(
-                                    "EPOCH_HASH divergence at icount {icount} (epoch {idx}): \
-                                 expected {:02x?}.., got {:02x?}..",
-                                    &e_value[..4],
-                                    &value[..4]
-                                )));
-                            }
-                            None => {
-                                return Err(BoundaryError::Exit(format!(
-                                    "replay produced an EPOCH_HASH at icount {icount} the \
-                                 recording does not have"
-                                )));
-                            }
+            )));
+        }
+        if target == start {
+            return Ok(None);
+        }
+        let out = {
+            let mut seg = Segment {
+                slot,
+                counter,
+                chain,
+                config: machine_config,
+                start_icount: start,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+            };
+            run_segment_with_epochs(
+                &mut seg,
+                Until::IcountBudget(target - start),
+                &mut || false,
+                &mut |exit| {
+                    let icount = counter
+                        .read()
+                        .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
+                    rail.borrow_mut().service_exit(icount, exit)
+                },
+                &mut |idx, icount, value| {
+                    let i = verified.get();
+                    match expected_epochs.get(i) {
+                        Some((e_idx, e_icount, e_value))
+                            if *e_idx == idx && *e_icount == icount && *e_value == value => {}
+                        Some((_, _, e_value)) => {
+                            divergence.set(Some((
+                                "EPOCH_HASH chain value",
+                                icount,
+                                *e_value,
+                                value,
+                            )));
+                            return Err(BoundaryError::Exit("epoch divergence".into()));
                         }
-                        verified.set(i + 1);
-                        rail.borrow_mut()
-                            .log_epoch_hash(idx, icount, value)
-                            .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
-                    },
-                )
-                .map_err(|e: RunError| match e {
-                    RunError::Boundary(BoundaryError::Exit(m)) if m.contains("EPOCH_HASH") => {
-                        ReplayError::Divergence {
-                            what: "EPOCH_HASH (see message)",
-                            at_icount: start,
-                            expected: [0; 32],
-                            got: [0; 32],
+                        None => {
+                            divergence.set(Some((
+                                "EPOCH_HASH the recording does not have",
+                                icount,
+                                [0; 32],
+                                value,
+                            )));
+                            return Err(BoundaryError::Exit("epoch divergence".into()));
                         }
                     }
-                    other => ReplayError::Run(format!("{other}")),
-                })?
-            };
-            if out.reason != StopReason::BudgetReached {
-                return Err(ReplayError::Run(format!(
+                    verified.set(i + 1);
+                    rail.borrow_mut()
+                        .log_epoch_hash(idx, icount, value)
+                        .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
+                },
+            )
+            .map_err(|e: RunError| {
+                // Structured side channel (iteration-88 review I1): the
+                // sink can only surface a BoundaryError; the real
+                // diagnostics travel through the Cell.
+                if let Some((what, at_icount, expected, got)) = divergence.take() {
+                    ReplayError::Divergence {
+                        what,
+                        at_icount,
+                        expected,
+                        got,
+                    }
+                } else {
+                    ReplayError::Run(format!("{e}"))
+                }
+            })?
+        };
+        Ok(Some(out))
+    };
+    // Intermediate quanta must land exactly (BudgetReached at the
+    // record's icount); the TAIL has its own contract at the call site.
+    let require_landed =
+        |out: &Option<dh_vmm::runctl::SegmentOutcome>, target: u64| -> Result<(), ReplayError> {
+            match out {
+                None => Ok(()),
+                Some(o) if o.reason == StopReason::BudgetReached => Ok(()),
+                Some(o) => Err(ReplayError::Run(format!(
                     "expected to land at {target}, stopped {:?} at {}",
-                    out.reason, out.boundary.icount
-                )));
+                    o.reason, o.boundary.icount
+                ))),
             }
-            Ok(())
         };
 
     // ── Walk the canonical records ────────────────────────────────────────
@@ -248,13 +270,15 @@ pub fn replay_segment<M: GuestMem>(
                 buttons,
                 frame_hint,
             } => {
-                run_to(slot, &mut chain, icount)?;
+                let o = run_to(slot, &mut chain, icount)?;
+                require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_pad_set(icount, rip, port, buttons, frame_hint)
                     .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
             }
             RecordBody::NetRx { frame } => {
-                run_to(slot, &mut chain, icount)?;
+                let o = run_to(slot, &mut chain, icount)?;
+                require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_net_rx(icount, rip, frame)
                     .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
@@ -279,7 +303,35 @@ pub fn replay_segment<M: GuestMem>(
     }
 
     // ── Run out the tail and check the END identity ───────────────────────
-    run_to(slot, &mut chain, header.end_icount)?;
+    let (stop_reason_byte, _) = log.end();
+    let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
+    let tail = run_to(slot, &mut chain, header.end_icount)?;
+    if let Some(out) = &tail {
+        // A GuestHalted recording legitimately stops ON its halt at
+        // end_icount; anything else must land the budget exactly. Either
+        // way the boundary must BE end_icount (iteration-88 review I2 —
+        // the halt coincidence is now a pinned contract, not luck).
+        let reason_ok = out.reason == StopReason::BudgetReached
+            || (out.reason == StopReason::GuestHalted
+                && expected_reason == StopReason::GuestHalted);
+        if !reason_ok || out.boundary.icount != header.end_icount {
+            return Err(ReplayError::Run(format!(
+                "tail stopped {:?} at {} (recording ended {:?} at {})",
+                out.reason, out.boundary.icount, expected_reason, header.end_icount
+            )));
+        }
+        // end_vns travels OUTSIDE body_hash (header-only), so the reseal
+        // byte-compare cannot verify it — check the live value here
+        // (iteration-88 review I1/opus2; masked by 1:1 clocks until a5e).
+        if out.vns != header.end_vns {
+            return Err(ReplayError::Divergence {
+                what: "end_vns",
+                at_icount: header.end_icount,
+                expected: u64_hash(header.end_vns),
+                got: u64_hash(out.vns),
+            });
+        }
+    }
     let verified = verified.get();
     if verified != expected_epochs.len() {
         return Err(ReplayError::Divergence {
@@ -300,9 +352,8 @@ pub fn replay_segment<M: GuestMem>(
     }
 
     // ── The reseal hammer ─────────────────────────────────────────────────
-    let (stop_reason, _) = log.end();
     let outcome_like = dh_vmm::runctl::SegmentOutcome {
-        reason: stop_reason_from_u8(stop_reason)?,
+        reason: expected_reason,
         boundary: dh_vmm::boundary::Boundary {
             icount: header.end_icount,
             rip: 0,
@@ -318,11 +369,18 @@ pub fn replay_segment<M: GuestMem>(
         .seal(&outcome_like, header.end_snapshot_id)
         .map_err(|e| ReplayError::Apply(format!("reseal: {e:?}")))?;
     if resealed != log_bytes {
+        // Find the first differing offset for the report (iteration-88
+        // review I2 — an undiffable pair helps nobody).
+        let first_diff = resealed
+            .iter()
+            .zip(log_bytes.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| resealed.len().min(log_bytes.len()));
         return Err(ReplayError::Divergence {
-            what: "resealed log bytes",
-            at_icount: header.end_icount,
+            what: "resealed log bytes (at_icount = first differing byte offset)",
+            at_icount: first_diff as u64,
             expected: header.body_hash,
-            got: [0; 32], // byte-compare failed; the diff is in the logs
+            got: [0; 32],
         });
     }
 
@@ -333,6 +391,13 @@ pub fn replay_segment<M: GuestMem>(
         end_state_hash: live_end,
         resealed,
     })
+}
+
+/// A u64 packed into the 32-byte divergence slot (LE in the first 8).
+fn u64_hash(v: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&v.to_le_bytes());
+    out
 }
 
 /// Inverse of `dh_vmm::recording::stop_reason_u8` for the END byte —
