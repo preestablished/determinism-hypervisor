@@ -45,6 +45,7 @@ snapstore-client = { path = "../snapshot-store/crates/snapstore-client" }
 # R12 joint testing (decision: docs/decisions/snapstore-server-for-tests.md):
 # tests spawn the REAL server in-process via its serve_for_tests seam.
 snapstore-manifest = { path = "../snapshot-store/crates/snapstore-manifest" }
+snapstore-types = { path = "../snapshot-store/crates/snapstore-types" }
 snapstore-server = { path = "../snapshot-store/crates/snapstore-server" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

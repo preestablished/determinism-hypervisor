@@ -394,6 +394,13 @@ dependencies = [
  "dh-snapshot",
  "dh-verify",
  "dh-vmm",
+ "snapstore-client",
+ "snapstore-manifest",
+ "snapstore-server",
+ "snapstore-types",
+ "tempfile",
+ "tokio",
+ "vm-memory",
 ]
 
 [[package]]
