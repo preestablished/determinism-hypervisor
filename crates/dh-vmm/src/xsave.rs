@@ -55,41 +55,111 @@ pub fn xstate_bv(area: &[u8]) -> Result<u64, XsaveError> {
     ))
 }
 
-/// The §8.1 canonicalization, in place. `extended` lists the bit-≥2
-/// component areas (CPUID-enumerated on the capture host; empty when the
-/// guest CPUID masks everything past SSE, as Phase 1 does).
+/// The §8.1 canonicalization, in place — ALLOWLIST semantics: the §8.1
+/// goal is "equality of blobs ⇔ equality of logical state", which the
+/// literal clear-components-only rule does NOT deliver, because bytes
+/// covered by NO component (legacy reserved/software-available
+/// `[416, 512)`, header reserved `[528, 576)`, inter-component gaps, the
+/// tail past the host's XSAVE size) carry kernel buffer garbage that can
+/// vary run-to-run (MEASURED: iteration 68 shipped the subtractive rule
+/// and the phase-1 gate flaked DIVERGED under parallel-suite load within
+/// the hour). Canonical form = everything zero EXCEPT:
 ///
-/// Deliberately NOT zeroed (the rule is scoped to component areas):
-/// MXCSR/MXCSR_MASK `[24, 32)` — real state, always valid in KVM output —
-/// and the legacy reserved/software-available bytes `[416, 512)`, which
-/// KVM zero-fills; if a kernel ever leaks variance there, the R7
-/// fault-injection test shape below is how it would be caught and the rule
-/// extended.
+/// - MXCSR/MXCSR_MASK `[24, 32)` — always-valid live state, not governed
+///   by an XSTATE_BV bit. RESTORE-SAFETY INVARIANT (55f): keeping these
+///   bytes unconditionally is what makes the canonical form exact under
+///   XRSTOR — MXCSR loads from the memory image whenever RFBM covers
+///   SSE/AVX, INDEPENDENT of XSTATE_BV[1], so clearing an init SSE bit
+///   never resets a live MXCSR. Do not gate these bytes on a bit;
+/// - the x87 area `[0, 24) ∪ [32, 160)` iff NORMALIZED bit 0 is set;
+/// - XMM0..15 `[160, 416)` iff normalized bit 1 is set;
+/// - each extended component's area iff its normalized bit is set;
+/// - the header words `[512, 528)`, with XSTATE_BV rewritten NORMALIZED:
+///   a set bit whose area carries the architectural init pattern is
+///   canonicalized to clear (KVM reports init state either way depending
+///   on host preemption timing — both encodings are the same logical
+///   state, measured as the iteration-68/69 gate flake).
+///
+/// `extended` lists the bit-≥2 component areas (CPUID-enumerated on the
+/// capture host; empty when guest CPUID masks everything past SSE, as
+/// Phase 1 does).
 pub fn canonicalize(area: &mut [u8], extended: &[XsaveComponent]) -> Result<(), XsaveError> {
     let bv = xstate_bv(area)?;
     let xcomp_bv = u64::from_le_bytes(area[520..528].try_into().expect("checked length"));
     if xcomp_bv >> 63 != 0 {
         return Err(XsaveError::CompactedFormat);
     }
-    if bv & 1 == 0 {
-        area[0..24].fill(0); // FCW/FSW/FTW/FOP/FIP/FDP
-        area[32..160].fill(0); // ST0..7
+
+    // INIT-STATE NORMALIZATION: for logically-init component state the
+    // kernel ABI permits either encoding — bit CLEAR (init optimization,
+    // area undefined) or bit SET with the architectural init-pattern
+    // bytes — and which one arrives may vary across kernels and fpstate
+    // paths (this box's 6.8 consistently reports x87-init as bit-set;
+    // the measured iteration-68 flake driver was the OTHER hole, gap
+    // garbage — e.g. the real 128-byte non-component gap [832,960) on
+    // this host. Both holes are closed here). Both encodings are the
+    // SAME logical state; canonical form is bit clear + zero area.
+    let mut canon_bv = bv;
+    if bv & 1 != 0 && is_x87_init(area) {
+        canon_bv &= !1;
     }
-    if bv & 2 == 0 {
-        area[160..416].fill(0); // XMM0..15
+    if bv & 2 != 0 && area[160..416].iter().all(|&b| b == 0) {
+        canon_bv &= !2;
+    }
+
+    // Collect the keep-ranges (bounds-checked), then rebuild the area as
+    // zeros + kept bytes. This allowlist shape cannot miss a garbage
+    // region by omission (legacy reserved, header reserved, gaps, tail).
+    let mut keep: Vec<(usize, usize)> = vec![(24, 32)];
+    if canon_bv & 1 != 0 {
+        keep.push((0, 24));
+        keep.push((32, 160));
+    }
+    if canon_bv & 2 != 0 {
+        keep.push((160, 416));
     }
     for c in extended {
         debug_assert!(c.bit >= 2, "legacy bits have fixed areas");
-        if bv & (1u64 << c.bit) == 0 {
-            let end = c
-                .offset
-                .checked_add(c.size)
-                .filter(|&e| e <= area.len())
-                .ok_or(XsaveError::ComponentOutOfBounds { bit: c.bit })?;
-            area[c.offset..end].fill(0);
+        let end = c
+            .offset
+            .checked_add(c.size)
+            .filter(|&e| e <= area.len())
+            .ok_or(XsaveError::ComponentOutOfBounds { bit: c.bit })?;
+        if bv & (1u64 << c.bit) != 0 {
+            // all-zero ⇒ init holds for the SSE-like register components
+            // (AVX YMM_Hi, AVX-512 ZMM halves/opmask) but NOT for every
+            // architectural component — restrict normalization to the
+            // bits where it is known-true; others keep their encoding.
+            // Phase 1 masks all extended state, so this list is ahead of
+            // need; 55f extends it deliberately, never by default.
+            const ZERO_INIT_BITS: u64 = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7);
+            if ZERO_INIT_BITS & (1u64 << c.bit) != 0 && area[c.offset..end].iter().all(|&b| b == 0)
+            {
+                canon_bv &= !(1u64 << c.bit);
+            } else {
+                keep.push((c.offset, end));
+            }
         }
     }
+
+    let mut canon = vec![0u8; area.len()];
+    for (a, b) in keep {
+        canon[a..b].copy_from_slice(&area[a..b]);
+    }
+    canon[512..520].copy_from_slice(&canon_bv.to_le_bytes());
+    // XCOMP_BV: standard form is 0 (bit63 already rejected above); write
+    // the canonical zero rather than passing through whatever arrived.
+    canon[520..528].copy_from_slice(&0u64.to_le_bytes());
+    area.copy_from_slice(&canon);
     Ok(())
+}
+
+/// The architectural x87 init pattern in FXSAVE layout: FCW = 0x037F,
+/// FSW = 0, FTW (abridged) = 0 = all-empty, FOP/FIP/FDP = 0, ST0..7 = 0.
+fn is_x87_init(area: &[u8]) -> bool {
+    area[0..2] == [0x7F, 0x03]
+        && area[2..24].iter().all(|&b| b == 0)
+        && area[32..160].iter().all(|&b| b == 0)
 }
 
 /// The capture host's extended-component table from CPUID leaf 0xD:
@@ -141,7 +211,7 @@ mod tests {
         canonicalize(&mut a, &[]).unwrap();
         assert!(a[0..24].iter().all(|&b| b == 0));
         assert!(a[32..160].iter().all(|&b| b == 0));
-        assert!(a[24..32].iter().all(|&b| b == 0xAB)); // MXCSR untouched
+        assert!(a[24..32].iter().all(|&b| b == 0xAB)); // MXCSR kept
         assert!(a[160..416].iter().all(|&b| b == 0xAB)); // XMM survive
 
         // SSE clear, x87 set: the reverse.
@@ -151,6 +221,79 @@ mod tests {
         assert!(a[160..416].iter().all(|&b| b == 0));
     }
 
+    /// The init-encoding flake, pinned: a component in INIT state arrives
+    /// from KVM either as bit-clear (area garbage) or bit-set (area =
+    /// architectural init pattern) depending on preemption timing. Both
+    /// must canonicalize identically — bit clear, area zero.
+    #[test]
+    fn init_state_normalizes_to_clear_bit_regardless_of_encoding() {
+        // Encoding A: x87 bit clear, garbage in the area.
+        let mut a = area_with(0b00, 0x00);
+        a[0..24].fill(0x99);
+        a[32..160].fill(0x99);
+        // Encoding B: x87 bit set, architectural init pattern.
+        let mut b = area_with(0b01, 0x00);
+        b[0..2].copy_from_slice(&[0x7F, 0x03]); // FCW = 0x037F
+                                                // Same MXCSR in both (always live).
+        a[24..32].copy_from_slice(&0x1F80_0000_FFFFu64.to_le_bytes()[..8]);
+        b[24..32].copy_from_slice(&0x1F80_0000_FFFFu64.to_le_bytes()[..8]);
+
+        canonicalize(&mut a, &[]).unwrap();
+        canonicalize(&mut b, &[]).unwrap();
+        assert_eq!(a, b, "both init encodings must canonicalize identically");
+        assert_eq!(xstate_bv(&a).unwrap(), 0);
+
+        // Same for SSE: bit set + all-zero XMMs == bit clear.
+        let mut c = area_with(0b10, 0x00);
+        let mut d = area_with(0b00, 0x00);
+        d[160..416].fill(0x55); // garbage under a clear bit
+        canonicalize(&mut c, &[]).unwrap();
+        canonicalize(&mut d, &[]).unwrap();
+        assert_eq!(c, d);
+
+        // And extended (all-zero area under a set bit ⇒ init ⇒ clear).
+        let avx = XsaveComponent {
+            bit: 2,
+            offset: 576,
+            size: 256,
+        };
+        let mut e = area_with(0b100, 0x00);
+        let mut f = area_with(0b000, 0x00);
+        canonicalize(&mut e, &[avx]).unwrap();
+        canonicalize(&mut f, &[avx]).unwrap();
+        assert_eq!(e, f);
+
+        // NON-init x87 state keeps its bit: FCW differs from 0x037F.
+        let mut g = area_with(0b01, 0x00);
+        g[0..2].copy_from_slice(&[0x7E, 0x03]);
+        canonicalize(&mut g, &[]).unwrap();
+        assert_eq!(xstate_bv(&g).unwrap(), 1);
+        assert_eq!(&g[0..2], &[0x7E, 0x03]);
+    }
+
+    /// The iteration-68 flake, pinned: bytes covered by NO component
+    /// (legacy reserved [416,512), header reserved [528,576), the tail)
+    /// are kernel-buffer garbage and MUST be zero in canonical form —
+    /// regardless of which XSTATE_BV bits are set.
+    #[test]
+    fn non_component_garbage_is_always_zeroed() {
+        for bv in [0u64, 0b01, 0b10, 0b11] {
+            let mut a = area_with(bv, 0xFF);
+            canonicalize(&mut a, &[]).unwrap();
+            assert!(
+                a[416..512].iter().all(|&b| b == 0),
+                "legacy reserved leaked (bv={bv:#b})"
+            );
+            assert!(
+                a[528..576].iter().all(|&b| b == 0),
+                "header reserved leaked (bv={bv:#b})"
+            );
+            assert!(a[576..].iter().all(|&b| b == 0), "tail leaked (bv={bv:#b})");
+            // XSTATE_BV itself survives.
+            assert_eq!(xstate_bv(&a).unwrap(), bv);
+        }
+    }
+
     #[test]
     fn extended_components_follow_the_table() {
         let avx = XsaveComponent {
@@ -158,16 +301,17 @@ mod tests {
             offset: 576,
             size: 256,
         };
-        // AVX clear: its area zeroes; everything else untouched.
+        // AVX clear: its area zeroes (everything non-allowlisted does).
         let mut a = area_with(0b011, 0xEE);
         canonicalize(&mut a, &[avx]).unwrap();
         assert!(a[576..832].iter().all(|&b| b == 0));
-        assert!(a[832..].iter().all(|&b| b == 0xEE));
+        assert!(a[832..].iter().all(|&b| b == 0)); // tail: no component, zero
 
-        // AVX set: area survives.
+        // AVX set: area survives; the gap past it is still zeroed.
         let mut a = area_with(0b111, 0xEE);
         canonicalize(&mut a, &[avx]).unwrap();
         assert!(a[576..832].iter().all(|&b| b == 0xEE));
+        assert!(a[832..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -188,8 +332,13 @@ mod tests {
             offset: 1020,
             size: 8,
         };
+        // OOB components are loud whether their bit is clear or SET.
         assert_eq!(
             canonicalize(&mut area_with(0, 0), &[oob]),
+            Err(XsaveError::ComponentOutOfBounds { bit: 9 })
+        );
+        assert_eq!(
+            canonicalize(&mut area_with(1 << 9, 0), &[oob]),
             Err(XsaveError::ComponentOutOfBounds { bit: 9 })
         );
     }
