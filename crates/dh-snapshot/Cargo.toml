@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dev-dependencies]
+# Golden-fixture hash pins (tests/golden.rs, bead 9tl).
+blake3.workspace = true
 # M4 store-integration readiness gate (bead 4nj): pins the sibling
 # snapstore-client surface at compile time via tests/snapstore_readiness.rs.
 snapstore-client.workspace = true
