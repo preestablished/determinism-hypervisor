@@ -42,6 +42,12 @@ dh-worker = { path = "crates/dh-worker" }
 # snapstore_readiness dev-dep surface-pin test. CI lanes must check out
 # ../snapshot-store (path deps resolve at cargo-metadata time).
 snapstore-client = { path = "../snapshot-store/crates/snapstore-client" }
+# R12 joint testing (decision: docs/decisions/snapstore-server-for-tests.md):
+# tests spawn the REAL server in-process via its serve_for_tests seam.
+snapstore-manifest = { path = "../snapshot-store/crates/snapstore-manifest" }
+snapstore-server = { path = "../snapshot-store/crates/snapstore-server" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # proto codegen for the API.md §2 surface (docs/decisions/proto-seam.md):
 # versions track ../snapshot-store's workspace so the lockfile shares one
 # tonic/prost closure. protoc is vendored — no runner provisioning needed.
