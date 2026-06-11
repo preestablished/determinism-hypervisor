@@ -18,7 +18,9 @@ pub const MMIO_HOLE_LEN: u64 = 0x7000;
 /// ARCH §8.2: dirty ring entry count; ring bytes = entries × 16-byte
 /// kvm_dirty_gfn (power of two, as KVM requires).
 pub const DIRTY_RING_ENTRIES: u64 = 65536;
-pub const DIRTY_RING_BYTES: u64 = DIRTY_RING_ENTRIES * 16;
+/// Bytes per `kvm_dirty_gfn` ring entry (the cap arg is entries × this).
+pub const DIRTY_RING_ENTRY_BYTES: u64 = 16;
+pub const DIRTY_RING_BYTES: u64 = DIRTY_RING_ENTRIES * DIRTY_RING_ENTRY_BYTES;
 
 /// PIO map (§2.2): debug serial + the detcall window; all else RAZ/WI.
 pub const PIO_SERIAL_BASE: u16 = 0x3F8;
@@ -232,7 +234,7 @@ impl KvmSystem {
                 cap: kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL,
                 ..Default::default()
             };
-            cap.args[0] = ring_entries * 16; // bytes of kvm_dirty_gfn
+            cap.args[0] = ring_entries * DIRTY_RING_ENTRY_BYTES;
             vm.enable_cap(&cap)
                 .map_err(|e| KvmError::VmCreate(format!("dirty ring enable: {e}")))?;
         }

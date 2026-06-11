@@ -155,7 +155,7 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
 
     // Now dirty exactly three pages from INSIDE the guest (the ring only
     // sees guest writes).
-    let mut ring = DirtyRing::map(&slot.vcpu).expect("ring");
+    let mut ring = DirtyRing::map(&slot).expect("ring");
     let mut dirty = DirtyPageSet::new(slot.mem_bytes);
     enable_dirty_logging(&slot).expect("logging on");
     use vm_memory::{Bytes, GuestAddress};

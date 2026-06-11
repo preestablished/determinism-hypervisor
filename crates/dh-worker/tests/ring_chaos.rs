@@ -15,6 +15,14 @@
 //! vCPU state — with a non-vacuity pin that the small ring actually
 //! overflowed many times and the large ring never did.
 //!
+//! REF EQUALITY vs THE BEAD'S H1==H2 WORDING: the snapshot ref is
+//! BLAKE3 over the manifest body, which folds in the page table
+//! (content + indices) AND the DHSNAP device blob (vCPU + devices) —
+//! so delta-ref equality is an equal-or-stronger discharge of the R8
+//! claim than the state-hash comparison the bead sketched, minus the
+//! restore-replay leg (R8 is about page LOSS, which the manifest
+//! catches by construction; restorability is the 9wa/7c8 suites' job).
+//!
 //! HARDWARE-GATED: kvm-intel lane + lab box; self-skips elsewhere.
 
 #![cfg(target_arch = "x86_64")]
@@ -87,7 +95,7 @@ fn run_leg(sys: &KvmSystem, store: &SnapstoreClient, ring_entries: u64) -> LegOu
     .expect("root snapshot")
     .snapshot_ref;
 
-    let mut ring = DirtyRing::map_sized(&slot.vcpu, ring_entries).expect("ring map");
+    let mut ring = DirtyRing::map(&slot).expect("ring map");
     let mut dirty = DirtyPageSet::new(slot.mem_bytes);
     enable_dirty_logging(&slot).expect("logging on");
 
