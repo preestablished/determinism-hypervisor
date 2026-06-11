@@ -34,15 +34,23 @@ pub const MAX_DEV_EVENT_DATA: usize = MAX_PAYLOAD - 8;
 
 pub const FLAG_SEALED: u32 = 1 << 0;
 pub const FLAG_HAS_AUX: u32 = 1 << 1;
+pub const FLAG_EPOCH_HASHES: u32 = 1 << 2;
 
-// Record kinds (§3.3).
+// Record kinds (§3.3). The writer emits the Phase-1 subset; NET_RX,
+// EPOCH_HASH and NET_TX are spec-defined v1 kinds the reader must accept.
 pub const KIND_PAD_SET: u8 = 0x01;
 pub const KIND_DEV_EVENT: u8 = 0x02;
+pub const KIND_NET_RX: u8 = 0x03;
 pub const KIND_ENTROPY: u8 = 0x40;
 pub const KIND_TIMER_FIRE: u8 = 0x41;
+pub const KIND_EPOCH_HASH: u8 = 0x42;
 pub const KIND_SDK_EVENT: u8 = 0x43;
+pub const KIND_NET_TX: u8 = 0x44;
 pub const KIND_FRAME_MARK: u8 = 0x45;
 pub const KIND_END: u8 = 0x7F;
+
+/// NET_RX payload IS the raw frame, capped at 2048 (§3.3).
+pub const MAX_NET_RX_FRAME: usize = 2048;
 
 pub const RFLAG_AUX: u8 = 1 << 0;
 
