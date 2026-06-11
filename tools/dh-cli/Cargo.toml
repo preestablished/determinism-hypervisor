@@ -14,9 +14,9 @@ dh-vmm.workspace = true
 # only reachable from them.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 kvm-bindings = "0.14.0"
-libc = "0.2.186"
-kvm-ioctls = "0.24.0"
-vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+libc.workspace = true
+kvm-ioctls.workspace = true
+vm-memory.workspace = true
 # The embedded test guests: the debug CLI ships them for boot/run/skid.
 nanokernel = { path = "../../tests/nanokernel" }
 

@@ -49,6 +49,11 @@ snapstore-types = { path = "../snapshot-store/crates/snapstore-types" }
 snapstore-server = { path = "../snapshot-store/crates/snapstore-server" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# KVM-facing FFI surface, one pinned closure for every member (iteration-75
+# review hygiene: these literals were drifting toward five copies).
+kvm-ioctls = "0.24.0"
+libc = "0.2.186"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 # proto codegen for the API.md §2 surface (docs/decisions/proto-seam.md):
 # versions track ../snapshot-store's workspace so the lockfile shares one
 # tonic/prost closure. protoc is vendored — no runner provisioning needed.

@@ -5,11 +5,12 @@
 //! same page set), for both FULL roots and DELTA chains.
 #![cfg(target_arch = "x86_64")]
 
-use dh_devices::clock::{PvClock, REG_TIMER_DEADLINE, REG_VNS};
+mod common;
+
+use common::{kvm_available, spawn_store_blocking, test_bus, CLOCK_BASE};
+use dh_devices::clock::{REG_TIMER_DEADLINE, REG_VNS};
 use dh_devices::ctx::VecGuestMem;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
-use dh_devices::pad::PvPad;
-use dh_devices::serial::DebugSerial;
 use dh_devices::{DevCtx, EntropySource, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_snapshot::dhsnap::{tag, Container, ContainerWriter};
@@ -21,72 +22,11 @@ use dh_worker::restore_engine::{restore_snapshot, RestoreError};
 use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
-use snapstore_client::blocking::SnapstoreClient as BlockingClient;
-use snapstore_client::Transport;
 use snapstore_manifest::DeviceBlob;
-use snapstore_server::build_server::{serve_for_tests, ServerHandle};
-use snapstore_server::config::ServerConfig;
 use snapstore_types::SnapshotRef;
-use tempfile::TempDir;
 use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
-const CLOCK_BASE: u64 = 0xD000_2000;
-
-fn kvm_available() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
-fn spawn_store_blocking() -> (
-    tokio::runtime::Runtime,
-    ServerHandle,
-    BlockingClient,
-    TempDir,
-) {
-    let rt = tokio::runtime::Runtime::new().expect("rt");
-    let dir = TempDir::new().expect("tempdir");
-    let data_root = dir.path().to_path_buf();
-    let config = ServerConfig {
-        data_root: data_root.clone(),
-        grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
-        grpc_uds_path: Some(data_root.join("snapstore.sock")),
-        page_channel_path: None,
-        http_addr: "127.0.0.1:0".parse().expect("addr"),
-        pagestore: Default::default(),
-        meta: Default::default(),
-        page_channel: Default::default(),
-    };
-    let (handle, uds) = rt
-        .block_on(serve_for_tests(config))
-        .expect("serve_for_tests");
-    let mut client = None;
-    for _ in 0..50 {
-        match BlockingClient::connect(Transport::Uds(uds.clone())) {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-    (rt, handle, client.expect("store ready"), dir)
-}
-
-fn test_bus() -> MmioBus {
-    let mut bus = MmioBus::new();
-    bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
-    bus.register(CLOCK_BASE, Box::new(PvClock::new(1, 1)))
-        .unwrap();
-    bus.register(0xD000_3000, Box::new(PvEntropy::new()))
-        .unwrap();
-    bus.register(0xD000_6000, Box::new(DebugSerial::new()))
-        .unwrap();
-    bus
-}
 
 fn test_config() -> MachineConfig {
     MachineConfig::new(

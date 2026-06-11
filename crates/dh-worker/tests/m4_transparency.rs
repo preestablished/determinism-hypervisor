@@ -2,10 +2,24 @@
 //! accept). Run the landing-loop guest 1e8 instructions, TakeSnapshot at
 //! the boundary, DESTROY the slot, restore into a fresh slot from the
 //! REAL snapshot-store, run 1e8 more → H1. Versus the same 2e8 with a
-//! plain pause at 1e8 and no snapshot machinery → H2. H1 == H2 EXACTLY —
-//! every epoch link in the §8.5 chain is a full-RAM walk plus the
-//! canonical vCPU blob, so any instruction-count drift, device-state
-//! leak, or RAM byte the restore failed to reproduce shows here.
+//! plain pause at 1e8 and no snapshot machinery → H2, and an
+//! UNINTERRUPTED single-segment 2e8 → H3. H3 == H2 proves the pause
+//! itself is invisible; H1 == H2 proves the snapshot/destroy/restore
+//! detour is.
+//!
+//! WHAT THE CHAIN GATES (scope honesty, iteration-75 review): every 50M
+//! epoch link is a full-RAM walk + the canonical vCPU blob + (icount,
+//! vns) — so instruction-count drift, any RAM byte the restore failed to
+//! reproduce, and any non-TSC vCPU divergence all show. Two things are
+//! OUTSIDE this gate by construction: (1) raw guest TSC — the canonical
+//! blob normalizes the TSC slot to vns (§8.1), and the landing loop never
+//! RDTSCs, so control's free-running TSC vs the restored leg's
+//! vns-programmed TSC_OFFSET is invisible here (the TSC≡vns discipline is
+//! tsc.rs's contract, pinned by its own tests); (2) device/bus state —
+//! runctl links hash device_sections=&[] in Phase 1 and these segments
+//! never touch MMIO, so device transparency is owned by the
+//! restore_engine joint tests (byte-level section round-trip + identical
+//! re-snapshot ref) and the ENTR golden bead (dy8).
 //!
 //! Counter axis note: runctl computes agendas and hash-link icounts in
 //! COUNTER space, and the counter counts only guest instructions
@@ -29,15 +43,13 @@
 // target compiles to empty on other arches.
 #![cfg(target_arch = "x86_64")]
 
-use std::io::ErrorKind;
+mod common;
+
 use std::sync::atomic::AtomicBool;
 
+use common::{kvm_available, spawn_store_blocking, test_bus};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
-use dh_devices::clock::PvClock;
-use dh_devices::entropy::{DetEntropy, PvEntropy};
-use dh_devices::pad::PvPad;
-use dh_devices::serial::DebugSerial;
-use dh_devices::MmioBus;
+use dh_devices::entropy::DetEntropy;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -47,30 +59,13 @@ use dh_vmm::SlotState;
 use dh_worker::restore_engine::restore_snapshot;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
-use snapstore_client::blocking::SnapstoreClient as BlockingClient;
-use snapstore_client::Transport;
-use snapstore_server::build_server::{serve_for_tests, ServerHandle};
-use snapstore_server::config::ServerConfig;
-use tempfile::TempDir;
 
 const MEM: u64 = 16 << 20;
-const HALF: u64 = 100_000_000; // epoch grid (50M) point — both legs link here
+const HALF: u64 = 100_000_000; // epoch grid (50M) point — all legs link here
 const FULL: u64 = 200_000_000;
 /// Landing-loop iterations: 8 instructions each; 30M iters = 2.4e8
-/// capacity, so neither leg ever reaches the guest's completion HLT.
+/// capacity, so no leg ever reaches the guest's completion HLT.
 const ITERS_CMDLINE: &[u8] = b"30000000";
-
-fn kvm_usable() -> bool {
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-    {
-        Ok(_) => true,
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => false,
-        Err(e) => panic!("unexpected /dev/kvm probe failure: {e}"),
-    }
-}
 
 fn gettid() -> i32 {
     // SAFETY: argless syscall.
@@ -80,57 +75,10 @@ fn gettid() -> i32 {
     }
 }
 
-fn spawn_store_blocking() -> (
-    tokio::runtime::Runtime,
-    ServerHandle,
-    BlockingClient,
-    TempDir,
-) {
-    let rt = tokio::runtime::Runtime::new().expect("rt");
-    let dir = TempDir::new().expect("tempdir");
-    let data_root = dir.path().to_path_buf();
-    let config = ServerConfig {
-        data_root: data_root.clone(),
-        grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
-        grpc_uds_path: Some(data_root.join("snapstore.sock")),
-        page_channel_path: None,
-        http_addr: "127.0.0.1:0".parse().expect("addr"),
-        pagestore: Default::default(),
-        meta: Default::default(),
-        page_channel: Default::default(),
-    };
-    let (handle, uds) = rt
-        .block_on(serve_for_tests(config))
-        .expect("serve_for_tests");
-    let mut client = None;
-    for _ in 0..50 {
-        match BlockingClient::connect(Transport::Uds(uds.clone())) {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-    (rt, handle, client.expect("store ready"), dir)
-}
-
-fn test_bus() -> MmioBus {
-    let mut bus = MmioBus::new();
-    bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
-    bus.register(0xD000_2000, Box::new(PvClock::new(1, 1)))
-        .unwrap();
-    bus.register(0xD000_3000, Box::new(PvEntropy::new()))
-        .unwrap();
-    bus.register(0xD000_6000, Box::new(DebugSerial::new()))
-        .unwrap();
-    bus
-}
-
 fn config() -> MachineConfig {
     MachineConfig::new(
         MEM,
-        [7; 32], // fixed seed material — identical across both legs
+        [7; 32], // fixed seed material — identical across all legs
         BootSpec::Elf {
             kernel_hash: [7; 32],
             cmdline: ITERS_CMDLINE.to_vec(),
@@ -191,10 +139,10 @@ fn run_more(
     out
 }
 
-/// The milestone gate. One test, both legs, exact equality.
+/// The milestone gate. Three legs, exact equality.
 #[test]
 fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
-    if !kvm_usable() {
+    if !kvm_available() {
         eprintln!("skipping: /dev/kvm not usable");
         return;
     }
@@ -206,13 +154,26 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
     let h2 = c2.state_hash;
     drop(slot);
 
+    // ── Uninterrupted leg: one 2e8 segment, no pause at 1e8 at all. The
+    //    epoch grid still links at 50/100/150/200M, so the chain is
+    //    comparable — H3 == H2 pins that the segment SPLIT is invisible,
+    //    isolating what H1 == H2 then attributes to the snapshot detour. ──
+    let (mut slot, counter, cfg, mut chain) = boot();
+    let u = run_more(&mut slot, &counter, &mut chain, &cfg, FULL);
+    assert_eq!(
+        u.state_hash, h2,
+        "H3 != H2: pausing at 1e8 is itself visible — segment-split bug, \
+         not a snapshot bug"
+    );
+    drop(slot);
+
     // ── Roundtrip leg: 1e8 + TakeSnapshot + destroy + restore + 1e8 ──────
     let (mut slot, counter, cfg, mut chain) = boot();
     let r1 = run_more(&mut slot, &counter, &mut chain, &cfg, HALF);
 
     // Cold-boot determinism (the M3 property) must hold first — otherwise
     // any H1/H2 mismatch below would be ambiguous.
-    assert_eq!(r1, c1, "the two legs diverged BEFORE the snapshot");
+    assert_eq!(r1, c1, "the legs diverged BEFORE the snapshot");
 
     let (_rt, _handle, store, _dir) = spawn_store_blocking();
     let bus = test_bus();
@@ -234,10 +195,12 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
         &store,
     )
     .expect("take_snapshot at the 1e8 boundary");
+    assert_eq!(snap.pages_shipped, MEM / 4096);
 
-    // DESTROY: the original slot (VM fd, vCPU fd, RAM mapping) is gone.
-    // The first leg's chain is dead too — shadow it so nothing below can
-    // touch pre-snapshot state by accident.
+    // DESTROY: the original slot (VM fd, vCPU fd, RAM mapping) is gone,
+    // and the first chain value lives on only inside the stored TIME
+    // section (`let _` keeps the borrow checker from letting anything
+    // below reuse it directly).
     drop(slot);
     drop(bus);
     let _ = chain;
@@ -257,8 +220,13 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
         &store,
     )
     .expect("restore into the fresh slot");
+    assert_eq!(outcome.pages_loaded, MEM / 4096);
     assert_eq!(outcome.cumulative_icount, HALF);
     assert_eq!(outcome.vns, r1.vns);
+    assert_eq!(outcome.epoch_index, HALF / cfg.epoch_len);
+    // The chain came back through the store's TIME section and must
+    // resume from EXACTLY the pre-destroy link value.
+    assert_eq!(outcome.chain.value(), r1.state_hash);
 
     // Second half on the restored slot, chain resumed from TIME.
     let mut chain = outcome.chain;
@@ -266,11 +234,12 @@ fn snapshot_restore_roundtrip_is_invisible_to_the_hash_chain() {
 
     // ── The milestone property ────────────────────────────────────────────
     let h1 = r2.state_hash;
-    assert_eq!(r2.boundary, c2.boundary, "landing position diverged");
-    assert_eq!(r2.vns, c2.vns, "virtual time diverged");
     assert_eq!(
         h1, h2,
         "H1 != H2: the snapshot/restore detour is VISIBLE in the state-hash \
-         chain — an instruction-count, device-state, or RAM leak"
+         chain — an instruction-count, RAM, or (non-TSC) vCPU-state leak"
     );
+    // Full outcome equality (reason, boundary tuple, vns, hash, delivery
+    // counts) — anything the segment reports must match, not just the hash.
+    assert_eq!(r2, c2, "segment outcomes diverged");
 }

@@ -20,10 +20,10 @@ blake3.workspace = true
 detguest-host.workspace = true
 dh-devices.workspace = true
 dh-inputlog.workspace = true
-kvm-ioctls = "0.24.0"
+kvm-ioctls.workspace = true
 nanokernel = { path = "../nanokernel" }
-libc = "0.2.186"
-vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+libc.workspace = true
+vm-memory.workspace = true
 # R12 joint tests against the REAL snapshot-store, spawned in-process
 # (decision: docs/decisions/snapstore-server-for-tests.md).
 snapstore-client.workspace = true
