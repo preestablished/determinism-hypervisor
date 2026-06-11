@@ -17,6 +17,8 @@ pub mod boundary;
 #[cfg(target_arch = "x86_64")]
 pub mod cpuid;
 #[cfg(target_arch = "x86_64")]
+pub mod dirty;
+#[cfg(target_arch = "x86_64")]
 pub mod hash;
 #[cfg(target_arch = "x86_64")]
 pub mod inject;

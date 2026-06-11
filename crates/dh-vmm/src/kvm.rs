@@ -347,6 +347,9 @@ pub enum ExitEvent {
     },
     Hlt,
     Shutdown,
+    /// The per-vCPU dirty ring filled (ARCH §8.2): harvest + reset + resume
+    /// (host-visible only; never perturbs guest state).
+    DirtyRingFull,
     /// Exit kinds later beads own (PMI/debug/MSR...) — carried verbatim.
     Other(String),
 }
@@ -421,6 +424,11 @@ pub fn classify_exit(exit: VcpuExit<'_>) -> ExitEvent {
         }
         VcpuExit::Hlt => ExitEvent::Hlt,
         VcpuExit::Shutdown => ExitEvent::Shutdown,
+        // Ring full is host-visible only (ARCH §8.2): service = harvest +
+        // KVM_RESET_DIRTY_RINGS (dirty::harvest_at_boundary), then resume.
+        VcpuExit::Unsupported(r) if r == kvm_bindings::KVM_EXIT_DIRTY_RING_FULL => {
+            ExitEvent::DirtyRingFull
+        }
         other => ExitEvent::Other(format!("{other:?}")),
     }
 }
