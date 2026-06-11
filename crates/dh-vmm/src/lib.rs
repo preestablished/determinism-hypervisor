@@ -9,6 +9,9 @@ pub mod agenda;
 pub mod blkfile;
 pub mod config;
 pub mod vt;
+// Pure byte transform (ARCH §8.1 XSAVE canonicalization): host-runnable
+// everywhere; only its CPUID/KVM helpers are x86-gated internally.
+pub mod xsave;
 
 #[cfg(target_arch = "x86_64")]
 pub mod boot;
