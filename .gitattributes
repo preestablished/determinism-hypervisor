@@ -1,2 +1,3 @@
 ci/determinism-class.lock text eol=lf
 ci/*.sh text eol=lf
+*.dhilog binary
