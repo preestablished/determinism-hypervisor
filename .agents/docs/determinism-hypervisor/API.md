@@ -615,7 +615,7 @@ authoritative struct definitions live in `dh-snapshot::dhsnap` with golden tests
 | `VCPU` | `kvm_regs`, `kvm_sregs2`, `kvm_fpu`, canonicalized XSAVE area (len-prefixed), `kvm_xcrs`, MSR list as `count u32 + (index u32, _pad u32, value u64)*`, `kvm_vcpu_events`, `kvm_debugregs` — raw kvm-bindings structs, byte-copied (they are `repr(C)`, stable ABI), with the XSAVE canonicalization of ARCHITECTURE §8.1 |
 | `LAPC` | lapic-stub state (Rust struct, fixed-layout encode) |
 | `TIME` | `cumulative_icount u64, vns u64, epoch_index u64, hash_chain [u8;32]` |
-| `ENTR` | ChaCha20 PRNG state, exactly `seed: [u8;32], stream: u64, word_pos: u128` (56 bytes) — `rand_chacha`'s exportable state (`get_seed`/`get_stream`/`get_word_pos`); restore re-seeds via `set_stream`/`set_word_pos` and MUST reproduce the next draws bit-identically (golden test, IMPLEMENTATION-PLAN M4) |
+| `ENTR` | VERSIONED by `sec_version`. v1: ChaCha20 PRNG state, exactly `seed: [u8;32], stream: u64, word_pos: u128` (56 bytes) — `rand_chacha`'s exportable state (`get_seed`/`get_stream`/`get_word_pos`); restore re-seeds via `set_stream`/`set_word_pos` and MUST reproduce the next draws bit-identically (golden test, IMPLEMENTATION-PLAN M4). v2 (what the snapshot engine writes): the v1 56 bytes ‖ the pv-entropy device's guest-visible regs `buf_gpa u64, len u32, status u32` (72 bytes total) — the regs have no §4 tag of their own |
 | `CLKD` | pv-clock device regs (timer deadline, vector) |
 | `PADD` | pv-pad latches `[u32;4]`, irq vector, frame_counter |
 | `EVTC` | detchannel attach state: channel base GPA `u64` (0 = not attached). All ring, manifest, and index state lives in guest RAM and travels with the pages (guest-sdk ARCHITECTURE §2); the host re-attaches at this GPA after restore |

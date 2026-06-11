@@ -34,6 +34,7 @@ use std::path::PathBuf;
 /// version bump landing NEW fixture file names.
 const KITCHEN_SINK_BLAKE3: &str =
     "9014b09685b48490c4e93a708ad3a56d074554174d8e008d41168571b4853a91";
+const ENTR_V2_BLAKE3: &str = "17c06b954816baebff872761013d067bb43872761ac25bf86035b972d00e79cf";
 const MINIMAL_BLAKE3: &str = "2e9df50e686e7d1c167d61beb669c6fadb67636d34c06807bfeb30fe50e084aa";
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -91,6 +92,23 @@ fn build_kitchen_sink() -> Vec<u8> {
 
 fn build_minimal() -> Vec<u8> {
     ContainerWriter::new().finish()
+}
+
+/// ENTR sec_version 2 (bead 6yl): a NEW fixture file — the v1 fixtures
+/// above are frozen and never grow sections.
+fn build_entr_v2() -> Vec<u8> {
+    let v2 = EntrSectionV2 {
+        seed: [0x6E; 32],
+        stream: 0x0102_0304_0506_0708,
+        word_pos: 0x1112_1314_1516_1718_2122_2324_2526_2728,
+        buf_gpa: 0xD000_3000,
+        len: 64,
+        status: 1,
+    };
+    let mut w = ContainerWriter::new();
+    w.push_section(tag::ENTR, EntrSectionV2::VERSION, &v2.encode())
+        .unwrap();
+    w.finish()
 }
 
 fn load_or_regen(name: &str, built: &[u8]) -> Vec<u8> {
@@ -188,6 +206,27 @@ fn kitchen_sink_fixture_parses_to_pinned_sections() {
     assert_eq!(c.get(tag::BLKO).unwrap().contents, &[0xB0; 36][..]);
     assert_eq!(c.get(tag::NETL).unwrap().contents, &[] as &[u8]);
     assert_eq!(c.get(tag::SERL).unwrap().contents, &[] as &[u8]);
+}
+
+#[test]
+fn entr_v2_fixture_is_frozen_and_decodes() {
+    let built = build_entr_v2();
+    let fixture = load_or_regen("v1_entr_v2.dhsnap", &built);
+    assert_eq!(
+        blake3::hash(&fixture).to_hex().as_str(),
+        ENTR_V2_BLAKE3,
+        "checked-in fixture changed — the ENTR v2 freeze is violated"
+    );
+    assert_eq!(built, fixture, "writer output drifted from the fixture");
+
+    let c = Container::parse(&fixture).unwrap();
+    let sec = c.get(tag::ENTR).unwrap();
+    assert_eq!(sec.sec_version, EntrSectionV2::VERSION);
+    let v2 = EntrSectionV2::decode(sec.contents, sec.sec_version).unwrap();
+    assert_eq!(v2.seed, [0x6E; 32]);
+    assert_eq!(v2.stream, 0x0102_0304_0506_0708);
+    assert_eq!(v2.word_pos, 0x1112_1314_1516_1718_2122_2324_2526_2728);
+    assert_eq!((v2.buf_gpa, v2.len, v2.status), (0xD000_3000, 64, 1));
 }
 
 #[test]

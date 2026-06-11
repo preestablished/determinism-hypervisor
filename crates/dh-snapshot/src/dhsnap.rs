@@ -405,6 +405,10 @@ impl EntrSectionV2 {
     }
 
     /// The device-reg half, in the exact `DetDevice::restore` layout.
+    ///
+    /// VERSION-DOMAIN SPLIT (engine trap, verified): feed this to
+    /// `device.restore(&regs, 1)` — the DEVICE's own section version,
+    /// NOT the ENTR section's `2`. The device rejects version 2.
     pub fn device_regs(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&self.buf_gpa.to_le_bytes());
