@@ -129,7 +129,7 @@ impl KvmSystem {
             Some(FileOffset::new(memfd, 0)),
         )])
         .map_err(|e| KvmError::Memory(e.to_string()))?;
-        self.assemble_slot_vm(region, mem_bytes)
+        self.assemble_slot_vm(region, mem_bytes, false)
     }
 
     /// Tier-A CoW fork (ARCH §8.4): a child slot whose RAM is a PRIVATE
@@ -150,7 +150,22 @@ impl KvmSystem {
     /// The child starts with NO vCPU/device state copied — the fork
     /// engine stuffs those from the parent's in-memory DHSNAP (the §8.3
     /// codec, minus the store round-trip).
+    ///
+    /// MAP_NORESERVE means CoW faults allocate lazily with no swap
+    /// reservation: a child touching many pages on a memory-tight host
+    /// can be OOM-killed at FAULT time rather than fork time. That is
+    /// the intended §8.4 trade (fork must not pre-commit a full copy);
+    /// capacity policy lives with the slot manager.
     pub fn fork_slot_vm(&self, parent: &SlotVm) -> Result<SlotVm, KvmError> {
+        if parent.ram_is_cow {
+            return Err(KvmError::Memory(
+                "fork of a CoW child: its memfd is the GRANDPARENT's, so the \
+                 new child would silently see pre-divergence bytes. \
+                 TakeSnapshot + restore into a fresh slot first (see \
+                 SlotVm::ram_is_cow)"
+                    .into(),
+            ));
+        }
         let seals = parent.ram_seals()?;
         if seals & libc::F_SEAL_FUTURE_WRITE == 0 {
             return Err(KvmError::Memory(
@@ -174,7 +189,7 @@ impl KvmSystem {
             .ok_or_else(|| KvmError::Memory("CoW region address overflow".into()))?;
         let mem = GuestMemoryMmap::<()>::from_regions(vec![region])
             .map_err(|e| KvmError::Memory(e.to_string()))?;
-        self.assemble_slot_vm(mem, parent.mem_bytes)
+        self.assemble_slot_vm(mem, parent.mem_bytes, true)
     }
 
     /// Everything after RAM exists: VM fd with the §2.1/§2.2 cap set,
@@ -184,6 +199,7 @@ impl KvmSystem {
         &self,
         region: GuestMemoryMmap<()>,
         mem_bytes: u64,
+        ram_is_cow: bool,
     ) -> Result<SlotVm, KvmError> {
         let vm = self
             .kvm
@@ -272,6 +288,7 @@ impl KvmSystem {
             vcpu,
             guest_mem: region,
             mem_bytes,
+            ram_is_cow,
         })
     }
 }
@@ -282,6 +299,15 @@ pub struct SlotVm {
     pub vcpu: VcpuFd,
     pub guest_mem: GuestMemoryMmap<()>,
     pub mem_bytes: u64,
+    /// True for tier-A CoW children: `guest_mem` is a PRIVATE mapping of
+    /// the parent's memfd, so the child's diverged pages live in
+    /// anonymous memory the memfd never sees. `freeze_ram` and
+    /// `fork_slot_vm` fail closed on such slots — sealing/re-mapping the
+    /// memfd would silently operate on the PARENT's bytes and drop the
+    /// child's divergence. Making a diverged child a fork base goes
+    /// through the store: TakeSnapshot, then restore into a fresh slot
+    /// (whose RAM IS its own memfd) and freeze that.
+    pub ram_is_cow: bool,
 }
 
 impl SlotVm {
@@ -311,6 +337,16 @@ impl SlotVm {
     /// (which is also why `F_SEAL_SEAL` is not added).
     pub fn freeze_ram(&self) -> Result<(), KvmError> {
         use std::os::fd::AsRawFd;
+        if self.ram_is_cow {
+            return Err(KvmError::Memory(
+                "freeze of a CoW child: its diverged pages live in anonymous \
+                 memory, not the memfd — sealing would freeze the PARENT's \
+                 bytes and silently drop the divergence. TakeSnapshot the \
+                 child and restore into a fresh slot to get a freezable base \
+                 (see SlotVm::ram_is_cow)"
+                    .into(),
+            ));
+        }
         let fd = self.ram_memfd()?.as_raw_fd();
         let seals = libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
         #[allow(unsafe_code)]

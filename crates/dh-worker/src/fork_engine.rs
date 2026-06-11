@@ -55,6 +55,13 @@ pub enum ForkError {
 /// What run control needs to start the child's segment. Same shape as a
 /// restore outcome, plus the child slot itself.
 pub struct ForkOutcome {
+    /// The child slot, Paused at the parent's boundary BY CONVENTION —
+    /// the engine returns raw KVM objects; registering the child in the
+    /// slot table as `SlotState::Paused` (and accounting it against the
+    /// parent's `Frozen{children}` count, R9) is the slot manager's job
+    /// (bead ol1). Note `child.ram_is_cow == true`: it cannot be frozen
+    /// or re-forked directly — a diverged child becomes a fork base via
+    /// TakeSnapshot + restore into a fresh slot.
     pub child: SlotVm,
     pub cumulative_icount: u64,
     pub vns: u64,

@@ -9,9 +9,12 @@
 
 mod common;
 
-use common::{kvm_available, spawn_store_blocking, test_bus};
+use common::{kvm_available, spawn_store_blocking, test_bus, CLOCK_BASE};
+use dh_devices::clock::REG_TIMER_DEADLINE;
+use dh_devices::ctx::VecGuestMem;
 use dh_devices::entropy::DetEntropy;
-use dh_devices::EntropySource;
+use dh_devices::{DevCtx, EntropySource};
+use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem, SlotVm};
 use dh_vmm::{vcpu_state, SlotState};
@@ -53,11 +56,39 @@ fn bus_state(bus: &dh_devices::MmioBus) -> Vec<(u16, Vec<u8>)> {
         .collect()
 }
 
-/// A parent slot with recognizable RAM, vCPU regs, and an advanced PRNG,
-/// frozen and ready to fork.
+/// Drive one MMIO access against a bus outside a live VM (test-only
+/// DevCtx plumbing; the bus only cares about a correct icount).
+fn with_ctx<R>(icount: u64, f: impl FnOnce(&mut DevCtx) -> R) -> R {
+    let mut log = LogWriter::new(SegmentHeader {
+        base_snapshot_id: [0; 32],
+        entropy_seed: [0; 32],
+        machine_config_hash: [0; 32],
+        clock_num: 1,
+        clock_den: 1,
+        encoder_fingerprint: 0,
+    });
+    let mut mem = VecGuestMem(vec![0u8; 16]);
+    let mut entropy = DetEntropy::from_seed([0; 32]);
+    let mut irqs = Vec::new();
+    let mut ctx = DevCtx::new(icount, 0, &mut log, &mut mem, &mut entropy, &mut irqs);
+    f(&mut ctx)
+}
+
+/// A parent slot with recognizable RAM, vCPU regs, NON-DEFAULT device
+/// state (armed clock deadline — so bus equality below is not a
+/// default-vs-default tautology), and an advanced PRNG, frozen and
+/// ready to fork.
 fn frozen_parent(sys: &KvmSystem) -> (SlotVm, dh_devices::MmioBus, DetEntropy, MachineConfig) {
     let slot = sys.create_slot_vm(MEM).unwrap();
-    let bus = test_bus();
+    let mut bus = test_bus();
+    with_ctx(0, |ctx| {
+        bus.write(
+            CLOCK_BASE + REG_TIMER_DEADLINE,
+            &5_555_555u64.to_le_bytes(),
+            ctx,
+        )
+        .unwrap();
+    });
     slot.guest_mem
         .write_slice(&[0xAB; 64], GuestAddress(0x4000))
         .unwrap();
@@ -307,6 +338,26 @@ fn fork_preconditions_fail_loudly() {
         Err(ForkError::AgendaNotEmpty)
     ));
 
+    // Shape guard: a child bus that cannot consume the parent's DHSNAP
+    // (here: no devices at all) is refused by the apply step — a fork
+    // must never produce a differently-shaped machine.
+    let mut empty_bus = dh_devices::MmioBus::new();
+    match fork_slot(
+        &sys,
+        &parent,
+        SlotState::Frozen,
+        &bus_p,
+        &entropy_p,
+        &config,
+        boundary(),
+        &mut empty_bus,
+        None,
+    ) {
+        Err(ForkError::Apply(m)) => assert!(m.contains("pv-entropy"), "{m}"),
+        Err(e) => panic!("wrong error class: {e:?}"),
+        Ok(_) => panic!("mis-shaped child bus must be rejected"),
+    }
+
     // Kernel guard: a caller LYING about Frozen (state says Frozen, memfd
     // never sealed) is caught by fork_slot_vm's seal check — the two
     // guards are independent on purpose.
@@ -326,6 +377,58 @@ fn fork_preconditions_fail_loudly() {
         Err(ForkError::Kvm(m)) => assert!(m.contains("UNFROZEN"), "{m}"),
         Err(e) => panic!("wrong error class: {e:?}"),
         Ok(_) => panic!("unsealed parent must not fork"),
+    }
+}
+
+/// A CoW child's diverged pages live in anonymous memory the memfd never
+/// sees — freezing or re-forking it would silently operate on the
+/// PARENT's bytes. Both fail closed (iteration-77 review I1); the
+/// documented path to a new fork base is TakeSnapshot + restore into a
+/// fresh slot.
+#[test]
+fn cow_children_cannot_be_frozen_or_re_forked() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let sys = KvmSystem::open().unwrap();
+    let (parent, bus_p, entropy_p, config) = frozen_parent(&sys);
+
+    let mut bus_c = test_bus();
+    let outcome = fork_slot(
+        &sys,
+        &parent,
+        SlotState::Frozen,
+        &bus_p,
+        &entropy_p,
+        &config,
+        boundary(),
+        &mut bus_c,
+        None,
+    )
+    .expect("fork");
+    assert!(outcome.child.ram_is_cow);
+
+    match outcome.child.freeze_ram() {
+        Err(e) => assert!(format!("{e:?}").contains("CoW"), "{e:?}"),
+        Ok(()) => panic!("freezing a CoW child must fail closed"),
+    }
+
+    let mut bus_g = test_bus();
+    match fork_slot(
+        &sys,
+        &outcome.child,
+        SlotState::Frozen,
+        &bus_c,
+        &outcome.entropy,
+        &config,
+        boundary(),
+        &mut bus_g,
+        None,
+    ) {
+        Err(ForkError::Kvm(m)) => assert!(m.contains("CoW"), "{m}"),
+        Err(e) => panic!("wrong error class: {e:?}"),
+        Ok(_) => panic!("fork-of-fork must fail closed"),
     }
 }
 
