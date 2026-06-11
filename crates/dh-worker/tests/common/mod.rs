@@ -15,6 +15,9 @@ use snapstore_server::build_server::{serve_for_tests, ServerHandle};
 use snapstore_server::config::ServerConfig;
 use tempfile::TempDir;
 
+// Not every test target uses every helper (replay_engine builds its own
+// pad+entropy bus).
+#[allow(dead_code)]
 pub const CLOCK_BASE: u64 = 0xD000_2000;
 
 pub fn kvm_available() -> bool {
@@ -80,6 +83,7 @@ pub fn spawn_store_at(
 
 /// The canonical joint-test bus: pad, clock, entropy, serial — one device
 /// per DHSNAP tag the engines exercise, deterministic base order.
+#[allow(dead_code)]
 pub fn test_bus() -> MmioBus {
     let mut bus = MmioBus::new();
     bus.register(0xD000_1000, Box::new(PvPad::new())).unwrap();
