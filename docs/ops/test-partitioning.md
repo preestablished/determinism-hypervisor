@@ -15,6 +15,7 @@ not usable (open rw probe), so the same command is correct everywhere.
 | Channel interop (real detguest-host attach/drain) | `cargo test -p nanokernel --test channel_interop` | mock guest memory |
 | ELF shape + asm constant pins | `cargo test -p nanokernel` | needs `nasm` (build.rs assembles the guests; cross-assembles fine on arm) |
 | Drift-check script logic | `bash ci/check-determinism-class.sh` | compares against the LIVE host — only meaningful on the lab box, but parses anywhere |
+| R12 joint tests vs the REAL snapshot-store | `cargo test -p determinism-tests --test store_joint` | spawns `snapstore-server` in-process on a TempDir over UDS (decision: docs/decisions/snapstore-server-for-tests.md) — needs only the `../snapshot-store` checkout, no provisioning, no KVM |
 | aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated. On an arm host this just works (CI's arm lane runs natively). On an x86 Linux box you need `rustup target add aarch64-unknown-linux-gnu` plus a cross C toolchain — see "aarch64 cross C toolchain on x86" below |
 
 ### aarch64 cross C toolchain on x86

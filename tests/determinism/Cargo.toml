@@ -24,3 +24,10 @@ kvm-ioctls = "0.24.0"
 nanokernel = { path = "../nanokernel" }
 libc = "0.2.186"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+# R12 joint tests against the REAL snapshot-store, spawned in-process
+# (decision: docs/decisions/snapstore-server-for-tests.md).
+snapstore-client.workspace = true
+snapstore-manifest.workspace = true
+snapstore-server.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
