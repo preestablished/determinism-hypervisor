@@ -144,8 +144,14 @@ fn kitchen_sink_fixture_parses_to_pinned_sections() {
 
     let tags: Vec<[u8; 4]> = c.sections().map(|s| s.tag).collect();
     assert_eq!(tags, KNOWN_TAGS.to_vec());
+    // Header version + every section's declared layout version.
+    assert_eq!(&fixture[6..8], &FORMAT_VERSION.to_le_bytes());
+    assert!(c.sections().all(|s| s.sec_version == 1));
 
-    // Reader half of the freeze: every section's contents pinned.
+    // Reader half of the freeze: every section's contents pinned. (The
+    // expected-value expressions are shared with build_kitchen_sink, so
+    // these asserts are decode checks; the independent anchor for the
+    // BYTES is the BLAKE3 constant above.)
     assert_eq!(
         c.get(tag::MCFG).unwrap().contents,
         (1u8..=64).collect::<Vec<u8>>().as_slice()
