@@ -27,19 +27,34 @@ pub fn kvm_available() -> bool {
 
 /// Real store on a side runtime; the engines stay synchronous and reach
 /// it via the blocking facade (the production shape).
+// Each test target compiles this module independently; not every target
+// uses every helper (store_durability owns its data root via
+// `spawn_store_at` directly).
+#[allow(dead_code)]
 pub fn spawn_store_blocking() -> (
     tokio::runtime::Runtime,
     ServerHandle,
     BlockingClient,
     TempDir,
 ) {
-    let rt = tokio::runtime::Runtime::new().expect("rt");
     let dir = TempDir::new().expect("tempdir");
-    let data_root = dir.path().to_path_buf();
+    let (rt, handle, client) = spawn_store_at(dir.path().to_path_buf(), "snapstore.sock");
+    (rt, handle, client, dir)
+}
+
+/// Spawn a server instance over a CALLER-OWNED data root — the seam the
+/// durability acceptance uses to restart the store over the same bytes.
+/// `sock_name` keeps each instance's UDS distinct (no reliance on the
+/// previous instance's socket file being unlinked).
+pub fn spawn_store_at(
+    data_root: std::path::PathBuf,
+    sock_name: &str,
+) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
     let config = ServerConfig {
         data_root: data_root.clone(),
         grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
-        grpc_uds_path: Some(data_root.join("snapstore.sock")),
+        grpc_uds_path: Some(data_root.join(sock_name)),
         page_channel_path: None,
         http_addr: "127.0.0.1:0".parse().expect("addr"),
         pagestore: Default::default(),
@@ -60,7 +75,7 @@ pub fn spawn_store_blocking() -> (
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     }
-    (rt, handle, client.expect("store ready"), dir)
+    (rt, handle, client.expect("store ready"))
 }
 
 /// The canonical joint-test bus: pad, clock, entropy, serial — one device
