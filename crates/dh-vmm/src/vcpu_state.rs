@@ -162,7 +162,7 @@ pub fn restore(slot: &SlotVm, st: &VcpuState, vns: u64) -> Result<(), KvmError> 
     for (i, chunk) in st.xsave.chunks_exact(4).enumerate() {
         xs.region[i] = u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)"));
     }
-    // SAFETY: plain kvm_xsave (no FAM tail in the 0.14 binding); the area
+    // SAFETY: plain kvm_xsave (no FAM tail in this kvm-bindings version); the area
     // is the canonical form whose clear bits XRSTOR treats as init.
     #[allow(unsafe_code)]
     unsafe { vcpu.set_xsave(&xs) }.map_err(kvm_err("KVM_SET_XSAVE"))?;
@@ -391,6 +391,19 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// Pin the struct ABI sizes the raw-byte section layout depends on: a
+    /// kvm-bindings upgrade that changes any size breaks decode of
+    /// existing sections and MUST be a sec_version bump, caught here.
+    #[test]
+    fn struct_abi_sizes_are_pinned() {
+        assert_eq!(std::mem::size_of::<kvm_regs>(), 144);
+        assert_eq!(std::mem::size_of::<kvm_sregs>(), 312);
+        assert_eq!(std::mem::size_of::<kvm_fpu>(), 416);
+        assert_eq!(std::mem::size_of::<kvm_xcrs>(), 392);
+        assert_eq!(std::mem::size_of::<kvm_vcpu_events>(), 64);
+        assert_eq!(std::mem::size_of::<kvm_debugregs>(), 128);
     }
 
     #[test]

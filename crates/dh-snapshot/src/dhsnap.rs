@@ -12,10 +12,13 @@
 //! Ownership split (the in-tree convention this codec completes):
 //! - Section CONTENTS are produced/consumed by their owners —
 //!   `DetDevice::snapshot`/`restore` for device tags, detchannel's
-//!   `snapshot`/`restore` for `EVTC`, dh-vmm's `canonical_vcpu_blob` for
-//!   `VCPU` (§8.1 field order — never re-serialized here; no KVM types in
-//!   this crate, bead-v5w discipline), dh-vmm's canonical MachineConfig
-//!   encoding for `MCFG`.
+//!   `snapshot`/`restore` for `EVTC`, dh-vmm's
+//!   `vcpu_state::encode_section` for `VCPU` (the API.md §4 raw-struct
+//!   layout; never re-serialized here; no KVM types in this crate,
+//!   bead-v5w discipline — NOTE: the state-HASH preimage uses hash.rs's
+//!   field-selective `canonical_vcpu_blob`, a different artifact; the
+//!   snapshot engine bead reconciles which feeds the snapshot ref),
+//!   dh-vmm's canonical MachineConfig encoding for `MCFG`.
 //! - This module owns the FRAMING, the tag table, the device-id↔tag map
 //!   (one place, per the `DetDevice` doc), and the typed structs for the
 //!   engine-owned fixed sections `TIME` and `ENTR`.
