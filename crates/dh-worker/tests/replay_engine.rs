@@ -443,7 +443,7 @@ fn verify_replay_reports_done_and_divergence() {
             got,
             ..
         } => {
-            assert_eq!(*first_bad_epoch, 1, "the very first epoch diverges");
+            assert_eq!(*first_bad_epoch, Some(1), "the very first epoch diverges");
             assert!(what.contains("EPOCH_HASH"));
             assert_ne!(expected, got);
         }

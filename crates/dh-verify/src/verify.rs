@@ -8,7 +8,11 @@
 //! narrows it to ≤1024 instructions is M8 (proto fields exist, the
 //! refinement does not).
 
-/// One verification event — mirrors proto `VerifyReplayProgress`.
+/// One verification event. `EpochOk`/`Done` mirror proto §2.7's
+/// `EpochOk`/`VerifyDone` field-for-field. `Divergence` mirrors the
+/// 1py bead's `Divergence{first_divergent_epoch, hashes}` — the PROTO
+/// Divergence instead carries the M8 bisection fields (icount range,
+/// rip pair) that do not exist yet; the M6 RPC (rfv) owns that mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyProgress {
     /// An EPOCH_HASH record matched the live chain (proto `EpochOk`).
@@ -18,12 +22,21 @@ pub enum VerifyProgress {
         total_icount: u64,
         end_state_hash: [u8; 32],
     },
-    /// Terminal mismatch (proto `Divergence`, P0 by convention). The
-    /// bisection fields (icount_lo/hi, rip pair) arrive with M8.
+    /// Terminal mismatch (P0 by convention).
     Divergence {
-        first_bad_epoch: u64,
+        /// `Some(n)` only when an EPOCH link itself diverged — the
+        /// first bad epoch. `None` means every epoch matched and the
+        /// divergence is in the END identity (end_state_hash/end_vns)
+        /// or the resealed bytes — naming an epoch there would blame
+        /// one that VERIFIED (iteration-89 review I1).
+        first_bad_epoch: Option<u64>,
+        /// For epoch/END-hash kinds: the diverging position in icount
+        /// space. For "resealed log bytes": the first differing BYTE
+        /// OFFSET (the engine's report shape, documented there).
         at_icount: u64,
         what: &'static str,
+        /// Hash pair for hash kinds; for "end_vns" these carry the two
+        /// u64s LE-packed in the first 8 bytes (the engine's shape).
         expected: [u8; 32],
         got: [u8; 32],
     },
@@ -40,10 +53,11 @@ impl VerifyReport {
         self.events.push(e);
     }
 
-    /// Verified end-to-end: ends with `Done` and carries no divergence.
+    /// Verified end-to-end: a `Done` was reported and no divergence —
+    /// order-independent (iteration-89 review I3: last-event semantics
+    /// would flip on any post-Done event a future caller appends).
     pub fn verified(&self) -> bool {
-        matches!(self.events.last(), Some(VerifyProgress::Done { .. }))
-            && self.divergence().is_none()
+        self.done().is_some() && self.divergence().is_none()
     }
 
     pub fn done(&self) -> Option<(u64, [u8; 32])> {
@@ -92,7 +106,7 @@ mod tests {
 
         let mut bad = VerifyReport::default();
         bad.push(VerifyProgress::Divergence {
-            first_bad_epoch: 2,
+            first_bad_epoch: Some(2),
             at_icount: 60_000,
             what: "EPOCH_HASH chain value",
             expected: [1; 32],

@@ -60,7 +60,18 @@ pub fn verify_replay<M: GuestMem>(
                     emitted += 1;
                 }
             }
-            debug_assert_eq!(emitted, outcome.epoch_hashes_verified);
+            // Structurally impossible to diverge (the engine pins the
+            // count before Ok and the parser forbids smuggled records —
+            // iteration-89 review traced it) — but a silent release-mode
+            // misreport is the one failure this layer exists to prevent,
+            // so the check is HARD (review I3).
+            if emitted != outcome.epoch_hashes_verified {
+                return Err(ReplayError::Apply(format!(
+                    "EpochOk reconstruction mismatch: log carries {emitted}, \
+                     engine verified {}",
+                    outcome.epoch_hashes_verified
+                )));
+            }
             report.push(VerifyProgress::Done {
                 total_icount: outcome.end_icount,
                 end_state_hash: outcome.end_state_hash,
@@ -74,7 +85,7 @@ pub fn verify_replay<M: GuestMem>(
             got,
         }) => {
             report.push(VerifyProgress::Divergence {
-                first_bad_epoch: at_icount / machine_config.epoch_len.max(1),
+                first_bad_epoch: first_bad_epoch_for(what, at_icount, machine_config.epoch_len),
                 at_icount,
                 what,
                 expected,
@@ -83,5 +94,58 @@ pub fn verify_replay<M: GuestMem>(
             Ok(report)
         }
         Err(other) => Err(other),
+    }
+}
+
+/// `first_bad_epoch` is meaningful ONLY when an epoch link itself
+/// diverged. END-identity kinds (end_state_hash, end_vns, epoch count)
+/// happen AFTER every epoch matched, and the reseal kind's `at_icount`
+/// is a byte offset — naming an epoch in those cases would blame one
+/// that verified (iteration-89 review I1).
+fn first_bad_epoch_for(what: &str, at_icount: u64, epoch_len: u64) -> Option<u64> {
+    if what.starts_with("EPOCH_HASH chain value")
+        || what.starts_with("EPOCH_HASH the recording does not have")
+    {
+        Some(at_icount / epoch_len.max(1))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_bad_epoch_for;
+
+    #[test]
+    fn epoch_attribution_is_what_aware() {
+        assert_eq!(
+            first_bad_epoch_for("EPOCH_HASH chain value", 60_000, 30_000),
+            Some(2)
+        );
+        assert_eq!(
+            first_bad_epoch_for("EPOCH_HASH the recording does not have", 30_000, 30_000),
+            Some(1)
+        );
+        // END-identity kinds: every epoch matched — no epoch to blame.
+        assert_eq!(first_bad_epoch_for("end_state_hash", 300_000, 30_000), None);
+        assert_eq!(first_bad_epoch_for("end_vns", 300_000, 30_000), None);
+        assert_eq!(
+            first_bad_epoch_for(
+                "EPOCH_HASH count (recording has more than replay produced)",
+                300_000,
+                30_000
+            ),
+            None
+        );
+        // Reseal: at_icount is a BYTE OFFSET — an epoch index from it
+        // would be nonsense.
+        assert_eq!(
+            first_bad_epoch_for(
+                "resealed log bytes (at_icount = first differing byte offset)",
+                123,
+                30_000
+            ),
+            None
+        );
     }
 }
