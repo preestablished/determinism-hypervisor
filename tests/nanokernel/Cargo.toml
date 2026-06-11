@@ -16,3 +16,6 @@ blake3.workspace = true
 [dev-dependencies]
 detguest-host.workspace = true
 detguest-wire.workspace = true
+# pad_echo's drift test pins the asm register offsets against the
+# DEVICE-SIDE truth (dh-devices pad constants), not re-typed literals.
+dh-devices.workspace = true

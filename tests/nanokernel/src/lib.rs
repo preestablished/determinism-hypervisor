@@ -79,6 +79,29 @@ pub fn timer_guest_elf() -> &'static [u8] {
 /// delivery in order. Mirrors the asm %define (drift-tested).
 pub const TIMER_GUEST_TABLE_GPA: u64 = 0x20_0000;
 
+/// pad_echo (bead 29a): the M5 record/replay guest — bumps FRAME_COUNTER
+/// each fake frame, polls PAD0, records (frame, pad0) to the RAM table,
+/// echoes pad0's low byte to serial. Polling only (no IDT/STI).
+pub fn pad_echo_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/pad_echo.elf"))
+}
+
+/// pad_echo's observation table GPA: u64 count, then 8 bytes per frame =
+/// frame u32 LE | pad0 u32 LE. Mirrors the asm %define (drift-tested).
+pub const PAD_ECHO_TABLE_GPA: u64 = 0x30_0000;
+/// Bytes per table entry (frame u32 + pad0 u32).
+pub const PAD_ECHO_ENTRY_BYTES: u64 = 8;
+/// Ring capacity in entries (2^16): the count at offset 0 is MONOTONE
+/// and never wraps; entry i lives at slot (i & (CAPACITY-1)), so the
+/// header + ring end at 0x38_0008 regardless of frame pacing — the
+/// table can never collide with the device_exercise channel at
+/// 0x40_0000 (2^17 would have overlapped it by the header's 8 bytes).
+pub const PAD_ECHO_TABLE_CAPACITY: u64 = 1 << 16;
+/// Busy iterations between frames (7 instructions each) — the fixed
+/// pacing that makes frame boundaries icount-deterministic. Mirrors the
+/// asm %define (drift-tested).
+pub const PAD_ECHO_PACE_ITERS: u64 = 64;
+
 /// The serial bytes hello emits before parking.
 pub const HELLO_SERIAL_OUTPUT: &[u8] = b"HELLO\n";
 

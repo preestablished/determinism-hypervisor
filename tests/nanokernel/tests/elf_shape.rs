@@ -63,6 +63,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("counting", counting_elf());
     assert_guest_shape("rep_loop", rep_loop_elf());
     assert_guest_shape("sse_probe", sse_probe_elf());
+    assert_guest_shape("pad_echo", pad_echo_elf());
 }
 
 /// include/bootinfo.inc is the asm side of the ABI — parse its %defines
@@ -221,4 +222,64 @@ fn hello_elf_embeds_the_serial_string() {
         elf.windows(needle.len()).any(|w| w == needle),
         "HELLO_SERIAL_OUTPUT not found in hello.elf"
     );
+}
+
+/// Same drift pin for pad_echo (bead 29a): the table GPA and the fixed
+/// frame pacing the M5 acceptance schedules against.
+#[test]
+fn pad_echo_asm_matches_rust_constants() {
+    let asm =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/pad_echo.asm")).unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("TABLE_GPA"), PAD_ECHO_TABLE_GPA);
+    assert_eq!(define("TABLE_MASK"), PAD_ECHO_TABLE_CAPACITY - 1);
+    assert_eq!(define("PACE_ITERS"), PAD_ECHO_PACE_ITERS);
+    // Register offsets pinned against the DEVICE-SIDE truth, not
+    // re-typed literals (iteration-81 review I2).
+    assert_eq!(define("PAD_BASE"), dh_devices::pad::PV_PAD_BASE);
+    assert_eq!(define("REG_PAD0"), dh_devices::pad::REG_PAD0);
+    assert_eq!(define("REG_FRAME"), dh_devices::pad::REG_FRAME_COUNTER);
+    assert_eq!(define("SERIAL_PORT"), 0x3F8); // dh_vmm kvm::PIO_SERIAL_BASE (x86-gated module)
+
+    // Header + ring must end strictly below the device_exercise channel
+    // (const-evaluated so the clippy lane sees it too).
+    const _TABLE_FITS: () = assert!(
+        PAD_ECHO_TABLE_GPA + 8 + PAD_ECHO_TABLE_CAPACITY * PAD_ECHO_ENTRY_BYTES
+            <= DEVICE_EXERCISE_CHANNEL_GPA
+    );
+
+    // Pace-loop body pin (same idea as landing_loop): 7 instructions
+    // between `.pace:` and its `jnz` inclusive — the M5 icount baseline
+    // must not silently drift.
+    let mut in_loop = false;
+    let mut instrs = 0u64;
+    for line in asm.lines() {
+        let t = line.split(';').next().unwrap().trim();
+        if t == ".pace:" {
+            in_loop = true;
+            continue;
+        }
+        if !in_loop || t.is_empty() || t.ends_with(':') || t.starts_with("align") {
+            continue;
+        }
+        instrs += 1;
+        if t.starts_with("jnz") {
+            break;
+        }
+    }
+    assert_eq!(instrs, 7, "pace-loop body drifted");
 }
