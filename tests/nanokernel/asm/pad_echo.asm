@@ -10,13 +10,20 @@
 ; default) and PAD_SET landings change the latch between polls.
 ;
 ; Table (host reads at TABLE_GPA; lib.rs mirrors, drift-tested):
-;   0x00 u64 count, then 8 bytes per frame: frame u32 LE | pad0 u32 LE.
-; The frame loop is the only writer; RAM is zeroed at boot so count
-; starts at 0.
+;   0x00 u64 count (MONOTONE, never wraps), then a RING of 2^16 entries,
+;   8 bytes each: frame u32 LE | pad0 u32 LE. Entry i lives at slot
+;   (i & TABLE_MASK), so header + ring end at 0x380008 — the table can
+;   never walk into the device_exercise channel at 0x400000 no matter
+;   how the harness paces frames (iteration-81 review I1; 2^17 would
+;   have overlapped 0x400000 by the header's 8 bytes). The
+;   frame loop is the only writer; RAM is zeroed at boot so count starts
+;   at 0; entries are written BEFORE the count increment (torn-read
+;   discipline for a host sampling mid-run).
 
 BITS 64
 
 %define TABLE_GPA    0x300000
+%define TABLE_MASK   0xFFFF
 %define PAD_BASE     0xD0001000
 %define REG_PAD0     0x08
 %define REG_FRAME    0x1C
@@ -37,9 +44,11 @@ prog_main:
     mov     [r8 + REG_FRAME], r10d   ; frame boundary (AUX FRAME_MARK)
     mov     eax, [r8 + REG_PAD0]     ; poll the latch
 
-    ; append (F, pad0) to the table
+    ; append (F, pad0) to the ring slot (count & TABLE_MASK)
     mov     rcx, [r9]
-    lea     rdx, [r9 + 8 + rcx*8]
+    mov     rdx, rcx
+    and     rdx, TABLE_MASK
+    lea     rdx, [r9 + 8 + rdx*8]
     mov     [rdx], r10d
     mov     [rdx + 4], eax
     add     rcx, 1
@@ -49,7 +58,9 @@ prog_main:
     mov     dx, SERIAL_PORT
     out     dx, al
 
-    ; fixed pacing: PACE_ITERS x 6-instruction busy iterations
+    ; fixed pacing: PACE_ITERS x 7-instruction busy iterations (the
+    ; `and ebx, 511` never wraps at PACE_ITERS=64 — it bounds work_buf
+    ; writes if pacing is ever retuned past 512)
     lea     r12, [work_buf]
     xor     ebx, ebx
     mov     r11d, PACE_ITERS

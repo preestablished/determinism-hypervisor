@@ -246,6 +246,40 @@ fn pad_echo_asm_matches_rust_constants() {
             .unwrap_or_else(|| panic!("missing %define {name}"))
     };
     assert_eq!(define("TABLE_GPA"), PAD_ECHO_TABLE_GPA);
+    assert_eq!(define("TABLE_MASK"), PAD_ECHO_TABLE_CAPACITY - 1);
     assert_eq!(define("PACE_ITERS"), PAD_ECHO_PACE_ITERS);
-    assert_eq!(define("PAD_BASE"), 0xD000_1000); // dh_devices pad::PV_PAD_BASE
+    // Register offsets pinned against the DEVICE-SIDE truth, not
+    // re-typed literals (iteration-81 review I2).
+    assert_eq!(define("PAD_BASE"), dh_devices::pad::PV_PAD_BASE);
+    assert_eq!(define("REG_PAD0"), dh_devices::pad::REG_PAD0);
+    assert_eq!(define("REG_FRAME"), dh_devices::pad::REG_FRAME_COUNTER);
+    assert_eq!(define("SERIAL_PORT"), 0x3F8); // dh_vmm kvm::PIO_SERIAL_BASE (x86-gated module)
+
+    // Header + ring must end strictly below the device_exercise channel
+    // (const-evaluated so the clippy lane sees it too).
+    const _TABLE_FITS: () = assert!(
+        PAD_ECHO_TABLE_GPA + 8 + PAD_ECHO_TABLE_CAPACITY * PAD_ECHO_ENTRY_BYTES
+            <= DEVICE_EXERCISE_CHANNEL_GPA
+    );
+
+    // Pace-loop body pin (same idea as landing_loop): 7 instructions
+    // between `.pace:` and its `jnz` inclusive — the M5 icount baseline
+    // must not silently drift.
+    let mut in_loop = false;
+    let mut instrs = 0u64;
+    for line in asm.lines() {
+        let t = line.split(';').next().unwrap().trim();
+        if t == ".pace:" {
+            in_loop = true;
+            continue;
+        }
+        if !in_loop || t.is_empty() || t.ends_with(':') || t.starts_with("align") {
+            continue;
+        }
+        instrs += 1;
+        if t.starts_with("jnz") {
+            break;
+        }
+    }
+    assert_eq!(instrs, 7, "pace-loop body drifted");
 }
