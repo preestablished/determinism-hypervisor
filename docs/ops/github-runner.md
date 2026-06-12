@@ -57,6 +57,39 @@ explicitly (`sched_setaffinity`/`taskset` to 2–5), which an inherited
 `CPUAffinity` mask would not prevent anyway. One rule: **nothing pins to slot
 cores except guest vCPU threads and the tests that stand in for them.**
 
+## Tool provisioning (beyond the base Rust toolchain)
+
+Tools the milestone jobs need on this box, beyond stable Rust + the host
+config. Runner jobs inherit the PATH captured in
+`~/actions-runner-determinism-hypervisor/.path` at `config.sh` time — it
+includes `~/go/bin`, `~/.local/bin`, and `~/.cargo/bin`, so user-local
+installs are visible to jobs without touching the service unit. (If a tool
+is installed to a directory NOT on that captured PATH, re-running
+`config.sh` is the wrong hammer — append the directory to the `.path` file
+and restart the service.)
+
+| Tool | Needed by | Status (2026-06-12) | Install |
+|---|---|---|---|
+| `protoc` | tonic codegen | **Not needed** — `dh-proto` and `snapstore-client` vendor it via `protoc-bin-vendored` (proto-seam decision, iteration 60) | — |
+| `grpcurl` | M6 smoke tests | ✅ v1.9.3 at `~/go/bin/grpcurl` | `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest` |
+| `cargo-fuzz` | M5 DHILOG fuzz | ✅ v0.13.2 at `~/.cargo/bin/cargo-fuzz` | `cargo install cargo-fuzz` |
+| Rust nightly | M5 fuzz (cargo-fuzz requires nightly) | ✅ 1.98.0-nightly (2026-06-08) | `rustup toolchain install nightly` |
+| `stress-ng` | M7 soak / chaos load | ❌ **pending — needs sudo** | `sudo apt-get install -y stress-ng` (candidate 0.17.06-1build1) |
+
+Notes:
+
+- **`grpcurl --version` prints `dev build <no version set>`** when installed
+  via `go install` (release binaries get the version stamped via ldflags;
+  go install does not). Verify the real version with
+  `go version -m ~/go/bin/grpcurl | grep '^\s*mod'`.
+- **Nightly drifts**: `rustup toolchain install nightly` updates in place via
+  `rustup update nightly`. The fuzz lane should treat nightly breakage as
+  lane-red, not gate-red — nightly is NOT part of the determinism class
+  (kernel/microcode are, see `ci/determinism-class.lock`).
+- **`stress-ng` is the one remaining operator step** — apt needs sudo, which
+  automation on this box does not have. After installing, verify with
+  `stress-ng --version` as `infra-admin`.
+
 ## Registration (already done; for rebuilds)
 
 ```bash
