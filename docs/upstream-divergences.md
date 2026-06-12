@@ -16,9 +16,27 @@ precisely so a sync cannot overwrite it.
 Section/line references are to the upstream documents as of the `d55ecc3` sync; line
 numbers may have drifted upstream — match on the quoted text.
 
+Operator instructions:
+
+- **If a quoted "Old" string is not found verbatim upstream, STOP on that entry and
+  flag it for human reconciliation — do not guess an insertion point.** Upstream may
+  have moved past the `d55ecc3` baseline. Entries #4, #5, and #6 quote multi-line
+  blocks that must be matched whole.
+- Bead IDs (`veu`, `4ld`, …) and iteration numbers are provenance only — they point
+  at this repo's history and are not prerequisites for applying an entry.
+- The long Markdown `| … |` table rows below are intentionally single-line; paste
+  them unwrapped or the table cell breaks.
+- Quick index — amended locally (exact diffs): #1, #2, #7, #9, #10; upstream-only
+  proposals: #3, #4, #5, #6, #8.
+
 ---
 
 ## Divergences with a local amendment (sync WILL revert these — apply upstream first)
+
+The "New" texts in this section are verbatim copies of review-passed local edits
+(commits cited per entry). Once upstream applies an entry and `.agents/docs` is
+re-synced, the local amendment is subsumed by the sync; when all five are applied
+(and the five proposals below are resolved), bead `veu` can close.
 
 ### #1 — API.md §3.1: `[240..256)` reserved row → `encoder_fingerprint` + `reserved` split
 
@@ -70,7 +88,8 @@ enum SlotState { SLOT_UNSPECIFIED = 0; EMPTY = 1; PAUSED_S = 2; RUNNING = 3;
 
 - **Found:** iteration 71 review. **Local amendment:** commit `efa286f`.
 - **Why:** the snapshot engine writes ENTR v2 = the spec's 56-byte PRNG state ‖ the
-  pv-entropy device's guest-visible regs (`buf_gpa u64, len u32, status u32`), which
+  pv-entropy device's guest-visible regs (`buf_gpa u64, len u32, status u32`:
+  56 + 8 + 4 + 4 = 72 bytes), which
   have no §4 tag of their own. v1 remains the spec-exact 56-byte form. ChaCha20
   known-answer pins in dh-devices guard the PRNG semantics across dep upgrades.
 
@@ -128,7 +147,9 @@ New:
 - **Why:** the landed pv-net device buffers NO frames — TX is drained per exit via
   `PvNet::tx_regs` by run control, RX delivery is immediate at record landing — so
   there is no pending-RX state to serialize and no enforcement code exists or is
-  needed.
+  needed. The 36-byte regs-only layout is documented and pinned in
+  `crates/dh-devices/src/net.rs` (layout doc + the
+  `snapshot_restore_roundtrip_is_byte_identical` test).
 
 Old (upstream §4 DHSNAP section table):
 
@@ -146,10 +167,15 @@ New:
 
 ## Upstream-only wording fixes (no local doc edit; code / decision doc is the authority)
 
+Unlike the section above, the "Proposed new" texts here are newly authored for this
+ledger (accurate against the cited code, but not themselves review-passed doc edits)
+— upstream is free to rewrap or rephrase as long as the technical content survives.
+
 ### #3 — API.md §4: `EVTC` row understates the implemented v1 contents
 
 - **Found:** iteration 65 review. **Authority:** `crates/dh-devices/src/detchannel.rs`
-  (`EVTC_LEN = 39`, `EVTC_VERSION = 1`; ships and round-trips, pinned by tests).
+  (`EVTC_LEN = 39`, `EVTC_VERSION = 1`; ships and round-trips, pinned by the
+  `evtc_roundtrips_attached_state_and_seqs` test in the same file).
 - The row says the section is just the channel base GPA, but EVTC v1 carries:
   `init_lo u32, init_hi u32, init_status u32` (offsets 0/4/8), `inject_iseq`
   flag u8 + u32 (12..17), `last_quiesce_ack` flag u8 + u32 (17..22), then channel
@@ -189,11 +215,14 @@ Proposed new (only the transition into Frozen changes — it leaves from Paused)
   Running`, `Paused → Frozen (parent of live CoW children) → Empty (DestroyVm)`. All RPCs carry
 ```
 
+(The chain is deliberately split into two inline-code spans: there is no
+`Running → Frozen` edge, so do not "tidy" it back into one arrow chain.)
+
 ### #5 — ARCHITECTURE.md §2.2 + §8.2: `KVM_MEM_LOG_DIRTY_PAGES` is required on BOTH paths
 
 - **Found:** iteration 67, bead ygt — EMPIRICALLY A/B-proven on a 6.8 kernel
   (0 ring entries harvested without the flag vs ≥3 with it). **Authority:**
-  `dirty.rs` `enable_dirty_logging`.
+  `crates/dh-vmm/src/dirty.rs` (`enable_dirty_logging`).
 - The kernel publishes dirty-RING entries only for dirty-tracked memslots; the ring
   and the bitmap differ in *retrieval* (`KVM_RESET_DIRTY_RINGS` vs
   `KVM_GET_DIRTY_LOG`, which the ring forbids), not in the memslot flag.
@@ -244,7 +273,9 @@ Proposed new:
   write. The upstream text already carries a caveat pointing toward the offset
   approach; the normative sentence should match the decision.
 
-Old (upstream §4, defense list item 4):
+Old (upstream §4, defense list item 4 — replace the item in its ENTIRETY; the
+"benchmark both in M3" closing clause is deliberately dropped in the new text
+because the benchmark happened and the decision is frozen):
 
 ```
   4. On **every VM entry** after an exit, the VMM aligns the guest TSC to `vns` at the
@@ -253,6 +284,8 @@ Old (upstream §4, defense list item 4):
      `KVM_SET_MSRS{IA32_TSC}` can engage KVM's TSC-offset synchronization/matching
      heuristics (KVM treats small-delta guest TSC writes specially) and cost
      measurably at ~3k exits/guest-second — prefer adjusting the **TSC offset**
+     (`KVM_VCPU_TSC_CTRL` offset attribute) over MSR value writes; benchmark both in
+     M3 before freezing the mechanism.
 ```
 
 Proposed new (rewrite item 4's opening to match the decision; keep the offset
@@ -271,9 +304,10 @@ preference as the normative mechanism rather than a caveat):
 
 ### #8 — ARCHITECTURE.md §8.5: the state-hash vCPU preimage is NOT the DHSNAP VCPU section bytes
 
-- **Found:** iteration 73 (the qmp reconciliation decided it). **Authority:**
-  `crates/dh-worker/src/snapshot_engine.rs` (decision documented at the top of the
-  module).
+- **Found:** iteration-70 review (item I1); decided during iteration 73's snapshot
+  engine work (bead qmp). **Authority:** `crates/dh-worker/src/snapshot_engine.rs`
+  (decision documented at the top of the module: "HASH vs SECTION reconciliation
+  (iteration-70 review I1, decided here)").
 - Decision (option b): the two stay SEPARATE. The hash keeps the field-selective
   `canonical_vcpu_blob` (padding-excluded; every existing chain value depends on
   it); the DHSNAP VCPU section is the raw-struct restore codec. Folding raw structs
