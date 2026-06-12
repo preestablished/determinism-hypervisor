@@ -5,12 +5,15 @@
 ;
 ; THE LOAD-BEARING DIFFERENCE from pad_echo: F is initialized by READING
 ; the device's FRAME_COUNTER at entry, not from zero. FRAME_COUNTER is
-; lineage-ABSOLUTE (strictly increasing across snapshot/restore, §6.4);
-; a register-tracked F survives an ordinary restore anyway (guest
-; registers are restored), but reading the device makes continuity hold
-; BY CONSTRUCTION for every composition — including a fresh-booted guest
-; against a restored device state — so the 5yo acceptance can assert
-; strict increase across the snapshot/restore seam unconditionally.
+; lineage-ABSOLUTE (strictly increasing across snapshot/restore, §6.4).
+; The normal restore path makes a register-tracked F continuous anyway
+; (guest registers and the PADD section are restored together); the
+; device read is defense-in-depth plus harness flexibility — a harness
+; that pre-seeds the device counter before a fresh boot still gets
+; strict increase — so the 5yo acceptance can assert continuity across
+; the snapshot/restore seam without caring how the slot was composed.
+; (F is a u32: strict increase holds below 2^32 frames — ~2e12
+; instructions at this cadence, out of practical reach.)
 ;
 ; Serial: a single 'G' after the initial read (boot proof), then silent —
 ; the FRAME_MARK table is the observable. No pad polling, no RAM table:
@@ -46,9 +49,11 @@ prog_main:
     add     r10d, 1
     mov     [r8 + REG_FRAME], r10d   ; frame boundary (AUX FRAME_MARK)
 
-    ; fixed pacing: PACE_ITERS x 7-instruction busy iterations (same
-    ; body as pad_echo's pace loop; the `and ebx, 511` bounds work_buf
-    ; writes if pacing is ever retuned past 512)
+    ; fixed pacing: PACE_ITERS x 7-instruction busy iterations — the
+    ; body is carried UNCHANGED from pad_echo so the cadences stay
+    ; identical (drift-pinned). The pace loop is this guest's only
+    ; memory writer, so the `and ebx, 511` mask is the sole bound on
+    ; work_buf if PACE_ITERS is ever retuned past 512.
     lea     r12, [work_buf]
     xor     ebx, ebx
     mov     r11d, PACE_ITERS

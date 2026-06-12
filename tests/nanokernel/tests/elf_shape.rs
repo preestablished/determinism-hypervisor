@@ -550,8 +550,8 @@ fn net_loopback_asm_matches_rust_constants() {
 /// Same drift pin for fake_frames (bead r2y): device-truth register
 /// offsets, the shared pace cadence, the 7-instruction pace body, the
 /// boot marker — and the guest's load-bearing property, the
-/// FRAME_COUNTER READ at entry (absolute-counter continuity across
-/// snapshot/restore happens by construction only if the read is there).
+/// FRAME_COUNTER READ at entry (defense-in-depth continuity: the read
+/// must exist for a pre-seeded device counter to carry into F).
 #[test]
 fn fake_frames_asm_matches_rust_constants() {
     let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/fake_frames.asm"))
@@ -595,6 +595,17 @@ fn fake_frames_asm_matches_rust_constants() {
         .position(|t| *t == ".frame:")
         .expect("missing .frame loop");
     assert!(read_at < loop_at, "the read must precede the bump loop");
+
+    // The work_buf ring bound must match the pace loop's mask: a
+    // PACE_ITERS retune past the mask would otherwise write past it.
+    assert!(
+        code.iter().any(|t| t.contains("and") && t.contains("ebx, 511")),
+        "pace mask drifted"
+    );
+    assert!(
+        code.iter().any(|t| t.contains("work_buf:") && t.contains("resq 512")),
+        "work_buf size drifted from the 511 pace mask"
+    );
 
     // Pace-loop body pin: 7 instructions between `.pace:` and its jnz
     // inclusive (the icount cadence the M5 acceptance schedules against).

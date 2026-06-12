@@ -227,10 +227,12 @@ pub fn net_loopback_frame() -> Vec<u8> {
 
 /// The M5 at_frame/frame_budget acceptance guest (bead r2y; see
 /// asm/fake_frames.asm): a pure fake-frame emitter — reads the device's
-/// ABSOLUTE FRAME_COUNTER at entry (continuity across snapshot/restore
-/// by construction, §6.4), emits one 'G' boot marker, then bumps
-/// FRAME_COUNTER forever on the fixed pad_echo pace cadence. No pad
-/// polling, no RAM table: the FRAME_MARK table is the observable.
+/// ABSOLUTE FRAME_COUNTER at entry (the normal restore path restores
+/// registers + PADD together; the read adds defense-in-depth and lets a
+/// harness pre-seed the counter before a fresh boot, §6.4), emits one
+/// 'G' boot marker, then bumps FRAME_COUNTER forever on the fixed
+/// pad_echo pace cadence. No pad polling, no RAM table: the FRAME_MARK
+/// table is the observable.
 pub fn fake_frames_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/fake_frames.elf"))
 }
