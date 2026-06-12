@@ -49,6 +49,9 @@ pub const STATUS_FAULT: u32 = 2;
 /// Frame cap — mirrors `dh_inputlog::dhilog::MAX_NET_RX_FRAME` (§3.3:
 /// the NET_RX payload IS the raw frame, ≤ 2048).
 pub const MAX_FRAME: u32 = 2048;
+// The mirror is compile-time-checked (iteration-100 review): the device
+// cap and the codec cap must never drift apart.
+const _: () = assert!(MAX_FRAME as usize == dh_inputlog::dhilog::MAX_NET_RX_FRAME);
 
 const SECTION_VERSION: u16 = 1;
 /// tx_buf_gpa u64 ‖ tx_len u32 ‖ tx_status u32 ‖ rx_buf_gpa u64 ‖
@@ -151,10 +154,9 @@ impl PvNet {
             return Err(NetRxError::NoRxBuffer);
         }
         let len = u32::try_from(frame.len()).map_err(|_| NetRxError::FrameTooBig)?;
-        // len == 0 rejected here while the DHILOG codec accepts empty
-        // NET_RX records — the cross-layer zero-length policy is its own
-        // bead (filed iteration 85); until it lands, recording never
-        // produces an empty frame so the asymmetry is unreachable.
+        // len == 0 rejected here AND at the codec (bead 206, ledger #19):
+        // dh-inputlog's writer refuses to record an empty NET_RX and the
+        // reader's validation rejects one — all three layers agree.
         if len == 0 || len > MAX_FRAME || len > self.rx_cap {
             return Err(NetRxError::FrameTooBig);
         }

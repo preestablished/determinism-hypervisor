@@ -20,6 +20,10 @@
 //! FLAG_EPOCH_HASHES header path (no writer emission until M5 — their READ
 //! side is already pinned by tests/reader_validation.rs), and unsealed logs
 //! (rejected wholesale by the reader; see bead lyu for inspection tooling).
+//! Zero-length NET_RX is likewise outside the freeze: never producible by
+//! a correct recording (the device faults empty TX/RX), and since bead 206
+//! the codec rejects it outright - a validation tightening, not a format
+//! change (the fixtures' NET_RX is 5 bytes; ledger #19).
 //!
 //! Regenerate (only for a NEW format version, into new file names):
 //! `DHILOG_REGEN_GOLDEN=1 cargo test -p dh-inputlog --test golden`
