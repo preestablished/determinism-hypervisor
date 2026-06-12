@@ -1,12 +1,17 @@
 # Upstream planning-tree divergence ledger (bead veu)
 
-`.agents/docs/determinism-hypervisor/{API,ARCHITECTURE,IMPLEMENTATION-PLAN}.md` are
-**synced from an upstream planning tree** (last sync: commit `d55ecc3`). During
-implementation this repo found ten places where those documents are stale or wrong;
-in every case **the code in this repo is authoritative** (it ships, round-trips, and
-is pinned by tests). Five were amended locally and will be silently reverted by the
-next upstream sync unless pushed; five are upstream-only wording fixes (no local doc
-edit was needed because the code or a decision doc is the authority).
+`.agents/docs/determinism-hypervisor/{API,ARCHITECTURE,IMPLEMENTATION-PLAN}.md` and
+`.agents/docs/guest-sdk/ARCHITECTURE.md` are **synced from an upstream planning
+tree** (last sync: commit `d55ecc3`). During implementation this repo found
+eighteen places where those documents are stale or wrong; in every case **the code
+in this repo is authoritative** (it ships, round-trips, and is pinned by tests).
+Five were amended locally after the sync and will be silently reverted by the next
+sync unless pushed; five are upstream-only wording fixes (no local doc edit was
+needed because the code or a decision doc is the authority); eight more were
+amended locally BEFORE the `d55ecc3` sync and were **already silently reverted by
+it** — the revert hazard this file exists to prevent is not theoretical, it has
+already happened once (entries #11–#18; for those, the current local copies are
+stale again too, so applying upstream + re-syncing fixes both sides).
 
 This file is the ready-to-apply artifact for whoever can write to the upstream tree:
 each entry gives the exact old text, the exact new text (or proposed wording), and
@@ -20,14 +25,15 @@ Operator instructions:
 
 - **If a quoted "Old" string is not found verbatim upstream, STOP on that entry and
   flag it for human reconciliation — do not guess an insertion point.** Upstream may
-  have moved past the `d55ecc3` baseline. Entries #4, #5, and #6 quote multi-line
-  blocks that must be matched whole.
+  have moved past the `d55ecc3` baseline. Entries #4, #5, #6, and #14–#17 quote
+  multi-line blocks that must be matched whole.
 - Bead IDs (`veu`, `4ld`, …) and iteration numbers are provenance only — they point
   at this repo's history and are not prerequisites for applying an entry.
 - The long Markdown `| … |` table rows below are intentionally single-line; paste
   them unwrapped or the table cell breaks.
-- Quick index — amended locally (exact diffs): #1, #2, #7, #9, #10; upstream-only
-  proposals: #3, #4, #5, #6, #8.
+- Quick index — amended locally after the sync (exact diffs): #1, #2, #7, #9, #10;
+  upstream-only proposals: #3, #4, #5, #6, #8; amended locally before the sync and
+  reverted by it (exact diffs recovered from `d55ecc3^`): #11–#18.
 
 ---
 
@@ -35,8 +41,8 @@ Operator instructions:
 
 The "New" texts in this section are verbatim copies of review-passed local edits
 (commits cited per entry). Once upstream applies an entry and `.agents/docs` is
-re-synced, the local amendment is subsumed by the sync; when all five are applied
-(and the five proposals below are resolved), bead `veu` can close.
+re-synced, the local amendment is subsumed by the sync; when all eighteen entries
+in this file are applied/resolved, bead `veu` can close.
 
 ### #1 — API.md §3.1: `[240..256)` reserved row → `encoder_fingerprint` + `reserved` split
 
@@ -330,6 +336,261 @@ Proposed new:
 
 ---
 
+## Divergences already reverted once by the `d55ecc3` sync (apply upstream, then re-sync)
+
+These eight were amended locally in iterations 8–51, before the `d55ecc3` sync; the
+sync overwrote them with the upstream (stale) text, so the CURRENT local copies are
+stale again as well. The "New" texts below are the exact pre-sync amendment texts,
+recovered mechanically from `git diff d55ecc3^ d55ecc3 -- .agents/docs/` (each "Old"
+block is the `+` side of that revert, i.e. today's upstream/local text; each "New"
+block is the `-` side, i.e. what review-passed iterations had written). Every entry's
+claim was re-verified against the current code on 2026-06-12 — all still hold.
+
+### #11 — API.md §2.1: `skid_margin` is EXCLUDED from the `machine_config_hash` preimage
+
+- **Found:** iteration 9 review. **Pre-sync amendment:** commit `354aa7f`.
+- **Why:** landing knobs must not fork snapshot identity. Pinned by the
+  `landing_knobs_do_not_fork_identity` test in `crates/dh-vmm/src/config.rs` (which
+  asserts `skid_margin` — and the later-added `resync_slack` — leave
+  `machine_config_hash` unchanged).
+
+Old (upstream §2.1 `MachineConfig`):
+
+```
+  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results)
+```
+
+New:
+
+```
+  uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results;
+                                 //   for that reason it is EXCLUDED from the canonical
+                                 //   MachineConfig encoding / machine_config_hash preimage
+                                 //   — landing knobs must not fork snapshot identity)
+```
+
+### #12 — API.md §3.1/§3.3: `HAS_AUX` excludes the terminal `END`; `END`'s AUX/boundary semantics
+
+- **Found:** iteration 8 review. **Pre-sync amendment:** commit `19c3ace`.
+- **Why:** `END` is itself an AUX-flagged record, so without the carve-out a log
+  whose only AUX record is the terminal `END` would ambiguously set `HAS_AUX`.
+  Authority: `crates/dh-inputlog/src/reader.rs` (validates "`flags.HAS_AUX`
+  disagrees with the records (END does not count)").
+
+Old (upstream §3.1 header table):
+
+```
+| 12 | 4 | `flags` | bit0 `SEALED` (complete, hashes valid); bit1 `HAS_AUX` (AUX records present); bit2 `EPOCH_HASHES` (AUX includes EPOCH_HASH records); others 0 |
+```
+
+New:
+
+```
+| 12 | 4 | `flags` | bit0 `SEALED` (complete, hashes valid); bit1 `HAS_AUX` (AUX records beyond the terminal `END` present); bit2 `EPOCH_HASHES` (AUX includes EPOCH_HASH records); others 0 |
+```
+
+Old (upstream §3.3 record table):
+
+```
+| `0x7F` | `END` | `stop_reason: u8` (mirrors proto StopReason), `_pad: [u8;7]`, `end_state_hash: [u8;32]` — always last record, always present in sealed logs |
+```
+
+New:
+
+```
+| `0x7F` | `END` | `stop_reason: u8` (mirrors proto StopReason), `_pad: [u8;7]`, `end_state_hash: [u8;32]` — always last record, always present in sealed logs. Carries `rflags.AUX = 1` and `boundary_rip = 0`: a minimal replayer that skips AUX records still terminates correctly via the header's `end_icount`/`end_state_hash`. `END` does not count toward `flags.HAS_AUX` |
+```
+
+### #13 — ARCHITECTURE.md §2.1 caps table: `KVM_CAP_TSC_CONTROL` → `KVM_CAP_VCPU_ATTRIBUTES`
+
+- **Found:** iteration 14 (empirics 2026-06-09, lab Coffee Lake). **Pre-sync
+  amendment:** commit `44a170f`. Companion to #6 (same TSC-offset decision).
+- **Why:** `KVM_CAP_TSC_CONTROL` is TSC *frequency scaling* — absent on the lab box
+  and never needed (single pinned host, no migration); restore normalizes TSC via
+  the offset vCPU attribute. Authority: `crates/dh-vmm/src/kvm.rs` (the
+  REQUIRED_RAW_CAPS list, with this exact empiric in the comment at line ~75).
+
+Old (upstream §2.1 caps table row):
+
+```
+| `KVM_CAP_GET_MSR_FEATURES`, `KVM_CAP_TSC_CONTROL` | TSC normalization on restore |
+```
+
+New:
+
+```
+| `KVM_CAP_GET_MSR_FEATURES`, `KVM_CAP_VCPU_ATTRIBUTES` (TSC offset vCPU attr) | TSC normalization on restore via OFFSET writes (§4.4). Empirics 2026-06-09: `KVM_CAP_TSC_CONTROL` (TSC *frequency scaling*) was listed here but is absent on the lab Coffee Lake and never needed — single pinned host, no migration |
+```
+
+### #14 — ARCHITECTURE.md §3.1 + IMPLEMENTATION-PLAN M2: VM-exiting instructions retire ZERO instructions, not "exactly once"
+
+- **Found:** iterations 47–50 (beads 0sc/20g/5l7 reconciliation + counting_semantics
+  acceptance), MEASURED. **Pre-sync amendments:** commits `881d8e1`, `9557e53`,
+  `3488efc` (the text below is the final form). This is the most load-bearing entry
+  in this file: the upstream spec's normative retirement claim is empirically false.
+- **Why:** exiting instructions exit before retirement and KVM completes them
+  host-side by skipping `RIP`, which an `exclude_host=1` counter never sees.
+  Authority: `tests/nanokernel/src/lib.rs` (`COUNTING_DELTA_AT_OUT_EXITS`) and
+  `tests/determinism/tests/counting_semantics.rs` (bit-stable across cold
+  boots/cores/processes/load).
+
+Old (upstream §3.1, replace the whole bullet):
+
+```
+- `CPUID`, `HLT`, MMIO-exiting instructions each retire exactly once, on the resume
+  that completes them. The boundary engine treats an instruction that has exited
+  mid-emulation (`KVM_EXIT_MMIO` not yet completed) as **not yet retired**.
+```
+
+New:
+
+```
+- VM-exiting instructions retire **zero** guest instructions. MEASURED in isolation
+  on the kvm-intel class for `CPUID`, PIO `OUT`, MMIO read, MMIO write, and `HLT`
+  (counting guest + the counting_semantics single-step attribution: every park-loop
+  hlt/jmp cycle advances the counter by exactly 1 — the jmp alone; see
+  `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); PIO `IN` is EXPECTED to follow the
+  same mechanism but is not yet isolated (constrained by the bit-identical icounts
+  of IN-heavy boots). The mechanism: the instruction exits before
+  retirement and KVM completes it host-side by skipping `RIP`, which an
+  `exclude_host=1` counter never sees. (An earlier revision of this section claimed
+  "retire exactly once, on the completing resume"; the empirics refuted that.)
+  The boundary engine treats an instruction that has exited mid-emulation
+  (`KVM_EXIT_MMIO` not yet completed) as **never retiring**: the count is the same
+  before the exit and after the completing resume. Like the interrupt rule, this is a
+  per-determinism-class measurement — re-validate per class, never assume across
+  classes.
+```
+
+Old (upstream IMPLEMENTATION-PLAN, M2 accept):
+
+```
+- `counting_semantics` test: single-step a known 1,000-instruction nanokernel sequence
+  (including REP MOVS, CPUID, MMIO exits); counter delta exactly 1,000; REP retires
+  as 1.
+```
+
+New:
+
+```
+- `counting_semantics` test: single-step a known 1,000-instruction nanokernel sequence
+  (including REP MOVS, CPUID, MMIO exits); counter delta exactly the region minus its
+  VM-exiting instructions (ARCH §3.1 measured rule: exiting instructions retire zero —
+  997 for the shipped guest, `nanokernel::COUNTING_DELTA_AT_OUT_EXITS`); REP retires
+  as 1.
+```
+
+### #15 — ARCHITECTURE.md §3.2 landing loop: re-assert guest_debug per exit + the PLATEAU RULE
+
+- **Found:** iteration 50 (measured, 240 cold boots). **Pre-sync amendments:**
+  commits `3488efc` + `483f37f` (the text below is the final form).
+- **Why:** an MMIO-WRITE exit eats the pending single-step trap (the emulator
+  completes the instruction and clears TF without delivering the #DB) — an
+  un-re-armed step free-runs. And targets on a zero-retirement plateau always land
+  at the FIRST `(icount, RIP)` of the plateau. Authority:
+  `crates/dh-vmm/src/boundary.rs` (the re-arm-on-every-exit logic and its comments,
+  ~lines 154–186).
+
+Old (upstream §3.2 landing-loop pseudocode annotation):
+
+```
+      (REP rule: if RIP unchanged, continue stepping without counting a boundary)
+```
+
+New:
+
+```
+      (REP rule: if RIP unchanged, continue stepping without counting a boundary;
+       re-assert guest_debug after every handled exit — an MMIO-WRITE exit eats the
+       pending single-step trap: the emulator completes the instruction and clears
+       TF without delivering the #DB, and an un-re-armed step would free-run.
+       PLATEAU RULE (measured, 240 cold boots): a target on a zero-retirement
+       plateau — several consecutive exiting instructions sharing one icount —
+       always lands at the FIRST (icount, RIP) of the plateau: the engine breaks at
+       the first loop-top count==target observation, which is RIP-deterministic
+       because the instruction stream is; skid variance never moves it)
+```
+
+### #16 — ARCHITECTURE.md §2.3: ELF boot CR4 carries OSFXSR/OSXMMEXCPT; OSXSAVE stays OFF as a determinism decision
+
+- **Found:** iteration 51, bead ttk (live-proven: an SSE2 guest triple-faults
+  without OSFXSR). **Pre-sync amendment:** commit `ad7185a`.
+- **Why:** compiled (Rust/C x86_64 ABI) guests emit SSE2 by default; with OSXSAVE
+  off there is no XSAVE/AVX surface, so guest FP state is exactly the x87+SSE set
+  `KVM_GET_FPU` captures into the §8.1 hash blob. Authority:
+  `crates/dh-vmm/src/boot.rs` (~line 241: `sregs.cr4 = PAE | OSFXSR | OSXMMEXCPT`)
+  and `crates/dh-vmm/src/cpuid.rs` (the matching XSAVE/AVX feature-bit mask).
+
+Old (upstream §2.3, guest type 1):
+
+```
+   (CR0/CR4/EFER/GDT set via `KVM_SET_SREGS`), `RIP = e_entry`, `RSI = &BootInfo`
+```
+
+New:
+
+```
+   (CR0/CR4/EFER/GDT set via `KVM_SET_SREGS`; CR4 carries PAE + OSFXSR/OSXMMEXCPT so
+   compiled guests' baseline SSE2 works — OSXSAVE stays OFF as a determinism decision:
+   no XSAVE/AVX surface exists, so guest FP state is exactly the x87+SSE set that
+   `KVM_GET_FPU` captures into the §8.1 hash blob, and the §7.2 mask clears the
+   XSAVE/AVX feature bits to match), `RIP = e_entry`, `RSI = &BootInfo`
+```
+
+### #17 — ARCHITECTURE.md §6.2: `TIMER_DEADLINE` is ABSOLUTE guest vns; `TimerArm` conversion is the caller's
+
+- **Found:** iteration 47 (reviewed and refined in `9557e53`). **Pre-sync
+  amendments:** commits `881d8e1` + `9557e53` (final form below).
+- **Why:** the deadline shares the `VNS_LO/HI` clock, never segment-relative;
+  run control's internal `TimerArm` carries counter-space vns and the caller
+  subtracts the segment vns base. Authority: `crates/dh-devices/src/clock.rs`
+  (absolute `timer_deadline_vns`) and `crates/dh-vmm/src/runctl.rs` (`TimerArm`).
+
+Old (upstream §6.2):
+
+```
+- `0x18 TIMER_DEADLINE` (RW, 8B): vns deadline; write 0 disarms. One-shot.
+```
+
+New:
+
+```
+- `0x18 TIMER_DEADLINE` (RW, 8B): vns deadline; write 0 disarms. One-shot. The
+  deadline is **ABSOLUTE guest vns** (the same clock `VNS_LO/HI` reads), never
+  segment-relative (mirrors §6.4's `at_frame` convention). Run control's internal
+  `TimerArm` carries counter-space (origin-0) vns; the conversion is the CALLER's
+  subtraction of the segment vns base when reading the device's absolute deadline —
+  a no-op until restore gives segments a nonzero base (see `runctl.rs` `TimerArm`).
+```
+
+### #18 — guest-sdk ARCHITECTURE.md, channel memory layout: ring W data is 0x100000 bytes (power of two), not 0x1E0000
+
+- **Found:** iteration 47 (beads 0sc/20g/5l7 vendored-doc reconciliation).
+  **Pre-sync amendment:** commit `881d8e1`. NOTE: this entry is in the
+  **guest-sdk** doc set, not determinism-hypervisor — apply it to the guest-sdk
+  ARCHITECTURE in the planning tree.
+- **Why:** ring indices are free-running and mask-wrapped, so ring sizes MUST be
+  powers of two; 1,966,080 (0x1E0000) is not one. Authority:
+  `../guest-sdk/crates/detguest-wire/src/header.rs` (`RING_W_SIZE: u32 = 0x10_0000`
+  with `is_power_of_two()` static asserts and the layout-offset asserts).
+
+Old (upstream guest-sdk ARCHITECTURE, channel layout block):
+
+```
+0x020000  ring W data (1,966,080 bytes = 0x1E0000)
+0x200000  end
+```
+
+New:
+
+```
+0x020000  ring W data (1,048,576 bytes = 0x100000)
+0x120000  reserved (unused page tail; ring sizes are powers of two)
+0x200000  end
+```
+
+---
+
 ## Provenance note
 
 The full ledger was reconstructed from the beads Dolt history
@@ -339,3 +600,9 @@ entries. Entries #1–#7 above were recovered from historical note versions; #8�
 are the bead's current notes. Local-amendment diffs were re-extracted from this
 repo's git history (commits cited per entry) — quote-match against upstream before
 applying, in case upstream moved.
+
+Entries #11–#18 were never on the bead at all: they predate it. They were found by
+checking whether the pre-`d55ecc3` local doc amendments survived that sync (none
+did — `git diff d55ecc3^ d55ecc3 -- .agents/docs/` is the authoritative revert
+record, and every old/new pair in that section is quoted verbatim from it). Each
+entry's technical claim was re-verified against the current code before inclusion.
