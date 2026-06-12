@@ -47,6 +47,7 @@ snapstore-client = { path = "../snapshot-store/crates/snapstore-client" }
 snapstore-manifest = { path = "../snapshot-store/crates/snapstore-manifest" }
 snapstore-types = { path = "../snapshot-store/crates/snapstore-types" }
 snapstore-server = { path = "../snapshot-store/crates/snapstore-server" }
+criterion = "0.5"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # KVM-facing FFI surface, one pinned closure for every member (iteration-75
