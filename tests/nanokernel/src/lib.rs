@@ -164,7 +164,9 @@ pub const DEVICE_EXERCISE_BEACON_ID: u32 = 0xB33F;
 /// region, then CHANNEL_INITs so the host snapshots the manifest at
 /// attach. layout_version comes from the cmdline's leading ASCII decimal
 /// digits (no digits, empty, or "0" → the default) — the bumpable knob
-/// the C2 FAILED_PRECONDITION test turns.
+/// the C2 FAILED_PRECONDITION test turns. The region is raw pattern
+/// bytes with NO FbInfo descriptor: it serves C2/C5, not the C4
+/// FbInfo-decode path.
 pub fn capture_fixture_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/capture_fixture.elf"))
 }

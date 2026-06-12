@@ -393,6 +393,65 @@ fn capture_fixture_asm_matches_rust_constants() {
     );
 }
 
+/// Both channel-publishing guests hardcode the eight ring-desc dwords in
+/// their header blocks; the interop tests rebuild headers FROM
+/// DEVICE_EXERCISE_RING_DESCS, so without this pin an edit to the asm
+/// header literals would go uncaught (iteration-94 review I1). Parse
+/// every `mov dword [rbx + 0xNN], VAL` store and compare the ring-desc
+/// slots against the constant.
+#[test]
+fn channel_guest_asm_ring_descs_match_the_constant() {
+    for file in ["device_exercise.asm", "capture_fixture.asm"] {
+        let asm = std::fs::read_to_string(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/asm")).join(file),
+        )
+        .unwrap();
+        let mut stores = std::collections::HashMap::new();
+        for line in asm.lines() {
+            let t = line.split(';').next().unwrap().trim();
+            let Some(rest) = t.strip_prefix("mov") else {
+                continue;
+            };
+            let Some(rest) = rest.trim().strip_prefix("dword [rbx + ") else {
+                continue;
+            };
+            let Some((off, val)) = rest.split_once(']') else {
+                continue;
+            };
+            // Numeric offsets only — symbolic ones (RINGW_PROD_OFF) are
+            // not header ring-desc stores.
+            let Some(off) = off
+                .strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+            else {
+                continue;
+            };
+            let val = val.trim_start_matches(',').trim();
+            let val = if let Some(h) = val.strip_prefix("0x") {
+                u64::from_str_radix(h, 16).ok()
+            } else {
+                val.parse().ok()
+            };
+            if let Some(v) = val {
+                stores.insert(off, v);
+            }
+        }
+        for (i, (off, size)) in DEVICE_EXERCISE_RING_DESCS.iter().enumerate() {
+            let at = 0x10 + (i as u64) * 8;
+            assert_eq!(
+                stores.get(&at),
+                Some(&u64::from(*off)),
+                "{file}: ring_desc[{i}].offset drifted from DEVICE_EXERCISE_RING_DESCS"
+            );
+            assert_eq!(
+                stores.get(&(at + 4)),
+                Some(&u64::from(*size)),
+                "{file}: ring_desc[{i}].size drifted from DEVICE_EXERCISE_RING_DESCS"
+            );
+        }
+    }
+}
+
 /// Same drift pin for page_dirtier (bead 28i): the chaos arithmetic
 /// (pages vs ring size) and the table start the harness reads.
 #[test]

@@ -21,8 +21,10 @@ use nanokernel::{
     DEVICE_EXERCISE_RING_DESCS,
 };
 
-/// Write channel page + framebuffer the way the guest does. The mock
-/// spans both (the fixture requires mem_size >= FB_GPA + FB_BYTES).
+/// Write channel page + framebuffer the way the guest does. The single
+/// mock spans channel page, gap, and framebuffer (the fixture requires
+/// mem_size >= FB_GPA + FB_BYTES; the const assert in elf_shape.rs pins
+/// the framebuffer clear of the channel page, so the span is coherent).
 /// `layout_version` models the cmdline knob the guest parses.
 fn guest_built_memory(layout_version: u32) -> MockGuestMem {
     let base = CAPTURE_FIXTURE_CHANNEL_GPA;
@@ -31,6 +33,9 @@ fn guest_built_memory(layout_version: u32) -> MockGuestMem {
 
     // Channel header: magic "DETGUEST" LE, proto 1, flags 0, ring_desc[4]
     // (the same canonical values as device_exercise — shared %defines).
+    // Built by hand ON PURPOSE: the point is that the asm's literal bytes
+    // pass the real attach — do not collapse this into a header-building
+    // helper, or the byte-level guarantee is lost.
     gm.write(base, &0x5453_4555_4754_4544u64.to_le_bytes())
         .unwrap();
     gm.write(base + 0x08, &1u32.to_le_bytes()).unwrap();
@@ -107,6 +112,11 @@ fn fixture_manifest_attaches_and_resolves_framebuffer() {
             len: CAPTURE_FIXTURE_FB_BYTES,
         }]
     );
+
+    // Name resolution is an exact NUL-terminated compare, not a prefix
+    // or extension match.
+    assert!(manifest.resolve("framebuffe").is_none());
+    assert!(manifest.resolve("framebufferX").is_none());
 }
 
 #[test]
@@ -132,6 +142,15 @@ fn read_region_walks_the_extent_into_the_known_content() {
     let mut slice = vec![0u8; 100];
     ch.read_region("framebuffer", 1234, &mut slice).unwrap();
     assert_eq!(&slice[..], &buf[1234..1334]);
+
+    // ...the exact-fit final qword succeeds (no off-by-one at the end)...
+    let mut last = [0u8; 8];
+    ch.read_region("framebuffer", CAPTURE_FIXTURE_FB_BYTES - 8, &mut last)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(last),
+        CAPTURE_FIXTURE_FB_QWORD_BASE + CAPTURE_FIXTURE_FB_BYTES / 8 - 1
+    );
 
     // ...and a read past the region end is refused, not truncated.
     let mut over = vec![0u8; 16];

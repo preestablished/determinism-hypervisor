@@ -18,6 +18,11 @@
 ; digits (e.g. cmdline "2" → layout_version 2). No digits, empty cmdline,
 ; or "0" → DEFAULT_LAYOUT_VERSION — same parse contract as landing_loop.
 ;
+; The framebuffer is RAW known-pattern bytes — no FbInfo descriptor at
+; offset 0. This fixture feeds the C2 by-name/layout_version resolution
+; and C5 neutrality paths; a C4 FbInfo-decode path needs a richer guest
+; (or it would parse pattern qwords as garbage dimensions).
+;
 ; Channel page layout is CLEAN-ROOM from .agents/docs/guest-sdk/ ONLY,
 ; identical to device_exercise's header (same ring descs — the canonical
 ; layout, mirrored in nanokernel::DEVICE_EXERCISE_RING_DESCS). The
@@ -47,6 +52,8 @@ BITS 64
 %define CHANNEL_PAGES   512
 
 ; Manifest area (channel offset 0x1000) and its internals (API.md §4.1).
+; All three offsets restate detguest-wire truth (header::OFF_MANIFEST,
+; RegionEntry::offset(0), Extent::offset(0)) — drift-pinned in elf_shape.
 %define MANIFEST_OFF    0x1000
 %define MANIFEST_MAGIC  0x46445444   ; "DTDF" little-endian
 %define OFF_ENTRY0      0x20         ; first region entry, area-relative
@@ -67,15 +74,20 @@ global prog_main
 extern BOOT_INFO_PTR
 
 prog_main:
-    ; ---- enough RAM for channel page + framebuffer? ---------------------
+    ; ---- BootInfo sane + enough RAM for channel page + framebuffer? -----
     mov     rsi, [BOOT_INFO_PTR]
     test    rsi, rsi
     jz      .fail_f
+    cmp     dword [rsi + BOOTINFO_OFF_MAGIC], BOOTINFO_MAGIC
+    jne     .fail_f
     mov     rax, [rsi + BOOTINFO_OFF_MEM_SIZE]
     cmp     rax, FB_GPA + FB_BYTES
     jb      .fail_f
 
     ; ---- layout_version: parse cmdline digits, else default -------------
+    ; A trusted test knob, not a hardened parser: the 64-bit accumulator
+    ; is narrowed to u32, so a pathological cmdline can wrap — fixture
+    ; cmdlines are author-supplied.
     mov     ecx, DEFAULT_LAYOUT_VERSION
     mov     r9d, [rsi + BOOTINFO_OFF_CMDLINE_LEN]
     lea     r8, [rsi + BOOTINFO_OFF_CMDLINE]
