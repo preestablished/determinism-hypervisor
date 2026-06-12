@@ -1,0 +1,30 @@
+# DHILOG read-path fuzzing (bead 1j4): arbitrary bytes -> LogReader::parse
+# -> full record walk; the invariant is NO panics and NO unbounded
+# allocation on hostile input (the reader fronts crash artifacts and
+# operator-supplied logs). Standalone workspace: the nightly-only
+# libFuzzer bins must not enter the main workspace's stable build graph.
+
+[package]
+name = "dh-inputlog-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dh-inputlog = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "dhilog_parse"
+path = "fuzz_targets/dhilog_parse.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
