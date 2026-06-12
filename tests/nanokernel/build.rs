@@ -17,6 +17,7 @@ const PROGRAMS: &[&str] = &[
     "landing_loop",
     "device_exercise",
     "capture_fixture",
+    "net_loopback",
     "hello",
     "sti_window",
     "timer_guest",

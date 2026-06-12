@@ -196,6 +196,35 @@ pub const CAPTURE_FIXTURE_FB_QWORD_BASE: u64 = 0xFB00_0000_0000_0000;
 pub const CAPTURE_FIXTURE_REGION_NAME: &[u8] = b"framebuffer";
 pub const CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION: u32 = 1;
 
+/// The M5 NET_RX landing guest (bead fbr; see asm/net_loopback.asm):
+/// publishes an RX buffer, TXes one known frame through the pv-net
+/// loopback doorbell, spins polling RX_LEN (bounded — 'r' on a harness
+/// that never delivers), verifies the delivered payload byte-identical,
+/// clears RX_LEN. Polling only (RX_VECTOR 0): the M5 demo path.
+pub fn net_loopback_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/net_loopback.elf"))
+}
+
+/// Full-success serial output ('T' TX ok, 'R' delivered, 'X' payload
+/// verified); a lowercase letter means that stage failed and parked.
+pub const NET_LOOPBACK_OK_SEQUENCE: &[u8] = b"TRX";
+
+/// Fixed buffer GPAs and the known-frame parameters (the czq harness
+/// recomputes the frame: byte i = (BYTE_BASE + i) & 0xFF). Mirror the
+/// asm %defines (drift-tested).
+pub const NET_LOOPBACK_TX_GPA: u64 = 0x20_0000;
+pub const NET_LOOPBACK_RX_GPA: u64 = 0x21_0000;
+pub const NET_LOOPBACK_RX_CAP: u32 = 2048;
+pub const NET_LOOPBACK_FRAME_LEN: u32 = 64;
+pub const NET_LOOPBACK_FRAME_BYTE_BASE: u8 = 0x5A;
+
+/// The frame exactly as the guest builds it.
+pub fn net_loopback_frame() -> Vec<u8> {
+    (0..NET_LOOPBACK_FRAME_LEN)
+        .map(|i| (u32::from(NET_LOOPBACK_FRAME_BYTE_BASE) + i) as u8)
+        .collect()
+}
+
 /// The counting-semantics guest (bead d34; ARCH §3.1 empirics, M2):
 /// emits an 'S' marker OUT, executes EXACTLY 1,000 instructions (by
 /// construction — assembly fails otherwise), then an 'E' marker OUT.
@@ -290,6 +319,7 @@ mod tests {
         assert!(!landing_loop_elf().is_empty());
         assert!(!device_exercise_elf().is_empty());
         assert!(!capture_fixture_elf().is_empty());
+        assert!(!net_loopback_elf().is_empty());
         assert!(!hello_elf().is_empty());
         assert!(!sti_window_elf().is_empty());
         assert!(!timer_guest_elf().is_empty());
