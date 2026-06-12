@@ -5,9 +5,11 @@
 //! times. Two empirics pin the test's parameters: (a) the bead said
 //! "ring size 512", but the kernel reserves 64 + 512 (PML) entries on
 //! x86 and rejects rings below that floor with EINVAL — 1024 is the
-//! smallest ring this hardware accepts; (b) the slot stays at 16 MiB
-//! because a 32 MiB FULL snapshot hangs the blocking store client
-//! today (bead 0vl). Ring-full exits are host-visible only and
+//! smallest ring this hardware accepts; (b) the slot stays at 16 MiB —
+//! plenty for the 3072 dirtied pages that drive the overflow (the
+//! 32 MiB client hang that originally forced this size is fixed and
+//! pinned by tests/snapstore_large_put.rs; bead 0vl). Ring-full exits
+//! are host-visible only and
 //! harvest-on-full is
 //! loss-free by construction (§8.2): the two legs must produce the
 //! IDENTICAL incremental snapshot ref (a single lost dirty page would
