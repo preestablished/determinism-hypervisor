@@ -59,6 +59,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("device_exercise", device_exercise_elf());
     assert_guest_shape("capture_fixture", capture_fixture_elf());
     assert_guest_shape("net_loopback", net_loopback_elf());
+    assert_guest_shape("fake_frames", fake_frames_elf());
     assert_guest_shape("hello", hello_elf());
     assert_guest_shape("sti_window", sti_window_elf());
     assert_guest_shape("timer_guest", timer_guest_elf());
@@ -544,6 +545,86 @@ fn net_loopback_asm_matches_rust_constants() {
         emitted, NET_LOOPBACK_OK_SEQUENCE,
         "asm success bytes drifted from NET_LOOPBACK_OK_SEQUENCE"
     );
+}
+
+/// Same drift pin for fake_frames (bead r2y): device-truth register
+/// offsets, the shared pace cadence, the 7-instruction pace body, the
+/// boot marker — and the guest's load-bearing property, the
+/// FRAME_COUNTER READ at entry (defense-in-depth continuity: the read
+/// must exist for a pre-seeded device counter to carry into F).
+#[test]
+fn fake_frames_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/fake_frames.asm"))
+        .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("PAD_BASE"), dh_devices::pad::PV_PAD_BASE);
+    assert_eq!(define("REG_FRAME"), dh_devices::pad::REG_FRAME_COUNTER);
+    assert_eq!(define("PACE_ITERS"), FAKE_FRAMES_PACE_ITERS);
+    assert_eq!(FAKE_FRAMES_PACE_ITERS, PAD_ECHO_PACE_ITERS, "shared cadence");
+    assert!(
+        asm.contains(&format!("'{}'", FAKE_FRAMES_BOOT_MARKER as char)),
+        "boot marker drifted from FAKE_FRAMES_BOOT_MARKER"
+    );
+
+    // The load-bearing read: FRAME_COUNTER is READ before the bump loop
+    // (strip comments so the doc header can't satisfy the pin).
+    let code: Vec<&str> = asm
+        .lines()
+        .map(|l| l.split(';').next().unwrap().trim())
+        .collect();
+    let read_at = code
+        .iter()
+        .position(|t| t.starts_with("mov") && t.contains("r10d, [r8 + REG_FRAME]"))
+        .expect("fake_frames must initialize F by READING the device's FRAME_COUNTER");
+    let loop_at = code
+        .iter()
+        .position(|t| *t == ".frame:")
+        .expect("missing .frame loop");
+    assert!(read_at < loop_at, "the read must precede the bump loop");
+
+    // The work_buf ring bound must match the pace loop's mask: a
+    // PACE_ITERS retune past the mask would otherwise write past it.
+    assert!(
+        code.iter().any(|t| t.contains("and") && t.contains("ebx, 511")),
+        "pace mask drifted"
+    );
+    assert!(
+        code.iter().any(|t| t.contains("work_buf:") && t.contains("resq 512")),
+        "work_buf size drifted from the 511 pace mask"
+    );
+
+    // Pace-loop body pin: 7 instructions between `.pace:` and its jnz
+    // inclusive (the icount cadence the M5 acceptance schedules against).
+    let mut in_loop = false;
+    let mut instrs = 0u64;
+    for t in &code {
+        if *t == ".pace:" {
+            in_loop = true;
+            continue;
+        }
+        if !in_loop || t.is_empty() || t.ends_with(':') || t.starts_with("align") {
+            continue;
+        }
+        instrs += 1;
+        if t.starts_with("jnz") {
+            break;
+        }
+    }
+    assert_eq!(instrs, 7, "pace-loop body drifted");
 }
 
 /// Same drift pin for page_dirtier (bead 28i): the chaos arithmetic
