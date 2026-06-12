@@ -94,12 +94,15 @@ Notes:
   after any incident (or surprising tool behavior), treat the Status column
   as a fingerprint and re-verify the binaries rather than trusting what is
   in place.
-- **These tools are pre-staged, not yet exercised**: as of 2026-06-12 no
-  workflow invokes grpcurl, cargo-fuzz, or stress-ng (the `kvm-intel` lane
-  runs `cargo build/test --workspace` only; the M5 fuzz target and M6/M7
-  jobs land later). "✅ installed" therefore does not mean "proven in a
-  runner job" — unlike the `protoc` row, which every build exercises via the
-  vendored binary.
+- **grpcurl and stress-ng are pre-staged, not yet exercised**: no workflow
+  invokes them yet (M6/M7 jobs land later), so "✅ installed" does not mean
+  "proven in a runner job" — unlike the `protoc` row, which every build
+  exercises via the vendored binary. cargo-fuzz + nightly ARE exercised:
+  `nightly-drift.yaml`'s `dhilog-fuzz` job runs 1h nightly on a HOSTED
+  runner (this box's install serves local runs and the 24h operator
+  dispatch: `gh workflow run nightly-drift.yaml -f fuzz_seconds=86400
+  -f fuzz_runner=kvm-intel` — which occupies the single kvm-intel runner
+  for the duration; schedule deliberately).
 - **`grpcurl --version` prints `dev build <no version set>`** when installed
   via `go install` (release binaries get the version stamped via ldflags;
   go install does not). Verify the real version with

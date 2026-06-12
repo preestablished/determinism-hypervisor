@@ -7,7 +7,26 @@ name: nightly-drift
 on:
   schedule:
     - cron: "17 3 * * *" # 03:17 UTC nightly
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      # The M5-accept 24h fuzz run is an OPERATOR dispatch (bead 1j4):
+      #   gh workflow run nightly-drift.yaml -f fuzz_seconds=86400 -f fuzz_runner=kvm-intel
+      # GitHub-hosted jobs hard-cap at 6h, so a >21600s run MUST set
+      # fuzz_runner=kvm-intel (self-hosted; no 6h cap). Know what the
+      # 24h dispatch costs: it holds this workflow's concurrency group
+      # AND the single kvm-intel runner for the duration, so the 03:17
+      # scheduled drift/canary run queues behind it and lands up to
+      # ~24h late (delayed, not dropped — cancel-in-progress is false).
+      # Timely drift detection is blanked out for that day: schedule
+      # the dispatch deliberately.
+      fuzz_seconds:
+        description: "DHILOG fuzz duration, seconds (24h accept run: 86400; >21600 REQUIRES fuzz_runner=kvm-intel or GitHub's 6h hosted cap kills the job and files a false failure issue)"
+        required: false
+        default: "3600"
+      fuzz_runner:
+        description: "Fuzz job runner label: ubuntu-latest or kvm-intel (exactly these — a typo'd label strands the run queued until the 25h timeout while holding the concurrency group)"
+        required: false
+        default: "ubuntu-latest"
 
 # Queue hygiene on the single kvm-intel runner; never cancel in flight —
 # this is the measurement workflow (docs/ops/github-runner.md caveat).
@@ -56,10 +75,52 @@ jobs:
         run: cargo test -p determinism-tests --test regression --test counting_semantics --test counting_smoke
         working-directory: repo
 
+  # 1h libFuzzer run over the DHILOG read path (bead 1j4): arbitrary
+  # bytes -> LogReader::parse -> full record walk; the invariant is no
+  # panics / no unbounded allocation on hostile input. Hosted by
+  # default — fuzzing needs no KVM and must not occupy the kvm-intel
+  # box. The golden v1 fixtures seed the corpus past the header magic
+  # (cov 31 -> 350 in the bring-up smoke).
+  dhilog-fuzz:
+    runs-on: ${{ inputs.fuzz_runner || 'ubuntu-latest' }}
+    # Expressions have no arithmetic, so one ceiling serves every
+    # duration: 25h covers the 24h dispatch + grace; hosted runs are
+    # additionally capped at 6h by GitHub regardless of this value.
+    timeout-minutes: 1500
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      # Corpus persists across nightlies (else every run restarts from
+      # the 2 golden seeds and discovers nothing cumulatively). Cache is
+      # default-branch-scoped with opaque fuzz inputs — acceptable
+      # poisoning surface for this public repo.
+      - uses: actions/cache@v4
+        with:
+          path: repo/crates/dh-inputlog/fuzz/corpus/dhilog_parse
+          key: dhilog-fuzz-corpus-${{ github.run_id }}
+          restore-keys: dhilog-fuzz-corpus-
+      - name: seed fixtures must exist and be non-empty
+        working-directory: repo/crates/dh-inputlog
+        run: test -s tests/fixtures/v1_minimal.dhilog && test -s tests/fixtures/v1_kitchen_sink.dhilog
+      - name: fuzz the DHILOG parser
+        working-directory: repo/crates/dh-inputlog
+        run: |
+          cargo +nightly fuzz run dhilog_parse fuzz/corpus/dhilog_parse tests/fixtures \
+            -- -max_total_time=${{ inputs.fuzz_seconds || '3600' }} -rss_limit_mb=4096
+      - name: keep crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhilog-fuzz-artifacts
+          path: repo/crates/dh-inputlog/fuzz/artifacts/
+
   # A silent-red nightly is the worst outcome for a determinism product:
   # route failures to a visible issue (updated, not duplicated).
   alert-on-failure:
-    needs: [determinism-class, determinism-canary]
+    needs: [determinism-class, determinism-canary, dhilog-fuzz]
     if: failure()
     runs-on: ubuntu-latest
     permissions:
@@ -70,8 +131,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
-          TITLE="nightly-drift FAILED: determinism class or canary"
-          BODY="Nightly drift/canary failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a canary failure is a P0 determinism divergence."
+          TITLE="nightly-drift FAILED: determinism class, canary, or DHILOG fuzz"
+          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a canary failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
