@@ -67,19 +67,38 @@ fn boundary() -> BoundaryState {
     }
 }
 
+/// Deliberately the UPPER median for even sample counts — conservative
+/// for a gate; do not "fix" into an averaging median (it loosens it).
 fn p50(samples: &mut [Duration]) -> Duration {
     samples.sort_unstable();
     samples[samples.len() / 2]
 }
 
+/// (min, p50, max) — the spread lets the operator spot a bimodal
+/// distribution (cold/warm split, fsync hiccups) at a glance.
+fn spread(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
+    let mid = p50(samples);
+    (samples[0], mid, samples[samples.len() - 1])
+}
+
 #[test]
 #[ignore = "M4 perf acceptance: quiesced box only — cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture"]
 fn m4_perf_gates_p50_128mib() {
+    // A skip looks exactly like a pass to a CI consumer. The nightly
+    // perf job (bead 1pa) sets PERF_GATE_REQUIRED=1 so a misconfigured
+    // runner fails loudly instead of going green without measuring;
+    // ad-hoc operator runs keep the friendly skip.
+    let required = std::env::var_os("PERF_GATE_REQUIRED").is_some();
     if !kvm_available() {
+        assert!(!required, "PERF_GATE_REQUIRED set but /dev/kvm not usable");
         eprintln!("skipping: /dev/kvm not usable");
         return;
     }
     if cfg!(debug_assertions) {
+        assert!(
+            !required,
+            "PERF_GATE_REQUIRED set but this is a debug build (use --release)"
+        );
         eprintln!("skipping: perf gates are meaningless in a debug build (use --release)");
         return;
     }
@@ -118,8 +137,8 @@ fn m4_perf_gates_p50_128mib() {
         fork_samples.push(t.elapsed());
         drop(outcome); // child teardown outside the timed window of the NEXT sample
     }
-    let fork_p50 = p50(&mut fork_samples);
-    eprintln!("fork p50: {fork_p50:?} (gate {FORK_P50_MAX:?})");
+    let (fork_min, fork_p50, fork_max) = spread(&mut fork_samples);
+    eprintln!("fork p50: {fork_p50:?} [min {fork_min:?}, max {fork_max:?}] (gate {FORK_P50_MAX:?})");
 
     // ── Gate 2: incremental snapshot at exactly 8k dirty pages ──────────
     let slot = sys.create_slot_vm(MEM).unwrap();
@@ -140,20 +159,28 @@ fn m4_perf_gates_p50_128mib() {
     let mut ring = DirtyRing::map(&slot).expect("ring");
     let mut dirty = DirtyPageSet::new(slot.mem_bytes);
     enable_dirty_logging(&slot).expect("dirty logging");
-    // Real bytes in every page the set will ship (host writes; the SET —
-    // not guest execution — defines the 8k load, which is exactly the
-    // engine path the gate times).
-    for page in 0..DIRTY_PAGES {
-        slot.guest_mem
-            .write_slice(&[page as u8 ^ 0x5A], GuestAddress(page * 4096))
-            .unwrap();
-    }
 
+    // Methodology (iteration-99 review): the SET — host-built, not guest
+    // execution — defines the 8k load. Two deliberate deviations from a
+    // guest-dirtied run, both currently sub-ms next to 32 MiB of durable
+    // I/O (revisit if the path ever stops being storage-bound, bead 8ot):
+    //  - harvest_at_boundary drains an EMPTY ring here (a real run would
+    //    harvest 8192 ring entries + reset ioctls inside the window);
+    //  - page CONTENT varies per sample (sample index mixed in), because
+    //    the pagestore dedups globally by content hash — identical bytes
+    //    would make samples 2..N dedup hits and measure the manifest
+    //    path, not the cold 8k-page write. Cost: the tempdir store grows
+    //    ~32 MiB per sample (~1 GiB for the run).
     let mut snap_samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        // The engine clears the set after the store acks — rebuild it
-        // (8192 bitset inserts; noise floor next to 32 MiB of I/O).
+    for sample in 0..SAMPLES {
         for page in 0..DIRTY_PAGES {
+            slot.guest_mem
+                .write_slice(
+                    &[(page as u8) ^ (sample as u8) ^ 0x5A],
+                    GuestAddress(page * 4096),
+                )
+                .unwrap();
+            // The engine clears the set after the store acks — rebuild.
             dirty.insert(page).unwrap();
         }
         let t = Instant::now();
@@ -175,12 +202,17 @@ fn m4_perf_gates_p50_128mib() {
         snap_samples.push(t.elapsed());
         assert_eq!(out.pages_shipped, DIRTY_PAGES, "the load must be exactly 8k pages");
     }
-    let snap_p50 = p50(&mut snap_samples);
-    eprintln!("incremental snapshot (8k pages) p50: {snap_p50:?} (gate {SNAP_P50_MAX:?})");
+    let (snap_min, snap_p50, snap_max) = spread(&mut snap_samples);
+    eprintln!(
+        "incremental snapshot (8k pages) p50: {snap_p50:?} [min {snap_min:?}, max {snap_max:?}] (gate {SNAP_P50_MAX:?})"
+    );
 
     // ── Gate 3: tier-B warm restore of the 128 MiB root ─────────────────
     // Slot creation is NOT part of the gate (RestoreSnapshot targets an
     // existing slot, §8.3) — created per sample outside the timed window.
+    // Warm page cache across samples is the CORRECT regime: "tier-B WARM
+    // restore" is the plan's wording; sample 0's cold read is an outlier
+    // the median is robust to.
     let mut restore_samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let fresh = sys.create_slot_vm(MEM).unwrap();
@@ -200,8 +232,10 @@ fn m4_perf_gates_p50_128mib() {
         restore_samples.push(t.elapsed());
         assert_eq!(out.pages_loaded, MEM / 4096);
     }
-    let restore_p50 = p50(&mut restore_samples);
-    eprintln!("warm restore p50: {restore_p50:?} (gate {RESTORE_P50_MAX:?})");
+    let (restore_min, restore_p50, restore_max) = spread(&mut restore_samples);
+    eprintln!(
+        "warm restore p50: {restore_p50:?} [min {restore_min:?}, max {restore_max:?}] (gate {RESTORE_P50_MAX:?})"
+    );
 
     // ── The gates ────────────────────────────────────────────────────────
     assert!(
