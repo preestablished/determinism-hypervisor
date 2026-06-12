@@ -18,6 +18,7 @@ const PROGRAMS: &[&str] = &[
     "device_exercise",
     "capture_fixture",
     "net_loopback",
+    "fake_frames",
     "hello",
     "sti_window",
     "timer_guest",

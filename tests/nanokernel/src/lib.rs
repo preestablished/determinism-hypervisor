@@ -225,6 +225,25 @@ pub fn net_loopback_frame() -> Vec<u8> {
         .collect()
 }
 
+/// The M5 at_frame/frame_budget acceptance guest (bead r2y; see
+/// asm/fake_frames.asm): a pure fake-frame emitter — reads the device's
+/// ABSOLUTE FRAME_COUNTER at entry (continuity across snapshot/restore
+/// by construction, §6.4), emits one 'G' boot marker, then bumps
+/// FRAME_COUNTER forever on the fixed pad_echo pace cadence. No pad
+/// polling, no RAM table: the FRAME_MARK table is the observable.
+pub fn fake_frames_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/fake_frames.elf"))
+}
+
+/// The single serial byte fake_frames emits after its initial
+/// FRAME_COUNTER read, before the first bump.
+pub const FAKE_FRAMES_BOOT_MARKER: u8 = b'G';
+
+/// Busy iterations between frames (7 instructions each) — the same
+/// fixed cadence as [`PAD_ECHO_PACE_ITERS`]. Mirrors the asm %define
+/// (drift-tested).
+pub const FAKE_FRAMES_PACE_ITERS: u64 = 64;
+
 /// The counting-semantics guest (bead d34; ARCH §3.1 empirics, M2):
 /// emits an 'S' marker OUT, executes EXACTLY 1,000 instructions (by
 /// construction — assembly fails otherwise), then an 'E' marker OUT.
@@ -320,6 +339,7 @@ mod tests {
         assert!(!device_exercise_elf().is_empty());
         assert!(!capture_fixture_elf().is_empty());
         assert!(!net_loopback_elf().is_empty());
+        assert!(!fake_frames_elf().is_empty());
         assert!(!hello_elf().is_empty());
         assert!(!sti_window_elf().is_empty());
         assert!(!timer_guest_elf().is_empty());
