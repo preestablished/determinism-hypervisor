@@ -547,7 +547,7 @@ land in `seq` order.
 |---:|---|---|
 | `0x01` | `PAD_SET` | `port: u8, _pad: [u8;3], buttons: u32, frame_hint: u32` (12 B). `frame_hint` = the at_frame value (the absolute FRAME_COUNTER value, §2.3) if frame-scheduled, else `0xFFFF_FFFF`. Replay lands by icount; frame_hint is verified against the FRAME_MARK table. |
 | `0x02` | `DEV_EVENT` | `device_id: u16, event_type: u16, data_len: u32, data: [u8; data_len]` |
-| `0x03` | `NET_RX` | raw frame bytes (`payload_len` is the frame length, ≤ 2048) |
+| `0x03` | `NET_RX` | raw frame bytes (`payload_len` is the frame length, 1–2048; zero-length is INVALID — the device rejects empty delivery, so writer and reader forbid it) |
 
 **`DEV_EVENT` payload encodings for the detchannel** (`device_id = 0x0001`) —
 normative, frozen with DHILOG v1. Every host-side mutation of detchannel memory is an

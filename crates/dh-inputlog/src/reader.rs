@@ -531,9 +531,10 @@ fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), Re
                 && u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize
                     == payload.len() - 8
         }
-        // §3.3 gives NET_RX no lower bound: a zero-length frame is accepted
-        // by design (land a minimum in API.md first if one is ever wanted).
-        KIND_NET_RX => payload.len() <= MAX_NET_RX_FRAME,
+        // NET_RX is 1..=2048 (bead 206; API.md §3.3 amended, ledger #19):
+        // PvNet rejects empty delivery, so an accepted empty record would
+        // be unreplayable — the codec forbids what the device refuses.
+        KIND_NET_RX => (1..=MAX_NET_RX_FRAME).contains(&payload.len()),
         KIND_ENTROPY | KIND_SDK_EVENT | KIND_NET_TX => payload.len() == 16,
         KIND_TIMER_FIRE => payload.len() == 20,
         KIND_EPOCH_HASH | KIND_END => payload.len() == 40,

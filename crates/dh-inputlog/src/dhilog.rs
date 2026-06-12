@@ -105,6 +105,11 @@ pub enum WriteError {
     IcountRegressed,
     /// `seq` is u32 and exhausted.
     SeqOverflow,
+    /// Zero-length NET_RX (bead 206): empty frames don't exist anywhere
+    /// in the platform — PvNet faults a len-0 TX and rejects a len-0
+    /// delivery — so the codec forbids recording one (an accepted empty
+    /// would be unreplayable).
+    EmptyNetRx,
 }
 
 /// Append-only DHILOG writer. Records go in in execution order; `seal`
@@ -183,14 +188,20 @@ impl LogWriter {
     }
 
     /// NET_RX (§3.3): a received raw frame; the payload IS the frame bytes
-    /// (no preamble), capped at 2048. Landed with the bp9 format freeze so
-    /// the golden fixtures cover every canonical v1 kind.
+    /// (no preamble), 1..=2048. Landed with the bp9 format freeze so the
+    /// golden fixtures cover every canonical v1 kind. Zero-length is
+    /// refused (bead 206): the device layer rejects empty delivery, so a
+    /// recorded empty would be unreplayable — all three layers agree
+    /// empties don't exist (reader validation matches; ledger #19).
     pub fn net_rx(
         &mut self,
         icount: u64,
         boundary_rip: u64,
         frame: &[u8],
     ) -> Result<(), WriteError> {
+        if frame.is_empty() {
+            return Err(WriteError::EmptyNetRx);
+        }
         if frame.len() > MAX_NET_RX_FRAME {
             return Err(WriteError::PayloadTooLong);
         }
@@ -564,6 +575,21 @@ mod tests {
         let over = vec![0u8; MAX_DEV_EVENT_DATA + 1];
         assert_eq!(
             w.dev_event(2, 0, 1, 1, &over),
+            Err(WriteError::PayloadTooLong)
+        );
+    }
+
+    #[test]
+    fn net_rx_frame_bounds_at_the_writer() {
+        let mut w = LogWriter::new(header());
+        // Empty frames don't exist anywhere in the platform (bead 206):
+        // the writer refuses to record what the device cannot replay.
+        assert_eq!(w.net_rx(1, 0, &[]), Err(WriteError::EmptyNetRx));
+        // 1 and 2048 are the bounds; one past the cap is too long.
+        w.net_rx(1, 0, &[0xEE]).unwrap();
+        w.net_rx(2, 0, &vec![0u8; MAX_NET_RX_FRAME]).unwrap();
+        assert_eq!(
+            w.net_rx(3, 0, &vec![0u8; MAX_NET_RX_FRAME + 1]),
             Err(WriteError::PayloadTooLong)
         );
     }
