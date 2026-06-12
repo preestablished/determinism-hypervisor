@@ -26,5 +26,8 @@ test = false
 doc = false
 bench = false
 
+# Line tables for symbolized fuzz backtraces — do not "optimize" to 0.
+# (cargo-fuzz itself turns on debug-assertions + overflow-checks; this
+# profile only needs the symbols.)
 [profile.release]
 debug = 1

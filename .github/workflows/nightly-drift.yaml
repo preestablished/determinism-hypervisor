@@ -12,15 +12,19 @@ on:
       # The M5-accept 24h fuzz run is an OPERATOR dispatch (bead 1j4):
       #   gh workflow run nightly-drift.yaml -f fuzz_seconds=86400 -f fuzz_runner=kvm-intel
       # GitHub-hosted jobs hard-cap at 6h, so a >21600s run MUST set
-      # fuzz_runner=kvm-intel (self-hosted; no 6h cap) — and that
-      # occupies the single kvm-intel runner for the duration: schedule
-      # it deliberately (docs/ops/github-runner.md one-KVM-job caveat).
+      # fuzz_runner=kvm-intel (self-hosted; no 6h cap). Know what the
+      # 24h dispatch costs: it holds this workflow's concurrency group
+      # AND the single kvm-intel runner for the duration, so the 03:17
+      # scheduled drift/canary run queues behind it and lands up to
+      # ~24h late (delayed, not dropped — cancel-in-progress is false).
+      # Timely drift detection is blanked out for that day: schedule
+      # the dispatch deliberately.
       fuzz_seconds:
-        description: "DHILOG fuzz duration, seconds (24h accept run: 86400)"
+        description: "DHILOG fuzz duration, seconds (24h accept run: 86400; >21600 REQUIRES fuzz_runner=kvm-intel or GitHub's 6h hosted cap kills the job and files a false failure issue)"
         required: false
         default: "3600"
       fuzz_runner:
-        description: "Fuzz job runner (ubuntu-latest, or kvm-intel for runs > 6h)"
+        description: "Fuzz job runner label: ubuntu-latest or kvm-intel (exactly these — a typo'd label strands the run queued until the 25h timeout while holding the concurrency group)"
         required: false
         default: "ubuntu-latest"
 
@@ -88,7 +92,19 @@ jobs:
         with:
           path: repo
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      # Corpus persists across nightlies (else every run restarts from
+      # the 2 golden seeds and discovers nothing cumulatively). Cache is
+      # default-branch-scoped with opaque fuzz inputs — acceptable
+      # poisoning surface for this public repo.
+      - uses: actions/cache@v4
+        with:
+          path: repo/crates/dh-inputlog/fuzz/corpus/dhilog_parse
+          key: dhilog-fuzz-corpus-${{ github.run_id }}
+          restore-keys: dhilog-fuzz-corpus-
+      - name: seed fixtures must exist and be non-empty
+        working-directory: repo/crates/dh-inputlog
+        run: test -s tests/fixtures/v1_minimal.dhilog && test -s tests/fixtures/v1_kitchen_sink.dhilog
       - name: fuzz the DHILOG parser
         working-directory: repo/crates/dh-inputlog
         run: |
