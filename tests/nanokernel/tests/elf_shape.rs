@@ -57,6 +57,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pipeline_smoke", pipeline_smoke_elf());
     assert_guest_shape("landing_loop", landing_loop_elf());
     assert_guest_shape("device_exercise", device_exercise_elf());
+    assert_guest_shape("capture_fixture", capture_fixture_elf());
     assert_guest_shape("hello", hello_elf());
     assert_guest_shape("sti_window", sti_window_elf());
     assert_guest_shape("timer_guest", timer_guest_elf());
@@ -322,6 +323,74 @@ fn entropy_draw_asm_matches_rust_constants() {
         dh_devices::entropy::STATUS_OK
     );
     assert_eq!(define("ENT_BASE"), 0xD000_3000);
+}
+
+/// Same drift pin for capture_fixture (bead 4ws): the harness-facing
+/// GPAs, the known-content pattern base, the default layout_version, and
+/// the wire-format constants the asm restates from detguest-wire
+/// (manifest magic and the two area-relative offsets it stores at).
+#[test]
+fn capture_fixture_asm_matches_rust_constants() {
+    let asm =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/capture_fixture.asm"))
+            .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("CHANNEL_GPA"), CAPTURE_FIXTURE_CHANNEL_GPA);
+    assert_eq!(define("FB_GPA"), CAPTURE_FIXTURE_FB_GPA);
+    assert_eq!(define("FB_BYTES"), CAPTURE_FIXTURE_FB_BYTES);
+    assert_eq!(define("FB_QWORDS"), CAPTURE_FIXTURE_FB_BYTES / 8);
+    assert_eq!(define("FB_QWORD_BASE"), CAPTURE_FIXTURE_FB_QWORD_BASE);
+    assert_eq!(
+        u32::try_from(define("DEFAULT_LAYOUT_VERSION")).unwrap(),
+        CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION
+    );
+    assert_eq!(
+        define("REGION_NAME_LEN"),
+        CAPTURE_FIXTURE_REGION_NAME.len() as u64
+    );
+    // Wire-format truth from detguest-wire, not re-typed literals: the
+    // asm's restated manifest constants cannot drift from the codec.
+    assert_eq!(
+        u32::try_from(define("MANIFEST_MAGIC")).unwrap(),
+        detguest_wire::manifest::MANIFEST_MAGIC
+    );
+    assert_eq!(
+        define("MANIFEST_OFF"),
+        detguest_wire::header::OFF_MANIFEST as u64
+    );
+    assert_eq!(
+        define("OFF_ENTRY0"),
+        detguest_wire::manifest::RegionEntry::offset(0) as u64
+    );
+    assert_eq!(
+        define("OFF_EXTENT0"),
+        detguest_wire::manifest::Extent::offset(0) as u64
+    );
+    assert_eq!(
+        u32::try_from(define("REGION_FLAG_FRAMEBUFFER")).unwrap(),
+        detguest_wire::manifest::REGION_FLAG_FRAMEBUFFER
+    );
+
+    // The framebuffer must start at or after the channel page's end —
+    // a manifest extent overlapping the channel would let capture reads
+    // see ring traffic (const-evaluated for the clippy lane).
+    const _FB_CLEAR_OF_CHANNEL: () = assert!(
+        CAPTURE_FIXTURE_FB_GPA >= CAPTURE_FIXTURE_CHANNEL_GPA + 0x20_0000
+    );
 }
 
 /// Same drift pin for page_dirtier (bead 28i): the chaos arithmetic

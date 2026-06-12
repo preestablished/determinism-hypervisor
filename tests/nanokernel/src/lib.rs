@@ -157,6 +157,43 @@ pub const DEVICE_EXERCISE_OK_SEQUENCE: &[u8] = b"CEPBDX";
 pub const DEVICE_EXERCISE_CHANNEL_GPA: u64 = 0x40_0000;
 pub const DEVICE_EXERCISE_BEACON_ID: u32 = 0xB33F;
 
+/// The M6 capture-engine fixture guest (bead 4ws; see
+/// asm/capture_fixture.asm): the only region-manifest producer until
+/// guest-sdk lands in Phase 3. Fills a 64 KiB framebuffer with a known
+/// pattern, publishes a manifest with that single FRAMEBUFFER-flagged
+/// region, then CHANNEL_INITs so the host snapshots the manifest at
+/// attach. layout_version comes from the cmdline's leading ASCII decimal
+/// digits (no digits, empty, or "0" → the default) — the bumpable knob
+/// the C2 FAILED_PRECONDITION test turns.
+pub fn capture_fixture_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/capture_fixture.elf"))
+}
+
+/// Full-success serial output of the capture fixture ('F' manifest
+/// published, 'D' CHANNEL_INIT ok, 'X' done); a lowercase letter means
+/// that stage failed and the guest parked.
+pub const CAPTURE_FIXTURE_OK_SEQUENCE: &[u8] = b"FDX";
+
+/// Channel page GPA the capture fixture donates (2 MiB-aligned, same
+/// canonical header/ring layout as device_exercise — see
+/// [`DEVICE_EXERCISE_RING_DESCS`]).
+pub const CAPTURE_FIXTURE_CHANNEL_GPA: u64 = 0x40_0000;
+
+/// The published FRAMEBUFFER region: one contiguous extent right after
+/// the channel page. Requires mem_size >= GPA + BYTES.
+pub const CAPTURE_FIXTURE_FB_GPA: u64 = 0x60_0000;
+pub const CAPTURE_FIXTURE_FB_BYTES: u64 = 0x1_0000;
+
+/// Known framebuffer content: qword j (little-endian, j in
+/// 0..BYTES/8) holds `FB_QWORD_BASE + j` — capture tests recompute the
+/// expected bytes from this. Mirrors the asm %define (drift-tested).
+pub const CAPTURE_FIXTURE_FB_QWORD_BASE: u64 = 0xFB00_0000_0000_0000;
+
+/// The manifest entry the fixture publishes (slot 0): name, flags, and
+/// the layout_version used when the cmdline carries no digits.
+pub const CAPTURE_FIXTURE_REGION_NAME: &[u8] = b"framebuffer";
+pub const CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION: u32 = 1;
+
 /// The counting-semantics guest (bead d34; ARCH §3.1 empirics, M2):
 /// emits an 'S' marker OUT, executes EXACTLY 1,000 instructions (by
 /// construction — assembly fails otherwise), then an 'E' marker OUT.
@@ -250,6 +287,7 @@ mod tests {
         assert!(!pipeline_smoke_elf().is_empty());
         assert!(!landing_loop_elf().is_empty());
         assert!(!device_exercise_elf().is_empty());
+        assert!(!capture_fixture_elf().is_empty());
         assert!(!hello_elf().is_empty());
         assert!(!sti_window_elf().is_empty());
         assert!(!timer_guest_elf().is_empty());

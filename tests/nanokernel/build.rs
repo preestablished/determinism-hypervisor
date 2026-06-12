@@ -16,6 +16,7 @@ const PROGRAMS: &[&str] = &[
     "pipeline_smoke",
     "landing_loop",
     "device_exercise",
+    "capture_fixture",
     "hello",
     "sti_window",
     "timer_guest",
