@@ -533,8 +533,19 @@ fn net_rx_frame_boundaries() {
         other => panic!("expected NetRx, got {other:?}"),
     }
 
-    // Zero-length frame: §3.3 gives no lower bound — accepted by design.
+    // Zero-length frame: rejected (bead 206, ledger #19) — PvNet refuses
+    // empty delivery, so an accepted empty record would be unreplayable.
     let rec = make_record(KIND_NET_RX, 0, 0, 10, 0x1000, &[]);
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED)).unwrap_err(),
+        ReadError::BadPayloadLayout {
+            kind: KIND_NET_RX,
+            seq: 0
+        }
+    );
+
+    // 1 byte — the new lower bound — is accepted.
+    let rec = make_record(KIND_NET_RX, 0, 0, 10, 0x1000, &[0xEE]);
     assert!(LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED)).is_ok());
 
     // 2049: rejected.

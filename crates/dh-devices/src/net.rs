@@ -58,6 +58,10 @@ const SECTION_LEN: usize = 8 + 4 + 4 + 8 + 4 + 4 + 4;
 
 /// `apply_net_rx` failure — corrupt or hostile log input, or a guest
 /// that published an unusable RX buffer. Run control faults the slot.
+/// Zero-length frames land here as `FrameTooBig` — and since bead 206
+/// the codec agrees: dh-inputlog's writer refuses to record an empty
+/// NET_RX and the reader's validation rejects one, so all three layers
+/// hold the same invariant (empty frames don't exist).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetRxError {
     /// Frame exceeds MAX_FRAME or the guest-published RX capacity.

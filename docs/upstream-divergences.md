@@ -169,6 +169,31 @@ New:
 | `NETL` | pv-net registers only (36 bytes: tx_buf_gpa u64, tx_len u32, tx_status u32, rx_buf_gpa u64, rx_cap u32, rx_len u32, rx_vector u32). The original "pending-RX state (must be empty at snapshot; enforced)" is satisfied BY CONSTRUCTION: the device buffers no frames (TX is drained per exit by run control; RX delivery is immediate at record landing), so no pending state exists to serialize — iteration-85 amendment |
 ```
 
+### #19 — API.md §3.3: `NET_RX` payload is 1–2048; zero-length is invalid
+
+- **Found:** iteration 85 review (opus1 I2), fixed iteration 100, bead 206.
+  **Local amendment:** this iteration's commit (record-kind table, `0x03` row).
+- **Why:** upstream gave NET_RX no lower bound ("≤ 2048"), and the reader
+  deliberately accepted zero-length frames — but `PvNet::apply_net_rx` rejects
+  `len == 0` (`FrameTooBig`) and a TX doorbell faults on `tx_len == 0`, so a
+  recorded empty NET_RX would be unreplayable. Bead 206 chose forbid-at-codec
+  over invent-empty-delivery-semantics: the writer refuses
+  (`WriteError::EmptyNetRx`), reader validation requires `1..=2048`, the device
+  is unchanged. Authority: `crates/dh-inputlog/src/{dhilog,reader}.rs`,
+  `crates/dh-devices/src/net.rs`.
+
+Old (record-kind table, `0x03` row):
+
+```
+| `0x03` | `NET_RX` | raw frame bytes (`payload_len` is the frame length, ≤ 2048) |
+```
+
+New:
+
+```
+| `0x03` | `NET_RX` | raw frame bytes (`payload_len` is the frame length, 1–2048; zero-length is INVALID — the device rejects empty delivery, so writer and reader forbid it) |
+```
+
 ---
 
 ## Upstream-only wording fixes (no local doc edit; code / decision doc is the authority)
