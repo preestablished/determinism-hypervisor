@@ -83,6 +83,7 @@ fn cold_run(budget: u64) -> (u64, u64, u64, u64, [u8; 32]) {
         injections: &[],
         timer: None,
         pause: &pause,
+        sdk_events: None,
     };
     let out = run_segment(
         &mut seg,

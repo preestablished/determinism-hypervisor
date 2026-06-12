@@ -85,6 +85,7 @@ impl Rig {
             injections: &[],
             timer,
             pause: &pause,
+            sdk_events: None,
         };
         run_segment(
             &mut seg,

@@ -63,6 +63,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         const SERIAL_END: u16 = SERIAL_PIO_BASE + SERIAL_PIO_LEN;
         let mut on_exit = |exit: VcpuExit| match exit {
@@ -83,6 +84,7 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
         reason: match outcome.reason {
             StopReason::BudgetReached => "budget_reached",
             StopReason::GoalSatisfied => "goal_satisfied",
+            StopReason::NextSdkEvent => "next_sdk_event",
             StopReason::HardCap => "hard_cap",
             StopReason::Paused => "paused",
             StopReason::GuestHalted => "guest_halted",

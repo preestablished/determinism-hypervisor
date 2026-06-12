@@ -170,6 +170,7 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let counter_ref = &counter;
             run_segment_with_epochs(

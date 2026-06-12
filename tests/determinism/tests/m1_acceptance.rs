@@ -187,6 +187,7 @@ fn run_m1(base_path: &std::path::Path) -> Result<RunOutcome, String> {
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let log_r = &mut log;
         let beacons_r = &mut beacons;
