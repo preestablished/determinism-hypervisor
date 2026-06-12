@@ -81,8 +81,16 @@ fork, tier-B mmap restore.
   draws bit-identically** (exercises the `{seed, stream, word_pos}` round trip,
   API.md §4).
 - Perf gates (p50 on the box, 128 MiB demo guest — MAP.md canonical figure):
-  fork < 10 ms, incremental snapshot ≤ 8k dirty pages < 15 ms, tier-B warm restore
-  < 150 ms.
+  fork < 10 ms, incremental snapshot ≤ 8k dirty pages < 150 ms, tier-B warm
+  restore < 450 ms. ACCEPTED-AS-MEASURED (bead 8ot decision, 2026-06-12;
+  ledger #20): the box's ext4 LV sustains ~350 MB/s durable, so the original
+  numbers (snapshot < 15 ms, restore < 150 ms — they imply > 2 GB/s durable)
+  are retained only as improvement TARGETS; correctness outranks speed.
+  Measured at acceptance: fork p50 326 µs, snapshot p50 103 ms, restore p50
+  307 ms. NOTE the M7 tension: the exploration-step budget (≤ 100 ms p50
+  end-to-end) cannot contain a snapshot or restore at these accepted numbers —
+  the storage-improvement work must land before that gate, or it needs the
+  same decision.
 
 ### M5 — Input log (DHILOG) + replay
 `dh-inputlog` full codec (golden bytes + `cargo fuzz` target), recording during runs,

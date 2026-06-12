@@ -74,7 +74,7 @@ the `.path` file and restart the service.)
 | `grpcurl` | M6 smoke tests | ✅ v1.9.3 at `~/go/bin/grpcurl` | `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3` |
 | `cargo-fuzz` | M5 DHILOG fuzz | ✅ v0.13.2 at `~/.cargo/bin/cargo-fuzz` | `cargo install cargo-fuzz --version 0.13.2 --locked` |
 | Rust nightly | M5 fuzz (cargo-fuzz requires nightly) | ✅ 1.98.0-nightly (2026-06-08) | `rustup toolchain install nightly` |
-| `stress-ng` | M7 soak / chaos load | ❌ **pending — needs sudo** | `sudo apt-get install -y stress-ng=0.17.06-1build1` (archive candidate as of 2026-06-12; if it has drifted, install the current candidate and update this row) |
+| `stress-ng` | M7 soak / chaos load | ✅ 0.17.06-1build1 (operator-installed 2026-06-12, verified as `infra-admin`) | `sudo apt-get install -y stress-ng=0.17.06-1build1` |
 
 Notes:
 
@@ -111,11 +111,10 @@ Notes:
   `rustup update nightly`. The fuzz lane should treat nightly breakage as
   lane-red, not gate-red — nightly is NOT part of the determinism class
   (kernel/microcode are, see `ci/determinism-class.lock`).
-- **`stress-ng` is the one remaining operator step** — apt needs sudo, which
-  automation on this box does not have. After installing, verify with
-  `stress-ng --version` as `infra-admin`. If soak-load determinism ever
-  matters, `sudo apt-mark hold stress-ng` matches the kernel/microcode hold
-  pattern.
+- **`stress-ng` landed 2026-06-12** (operator install; verified as
+  `infra-admin`) — the provisioning table is fully green. If soak-load
+  determinism ever matters, `sudo apt-mark hold stress-ng` matches the
+  kernel/microcode hold pattern.
 
 ## Registration (already done; for rebuilds)
 
