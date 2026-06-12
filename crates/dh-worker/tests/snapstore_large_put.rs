@@ -57,9 +57,14 @@ fn full_32mib_put_snapshot_from_parts_completes() {
         let container = store.get_snapshot(sref).expect("get_snapshot");
         let manifest = snapstore_manifest::Manifest::decode(&container).expect("manifest");
         assert_eq!(manifest.entries.len() as u64, PAGES);
+        assert_eq!(manifest.guest_ram_bytes, PAGES * PAGE as u64);
         let _ = done_tx.send(());
     });
 
+    // The worker is deliberately NOT joined: on regression it is wedged in
+    // ep_poll forever, and a join would turn this watchdog back into the
+    // unbounded hang it exists to prevent. 120s (vs the client's ~30s retry
+    // budget) so only the non-retryable deadlock can trip it.
     done_rx
         .recv_timeout(std::time::Duration::from_secs(120))
         .expect("32 MiB FULL put hung >120s — bead 0vl regressed");
