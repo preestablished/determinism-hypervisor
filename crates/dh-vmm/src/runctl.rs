@@ -51,6 +51,10 @@ pub enum Until {
     /// frame-quantized stop (API.md §2.4). Reports `BudgetReached`.
     FrameBudget { frames: u64, hard_cap: u64 },
 }
+// `hard_cap` is taken LITERALLY in both event-driven modes: the proto's
+// "0 ⇒ worker default (10e9)" rule is the worker's RunRequest → Until
+// mapping job, never runctl's — wiring a raw proto 0 through here caps
+// the run at the start boundary.
 
 /// Why the segment stopped (mirrors proto StopReason).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,10 +83,10 @@ pub struct SegmentOutcome {
     /// The timer delivery, if the armed timer fired in this segment — the
     /// caller logs AUX TIMER_FIRE and disarms the device (one-shot).
     pub timer_fired: Option<TimerFired>,
-    /// Frame-boundary exits (pv-pad FRAME_COUNTER MMIO writes) observed
-    /// during this segment, in EVERY until-mode — RunResponse
-    /// `frames_elapsed` (== `frames` when a FrameBudget run stops
-    /// BudgetReached).
+    /// Count of frame-boundary exits (pv-pad FRAME_COUNTER MMIO writes)
+    /// observed during this segment — maintained in EVERY until-mode and
+    /// surfaced as RunResponse `frames_elapsed`. In the FrameBudget mode
+    /// specifically it equals `frames` when the run stops BudgetReached.
     pub frames_elapsed: u64,
 }
 
@@ -275,12 +279,12 @@ pub fn run_segment_with_epochs(
         _ => None,
     };
     let sdk_feed = match until {
-        Until::NextSdkEvent { .. } => Some((
-            seg.sdk_events.ok_or(RunError::MissingSdkEventFeed)?,
+        Until::NextSdkEvent { .. } => {
+            let cell = seg.sdk_events.ok_or(RunError::MissingSdkEventFeed)?;
             // Baseline at segment start: the feed may be cumulative
             // across segments; only a rise during THIS one stops it.
-            seg.sdk_events.ok_or(RunError::MissingSdkEventFeed)?.get(),
-        )),
+            Some((cell, cell.get()))
+        }
         _ => None,
     };
     let event_reason = match until {
@@ -360,85 +364,15 @@ pub fn run_segment_with_epochs(
 
     let mut delivered = 0u64;
     let mut timer_fired: Option<TimerFired> = None;
-    for point in &agenda {
-        let landed = land_at(
-            &mut seg.slot.vcpu,
-            seg.counter,
-            point.icount,
-            &margins,
-            exits!(),
-        );
-        let boundary = match landed {
-            Ok(b) => b,
-            Err(_) if halted => {
-                return finish_at_counter(
-                    seg,
-                    clock,
-                    StopReason::GuestHalted,
-                    delivered,
-                    timer_fired,
-                    frames_seen,
-                )
-            }
-            Err(_) if event_stop => {
-                return finish_at_counter(seg, clock, event_reason, delivered, timer_fired, frames_seen)
-            }
-            Err(e) => return Err(RunError::Boundary(e)),
-        };
 
-        // Scheduled injections at this point (§3.4). KVM holds ONE queued
-        // vector, and a second KVM_INTERRUPT before the next entry
-        // silently OVERWRITES it (review, live-proven) — so between
-        // vectors sharing a boundary the guest is entered for exactly one
-        // retirement, delivering the queued vector before the next is
-        // queued ("chained across consecutive entries", agenda docs).
-        let mut at = boundary;
-        for (i, idx) in point.injections.iter().enumerate() {
-            if i > 0 {
-                // ONE ENTRY, not one retirement: the entry delivering the
-                // previously queued vector runs its whole ISR before the
-                // step trap fires (delivery suppresses the single-step),
-                // so a +1 landing would overshoot loudly.
-                let stepped =
-                    crate::boundary::step_one_entry(&mut seg.slot.vcpu, seg.counter, exits!());
-                at = match stepped {
-                    Ok(b) => b,
-                    Err(_) if halted => {
-                        return finish_at_counter(
-                            seg,
-                            clock,
-                            StopReason::GuestHalted,
-                            delivered,
-                            timer_fired,
-                            frames_seen,
-                        )
-                    }
-                    Err(_) if event_stop => {
-                        return finish_at_counter(
-                            seg,
-                            clock,
-                            event_reason,
-                            delivered,
-                            timer_fired,
-                            frames_seen,
-                        )
-                    }
-                    Err(e) => return Err(RunError::Boundary(e)),
-                };
-            }
-            // An event-stop (or HLT) can also surface mid-deferral —
-            // inside inject_at_boundary's stepping — wrapped in its
-            // error; the flags, not the wrapper, are the truth.
-            let inj: Injection = match inject_at_boundary(
-                &mut seg.slot.vcpu,
-                seg.counter,
-                all_injections[*idx].vector,
-                &at,
-                &margins,
-                INJECT_DEFER_BUDGET,
-                exits!(),
-            ) {
-                Ok(i) => i,
+    // One unwind policy for every guest-executing flight: terminal HLT
+    // wins (execution ended), then the until-event, else the real error
+    // wrapped by `$wrap`. The flags — not the error the sentinel rode in
+    // on — are the truth.
+    macro_rules! unwind_or {
+        ($res:expr, $wrap:expr) => {
+            match $res {
+                Ok(v) => v,
                 Err(_) if halted => {
                     return finish_at_counter(
                         seg,
@@ -459,8 +393,56 @@ pub fn run_segment_with_epochs(
                         frames_seen,
                     )
                 }
-                Err(e) => return Err(RunError::Inject(e)),
-            };
+                Err(e) => return Err($wrap(e)),
+            }
+        };
+    }
+
+    for point in &agenda {
+        let boundary = unwind_or!(
+            land_at(
+                &mut seg.slot.vcpu,
+                seg.counter,
+                point.icount,
+                &margins,
+                exits!(),
+            ),
+            RunError::Boundary
+        );
+
+        // Scheduled injections at this point (§3.4). KVM holds ONE queued
+        // vector, and a second KVM_INTERRUPT before the next entry
+        // silently OVERWRITES it (review, live-proven) — so between
+        // vectors sharing a boundary the guest is entered for exactly one
+        // retirement, delivering the queued vector before the next is
+        // queued ("chained across consecutive entries", agenda docs).
+        let mut at = boundary;
+        for (i, idx) in point.injections.iter().enumerate() {
+            if i > 0 {
+                // ONE ENTRY, not one retirement: the entry delivering the
+                // previously queued vector runs its whole ISR before the
+                // step trap fires (delivery suppresses the single-step),
+                // so a +1 landing would overshoot loudly.
+                at = unwind_or!(
+                    crate::boundary::step_one_entry(&mut seg.slot.vcpu, seg.counter, exits!()),
+                    RunError::Boundary
+                );
+            }
+            // An event-stop (or HLT) can also surface mid-deferral —
+            // inside inject_at_boundary's stepping — wrapped in its
+            // error; unwind_or!'s flags, not the wrapper, are the truth.
+            let inj: Injection = unwind_or!(
+                inject_at_boundary(
+                    &mut seg.slot.vcpu,
+                    seg.counter,
+                    all_injections[*idx].vector,
+                    &at,
+                    &margins,
+                    INJECT_DEFER_BUDGET,
+                    exits!(),
+                ),
+                RunError::Inject
+            );
             delivered += 1;
             if timer_slot == Some(*idx) {
                 timer_fired = Some(TimerFired {
@@ -527,37 +509,16 @@ pub fn run_segment_with_epochs(
         if seg.pause.load(Ordering::Relaxed) {
             let epoch = seg.config.epoch_len.max(1);
             let next_epoch = point.icount.div_ceil(epoch).max(1) * epoch;
-            let rolled = land_at(
-                &mut seg.slot.vcpu,
-                seg.counter,
-                next_epoch,
-                &margins,
-                exits!(),
+            let b = unwind_or!(
+                land_at(
+                    &mut seg.slot.vcpu,
+                    seg.counter,
+                    next_epoch,
+                    &margins,
+                    exits!(),
+                ),
+                RunError::Boundary
             );
-            let b = match rolled {
-                Ok(b) => b,
-                Err(_) if halted => {
-                    return finish_at_counter(
-                        seg,
-                        clock,
-                        StopReason::GuestHalted,
-                        delivered,
-                        timer_fired,
-                        frames_seen,
-                    )
-                }
-                Err(_) if event_stop => {
-                    return finish_at_counter(
-                        seg,
-                        clock,
-                        event_reason,
-                        delivered,
-                        timer_fired,
-                        frames_seen,
-                    )
-                }
-                Err(e) => return Err(RunError::Boundary(e)),
-            };
             let vns = clock
                 .vns_from_icount(b.icount)
                 .ok_or(RunError::ClockOverflow)?;
@@ -1410,6 +1371,18 @@ mod event_until_tests {
         )
     }
 
+    /// Host-runnable (no KVM): the frame-mark GPA runctl decodes must
+    /// stay the pv-pad window slot the guests write — a silent device
+    /// constant move that still lands inside the tests' MMIO window
+    /// would otherwise pass the live tests while breaking real rails.
+    #[test]
+    fn frame_mark_gpa_is_pinned_to_the_device_window() {
+        assert_eq!(
+            dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER,
+            0xD000_101C
+        );
+    }
+
     /// pad_echo's exit surface: pv-pad MMIO (PAD0 polls answered 0,
     /// FRAME_COUNTER writes accepted) + debug serial.
     fn pad_serial_exits(exit: VcpuExit) -> Result<(), BoundaryError> {
@@ -1581,6 +1554,9 @@ mod event_until_tests {
                 out.boundary.icount < 1_000_000,
                 "must stop at the event, not the cap"
             );
+            // Cross-mode frame counting must not leak into a non-frame
+            // run (pipeline_smoke never writes FRAME_COUNTER).
+            assert_eq!(out.frames_elapsed, 0);
             Some((out.boundary.icount, out.boundary.rip, out.state_hash))
         };
         let (Some(a), Some(b)) = (run(), run()) else {
