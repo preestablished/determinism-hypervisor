@@ -48,6 +48,9 @@ BITS 64
 %define RX_CAP_BYTES    2048
 %define FRAME_LEN       64
 %define FRAME_BYTE_BASE 0x5A
+; Units: RX_LEN poll exits (one MMIO read per iteration). Only needs to
+; exceed worst-case exits-until-delivery; the exact value is not
+; load-bearing — RX_LEN is sticky, so a delivery can never be missed.
 %define SPIN_BUDGET     65536
 
 SECTION .text
@@ -80,7 +83,8 @@ prog_main:
     mov     rax, RX_GPA
     mov     [r8 + REG_RX_BUF_GPA], rax
     mov     dword [r8 + REG_RX_CAP], RX_CAP_BYTES
-    ; RX_VECTOR stays 0 (polling); RX_LEN starts 0 (zeroed RAM-like reset)
+    ; RX_VECTOR stays 0 (polling); RX_LEN starts 0 per PvNet::new's
+    ; register reset (the guest gates on RX_LEN, not on RAM zeroing)
 
     ; ---- TX the frame ------------------------------------------------------
     mov     rax, TX_GPA

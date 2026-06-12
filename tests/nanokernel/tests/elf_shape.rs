@@ -508,14 +508,41 @@ fn net_loopback_asm_matches_rust_constants() {
     let frame = net_loopback_frame();
     assert_eq!(frame.len() as u32, NET_LOOPBACK_FRAME_LEN);
     assert_eq!(frame[0], NET_LOOPBACK_FRAME_BYTE_BASE);
-    assert_eq!(frame[63], NET_LOOPBACK_FRAME_BYTE_BASE.wrapping_add(63));
+    let last = frame.len() - 1;
+    assert_eq!(
+        frame[last],
+        NET_LOOPBACK_FRAME_BYTE_BASE.wrapping_add(last as u8),
+        "helper must match the asm's `inc al` wraparound at any length"
+    );
     const _FRAME_FITS_DEVICE_CAP: () =
         assert!(NET_LOOPBACK_FRAME_LEN <= dh_devices::net::MAX_FRAME);
     const _FRAME_FITS_RX_CAP: () = assert!(NET_LOOPBACK_FRAME_LEN <= NET_LOOPBACK_RX_CAP);
 
-    // Buffers must not overlap each other (TX cap is the frame itself).
+    // TX frame end must not reach into the RX buffer (this asserts
+    // TX-end <= RX-start only; nothing is mapped above RX to collide
+    // with its capacity).
     const _BUFFERS_DISJOINT: () = assert!(
         NET_LOOPBACK_TX_GPA + NET_LOOPBACK_FRAME_LEN as u64 <= NET_LOOPBACK_RX_GPA
+    );
+
+    // The serial protocol: the asm's uppercase putc bytes, in program
+    // order, must spell the lib.rs OK sequence (lowercase = failures).
+    let emitted: Vec<u8> = asm
+        .lines()
+        .filter_map(|l| {
+            let t = l.split(';').next().unwrap().trim();
+            let c = t
+                .strip_prefix("mov")?
+                .trim()
+                .strip_prefix("al, '")?
+                .chars()
+                .next()?;
+            c.is_ascii_uppercase().then_some(c as u8)
+        })
+        .collect();
+    assert_eq!(
+        emitted, NET_LOOPBACK_OK_SEQUENCE,
+        "asm success bytes drifted from NET_LOOPBACK_OK_SEQUENCE"
     );
 }
 
