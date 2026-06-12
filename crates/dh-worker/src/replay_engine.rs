@@ -186,6 +186,7 @@ pub fn replay_segment<M: GuestMem>(
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             run_segment_with_epochs(
                 &mut seg,
@@ -363,6 +364,10 @@ pub fn replay_segment<M: GuestMem>(
         state_hash: live_end,
         injections_delivered: 0,
         timer_fired: None,
+        // seal() does not read frames_elapsed (frame marks travel as AUX
+        // FRAME_MARK records, not END fields) — any value reseals the
+        // same bytes.
+        frames_elapsed: 0,
     };
     let resealed = rail
         .into_inner()

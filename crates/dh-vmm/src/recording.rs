@@ -43,6 +43,7 @@ pub fn stop_reason_u8(reason: StopReason) -> u8 {
     match reason {
         StopReason::BudgetReached => 1,
         StopReason::GoalSatisfied => 2,
+        StopReason::NextSdkEvent => 3,
         StopReason::HardCap => 4,
         StopReason::Paused => 5,
         StopReason::GuestHalted => 6,
@@ -395,6 +396,7 @@ mod tests {
             state_hash: [0xAB; 32],
             injections_delivered: 0,
             timer_fired: None,
+            frames_elapsed: 0,
         };
         // (clone the rail pieces we need post-move via a rebuild)
         let drained: Vec<_> = rail.irqs.drain(..).collect();
@@ -518,6 +520,7 @@ mod tests {
                     state_hash: [0; 32],
                     injections_delivered: 1,
                     timer_fired: None,
+                    frames_elapsed: 0,
                 },
                 [0; 32],
             )
@@ -626,6 +629,7 @@ mod live_tests {
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let counter_ref = &counter;
             let links_r = &mut links;
@@ -749,6 +753,7 @@ mod live_tests {
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let counter_ref = &counter;
             let out = run_segment(

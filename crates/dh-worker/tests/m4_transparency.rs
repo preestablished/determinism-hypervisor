@@ -140,6 +140,7 @@ fn run_more(
         injections,
         timer: None,
         pause: &pause,
+        sdk_events: None,
     };
     let out = run_segment(
         &mut seg,

@@ -169,6 +169,7 @@ fn run_one_batch(
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let mut on_exit = |exit: VcpuExit| {
             let icount = counter_ref

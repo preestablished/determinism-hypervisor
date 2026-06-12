@@ -9,9 +9,10 @@
 //! loudly here instead of silently mislabeling slots on the API.
 //!
 //! Exhaustiveness is the other half of the contract: when run control
-//! grows `runctl::StopReason::Faulted` / `NextSdkEvent` producers, the
-//! match below stops compiling and forces the mapping decision at the
-//! same commit — never a silent `_ => Unspecified`.
+//! grows a `runctl::StopReason::Faulted` producer, the match below stops
+//! compiling and forces the mapping decision at the same commit — never
+//! a silent `_ => Unspecified`. (`NextSdkEvent` landed exactly that way
+//! with bead 4qo.)
 
 use dh_proto::v1 as proto;
 use dh_vmm::SlotState;
@@ -29,15 +30,15 @@ pub fn slot_state_to_proto(s: SlotState) -> proto::SlotState {
 }
 
 /// Segment stop → API.md §2.4 `StopReason`. runctl deliberately has no
-/// `NextSdkEvent` (NotYetWired until the device run loop) and no
-/// `Faulted` (fault wiring is run control's, see sr5 notes) — those
-/// arms appear here the day the variants do.
+/// `Faulted` (fault wiring is run control's, see sr5 notes) — that arm
+/// appears here the day the variant does.
 #[cfg(target_arch = "x86_64")]
 pub fn stop_reason_to_proto(r: dh_vmm::runctl::StopReason) -> proto::StopReason {
     use dh_vmm::runctl::StopReason as R;
     match r {
         R::BudgetReached => proto::StopReason::BudgetReached,
         R::GoalSatisfied => proto::StopReason::GoalSatisfied,
+        R::NextSdkEvent => proto::StopReason::NextSdkEvent,
         R::HardCap => proto::StopReason::HardCap,
         R::Paused => proto::StopReason::Paused,
         R::GuestHalted => proto::StopReason::GuestHalted,
@@ -84,6 +85,7 @@ mod tests {
         for r in [
             R::BudgetReached,
             R::GoalSatisfied,
+            R::NextSdkEvent,
             R::HardCap,
             R::Paused,
             R::GuestHalted,
@@ -103,6 +105,7 @@ mod tests {
         let pins = [
             (R::BudgetReached, 1),
             (R::GoalSatisfied, 2),
+            (R::NextSdkEvent, 3),
             (R::HardCap, 4),
             (R::Paused, 5),
             (R::GuestHalted, 6),

@@ -5,11 +5,15 @@
 //! FORWARD to the next epoch boundary before reporting paused
 //! (pause-soon-at-a-deterministic-point; latency ≤ epoch_len).
 //!
-//! Phase-1 scope: `Until::{IcountBudget, VnsBudget, Goal}` are live;
-//! `NextSdkEvent` and `FrameBudget` need the device-bus run loop (M1
-//! acceptance bead) and return [`RunError::NotYetWired`] — the enum shape
-//! stays aligned with API.md §2.4 so M6's gRPC Run maps 1:1. Margins come
-//! from MachineConfig (single source of truth — bead srz).
+//! All five API.md §2.4 until-modes are live (bead 4qo wired the two
+//! event-driven ones). `FrameBudget` stops ON the Nth frame-boundary
+//! exit (the pv-pad FRAME_COUNTER MMIO write, ARCH §6.6); `NextSdkEvent`
+//! stops ON the doorbell exit whose drain produced a matching event —
+//! matching is the CALLER's (the device rail applies the stream filter
+//! and reports through [`Segment::sdk_events`]). Both exits are
+//! guest-initiated at deterministic icounts, so the stop boundary
+//! replays identically; both run under the request's hard cap. Margins
+//! come from MachineConfig (single source of truth — bead srz).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,11 +41,20 @@ pub enum Until {
     VnsBudget(u64),
     /// Poll a goal every `poll_period` instructions under a hard cap.
     Goal { poll_period: u64, hard_cap: u64 },
-    /// Needs the device run loop (doorbell exits) — NotYetWired.
-    NextSdkEvent,
-    /// Needs the device run loop (FRAME_COUNTER exits) — NotYetWired.
-    FrameBudget(u64),
+    /// Stop ON the doorbell exit whose drain produced a matching SDK
+    /// event (API.md §2.4 `next_sdk_event`). The caller's exit servicing
+    /// applies the stream filter and bumps [`Segment::sdk_events`];
+    /// `hard_cap` is the request's safety net (proto `hard_icount_cap`).
+    NextSdkEvent { hard_cap: u64 },
+    /// Stop ON the frame-boundary exit (pv-pad FRAME_COUNTER MMIO write)
+    /// of the Nth FrameMark since run start — the platform's only
+    /// frame-quantized stop (API.md §2.4). Reports `BudgetReached`.
+    FrameBudget { frames: u64, hard_cap: u64 },
 }
+// `hard_cap` is taken LITERALLY in both event-driven modes: the proto's
+// "0 ⇒ worker default (10e9)" rule is the worker's RunRequest → Until
+// mapping job, never runctl's — wiring a raw proto 0 through here caps
+// the run at the start boundary.
 
 /// Why the segment stopped (mirrors proto StopReason).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +65,9 @@ pub enum StopReason {
     Paused,
     /// The guest executed a terminal HLT mid-segment (proto GUEST_HALTED).
     GuestHalted,
+    /// A matching SDK event stopped a `next_sdk_event` run (proto
+    /// NEXT_SDK_EVENT); the caller returns the drained event itself.
+    NextSdkEvent,
 }
 
 /// A finished segment.
@@ -67,6 +83,11 @@ pub struct SegmentOutcome {
     /// The timer delivery, if the armed timer fired in this segment — the
     /// caller logs AUX TIMER_FIRE and disarms the device (one-shot).
     pub timer_fired: Option<TimerFired>,
+    /// Count of frame-boundary exits (pv-pad FRAME_COUNTER MMIO writes)
+    /// observed during this segment — maintained in EVERY until-mode and
+    /// surfaced as RunResponse `frames_elapsed`. In the FrameBudget mode
+    /// specifically it equals `frames` when the run stops BudgetReached.
+    pub frames_elapsed: u64,
 }
 
 #[derive(Debug)]
@@ -77,8 +98,11 @@ pub enum RunError {
     Kvm(String),
     /// vns/icount conversion overflowed u64 space.
     ClockOverflow,
-    /// The until-mode needs machinery a later bead wires (device loop).
-    NotYetWired(&'static str),
+    /// `Until::NextSdkEvent` without [`Segment::sdk_events`]: the mode is
+    /// caller-fed (the rail counts matching drained events) — running it
+    /// without the feed would spin to the hard cap and report the wrong
+    /// reason. Loud instead.
+    MissingSdkEventFeed,
 }
 
 impl std::fmt::Display for RunError {
@@ -89,8 +113,12 @@ impl std::fmt::Display for RunError {
             RunError::Inject(e) => write!(f, "inject: {e}"),
             RunError::Kvm(e) => write!(f, "kvm: {e}"),
             RunError::ClockOverflow => write!(f, "vns/icount conversion overflow"),
-            RunError::NotYetWired(what) => {
-                write!(f, "{what} needs the device run loop (M1 acceptance bead)")
+            RunError::MissingSdkEventFeed => {
+                write!(
+                    f,
+                    "Until::NextSdkEvent requires Segment::sdk_events (the \
+                     caller's matching-event count)"
+                )
             }
         }
     }
@@ -160,6 +188,12 @@ pub struct Segment<'a> {
     pub timer: Option<TimerArm>,
     /// Cooperative pause flag (another thread / signal handler sets it).
     pub pause: &'a AtomicBool,
+    /// `Until::NextSdkEvent`'s feed: a monotone count of MATCHING SDK
+    /// events the caller's exit servicing has drained (the rail applies
+    /// the request's stream filter and bumps this inside `on_exit`).
+    /// runctl stops when it rises above its segment-start value. `None`
+    /// is fine for every other mode; NextSdkEvent without it errs loud.
+    pub sdk_events: Option<&'a std::cell::Cell<u64>>,
 }
 
 /// Run one segment to its stop. `goal` is consulted only for
@@ -229,9 +263,40 @@ pub fn run_segment_with_epochs(
             FinalStop::HardCap(hard_cap),
             std::num::NonZeroU64::new(poll_period),
         ),
-        Until::NextSdkEvent => return Err(RunError::NotYetWired("next_sdk_event")),
-        Until::FrameBudget(_) => return Err(RunError::NotYetWired("frame_budget")),
+        // The event-driven modes walk toward the request's hard cap; the
+        // triggering exit unwinds the flight early (see exits! below).
+        Until::NextSdkEvent { hard_cap } => (FinalStop::HardCap(hard_cap), None),
+        Until::FrameBudget { hard_cap, .. } => (FinalStop::HardCap(hard_cap), None),
     };
+
+    // Event-stop bookkeeping. Frame marks are decoded HERE (pure exit
+    // decode against the device-side constants — pv-pad's FRAME_COUNTER
+    // MMIO write); SDK-event matching is the CALLER's, consumed through
+    // the Segment::sdk_events feed.
+    let frame_mark_gpa = dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER;
+    let frame_target = match until {
+        Until::FrameBudget { frames, .. } => Some(frames),
+        _ => None,
+    };
+    let sdk_feed = match until {
+        Until::NextSdkEvent { .. } => {
+            let cell = seg.sdk_events.ok_or(RunError::MissingSdkEventFeed)?;
+            // Baseline at segment start: the feed may be cumulative
+            // across segments; only a rise during THIS one stops it.
+            Some((cell, cell.get()))
+        }
+        _ => None,
+    };
+    let event_reason = match until {
+        Until::FrameBudget { .. } => StopReason::BudgetReached,
+        _ => StopReason::NextSdkEvent,
+    };
+
+    // FrameBudget(0): zero MORE frames — satisfied at the start boundary
+    // without entering the guest (mirrors IcountBudget(0) semantics).
+    if frame_target == Some(0) {
+        return finish_at_counter(seg, clock, StopReason::BudgetReached, 0, None, 0);
+    }
 
     // Merge the guest-armed timer (converted per the §4 ceil rule) into
     // the scheduled-injection set; remember which slot is the timer so
@@ -262,7 +327,13 @@ pub fn run_segment_with_epochs(
 
     // Terminal HLT (proto GUEST_HALTED) is a STOP, not a fault: the
     // wrapper flags it and unwinds the landing loop via a sentinel error.
+    // The event-driven stops use the same unwind: the triggering exit is
+    // serviced by on_exit FIRST (the rail logs FRAME_MARK / drains the
+    // doorbell at the exit's icount), THEN flagged — so the stop boundary
+    // is the exit boundary, with the device state already current.
     let mut halted = false;
+    let mut event_stop = false;
+    let mut frames_seen = 0u64;
     macro_rules! exits {
         () => {
             &mut |exit: VcpuExit| {
@@ -270,26 +341,74 @@ pub fn run_segment_with_epochs(
                     halted = true;
                     return Err(BoundaryError::Exit("guest halted".into()));
                 }
-                on_exit(exit)
+                let frame_mark =
+                    matches!(exit, VcpuExit::MmioWrite(gpa, _) if gpa == frame_mark_gpa);
+                on_exit(exit)?;
+                if frame_mark {
+                    frames_seen += 1;
+                    if frame_target == Some(frames_seen) {
+                        event_stop = true;
+                        return Err(BoundaryError::Exit("frame budget reached".into()));
+                    }
+                }
+                if let Some((cell, baseline)) = sdk_feed {
+                    if cell.get() > baseline {
+                        event_stop = true;
+                        return Err(BoundaryError::Exit("sdk event matched".into()));
+                    }
+                }
+                Ok(())
             }
         };
     }
 
     let mut delivered = 0u64;
     let mut timer_fired: Option<TimerFired> = None;
-    for point in &agenda {
-        let landed = land_at(
-            &mut seg.slot.vcpu,
-            seg.counter,
-            point.icount,
-            &margins,
-            exits!(),
-        );
-        let boundary = match landed {
-            Ok(b) => b,
-            Err(_) if halted => return finish_halted(seg, clock, delivered, timer_fired),
-            Err(e) => return Err(RunError::Boundary(e)),
+
+    // One unwind policy for every guest-executing flight: terminal HLT
+    // wins (execution ended), then the until-event, else the real error
+    // wrapped by `$wrap`. The flags — not the error the sentinel rode in
+    // on — are the truth.
+    macro_rules! unwind_or {
+        ($res:expr, $wrap:expr) => {
+            match $res {
+                Ok(v) => v,
+                Err(_) if halted => {
+                    return finish_at_counter(
+                        seg,
+                        clock,
+                        StopReason::GuestHalted,
+                        delivered,
+                        timer_fired,
+                        frames_seen,
+                    )
+                }
+                Err(_) if event_stop => {
+                    return finish_at_counter(
+                        seg,
+                        clock,
+                        event_reason,
+                        delivered,
+                        timer_fired,
+                        frames_seen,
+                    )
+                }
+                Err(e) => return Err($wrap(e)),
+            }
         };
+    }
+
+    for point in &agenda {
+        let boundary = unwind_or!(
+            land_at(
+                &mut seg.slot.vcpu,
+                seg.counter,
+                point.icount,
+                &margins,
+                exits!(),
+            ),
+            RunError::Boundary
+        );
 
         // Scheduled injections at this point (§3.4). KVM holds ONE queued
         // vector, and a second KVM_INTERRUPT before the next entry
@@ -304,24 +423,26 @@ pub fn run_segment_with_epochs(
                 // previously queued vector runs its whole ISR before the
                 // step trap fires (delivery suppresses the single-step),
                 // so a +1 landing would overshoot loudly.
-                let stepped =
-                    crate::boundary::step_one_entry(&mut seg.slot.vcpu, seg.counter, exits!());
-                at = match stepped {
-                    Ok(b) => b,
-                    Err(_) if halted => return finish_halted(seg, clock, delivered, timer_fired),
-                    Err(e) => return Err(RunError::Boundary(e)),
-                };
+                at = unwind_or!(
+                    crate::boundary::step_one_entry(&mut seg.slot.vcpu, seg.counter, exits!()),
+                    RunError::Boundary
+                );
             }
-            let inj: Injection = inject_at_boundary(
-                &mut seg.slot.vcpu,
-                seg.counter,
-                all_injections[*idx].vector,
-                &at,
-                &margins,
-                INJECT_DEFER_BUDGET,
-                exits!(),
-            )
-            .map_err(RunError::Inject)?;
+            // An event-stop (or HLT) can also surface mid-deferral —
+            // inside inject_at_boundary's stepping — wrapped in its
+            // error; unwind_or!'s flags, not the wrapper, are the truth.
+            let inj: Injection = unwind_or!(
+                inject_at_boundary(
+                    &mut seg.slot.vcpu,
+                    seg.counter,
+                    all_injections[*idx].vector,
+                    &at,
+                    &margins,
+                    INJECT_DEFER_BUDGET,
+                    exits!(),
+                ),
+                RunError::Inject
+            );
             delivered += 1;
             if timer_slot == Some(*idx) {
                 timer_fired = Some(TimerFired {
@@ -362,6 +483,7 @@ pub fn run_segment_with_epochs(
                 delivered,
                 timer_fired,
                 point.epoch_hash,
+                frames_seen,
             );
         }
 
@@ -378,6 +500,7 @@ pub fn run_segment_with_epochs(
                 delivered,
                 timer_fired,
                 point.epoch_hash,
+                frames_seen,
             );
         }
 
@@ -386,18 +509,16 @@ pub fn run_segment_with_epochs(
         if seg.pause.load(Ordering::Relaxed) {
             let epoch = seg.config.epoch_len.max(1);
             let next_epoch = point.icount.div_ceil(epoch).max(1) * epoch;
-            let rolled = land_at(
-                &mut seg.slot.vcpu,
-                seg.counter,
-                next_epoch,
-                &margins,
-                exits!(),
+            let b = unwind_or!(
+                land_at(
+                    &mut seg.slot.vcpu,
+                    seg.counter,
+                    next_epoch,
+                    &margins,
+                    exits!(),
+                ),
+                RunError::Boundary
             );
-            let b = match rolled {
-                Ok(b) => b,
-                Err(_) if halted => return finish_halted(seg, clock, delivered, timer_fired),
-                Err(e) => return Err(RunError::Boundary(e)),
-            };
             let vns = clock
                 .vns_from_icount(b.icount)
                 .ok_or(RunError::ClockOverflow)?;
@@ -421,6 +542,7 @@ pub fn run_segment_with_epochs(
                 state_hash: seg.chain.value(),
                 injections_delivered: delivered,
                 timer_fired,
+                frames_elapsed: frames_seen,
             });
         }
     }
@@ -436,6 +558,7 @@ fn finish(
     delivered: u64,
     timer_fired: Option<TimerFired>,
     already_hashed: bool,
+    frames_elapsed: u64,
 ) -> Result<SegmentOutcome, RunError> {
     // Every segment ends with a hash link at its stop boundary (§8.5: "at
     // every final pause") — exactly ONE link per boundary: a stop point
@@ -452,15 +575,22 @@ fn finish(
         state_hash: seg.chain.value(),
         injections_delivered: delivered,
         timer_fired,
+        frames_elapsed,
     })
 }
 
-/// Terminal HLT: stop where the guest stopped (proto GUEST_HALTED).
-fn finish_halted(
+/// Stop where the guest stopped, reading the boundary off the counter
+/// and registers: terminal HLT (GuestHalted) and the event-driven stops
+/// (the Nth frame mark / the matching SDK event), whose triggering exit
+/// unwound the flight mid-air — guest-initiated at a deterministic
+/// icount, so the boundary replays identically.
+fn finish_at_counter(
     seg: &mut Segment<'_>,
     clock: crate::vt::ClockRatio,
+    reason: StopReason,
     delivered: u64,
     timer_fired: Option<TimerFired>,
+    frames_elapsed: u64,
 ) -> Result<SegmentOutcome, RunError> {
     let icount = seg
         .counter
@@ -481,12 +611,13 @@ fn finish_halted(
         .ok_or(RunError::ClockOverflow)?;
     finish(
         seg,
-        StopReason::GuestHalted,
+        reason,
         boundary,
         vns,
         delivered,
         timer_fired,
         false,
+        frames_elapsed,
     )
 }
 
@@ -560,6 +691,7 @@ mod tests {
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -600,6 +732,7 @@ mod tests {
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let mut polls = 0u32;
         let out = run_segment(
@@ -638,6 +771,7 @@ mod tests {
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let out = run_segment(
             &mut seg,
@@ -655,7 +789,9 @@ mod tests {
     }
 
     #[test]
-    fn unwired_modes_fail_loudly() {
+    fn next_sdk_event_without_a_feed_fails_loudly() {
+        // NextSdkEvent is caller-fed; running it without the feed must
+        // err loudly instead of spinning to the cap with a wrong reason.
         let Some((mut slot, counter)) = rig() else {
             return;
         };
@@ -671,14 +807,16 @@ mod tests {
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         assert!(matches!(
-            run_segment(&mut seg, Until::NextSdkEvent, &mut never, &mut no_exits),
-            Err(RunError::NotYetWired("next_sdk_event"))
-        ));
-        assert!(matches!(
-            run_segment(&mut seg, Until::FrameBudget(3), &mut never, &mut no_exits),
-            Err(RunError::NotYetWired("frame_budget"))
+            run_segment(
+                &mut seg,
+                Until::NextSdkEvent { hard_cap: 100_000 },
+                &mut never,
+                &mut no_exits
+            ),
+            Err(RunError::MissingSdkEventFeed)
         ));
     }
 }
@@ -742,6 +880,7 @@ mod halt_tests {
             injections: &[],
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let out = run_segment(
             &mut seg,
@@ -810,6 +949,7 @@ mod halt_tests {
                 injections: &[],
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -959,6 +1099,7 @@ mod timer_tests {
                 vector: 0x40,
             }),
             pause: &pause,
+            sdk_events: None,
         };
         // Budget EQUAL to the deadline: injection and final stop merge
         // into one agenda point, so the queued vector never enters the
@@ -1081,6 +1222,7 @@ mod idt_guest_tests {
                 injections: &injections,
                 timer: None,
                 pause: &pause,
+                sdk_events: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -1124,6 +1266,7 @@ mod idt_guest_tests {
                 vector: 0x41,
             }),
             pause: &pause,
+            sdk_events: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1161,6 +1304,7 @@ mod idt_guest_tests {
             injections: &injections,
             timer: None,
             pause: &pause,
+            sdk_events: None,
         };
         let err = run_segment(
             &mut seg,
@@ -1178,5 +1322,279 @@ mod idt_guest_tests {
         );
         let (count, _) = read_table(seg.slot);
         assert_eq!(count, 0, "no delivery can have happened with IF=0");
+    }
+}
+
+#[cfg(test)]
+mod event_until_tests {
+    use super::*;
+    use crate::boot::load_and_enter;
+    use crate::kvm::KvmSystem;
+    use crate::run::install_kick_handler;
+    use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+
+    fn gettid() -> i32 {
+        // SAFETY: argless syscall.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::syscall(libc::SYS_gettid) as i32
+        }
+    }
+
+    fn rig(elf: &[u8], cmdline: &[u8]) -> Option<(crate::kvm::SlotVm, InstRetired)> {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return None;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, elf, cmdline).unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        Some((slot, counter))
+    }
+
+    fn cfg() -> MachineConfig {
+        MachineConfig::new(
+            16 << 20,
+            [0; 32],
+            crate::config::BootSpec::Elf {
+                kernel_hash: [0; 32],
+                cmdline: Vec::new(),
+            },
+        )
+    }
+
+    /// Host-runnable (no KVM): the frame-mark GPA runctl decodes must
+    /// stay the pv-pad window slot the guests write — a silent device
+    /// constant move that still lands inside the tests' MMIO window
+    /// would otherwise pass the live tests while breaking real rails.
+    #[test]
+    fn frame_mark_gpa_is_pinned_to_the_device_window() {
+        assert_eq!(
+            dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER,
+            0xD000_101C
+        );
+    }
+
+    /// pad_echo's exit surface: pv-pad MMIO (PAD0 polls answered 0,
+    /// FRAME_COUNTER writes accepted) + debug serial.
+    fn pad_serial_exits(exit: VcpuExit) -> Result<(), BoundaryError> {
+        const PAD_LO: u64 = dh_devices::pad::PV_PAD_BASE;
+        const PAD_HI: u64 = PAD_LO + 0x1000;
+        match exit {
+            VcpuExit::MmioWrite(gpa, _) if (PAD_LO..PAD_HI).contains(&gpa) => Ok(()),
+            VcpuExit::MmioRead(gpa, data) if (PAD_LO..PAD_HI).contains(&gpa) => {
+                data.fill(0);
+                Ok(())
+            }
+            VcpuExit::IoOut(port, _) if (0x3F8..0x400).contains(&port) => Ok(()),
+            other => Err(BoundaryError::Exit(format!("unexpected exit: {other:?}"))),
+        }
+    }
+
+    /// API.md §2.4: frame_budget stops ON the frame-boundary exit of the
+    /// Nth FrameMark, reason BUDGET_REACHED — and the boundary replays
+    /// identically (the exit is guest-initiated at a fixed icount).
+    #[test]
+    fn frame_budget_stops_on_the_nth_frame_mark_live() {
+        let run = || {
+            let (mut slot, counter) = rig(nanokernel::pad_echo_elf(), b"")?;
+            let config = cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: None,
+            };
+            let out = run_segment(
+                &mut seg,
+                Until::FrameBudget {
+                    frames: 3,
+                    hard_cap: 50_000_000,
+                },
+                &mut || false,
+                &mut pad_serial_exits,
+            )
+            .unwrap();
+            assert_eq!(out.reason, StopReason::BudgetReached);
+            assert_eq!(out.frames_elapsed, 3);
+            assert!(out.boundary.icount > 0);
+            Some((out.boundary.icount, out.boundary.rip, out.state_hash))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "frame-budget stop must replay identically");
+    }
+
+    /// FrameBudget(0) — zero MORE frames — is satisfied at the start
+    /// boundary without entering the guest (IcountBudget(0) semantics).
+    #[test]
+    fn frame_budget_zero_stops_at_the_start_boundary_live() {
+        let Some((mut slot, counter)) = rig(nanokernel::pad_echo_elf(), b"") else {
+            return;
+        };
+        let config = cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let out = run_segment(
+            &mut seg,
+            Until::FrameBudget {
+                frames: 0,
+                hard_cap: 1_000_000,
+            },
+            &mut || false,
+            &mut pad_serial_exits,
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::BudgetReached);
+        assert_eq!(out.boundary.icount, 0, "no guest entry");
+        assert_eq!(out.frames_elapsed, 0);
+    }
+
+    /// A guest that never writes FRAME_COUNTER runs to the request's
+    /// safety net: HARD_CAP, zero frames elapsed.
+    #[test]
+    fn frame_budget_without_frames_hits_the_hard_cap_live() {
+        let Some((mut slot, counter)) = rig(nanokernel::landing_loop_elf(), b"1000000000") else {
+            return;
+        };
+        let config = cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let out = run_segment(
+            &mut seg,
+            Until::FrameBudget {
+                frames: 1,
+                hard_cap: 300_000,
+            },
+            &mut || false,
+            &mut |exit| Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}"))),
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::HardCap);
+        assert_eq!(out.boundary.icount, 300_000);
+        assert_eq!(out.frames_elapsed, 0);
+    }
+
+    /// NextSdkEvent stops ON the exit whose servicing reported a
+    /// matching event (here: the caller bumps the feed at the guest's
+    /// first serial OUT — the rail does the same at a matching doorbell
+    /// drain), reason NEXT_SDK_EVENT, replay-identical boundary.
+    #[test]
+    fn next_sdk_event_stops_at_the_feeding_exit_live() {
+        let run = || {
+            let (mut slot, counter) = rig(nanokernel::pipeline_smoke_elf(), b"")?;
+            let config = cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let events = std::cell::Cell::new(0u64);
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: Some(&events),
+            };
+            let out = run_segment(
+                &mut seg,
+                Until::NextSdkEvent { hard_cap: 1_000_000 },
+                &mut || false,
+                &mut |exit| match exit {
+                    VcpuExit::IoOut(port, _) if (0x3F8..0x400).contains(&port) => {
+                        events.set(events.get() + 1);
+                        Ok(())
+                    }
+                    other => Err(BoundaryError::Exit(format!("unexpected exit: {other:?}"))),
+                },
+            )
+            .unwrap();
+            assert_eq!(out.reason, StopReason::NextSdkEvent);
+            assert!(
+                out.boundary.icount < 1_000_000,
+                "must stop at the event, not the cap"
+            );
+            // Cross-mode frame counting must not leak into a non-frame
+            // run (pipeline_smoke never writes FRAME_COUNTER).
+            assert_eq!(out.frames_elapsed, 0);
+            Some((out.boundary.icount, out.boundary.rip, out.state_hash))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "sdk-event stop must replay identically");
+    }
+
+    /// No matching event all segment: the safety net stops it (HARD_CAP),
+    /// never a spin.
+    #[test]
+    fn next_sdk_event_without_events_hits_the_hard_cap_live() {
+        let Some((mut slot, counter)) = rig(nanokernel::landing_loop_elf(), b"1000000000") else {
+            return;
+        };
+        let config = cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let events = std::cell::Cell::new(0u64);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: Some(&events),
+        };
+        let out = run_segment(
+            &mut seg,
+            Until::NextSdkEvent { hard_cap: 300_000 },
+            &mut || false,
+            &mut |exit| Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}"))),
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::HardCap);
+        assert_eq!(out.boundary.icount, 300_000);
     }
 }
