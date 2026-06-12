@@ -57,7 +57,69 @@ explicitly (`sched_setaffinity`/`taskset` to 2–5), which an inherited
 `CPUAffinity` mask would not prevent anyway. One rule: **nothing pins to slot
 cores except guest vCPU threads and the tests that stand in for them.**
 
+## Tool provisioning (beyond the base Rust toolchain)
+
+Tools the milestone jobs (M5 fuzz / M6 smoke / M7 soak — IMPLEMENTATION-PLAN)
+need on this box, beyond stable Rust + the host config. Runner jobs inherit
+the PATH captured in `~/actions-runner-determinism-hypervisor/.path` at
+`config.sh` time — it includes `~/go/bin`, `~/.local/bin`, and
+`~/.cargo/bin`, so user-local installs are visible to jobs without touching
+the service unit. (If a tool is installed to a directory NOT on that captured
+PATH, re-running `config.sh` is the wrong hammer — append the directory to
+the `.path` file and restart the service.)
+
+| Tool | Needed by | Status (2026-06-12) | Install (pinned to Status) |
+|---|---|---|---|
+| `protoc` | tonic codegen | **Not needed** — `dh-proto` and `snapstore-client` vendor it via `protoc-bin-vendored` (proto-seam decision, iteration 60) | — |
+| `grpcurl` | M6 smoke tests | ✅ v1.9.3 at `~/go/bin/grpcurl` | `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3` |
+| `cargo-fuzz` | M5 DHILOG fuzz | ✅ v0.13.2 at `~/.cargo/bin/cargo-fuzz` | `cargo install cargo-fuzz --version 0.13.2 --locked` |
+| Rust nightly | M5 fuzz (cargo-fuzz requires nightly) | ✅ 1.98.0-nightly (2026-06-08) | `rustup toolchain install nightly` |
+| `stress-ng` | M7 soak / chaos load | ❌ **pending — needs sudo** | `sudo apt-get install -y stress-ng=0.17.06-1build1` (archive candidate as of 2026-06-12; if it has drifted, install the current candidate and update this row) |
+
+Notes:
+
+- **Installs are pinned on purpose.** This repo pins its environment
+  (`ci/determinism-class.lock`); ad-hoc `@latest`/unpinned installs would
+  contradict that. To bump a tool: install the new version, re-verify, then
+  update the Status and Install columns and the Status date. Nightly is the
+  deliberate exception — see below. To re-verify the whole table:
+  `go version -m ~/go/bin/grpcurl`, `cargo-fuzz --version`,
+  `rustc +nightly --version`, `stress-ng --version`.
+- **The tool dirs are writable by every job on this box** — `~/go/bin`,
+  `~/.local/bin`, and `~/.cargo/bin` are plain user-writable directories on a
+  persistent, privileged runner, shared with neighbor repos' jobs and any
+  approved fork-PR run. A job can overwrite a binary the next job executes.
+  The risk is bounded by the fork-PR gating in
+  [Security](#security-public-repo--privileged-runner) above, not eliminated:
+  after any incident (or surprising tool behavior), treat the Status column
+  as a fingerprint and re-verify the binaries rather than trusting what is
+  in place.
+- **These tools are pre-staged, not yet exercised**: as of 2026-06-12 no
+  workflow invokes grpcurl, cargo-fuzz, or stress-ng (the `kvm-intel` lane
+  runs `cargo build/test --workspace` only; the M5 fuzz target and M6/M7
+  jobs land later). "✅ installed" therefore does not mean "proven in a
+  runner job" — unlike the `protoc` row, which every build exercises via the
+  vendored binary.
+- **`grpcurl --version` prints `dev build <no version set>`** when installed
+  via `go install` (release binaries get the version stamped via ldflags;
+  go install does not). Verify the real version with
+  `go version -m ~/go/bin/grpcurl | grep -E '^[[:space:]]*mod'`.
+- **Nightly drifts**: `rustup toolchain install nightly` updates in place via
+  `rustup update nightly`. The fuzz lane should treat nightly breakage as
+  lane-red, not gate-red — nightly is NOT part of the determinism class
+  (kernel/microcode are, see `ci/determinism-class.lock`).
+- **`stress-ng` is the one remaining operator step** — apt needs sudo, which
+  automation on this box does not have. After installing, verify with
+  `stress-ng --version` as `infra-admin`. If soak-load determinism ever
+  matters, `sudo apt-mark hold stress-ng` matches the kernel/microcode hold
+  pattern.
+
 ## Registration (already done; for rebuilds)
+
+On a from-scratch rebuild, do the [Tool provisioning](#tool-provisioning-beyond-the-base-rust-toolchain)
+installs BEFORE running `config.sh`, so the captured `.path` already contains
+`~/go/bin` and `~/.cargo/bin` (otherwise: append to `.path` and restart the
+service, per that section).
 
 ```bash
 mkdir -p ~/actions-runner-determinism-hypervisor && cd ~/actions-runner-determinism-hypervisor
