@@ -58,6 +58,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("landing_loop", landing_loop_elf());
     assert_guest_shape("device_exercise", device_exercise_elf());
     assert_guest_shape("capture_fixture", capture_fixture_elf());
+    assert_guest_shape("net_loopback", net_loopback_elf());
     assert_guest_shape("hello", hello_elf());
     assert_guest_shape("sti_window", sti_window_elf());
     assert_guest_shape("timer_guest", timer_guest_elf());
@@ -450,6 +451,72 @@ fn channel_guest_asm_ring_descs_match_the_constant() {
             );
         }
     }
+}
+
+/// Same drift pin for net_loopback (bead fbr): register offsets against
+/// the DEVICE-SIDE truth in dh-devices, the harness-facing GPAs/frame
+/// parameters against the lib.rs constants, and the frame helper against
+/// the documented byte rule.
+#[test]
+fn net_loopback_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/net_loopback.asm"))
+        .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("NET_BASE"), dh_devices::net::PV_NET_BASE);
+    assert_eq!(define("REG_TX_BUF_GPA"), dh_devices::net::REG_TX_BUF_GPA);
+    assert_eq!(define("REG_TX_LEN"), dh_devices::net::REG_TX_LEN);
+    assert_eq!(define("REG_TX_DOORBELL"), dh_devices::net::REG_TX_DOORBELL);
+    assert_eq!(define("REG_TX_STATUS"), dh_devices::net::REG_TX_STATUS);
+    assert_eq!(define("REG_RX_BUF_GPA"), dh_devices::net::REG_RX_BUF_GPA);
+    assert_eq!(define("REG_RX_CAP"), dh_devices::net::REG_RX_CAP);
+    assert_eq!(define("REG_RX_LEN"), dh_devices::net::REG_RX_LEN);
+    assert_eq!(
+        u32::try_from(define("STATUS_OK")).unwrap(),
+        dh_devices::net::STATUS_OK
+    );
+    assert_eq!(define("TX_GPA"), NET_LOOPBACK_TX_GPA);
+    assert_eq!(define("RX_GPA"), NET_LOOPBACK_RX_GPA);
+    assert_eq!(
+        u32::try_from(define("RX_CAP_BYTES")).unwrap(),
+        NET_LOOPBACK_RX_CAP
+    );
+    assert_eq!(
+        u32::try_from(define("FRAME_LEN")).unwrap(),
+        NET_LOOPBACK_FRAME_LEN
+    );
+    assert_eq!(
+        u8::try_from(define("FRAME_BYTE_BASE")).unwrap(),
+        NET_LOOPBACK_FRAME_BYTE_BASE
+    );
+
+    // The frame helper obeys the documented byte rule, and the frame
+    // fits both the device cap and the published RX capacity.
+    let frame = net_loopback_frame();
+    assert_eq!(frame.len() as u32, NET_LOOPBACK_FRAME_LEN);
+    assert_eq!(frame[0], NET_LOOPBACK_FRAME_BYTE_BASE);
+    assert_eq!(frame[63], NET_LOOPBACK_FRAME_BYTE_BASE.wrapping_add(63));
+    const _FRAME_FITS_DEVICE_CAP: () =
+        assert!(NET_LOOPBACK_FRAME_LEN <= dh_devices::net::MAX_FRAME);
+    const _FRAME_FITS_RX_CAP: () = assert!(NET_LOOPBACK_FRAME_LEN <= NET_LOOPBACK_RX_CAP);
+
+    // Buffers must not overlap each other (TX cap is the frame itself).
+    const _BUFFERS_DISJOINT: () = assert!(
+        NET_LOOPBACK_TX_GPA + NET_LOOPBACK_FRAME_LEN as u64 <= NET_LOOPBACK_RX_GPA
+    );
 }
 
 /// Same drift pin for page_dirtier (bead 28i): the chaos arithmetic
