@@ -32,3 +32,14 @@ nanokernel = { path = "../../tests/nanokernel" }
 snapstore-server.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+# Criterion perf benches (bead 9sb): fork / incremental snapshot /
+# restore latency distributions for the nightly perf-gate job (bead
+# 1pa, >20% regression fails). The p50 ACCEPTANCE thresholds live in
+# tests/perf_gates.rs; this target is the trend instrument.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies.criterion]
+workspace = true
+
+[[bench]]
+name = "perf_gates"
+harness = false
