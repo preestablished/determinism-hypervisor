@@ -54,8 +54,10 @@ pub struct Edge<'a> {
 
 /// A validated fork-tree path. Borrowed: the segment bytes live with
 /// the caller (the store / the recording rails); this type only proves
-/// they compose.
-#[derive(Debug)]
+/// they compose. `Clone` is cheap (slices + headers) and is how one
+/// validated parent prefix is shared across many children (M7: one
+/// root, a thousand forks).
+#[derive(Clone, Debug)]
 pub struct Lineage<'a> {
     segments: Vec<(&'a [u8], Header)>,
 }
@@ -94,8 +96,9 @@ impl<'a> Lineage<'a> {
 
     /// `child log = parent prefix + child segment` — the fork-tree
     /// composition this module exists for. Re-validates only the new
-    /// edge (the prefix is already proven).
-    pub fn extend(self, child_segment: &'a [u8]) -> Result<Self, SpliceError> {
+    /// edge (the prefix is already proven). Borrows the parent so one
+    /// validated prefix can fan out to many children.
+    pub fn extend(&self, child_segment: &'a [u8]) -> Result<Self, SpliceError> {
         let index = self.segments.len();
         let log =
             LogReader::parse(child_segment).map_err(|err| SpliceError::Segment { index, err })?;
@@ -114,7 +117,7 @@ impl<'a> Lineage<'a> {
         if last.end_snapshot_id != h.base_snapshot_id {
             return Err(SpliceError::BrokenStitch { index: index - 1 });
         }
-        let mut segments = self.segments;
+        let mut segments = self.segments.clone();
         segments.push((child_segment, h));
         Ok(Self { segments })
     }
@@ -215,19 +218,38 @@ mod tests {
     fn extend_is_the_fork_composition() {
         let a = seal_segment(R, S1, CFG, (1, 1));
         let parent = Lineage::new(&[&a]).unwrap();
+
+        // One validated parent prefix fans out to many children — the
+        // M7 shape (one root, a thousand forks): extend borrows.
         let b = seal_segment(S1, [0; 32], CFG, (1, 1));
+        let b2 = seal_segment(S1, S2, CFG, (1, 1));
         let child = parent.extend(&b).unwrap();
+        let sibling = parent.extend(&b2).unwrap();
         assert_eq!(child.len(), 2);
         assert_eq!(child.root_base(), R);
+        assert_eq!(sibling.len(), 2);
+        assert_eq!(sibling.end_identity().0, S2);
+        assert_eq!(parent.len(), 1); // the prefix is untouched
 
         // A child whose base is NOT the parent's end ref is refused.
-        let a2 = seal_segment(R, S1, CFG, (1, 1));
-        let parent2 = Lineage::new(&[&a2]).unwrap();
         let stranger = seal_segment(S2, [0; 32], CFG, (1, 1));
         assert_eq!(
-            parent2.extend(&stranger).unwrap_err(),
+            parent.extend(&stranger).unwrap_err(),
             SpliceError::BrokenStitch { index: 0 }
         );
+    }
+
+    #[test]
+    fn a_single_leaf_only_segment_is_a_valid_lineage() {
+        // The simplest fork child: one sealed segment, no end snapshot.
+        let leaf = seal_segment(R, [0; 32], CFG, (1, 1));
+        let lineage = Lineage::new(&[&leaf]).unwrap();
+        assert_eq!(lineage.len(), 1);
+        assert!(!lineage.is_empty());
+        assert_eq!(lineage.root_base(), R);
+        assert_eq!(lineage.end_identity().0, [0; 32]);
+        let plan: Vec<usize> = lineage.edges().map(|e| e.index).collect();
+        assert_eq!(plan, vec![0]);
     }
 
     #[test]
