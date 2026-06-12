@@ -1,7 +1,8 @@
 //! M4 ACCEPT perf gates (bead 9sb): p50 latency thresholds on the
-//! quiesced Intel box, 128 MiB guest (the MAP.md canonical demo figure),
-//! per IMPLEMENTATION-PLAN: tier-A fork < 10 ms, incremental snapshot at
-//! 8k dirty pages < 15 ms, tier-B warm restore < 150 ms.
+//! quiesced Intel box, 128 MiB guest (the MAP.md canonical demo figure).
+//! Thresholds are the ACCEPTED-AS-MEASURED numbers (bead 8ot, ledger
+//! #20), not the plan's original aspirational ones — see the constants
+//! below for the decision record.
 //!
 //! ONE sequential test, #[ignore]d: perf assertions flake under parallel
 //! suite load (the iteration-68/69 lesson), so this never runs in the
@@ -42,9 +43,16 @@ const DIRTY_PAGES: u64 = 8192;
 /// Samples per gate; the median of 30 is stable on the quiesced box.
 const SAMPLES: usize = 30;
 
+// ACCEPTED-AS-MEASURED gates (bead 8ot decision, 2026-06-12; ledger #20):
+// the box's storage sustains ~350 MB/s durable, so the plan's original
+// snapshot/restore numbers (15 ms / 150 ms — they imply > 2 GB/s durable)
+// were accepted at the measured baseline plus ~45% day-to-day variance
+// headroom (measured p50: fork 326 µs, snapshot 103 ms, restore 307 ms).
+// These are REGRESSION gates at the accepted baseline; the original
+// numbers remain the improvement targets (correctness outranks speed).
 const FORK_P50_MAX: Duration = Duration::from_millis(10);
-const SNAP_P50_MAX: Duration = Duration::from_millis(15);
-const RESTORE_P50_MAX: Duration = Duration::from_millis(150);
+const SNAP_P50_MAX: Duration = Duration::from_millis(150);
+const RESTORE_P50_MAX: Duration = Duration::from_millis(450);
 
 fn config_128() -> MachineConfig {
     MachineConfig::new(

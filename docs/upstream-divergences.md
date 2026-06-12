@@ -194,6 +194,35 @@ New:
 | `0x03` | `NET_RX` | raw frame bytes (`payload_len` is the frame length, 1–2048; zero-length is INVALID — the device rejects empty delivery, so writer and reader forbid it) |
 ```
 
+### #20 — IMPLEMENTATION-PLAN.md M4: perf gates accepted-as-measured (snapshot < 150 ms, restore < 450 ms)
+
+- **Found:** iteration 99 (bead 9sb instruments + measurement). **Decision:**
+  bead 8ot, operator call 2026-06-12 — option (d), accept-as-measured.
+  **Local amendment:** this commit (M4 "Perf gates" bullet).
+- **Why:** the original snapshot/restore numbers (15 ms / 150 ms at 8k pages /
+  128 MiB) imply > 2 GB/s durable bandwidth; the box's ext4 LV sustains
+  ~350 MB/s durable (`dd conv=fsync` floor 96–200 ms / 32 MiB), and the store's
+  put is a durability receipt (R12) that cannot beat the disk. Engines are not
+  the bottleneck (fork p50 326 µs passes with 30× headroom; defeating store
+  dedup moved snapshot p50 < 10%). Correctness outranks speed: gates were reset
+  to the measured baseline + ~45% variance headroom and now act as REGRESSION
+  gates; the original numbers are retained as improvement targets (backlog
+  bead). M7's ≤ 100 ms exploration-step budget is flagged in the amendment as
+  in tension with these numbers. Authority:
+  `crates/dh-worker/tests/perf_gates.rs` (decision record at the constants).
+
+Old (M4 "Accept" list, perf-gates bullet):
+
+```
+- Perf gates (p50 on the box, 128 MiB demo guest — MAP.md canonical figure):
+  fork < 10 ms, incremental snapshot ≤ 8k dirty pages < 15 ms, tier-B warm restore
+  < 150 ms.
+```
+
+New: same bullet with snapshot < 150 ms / restore < 450 ms, the
+ACCEPTED-AS-MEASURED rationale, the measured baselines, and the M7
+exploration-step tension note (quoted in full in the amendment).
+
 ---
 
 ## Upstream-only wording fixes (no local doc edit; code / decision doc is the authority)
