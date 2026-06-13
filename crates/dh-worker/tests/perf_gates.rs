@@ -146,7 +146,9 @@ fn m4_perf_gates_p50_128mib() {
         drop(outcome); // child teardown outside the timed window of the NEXT sample
     }
     let (fork_min, fork_p50, fork_max) = spread(&mut fork_samples);
-    eprintln!("fork p50: {fork_p50:?} [min {fork_min:?}, max {fork_max:?}] (gate {FORK_P50_MAX:?})");
+    eprintln!(
+        "fork p50: {fork_p50:?} [min {fork_min:?}, max {fork_max:?}] (gate {FORK_P50_MAX:?})"
+    );
 
     // ── Gate 2: incremental snapshot at exactly 8k dirty pages ──────────
     let slot = sys.create_slot_vm(MEM).unwrap();
@@ -208,7 +210,10 @@ fn m4_perf_gates_p50_128mib() {
         )
         .expect("incremental snapshot");
         snap_samples.push(t.elapsed());
-        assert_eq!(out.pages_shipped, DIRTY_PAGES, "the load must be exactly 8k pages");
+        assert_eq!(
+            out.pages_shipped, DIRTY_PAGES,
+            "the load must be exactly 8k pages"
+        );
     }
     let (snap_min, snap_p50, snap_max) = spread(&mut snap_samples);
     eprintln!(

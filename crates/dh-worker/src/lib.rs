@@ -8,6 +8,7 @@ pub mod proto_map;
 pub mod replay_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod restore_engine;
+pub mod slot_manager;
 #[cfg(target_arch = "x86_64")]
 pub mod snapshot_engine;
 #[cfg(target_arch = "x86_64")]

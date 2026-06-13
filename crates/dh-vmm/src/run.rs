@@ -144,6 +144,66 @@ pub fn clear_immediate_exit(vcpu: &mut VcpuFd) {
     vcpu.set_kvm_immediate_exit(0);
 }
 
+// ── vCPU thread placement (ARCH §9, bead ol1) ───────────────────────────
+//
+// "1 vCPU thread per active slot (pinned, SCHED_FIFO prio 10 on its
+// isolated core)". The slot→core MAP lives in dh-worker's slot manager;
+// the SYSCALLS live here because dh-worker forbids unsafe code and
+// thread plumbing is this module's home. Affinity and scheduling class
+// are separate calls: SCHED_FIFO needs CAP_SYS_NICE, plain affinity
+// does not — the daemon decides per deployment whether a FIFO EPERM is
+// fatal.
+
+/// ARCH §9 vCPU scheduling priority.
+pub const VCPU_FIFO_PRIORITY: i32 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinError {
+    /// `sched_setaffinity` failed (errno) — e.g. the core is outside the
+    /// process cpuset.
+    Affinity(i32),
+    /// `sched_setscheduler` failed (errno) — typically EPERM without
+    /// CAP_SYS_NICE.
+    Scheduler(i32),
+}
+
+/// Pin the CURRENT thread to `core` (the vCPU thread calls this with its
+/// slot's dedicated isolated core before first guest entry).
+pub fn pin_current_thread(core: u32) -> Result<(), PinError> {
+    // SAFETY: cpu_set_t is plain data, zero-initialized on the stack and
+    // populated through libc's CPU_SET accessor; sched_setaffinity(0, ..)
+    // targets the calling thread only.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(core as usize, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(PinError::Affinity(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Promote the CURRENT thread to SCHED_FIFO at [`VCPU_FIFO_PRIORITY`].
+pub fn set_current_thread_fifo() -> Result<(), PinError> {
+    // SAFETY: sched_param is plain data; sched_setscheduler(0, ..)
+    // targets the calling thread only.
+    #[allow(unsafe_code)]
+    unsafe {
+        let param = libc::sched_param {
+            sched_priority: VCPU_FIFO_PRIORITY,
+        };
+        if libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) != 0 {
+            return Err(PinError::Scheduler(
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
