@@ -8,9 +8,12 @@
 //!
 //! NON-1:1 CLOCK (load-bearing): the segment runs under a 10_000:1
 //! vns/icount ratio, so 100k icount = one guest-second and the 6M-icount
-//! run ends at exactly 60e9 vns. This is the first gate to exercise the
-//! replay engine's `end_vns` check with a value the icount axis does not
-//! mask (replay_engine.rs: "masked by 1:1 clocks until a5e").
+//! run ends at exactly 60e9 vns. The RECORD-side `vns == seconds * 1e9`
+//! assert is the independent oracle for the clock arithmetic; on the
+//! replay side, end_vns finally flows through replay_engine.rs's check
+//! with a value distinct from the icount (its note: "masked by 1:1
+//! clocks until a5e") — though once the header pins the clock ratio,
+//! that check cannot fail independently of end_icount.
 //!
 //! GRID: quantum == epoch_len == 100k, so every recorded stop boundary
 //! IS an epoch point — the hash chain is a pure function of the absolute
@@ -43,7 +46,7 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{kvm_available, spawn_store_blocking};
+use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
@@ -61,7 +64,7 @@ use dh_vmm::SlotState;
 use dh_worker::replay_engine::replay_segment;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
 
@@ -85,29 +88,6 @@ fn hex(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn gettid() -> i32 {
-    // SAFETY: argless syscall.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::syscall(libc::SYS_gettid) as i32
-    }
-}
-
-#[derive(Clone)]
-struct VmMem(GuestMemoryMmap<()>);
-impl dh_devices::ctx::GuestMem for VmMem {
-    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .read_slice(out, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .write_slice(data, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-}
-
 /// SplitMix64 — tiny, dependency-free, and fully determined by the seed.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -120,9 +100,21 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// The scripted pad sequence: one PAD_SET per inter-quantum boundary
 /// (`seconds - 1` of them — none after the final quantum; a sealed
 /// segment ends on a clean boundary with nothing pending).
+///
+/// INVARIANT (checked): no value is 0 (the boot latch) and no two
+/// adjacent values are equal — `assert_table_eras` compares the
+/// guest-observed era sequence EXACTLY, so a seed change that
+/// introduced a collapsed era must fail here, loudly, not weaken the
+/// era assertion silently.
 fn pad_script(seconds: u64) -> Vec<u32> {
     let mut s = SCRIPT_SEED;
-    (1..seconds).map(|_| splitmix64(&mut s) as u32).collect()
+    let script: Vec<u32> = (1..seconds).map(|_| splitmix64(&mut s) as u32).collect();
+    assert!(
+        !script.contains(&0) && script.windows(2).all(|w| w[0] != w[1]),
+        "script invariant violated for seed {SCRIPT_SEED:#x}: pick a seed with \
+         no zeros and no adjacent-equal values (eras would collapse)"
+    );
+    script
 }
 
 fn config() -> MachineConfig {
@@ -140,7 +132,10 @@ fn config() -> MachineConfig {
 }
 
 /// The pad-echo bus: the pad the guest polls plus the entropy device the
-/// snapshot engines require on every bus.
+/// snapshot engines require on every bus. 0xD000_3000 is the joint-test
+/// entropy base (replay_engine.rs, common::test_bus) — deliberately NOT
+/// `entropy::PV_ENTROPY_BASE` (0xD000_2000), which collides with the
+/// canonical clock base in that layout.
 fn record_bus() -> MmioBus {
     let mut bus = MmioBus::new();
     bus.register(dh_devices::pad::PV_PAD_BASE, Box::new(PvPad::new()))
@@ -267,6 +262,9 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, seconds: u64) -> 
         );
         if i < seconds {
             // The script: pad i lands at the end-of-second-i boundary.
+            // frame_hint = i is not independently asserted here — it
+            // matters because the reseal hammer round-trips it
+            // byte-identically through record and replay.
             rail.borrow_mut()
                 .apply_pad_set(
                     out.boundary.icount,
@@ -322,7 +320,9 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, seconds: u64) -> 
 /// One replay leg on a fresh slot: full verification happens inside
 /// `replay_segment` (epoch links at the link point, end_vns,
 /// end_state_hash, reseal); the assertions here pin the counts and the
-/// byte-identity to THIS recording.
+/// byte-identity to THIS recording. Returns the slot SO THE CALLER CAN
+/// READ THE GUEST OBSERVATION TABLE (`assert_table_eras`) — do not
+/// simplify the return to `()`.
 fn replay_once(
     sys: &KvmSystem,
     counter: &InstRetired,
@@ -359,13 +359,21 @@ fn replay_once(
     );
     assert_eq!(outcome.end_icount, seconds * QUANTUM);
     assert_eq!(outcome.end_state_hash, rec.end_state_hash);
+    // DELIBERATE wire-format lock: replay_segment already enforces the
+    // reseal internally, so this adds no divergence-detection power —
+    // but the M5 gate also pins DHILOG v1.0 bytes (the golden-fixtures
+    // milestone sibling): a log-format change SHOULD redden this
+    // acceptance and force a re-bless.
     assert_eq!(outcome.resealed, rec.log, "the reseal hammer");
     slot
 }
 
 /// The guest-side proof: pad-echo's RAM table observed the latch eras in
-/// script order. Consecutive-dedup of the per-frame pad0 column must be
-/// exactly `[0 (boot latch), script...]`.
+/// script order — consecutive-dedup of the per-frame pad0 column must be
+/// exactly `[0 (boot latch), script...]` (exact because of pad_script's
+/// checked invariant). The strong "every PAD_SET landed with the right
+/// bytes" proof is the host-side `pads == script` compare in `record`;
+/// this one proves the values reached the GUEST.
 fn assert_table_eras(slot: &SlotVm, seconds: u64) {
     let mut head = [0u8; 8];
     slot.guest_mem
@@ -396,9 +404,11 @@ fn assert_table_eras(slot: &SlotVm, seconds: u64) {
             eras.push(pad0);
         }
     }
+    // Exact compare, no dedup on the expected side: pad_script's checked
+    // invariant (no zeros, no adjacent-equal values) guarantees every
+    // scripted value opens a distinct era.
     let mut expected = vec![0u32];
     expected.extend(pad_script(seconds));
-    expected.dedup();
     assert_eq!(eras, expected, "guest-observed latch eras == the script");
 }
 

@@ -47,7 +47,7 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{kvm_available, spawn_store_blocking, test_bus};
+use common::{gettid, kvm_available, spawn_store_blocking, test_bus};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::DetEntropy;
 use dh_vmm::boundary::BoundaryError;
@@ -68,14 +68,6 @@ const FULL: u64 = 200_000_000;
 /// Landing-loop iterations: 8 instructions each; 30M iters = 2.4e8
 /// capacity, so no leg ever reaches the guest's completion HLT.
 const ITERS_CMDLINE: &[u8] = b"30000000";
-
-fn gettid() -> i32 {
-    // SAFETY: argless syscall.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::syscall(libc::SYS_gettid) as i32
-    }
-}
 
 fn config(cmdline: &[u8]) -> MachineConfig {
     MachineConfig::new(

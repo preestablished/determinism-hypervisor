@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{kvm_available, spawn_store_blocking};
+use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
@@ -33,33 +33,10 @@ use dh_worker::replay_engine::{replay_segment, ReplayError};
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use dh_worker::verify_replay::verify_replay;
 use kvm_ioctls::VcpuExit;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
 const QUANTUM: u64 = 100_000;
-
-fn gettid() -> i32 {
-    // SAFETY: argless syscall.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::syscall(libc::SYS_gettid) as i32
-    }
-}
-
-#[derive(Clone)]
-struct VmMem(GuestMemoryMmap<()>);
-impl dh_devices::ctx::GuestMem for VmMem {
-    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .read_slice(out, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .write_slice(data, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-}
 
 fn config() -> MachineConfig {
     let mut c = MachineConfig::new(
