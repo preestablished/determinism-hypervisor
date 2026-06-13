@@ -30,7 +30,7 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{kvm_available, spawn_store_blocking, test_bus};
+use common::{gettid, kvm_available, spawn_store_blocking, test_bus, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::DetEntropy;
 use dh_devices::{DevCtx, MmioBus};
@@ -54,32 +54,8 @@ const BATCHES_GOLDEN: u64 = 4;
 const GOLDEN_DRAWS: u64 = BATCHES_GOLDEN * nanokernel::ENTROPY_DRAW_BATCH;
 const HUGE_BUDGET: u64 = 1_000_000_000;
 
-fn gettid() -> i32 {
-    // SAFETY: argless syscall.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::syscall(libc::SYS_gettid) as i32
-    }
-}
-
 /// m1_acceptance's GuestMem adapter, minimal: the device writes draw
 /// bytes straight into guest RAM through this.
-#[derive(Clone)]
-struct VmMem(GuestMemoryMmap<()>);
-
-impl dh_devices::ctx::GuestMem for VmMem {
-    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .read_slice(out, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
-        self.0
-            .write_slice(data, GuestAddress(gpa))
-            .map_err(|_| dh_devices::ctx::MemError)
-    }
-}
-
 fn fresh_log() -> LogWriter {
     LogWriter::new(SegmentHeader {
         base_snapshot_id: [0; 32],

@@ -28,6 +28,39 @@ pub fn kvm_available() -> bool {
         .is_ok()
 }
 
+/// The current thread id — counter overflow routing needs the real tid.
+/// (Hoisted from four per-target copies, iteration-101 review.)
+#[allow(dead_code)]
+pub fn gettid() -> i32 {
+    // SAFETY: argless syscall.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::syscall(libc::SYS_gettid) as i32
+    }
+}
+
+/// GuestMem adapter over a slot's memory map — the DeviceRail seam the
+/// live joint tests share. (Hoisted from three per-target copies,
+/// iteration-101 review.)
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct VmMem(pub vm_memory::GuestMemoryMmap<()>);
+
+impl dh_devices::ctx::GuestMem for VmMem {
+    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .read_slice(out, vm_memory::GuestAddress(gpa))
+            .map_err(|_| dh_devices::ctx::MemError)
+    }
+    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .write_slice(data, vm_memory::GuestAddress(gpa))
+            .map_err(|_| dh_devices::ctx::MemError)
+    }
+}
+
 /// Real store on a side runtime; the engines stay synchronous and reach
 /// it via the blocking facade (the production shape).
 // Each test target compiles this module independently; not every target
