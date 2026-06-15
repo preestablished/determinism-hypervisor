@@ -162,7 +162,7 @@ async fn execute_to_writer<W: std::io::Write + ?Sized>(
             let response = client
                 .take_snapshot(proto::TakeSnapshotRequest {
                     lease: Some(lease),
-                    seal_input_log,
+                    seal_input_log: Some(seal_input_log),
                     capture: None,
                 })
                 .await
@@ -1242,7 +1242,7 @@ mod tests {
         match &worker.calls()[0] {
             SeenCall::TakeSnapshot(req) => {
                 assert_eq!(req.lease.as_ref().unwrap().slot_id, 7);
-                assert!(req.seal_input_log);
+                assert_eq!(req.seal_input_log, Some(true));
             }
             other => panic!("expected TakeSnapshot, got {other:?}"),
         }
@@ -1261,7 +1261,7 @@ mod tests {
         match &worker.calls()[0] {
             SeenCall::TakeSnapshot(req) => {
                 assert_eq!(req.lease.as_ref().unwrap().slot_id, 8);
-                assert!(!req.seal_input_log);
+                assert_eq!(req.seal_input_log, Some(false));
             }
             other => panic!("expected TakeSnapshot, got {other:?}"),
         }

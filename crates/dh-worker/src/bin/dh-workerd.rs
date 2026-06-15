@@ -1,14 +1,23 @@
 //! dh-workerd — the per-host daemon (ARCH §7.5).
 
+#[cfg(target_arch = "x86_64")]
+use dh_worker::image_resolver::DEFAULT_IMAGE_CACHE_DIR;
+#[cfg(target_arch = "x86_64")]
+use dh_worker::service::DEFAULT_SNAPSTORE_TCP;
 use dh_worker::service::{WorkerConfig, DEFAULT_TCP_ADDR, DEFAULT_UDS_PATH};
 use std::path::PathBuf;
 
+#[derive(Debug)]
 enum Command {
     Preflight,
     Serve {
         tcp_addr: std::net::SocketAddr,
         uds_path: Option<PathBuf>,
         skip_preflight: bool,
+        #[cfg(target_arch = "x86_64")]
+        image_cache_dir: PathBuf,
+        #[cfg(target_arch = "x86_64")]
+        snapstore: Option<snapstore_client::Transport>,
     },
 }
 
@@ -30,10 +39,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tcp_addr,
             uds_path,
             skip_preflight,
+            #[cfg(target_arch = "x86_64")]
+            image_cache_dir,
+            #[cfg(target_arch = "x86_64")]
+            snapstore,
         } => {
             if !skip_preflight {
                 run_preflight_or_exit();
             }
+            #[cfg(target_arch = "x86_64")]
+            let config = {
+                let mut config = WorkerConfig::from_host_defaults()?;
+                config.image_cache_dir = image_cache_dir;
+                config.snapstore = snapstore;
+                config
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let config = WorkerConfig::from_host_defaults()?;
             eprintln!(
                 "dh-workerd serving TCP {tcp_addr}{}",
@@ -77,6 +98,12 @@ where
         .map_err(|e| format!("invalid default TCP addr {DEFAULT_TCP_ADDR}: {e}"))?;
     let mut uds_path = Some(PathBuf::from(DEFAULT_UDS_PATH));
     let mut skip_preflight = false;
+    #[cfg(target_arch = "x86_64")]
+    let mut image_cache_dir = PathBuf::from(DEFAULT_IMAGE_CACHE_DIR);
+    #[cfg(target_arch = "x86_64")]
+    let mut snapstore = Some(snapstore_client::Transport::Tcp(
+        DEFAULT_SNAPSTORE_TCP.into(),
+    ));
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,6 +121,26 @@ where
             }
             "--no-uds" => uds_path = None,
             "--skip-preflight" => skip_preflight = true,
+            #[cfg(target_arch = "x86_64")]
+            "--image-cache" => {
+                i += 1;
+                let value = args.get(i).ok_or("--image-cache requires a path")?;
+                image_cache_dir = PathBuf::from(value);
+            }
+            #[cfg(target_arch = "x86_64")]
+            "--snapstore-tcp" => {
+                i += 1;
+                let value = args.get(i).ok_or("--snapstore-tcp requires a URI")?;
+                snapstore = Some(snapstore_client::Transport::Tcp(value.to_owned()));
+            }
+            #[cfg(target_arch = "x86_64")]
+            "--snapstore-uds" => {
+                i += 1;
+                let value = args.get(i).ok_or("--snapstore-uds requires a path")?;
+                snapstore = Some(snapstore_client::Transport::Uds(PathBuf::from(value)));
+            }
+            #[cfg(target_arch = "x86_64")]
+            "--no-snapstore" => snapstore = None,
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
@@ -104,11 +151,107 @@ where
         tcp_addr,
         uds_path,
         skip_preflight,
+        #[cfg(target_arch = "x86_64")]
+        image_cache_dir,
+        #[cfg(target_arch = "x86_64")]
+        snapstore,
     })
 }
 
+#[cfg(target_arch = "x86_64")]
+fn usage() -> String {
+    format!(
+        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--uds PATH|--no-uds] [--image-cache PATH] [--snapstore-tcp URI|--snapstore-uds PATH|--no-snapstore] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --uds {DEFAULT_UDS_PATH} --image-cache {DEFAULT_IMAGE_CACHE_DIR} --snapstore-tcp {DEFAULT_SNAPSTORE_TCP}"
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 fn usage() -> String {
     format!(
         "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--uds PATH|--no-uds] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --uds {DEFAULT_UDS_PATH}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_default_serve_args() {
+        let command = parse_args(Vec::<String>::new()).unwrap();
+        let Command::Serve {
+            tcp_addr,
+            uds_path,
+            skip_preflight,
+            #[cfg(target_arch = "x86_64")]
+            image_cache_dir,
+            #[cfg(target_arch = "x86_64")]
+            snapstore,
+        } = command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(tcp_addr, DEFAULT_TCP_ADDR.parse().unwrap());
+        assert_eq!(uds_path, Some(PathBuf::from(DEFAULT_UDS_PATH)));
+        assert!(!skip_preflight);
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(image_cache_dir, PathBuf::from(DEFAULT_IMAGE_CACHE_DIR));
+            match snapstore {
+                Some(snapstore_client::Transport::Tcp(uri)) => {
+                    assert_eq!(uri, DEFAULT_SNAPSTORE_TCP)
+                }
+                other => panic!("expected default TCP snapstore transport, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_preflight_short_circuits_serve_defaults() {
+        let command = parse_args(["--preflight".to_owned()]).unwrap();
+        assert!(matches!(command, Command::Preflight));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn parse_x86_resource_flags() {
+        let command = parse_args([
+            "serve".to_owned(),
+            "--tcp".to_owned(),
+            "127.0.0.1:7500".to_owned(),
+            "--no-uds".to_owned(),
+            "--image-cache".to_owned(),
+            "/tmp/dh-images".to_owned(),
+            "--snapstore-uds".to_owned(),
+            "/tmp/snapstore.sock".to_owned(),
+            "--skip-preflight".to_owned(),
+        ])
+        .unwrap();
+        let Command::Serve {
+            tcp_addr,
+            uds_path,
+            skip_preflight,
+            image_cache_dir,
+            snapstore,
+        } = command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(tcp_addr, "127.0.0.1:7500".parse().unwrap());
+        assert_eq!(uds_path, None);
+        assert!(skip_preflight);
+        assert_eq!(image_cache_dir, PathBuf::from("/tmp/dh-images"));
+        match snapstore {
+            Some(snapstore_client::Transport::Uds(path)) => {
+                assert_eq!(path, PathBuf::from("/tmp/snapstore.sock"))
+            }
+            other => panic!("expected UDS snapstore transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_missing_value_reports_specific_flag() {
+        let err = parse_args(["--tcp".to_owned()]).unwrap_err();
+        assert_eq!(err, "--tcp requires an address");
+    }
 }

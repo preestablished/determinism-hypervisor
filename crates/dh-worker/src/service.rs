@@ -1,14 +1,20 @@
-//! dh-workerd gRPC service shell (bead rfv).
+//! dh-workerd gRPC service (bead rfv).
 //!
 //! This module is the daemon-owned API seam: tonic transport, worker
-//! identity, slot table visibility, status-code mapping, and runtime-table
-//! ownership. Guest mutating RPCs stay `UNIMPLEMENTED` until each path owns
-//! real per-slot KVM, device, counter, DHILOG, and snapshot-store state;
-//! returning success before that would fake the M6 acceptance surface.
+//! identity, slot table visibility, status-code mapping, runtime-table
+//! ownership, and the daemon-side resource seams for image-cache and
+//! snapshot-store backed lifecycle operations.
 
+#[cfg(target_arch = "x86_64")]
+use crate::image_resolver::{ImageResolver, ImageResolverError, ResolvedBoot};
 use crate::proto_map::slot_info_to_proto;
 #[cfg(target_arch = "x86_64")]
-use crate::runtime::{RuntimeError, SlotRuntime, WorkerRuntimeTable};
+use crate::proto_map::{
+    fork_entropy_seeds_from_proto, lease_to_proto, machine_config_from_proto,
+    machine_config_to_proto,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::runtime::{RuntimeError, RuntimeThreadState, SlotRuntime, WorkerRuntimeTable};
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
@@ -18,11 +24,15 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(target_arch = "x86_64")]
+use std::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
+#[cfg(target_arch = "x86_64")]
+pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
 
 type ResponseStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -33,6 +43,10 @@ pub struct WorkerConfig {
     pub slot_cores: Vec<u32>,
     pub lease_policy: LeasePolicy,
     pub class: proto::DeterminismClass,
+    #[cfg(target_arch = "x86_64")]
+    pub image_cache_dir: PathBuf,
+    #[cfg(target_arch = "x86_64")]
+    pub snapstore: Option<snapstore_client::Transport>,
 }
 
 impl WorkerConfig {
@@ -44,6 +58,12 @@ impl WorkerConfig {
             slot_cores,
             lease_policy: LeasePolicy::default(),
             class: detect_determinism_class(),
+            #[cfg(target_arch = "x86_64")]
+            image_cache_dir: crate::image_resolver::DEFAULT_IMAGE_CACHE_DIR.into(),
+            #[cfg(target_arch = "x86_64")]
+            snapstore: Some(snapstore_client::Transport::Tcp(
+                DEFAULT_SNAPSTORE_TCP.into(),
+            )),
         })
     }
 }
@@ -52,6 +72,8 @@ impl WorkerConfig {
 pub enum ConfigError {
     InvalidCoreList(String),
     Slot(SlotError),
+    #[cfg(target_arch = "x86_64")]
+    Store(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -59,6 +81,8 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::InvalidCoreList(spec) => write!(f, "invalid slot core list: {spec}"),
             ConfigError::Slot(e) => write!(f, "slot manager config: {e:?}"),
+            #[cfg(target_arch = "x86_64")]
+            ConfigError::Store(e) => write!(f, "snapstore config: {e}"),
         }
     }
 }
@@ -117,6 +141,10 @@ struct WorkerInner {
     manager: Arc<SlotManager>,
     #[cfg(target_arch = "x86_64")]
     runtimes: Arc<WorkerRuntimeTable>,
+    #[cfg(target_arch = "x86_64")]
+    image_resolver: ImageResolver,
+    #[cfg(target_arch = "x86_64")]
+    store: Option<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>>,
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
@@ -130,11 +158,22 @@ impl WorkerService {
             config.slot_cores,
             config.lease_policy,
         )?);
+        #[cfg(target_arch = "x86_64")]
+        let store = config
+            .snapstore
+            .map(snapstore_client::blocking::SnapstoreClient::connect)
+            .transpose()
+            .map_err(|e| ConfigError::Store(e.to_string()))?
+            .map(|client| Arc::new(Mutex::new(client)));
         Ok(Self {
             inner: Arc::new(WorkerInner {
                 manager,
                 #[cfg(target_arch = "x86_64")]
                 runtimes: Arc::new(WorkerRuntimeTable::new(slot_count)),
+                #[cfg(target_arch = "x86_64")]
+                image_resolver: ImageResolver::new(config.image_cache_dir),
+                #[cfg(target_arch = "x86_64")]
+                store,
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -149,6 +188,14 @@ impl WorkerService {
     #[cfg(target_arch = "x86_64")]
     pub fn runtime_table(&self) -> Arc<WorkerRuntimeTable> {
         self.inner.runtimes.clone()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn store(&self) -> Result<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>, Status> {
+        self.inner
+            .store
+            .clone()
+            .ok_or_else(|| unavailable_status("snapshot-store"))
     }
 
     fn slots_total(&self) -> u32 {
@@ -318,6 +365,289 @@ fn unimplemented_status(method: &'static str) -> Status {
     ))
 }
 
+#[cfg(target_arch = "x86_64")]
+fn unavailable_status(resource: &'static str) -> Status {
+    Status::failed_precondition(format!(
+        "{resource} is not configured for this WorkerService"
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn store_error_to_status(context: &'static str, e: impl std::fmt::Display) -> Status {
+    Status::unavailable(format!("{context}: {e}"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn image_error_to_status(e: ImageResolverError) -> Status {
+    match e {
+        ImageResolverError::InvalidConfig(_) => Status::invalid_argument(e.to_string()),
+        ImageResolverError::NotFound { .. } | ImageResolverError::NotFile { .. } => {
+            Status::failed_precondition(e.to_string())
+        }
+        ImageResolverError::HashMismatch { .. } => Status::data_loss(e.to_string()),
+        ImageResolverError::TooLarge { .. } => Status::invalid_argument(e.to_string()),
+        ImageResolverError::Io { .. } => Status::unavailable(e.to_string()),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn machine_config_error_to_status(e: crate::proto_map::MachineConfigWireError) -> Status {
+    Status::invalid_argument(e.to_string())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fork_wire_error_to_status(e: crate::proto_map::ForkRequestWireError) -> Status {
+    Status::invalid_argument(e.to_string())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn kvm_error_to_status(context: &'static str, e: dh_vmm::kvm::KvmError) -> Status {
+    Status::failed_precondition(format!("{context}: {e:?}"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn snapshot_engine_error_to_status(e: crate::snapshot_engine::EngineError) -> Status {
+    use crate::snapshot_engine::EngineError;
+    match e {
+        EngineError::AgendaNotEmpty | EngineError::NotPaused { .. } => {
+            Status::failed_precondition(format!("{e:?}"))
+        }
+        EngineError::Kvm(m) => Status::failed_precondition(m),
+        EngineError::Codec(m) => Status::data_loss(m),
+        EngineError::Store(m) => Status::unavailable(m),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn restore_engine_error_to_status(e: crate::restore_engine::RestoreError) -> Status {
+    use crate::restore_engine::RestoreError;
+    match e {
+        RestoreError::NotPaused { .. } | RestoreError::ConfigMismatch(_) => {
+            Status::failed_precondition(format!("{e:?}"))
+        }
+        RestoreError::Kvm(m) => Status::failed_precondition(m),
+        RestoreError::Codec(m) => Status::data_loss(m),
+        RestoreError::Store(m) => Status::unavailable(m),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fork_engine_error_to_status(e: crate::fork_engine::ForkError) -> Status {
+    use crate::fork_engine::ForkError;
+    match e {
+        ForkError::AgendaNotEmpty | ForkError::ParentNotFrozen { .. } => {
+            Status::failed_precondition(format!("{e:?}"))
+        }
+        ForkError::Capture(m) | ForkError::Apply(m) => Status::data_loss(m),
+        ForkError::Kvm(m) => Status::failed_precondition(m),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn snapshot_ref_from_proto(
+    snapshot: Option<proto::SnapshotRef>,
+) -> Result<snapstore_types::SnapshotRef, Status> {
+    let snapshot = snapshot.ok_or_else(|| Status::invalid_argument("missing snapshot"))?;
+    let hash: [u8; 32] = snapshot
+        .hash
+        .try_into()
+        .map_err(|_| Status::invalid_argument("snapshot hash must be 32 bytes"))?;
+    Ok(snapstore_types::SnapshotRef::from_bytes(hash))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn entropy_seed_from_proto(
+    field: &'static str,
+    bytes: &[u8],
+    allow_empty_continue: bool,
+) -> Result<Option<[u8; 32]>, Status> {
+    if bytes.is_empty() && allow_empty_continue {
+        return Ok(None);
+    }
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Status::invalid_argument(format!("{field} must be 32 bytes")))?;
+    Ok(Some(seed))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn segment_vns_from_icount(
+    config: &dh_vmm::config::MachineConfig,
+    segment_icount: u64,
+) -> Result<u64, Status> {
+    config
+        .clock
+        .vns_from_icount(segment_icount)
+        .ok_or_else(|| Status::failed_precondition("segment vns conversion overflow"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fault_runtime_after_snapshot_loss(
+    manager: &SlotManager,
+    runtime: &mut SlotRuntime,
+    slot_id: u64,
+    context: &'static str,
+    status: Status,
+) -> Status {
+    runtime.thread = RuntimeThreadState::Faulted(format!(
+        "{context}: {}: {}",
+        status.code(),
+        status.message()
+    ));
+    if let Err(fault) = manager.mark_faulted(slot_id) {
+        Status::internal(format!(
+            "{context} failed with {}: {}; also failed to mark slot faulted: {fault:?}",
+            status.code(),
+            status.message()
+        ))
+    } else {
+        status
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn base_snapshot_bytes(base: Option<&snapstore_types::SnapshotRef>) -> [u8; 32] {
+    base.map(snapstore_types::SnapshotRef::to_bytes)
+        .unwrap_or([0; 32])
+}
+
+#[cfg(target_arch = "x86_64")]
+fn new_segment_log(
+    config: &dh_vmm::config::MachineConfig,
+    base_snapshot: Option<&snapstore_types::SnapshotRef>,
+    entropy_seed: [u8; 32],
+) -> Result<dh_inputlog::dhilog::LogWriter, Status> {
+    let machine_config_hash = config
+        .config_hash()
+        .map_err(|e| Status::invalid_argument(format!("MachineConfig hash: {e:?}")))?;
+    Ok(dh_inputlog::dhilog::LogWriter::new(
+        dh_inputlog::dhilog::SegmentHeader {
+            base_snapshot_id: base_snapshot_bytes(base_snapshot),
+            entropy_seed,
+            machine_config_hash,
+            clock_num: config.clock.num(),
+            clock_den: config.clock.den(),
+            encoder_fingerprint: 0,
+        },
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_with_log(
+    slot: dh_vmm::kvm::SlotVm,
+    bus: dh_devices::MmioBus,
+    entropy: dh_devices::entropy::DetEntropy,
+    config: dh_vmm::config::MachineConfig,
+    chain: dh_vmm::hash::StateHashChain,
+    base_snapshot: Option<snapstore_types::SnapshotRef>,
+    position: crate::runtime::SlotPosition,
+    entropy_seed: [u8; 32],
+) -> Result<SlotRuntime, Status> {
+    let log = new_segment_log(&config, base_snapshot.as_ref(), entropy_seed)?;
+    let mut runtime = SlotRuntime::new(
+        slot,
+        bus,
+        entropy,
+        config,
+        chain,
+        None,
+        base_snapshot,
+        position,
+    )
+    .map_err(|e| kvm_error_to_status("create runtime", e))?;
+    runtime.log = Some(log);
+    Ok(runtime)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_bus(
+    config: &dh_vmm::config::MachineConfig,
+    base_image: dh_vmm::blkfile::FileBase,
+) -> Result<dh_devices::MmioBus, Status> {
+    let mut bus = dh_devices::MmioBus::new();
+    let mut base_image = Some(base_image);
+    for id in &config.device_set {
+        match *id {
+            dh_devices::clock::DEVICE_ID_PV_CLOCK => bus
+                .register(
+                    dh_devices::clock::PV_CLOCK_BASE,
+                    Box::new(dh_devices::clock::PvClock::new(
+                        config.clock.num(),
+                        config.clock.den(),
+                    )),
+                )
+                .map_err(|e| Status::internal(format!("register pv-clock: {e:?}")))?,
+            dh_devices::pad::DEVICE_ID_PV_PAD => bus
+                .register(
+                    dh_devices::pad::PV_PAD_BASE,
+                    Box::new(dh_devices::pad::PvPad::new()),
+                )
+                .map_err(|e| Status::internal(format!("register pv-pad: {e:?}")))?,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY => bus
+                .register(
+                    dh_devices::entropy::PV_ENTROPY_BASE,
+                    Box::new(dh_devices::entropy::PvEntropy::new()),
+                )
+                .map_err(|e| Status::internal(format!("register pv-entropy: {e:?}")))?,
+            dh_devices::blk::DEVICE_ID_PV_BLK => {
+                let base = base_image.take().ok_or_else(|| {
+                    Status::invalid_argument("device_set contains duplicate pv-blk")
+                })?;
+                bus.register(
+                    0xD000_4000,
+                    Box::new(dh_devices::blk::PvBlk::new(Box::new(base))),
+                )
+                .map_err(|e| Status::internal(format!("register pv-blk: {e:?}")))?;
+            }
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL => bus
+                .register(0xD000_6000, Box::new(dh_devices::DebugSerial::new()))
+                .map_err(|e| Status::internal(format!("register debug-serial: {e:?}")))?,
+            dh_devices::net::DEVICE_ID_PV_NET => bus
+                .register(
+                    dh_devices::net::PV_NET_BASE,
+                    Box::new(dh_devices::net::PvNet::new()),
+                )
+                .map_err(|e| Status::internal(format!("register pv-net: {e:?}")))?,
+            other => {
+                return Err(Status::failed_precondition(format!(
+                    "device id {other:#06x} is not supported by dh-workerd bus builder"
+                )));
+            }
+        }
+    }
+    Ok(bus)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boot_slot(slot: &dh_vmm::kvm::SlotVm, boot: ResolvedBoot) -> Result<(), Status> {
+    match boot {
+        ResolvedBoot::Elf { kernel, cmdline } => {
+            dh_vmm::boot::load_and_enter(slot, &kernel, &cmdline)
+                .map(|_| ())
+                .map_err(|e| Status::failed_precondition(format!("ELF boot: {e}")))
+        }
+        ResolvedBoot::BzImage { .. } => Err(Status::unimplemented(
+            "BzImage boot is in the wire schema, but dh-vmm currently only boots ELF images",
+        )),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn frame_counter_from_bus(bus: &mut dh_devices::MmioBus) -> u32 {
+    for (_base, dev) in bus.devices_mut() {
+        if dev.device_id() == dh_devices::pad::DEVICE_ID_PV_PAD {
+            if let Some(pad) = dev
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<dh_devices::pad::PvPad>())
+            {
+                return pad.frame_counter();
+            }
+        }
+    }
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
 fn lease_now_ms() -> u64 {
     let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return 0;
@@ -695,23 +1025,250 @@ impl HypervisorWorker for WorkerService {
 
     async fn create_vm(
         &self,
-        _request: Request<proto::CreateVmRequest>,
+        request: Request<proto::CreateVmRequest>,
     ) -> Result<Response<proto::CreateVmResponse>, Status> {
-        Err(unimplemented_status("CreateVm"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            let config = machine_config_from_proto(
+                request
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("missing config"))?,
+            )
+            .map_err(machine_config_error_to_status)?;
+            let entropy_seed =
+                entropy_seed_from_proto("entropy_seed", &request.entropy_seed, false)?
+                    .expect("allow_empty_continue=false");
+            let image_resolver = self.inner.image_resolver.clone();
+            let lease = self
+                .install_allocated_runtime("CreateVm", move |_| {
+                    let assets = image_resolver
+                        .resolve_create_vm(&config)
+                        .map_err(image_error_to_status)?;
+                    let sys = dh_vmm::kvm::KvmSystem::open()
+                        .map_err(|e| kvm_error_to_status("open KVM", e))?;
+                    if !sys.dirty_ring {
+                        return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+                    }
+                    let slot = sys
+                        .create_slot_vm(config.mem_bytes)
+                        .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+                    boot_slot(&slot, assets.boot)?;
+                    let bus = build_bus(&config, assets.base_image)?;
+                    let config_hash = config.config_hash().map_err(|e| {
+                        Status::invalid_argument(format!("MachineConfig hash: {e:?}"))
+                    })?;
+                    runtime_with_log(
+                        slot,
+                        bus,
+                        dh_devices::entropy::DetEntropy::from_seed(entropy_seed),
+                        config,
+                        dh_vmm::hash::StateHashChain::new(&config_hash, &[0; 32]),
+                        None,
+                        crate::runtime::SlotPosition::default(),
+                        entropy_seed,
+                    )
+                })
+                .await?;
+            Ok(Response::new(proto::CreateVmResponse {
+                lease: Some(lease_to_proto(&lease)),
+                icount: 0,
+            }))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("CreateVm"))
+        }
     }
 
     async fn restore_snapshot(
         &self,
-        _request: Request<proto::RestoreSnapshotRequest>,
+        request: Request<proto::RestoreSnapshotRequest>,
     ) -> Result<Response<proto::RestoreSnapshotResponse>, Status> {
-        Err(unimplemented_status("RestoreSnapshot"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            let snapshot_ref = snapshot_ref_from_proto(request.snapshot)?;
+            let requested_seed =
+                entropy_seed_from_proto("entropy_seed", &request.entropy_seed, true)?;
+            if requested_seed == Some([0; 32]) {
+                return Err(Status::invalid_argument(
+                    "entropy_seed must be non-zero when present; omit it to continue snapshot PRNG",
+                ));
+            }
+            let store = self.store()?;
+            let image_resolver = self.inner.image_resolver.clone();
+            let lease = self
+                .install_allocated_runtime("RestoreSnapshot", move |_| {
+                    let config = {
+                        let store = store.lock().map_err(|_| {
+                            Status::internal("snapshot-store client mutex poisoned")
+                        })?;
+                        crate::restore_engine::recover_machine_config(snapshot_ref.clone(), &store)
+                            .map_err(restore_engine_error_to_status)?
+                    };
+                    let assets = image_resolver
+                        .resolve_create_vm(&config)
+                        .map_err(image_error_to_status)?;
+                    let sys = dh_vmm::kvm::KvmSystem::open()
+                        .map_err(|e| kvm_error_to_status("open KVM", e))?;
+                    if !sys.dirty_ring {
+                        return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+                    }
+                    let slot = sys
+                        .create_slot_vm(config.mem_bytes)
+                        .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+                    let mut bus = build_bus(&config, assets.base_image)?;
+                    let mut dirty = dh_vmm::dirty::DirtyPageSet::new(slot.mem_bytes);
+                    let outcome = {
+                        let store = store.lock().map_err(|_| {
+                            Status::internal("snapshot-store client mutex poisoned")
+                        })?;
+                        crate::restore_engine::restore_snapshot(
+                            &slot,
+                            dh_vmm::SlotState::Paused,
+                            &mut bus,
+                            &config,
+                            snapshot_ref.clone(),
+                            None,
+                            Some(&mut dirty),
+                            &store,
+                        )
+                        .map_err(restore_engine_error_to_status)?
+                    };
+                    let entropy = requested_seed
+                        .map(dh_devices::entropy::DetEntropy::from_seed)
+                        .unwrap_or(outcome.entropy);
+                    let frame_counter = frame_counter_from_bus(&mut bus);
+                    runtime_with_log(
+                        slot,
+                        bus,
+                        entropy,
+                        config,
+                        outcome.chain,
+                        Some(snapshot_ref),
+                        crate::runtime::SlotPosition {
+                            cumulative_icount: outcome.cumulative_icount,
+                            segment_icount: 0,
+                            vns: outcome.vns,
+                            epoch_index: outcome.epoch_index,
+                            frame_counter,
+                        },
+                        requested_seed.unwrap_or([0; 32]),
+                    )
+                })
+                .await?;
+            let (config, state_hash, frame_counter) = self
+                .inner
+                .runtimes
+                .with(lease.slot_id, |runtime| {
+                    (
+                        machine_config_to_proto(&runtime.machine_config),
+                        runtime.state_hash(),
+                        runtime.position.frame_counter,
+                    )
+                })
+                .map_err(runtime_error_to_status)?;
+            Ok(Response::new(proto::RestoreSnapshotResponse {
+                lease: Some(lease_to_proto(&lease)),
+                config: Some(config),
+                state_hash: Some(proto::StateHash {
+                    hash: state_hash.to_vec(),
+                }),
+                frame_counter,
+            }))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("RestoreSnapshot"))
+        }
     }
 
     async fn fork(
         &self,
-        _request: Request<proto::ForkRequest>,
+        request: Request<proto::ForkRequest>,
     ) -> Result<Response<proto::ForkResponse>, Status> {
-        Err(unimplemented_status("Fork"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            let parent = lease_from_proto(request.parent)?;
+            let count = usize::try_from(request.count)
+                .map_err(|_| Status::invalid_argument("count does not fit usize"))?;
+            let entropy_seeds =
+                fork_entropy_seeds_from_proto(request.count, &request.entropy_seeds)
+                    .map_err(fork_wire_error_to_status)?;
+            let image_resolver = self.inner.image_resolver.clone();
+            let child_leases = self
+                .install_forked_runtimes(parent.clone(), count, move |table, _leases| {
+                    table
+                        .with_mut(parent.slot_id, |parent_runtime| {
+                            parent_runtime
+                                .slot
+                                .freeze_ram()
+                                .map_err(|e| kvm_error_to_status("freeze parent RAM", e))?;
+                            let sys = dh_vmm::kvm::KvmSystem::open()
+                                .map_err(|e| kvm_error_to_status("open KVM", e))?;
+                            if parent_runtime.position.segment_icount != 0 {
+                                return Err(Status::failed_precondition(
+                                    "Fork requires the parent at its segment base; take a snapshot before forking a dirty segment",
+                                ));
+                            }
+                            let parent_base = parent_runtime.base_snapshot.clone();
+                            let parent_boundary = parent_runtime.boundary_state(true);
+                            let mut out = Vec::with_capacity(entropy_seeds.len());
+                            for seed in entropy_seeds {
+                                let assets = image_resolver
+                                    .resolve_create_vm(&parent_runtime.machine_config)
+                                    .map_err(image_error_to_status)?;
+                                let mut child_bus =
+                                    build_bus(&parent_runtime.machine_config, assets.base_image)?;
+                                let forked = crate::fork_engine::fork_slot(
+                                    &sys,
+                                    &parent_runtime.slot,
+                                    dh_vmm::SlotState::Frozen,
+                                    &parent_runtime.bus,
+                                    &parent_runtime.entropy,
+                                    &parent_runtime.machine_config,
+                                    parent_boundary,
+                                    seed,
+                                    &mut child_bus,
+                                    None,
+                                )
+                                .map_err(fork_engine_error_to_status)?;
+                                out.push(runtime_with_log(
+                                    forked.child,
+                                    child_bus,
+                                    forked.entropy,
+                                    parent_runtime.machine_config.clone(),
+                                    forked.chain,
+                                    parent_base.clone(),
+                                    crate::runtime::SlotPosition {
+                                        cumulative_icount: forked.cumulative_icount,
+                                        segment_icount: 0,
+                                        vns: forked.vns,
+                                        epoch_index: forked.epoch_index,
+                                        frame_counter: parent_runtime.position.frame_counter,
+                                    },
+                                    seed.unwrap_or([0; 32]),
+                                )?);
+                            }
+                            Ok(out)
+                        })
+                        .map_err(runtime_error_to_status)?
+                })
+                .await?;
+            Ok(Response::new(proto::ForkResponse {
+                children: child_leases.iter().map(lease_to_proto).collect(),
+            }))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("Fork"))
+        }
     }
 
     async fn destroy_vm(
@@ -754,9 +1311,174 @@ impl HypervisorWorker for WorkerService {
 
     async fn take_snapshot(
         &self,
-        _request: Request<proto::TakeSnapshotRequest>,
+        request: Request<proto::TakeSnapshotRequest>,
     ) -> Result<Response<proto::TakeSnapshotResponse>, Status> {
-        Err(unimplemented_status("TakeSnapshot"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            if request.capture.is_some() {
+                return Err(unimplemented_status("TakeSnapshot capture"));
+            }
+            let lease = lease_from_proto(request.lease)?;
+            let seal_input_log = request.seal_input_log.unwrap_or(true);
+            let store = self.store()?;
+            let manager = self.inner.manager.clone();
+            let runtimes = self.inner.runtimes.clone();
+            let class = self.inner.class.clone();
+            let snapshot = blocking_lifecycle("TakeSnapshot", move || {
+                let store = store
+                    .lock()
+                    .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
+                let now_ms = lease_now_ms();
+                manager
+                    .validate(&lease, now_ms)
+                    .map_err(slot_error_to_status)?;
+                let slot_state = manager
+                    .slot_info(lease.slot_id)
+                    .map_err(slot_error_to_status)?
+                    .state;
+                runtimes
+                    .with_mut(lease.slot_id, |runtime| {
+                        let boundary = runtime.boundary_state(true);
+                        let segment_icount = runtime.position.segment_icount;
+                        let segment_vns =
+                            segment_vns_from_icount(&runtime.machine_config, segment_icount)?;
+                        let machine_config_hash = runtime
+                            .machine_config
+                            .config_hash()
+                            .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
+                        let source = match runtime.base_snapshot.clone() {
+                            Some(parent) => crate::snapshot_engine::PageSource::Incremental {
+                                parent,
+                                ring: &mut runtime.dirty_ring,
+                                dirty: &mut runtime.dirty,
+                            },
+                            None => crate::snapshot_engine::PageSource::Full,
+                        };
+                        let out = crate::snapshot_engine::take_snapshot(
+                            &runtime.slot,
+                            slot_state,
+                            &runtime.bus,
+                            &runtime.entropy,
+                            &runtime.machine_config,
+                            boundary,
+                            source,
+                            &store,
+                        )
+                        .map_err(snapshot_engine_error_to_status)?;
+                        let input_log_id = if seal_input_log {
+                            match (|| {
+                                let log = runtime.log.take().ok_or_else(|| {
+                                    Status::failed_precondition("no active DHILOG segment to seal")
+                                })?;
+                                let log_bytes = log
+                                    .seal(dh_inputlog::dhilog::SealParams {
+                                        end_snapshot_id: out.snapshot_ref.to_bytes(),
+                                        end_icount: segment_icount,
+                                        end_vns: segment_vns,
+                                        end_state_hash: out.hash_chain,
+                                        stop_reason: dh_vmm::recording::stop_reason_u8(
+                                            dh_vmm::runctl::StopReason::BudgetReached,
+                                        ),
+                                    })
+                                    .map_err(|e| {
+                                        Status::data_loss(format!("seal DHILOG: {e:?}"))
+                                    })?;
+                                let log_container =
+                                    snapstore_client::helpers::build_input_log_container(
+                                        dh_inputlog::DHILOG_FORMAT_VERSION,
+                                        &log_bytes,
+                                    );
+                                let (log_id, _deduped) = store
+                                    .put_input_log(log_container)
+                                    .map_err(|e| store_error_to_status("put_input_log", e))?;
+                                Ok::<_, Status>(log_id.to_bytes().to_vec())
+                            })() {
+                                Ok(log_id) => log_id,
+                                Err(e) => {
+                                    return Err(fault_runtime_after_snapshot_loss(
+                                        manager.as_ref(),
+                                        runtime,
+                                        lease.slot_id,
+                                        "TakeSnapshot lost active DHILOG",
+                                        e,
+                                    ));
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let next_log = new_segment_log(
+                            &runtime.machine_config,
+                            Some(&out.snapshot_ref),
+                            [0; 32],
+                        )
+                        .map_err(|e| {
+                            fault_runtime_after_snapshot_loss(
+                                manager.as_ref(),
+                                runtime,
+                                lease.slot_id,
+                                "TakeSnapshot could not open next DHILOG segment",
+                                e,
+                            )
+                        })?;
+                        if let Err(e) = manager
+                            .set_position(
+                                &lease,
+                                boundary.icount,
+                                Some(out.snapshot_ref.to_bytes()),
+                                lease_now_ms(),
+                            )
+                            .map_err(slot_error_to_status)
+                        {
+                            return Err(fault_runtime_after_snapshot_loss(
+                                manager.as_ref(),
+                                runtime,
+                                lease.slot_id,
+                                "TakeSnapshot could not publish snapshot position",
+                                e,
+                            ));
+                        }
+                        runtime.base_snapshot = Some(out.snapshot_ref.clone());
+                        runtime.log = Some(next_log);
+                        runtime.position.segment_icount = 0;
+                        Ok((
+                            out,
+                            machine_config_hash,
+                            input_log_id,
+                            runtime.position.frame_counter,
+                            boundary.icount,
+                            boundary.vns,
+                        ))
+                    })
+                    .map_err(runtime_error_to_status)?
+            })
+            .await?;
+            let (out, machine_config_hash, input_log_id, frame_counter, icount, vns) = snapshot;
+            Ok(Response::new(proto::TakeSnapshotResponse {
+                snapshot: Some(proto::SnapshotRef {
+                    hash: out.snapshot_ref.to_bytes().to_vec(),
+                }),
+                input_log_id,
+                icount,
+                vns,
+                state_hash: Some(proto::StateHash {
+                    hash: out.hash_chain.to_vec(),
+                }),
+                dirty_pages: u32::try_from(out.pages_shipped).unwrap_or(u32::MAX),
+                machine_config_hash: machine_config_hash.to_vec(),
+                determinism_class: Some(class),
+                feature_bytes: Vec::new(),
+                fb_lz4: Vec::new(),
+                fb_info: None,
+                frame_counter,
+            }))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("TakeSnapshot"))
+        }
     }
 
     async fn quiesce(
@@ -857,7 +1579,76 @@ mod tests {
                 host_kernel: "test-kernel".into(),
                 vmm_version: "test-vmm".into(),
             },
+            #[cfg(target_arch = "x86_64")]
+            image_cache_dir: std::env::temp_dir(),
+            #[cfg(target_arch = "x86_64")]
+            snapstore: None,
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn test_config_with_resources(
+        slots: usize,
+        image_cache_dir: PathBuf,
+        snapstore: Option<snapstore_client::Transport>,
+    ) -> WorkerConfig {
+        WorkerConfig {
+            image_cache_dir,
+            snapstore,
+            ..test_config(slots)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_cache_blob(root: &Path, bytes: &[u8]) -> [u8; 32] {
+        let hash = *blake3::hash(bytes).as_bytes();
+        std::fs::write(root.join(crate::image_resolver::cache_key(&hash)), bytes).unwrap();
+        hash
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn service_machine_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::MachineConfig {
+        let mut config = dh_vmm::config::MachineConfig::new(
+            2 * 1024 * 1024,
+            base_hash,
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash,
+                cmdline: b"1000000".to_vec(),
+            },
+        );
+        config.device_set = vec![
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+        machine_config_to_proto(&config)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn spawn_store_for_service_test() -> (
+        tokio::runtime::Runtime,
+        snapstore_server::build_server::ServerHandle,
+        tempfile::TempDir,
+        snapstore_client::Transport,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let uds_path = dir.path().join("snapstore.sock");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = snapstore_server::config::ServerConfig {
+            data_root: dir.path().to_path_buf(),
+            grpc_tcp_addr: "127.0.0.1:0".parse().unwrap(),
+            grpc_uds_path: Some(uds_path.clone()),
+            page_channel_path: Some(dir.path().join("snapstore.sock.pages")),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            pagestore: Default::default(),
+            meta: Default::default(),
+            page_channel: Default::default(),
+        };
+        let (handle, uds) = rt
+            .block_on(snapstore_server::build_server::serve_for_tests(config))
+            .unwrap();
+        (rt, handle, dir, snapstore_client::Transport::Uds(uds))
     }
 
     #[tokio::test]
@@ -983,13 +1774,142 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_surface_does_not_fake_engine_success() {
+    async fn create_vm_rejects_missing_config_before_engine_work() {
         let svc = WorkerService::new(test_config(1)).unwrap();
         let err = svc
             .create_vm(Request::new(proto::CreateVmRequest::default()))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "missing config");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn create_vm_and_take_snapshot_use_real_cache_kvm_and_store() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xA5; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            assert_eq!(created.icount, 0);
+            assert_eq!(svc.runtime_table().occupied_count(), 1);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let snapshot = snap.snapshot.unwrap();
+            assert_eq!(snapshot.hash.len(), 32);
+            assert_eq!(snap.input_log_id.len(), 32);
+            assert_eq!(snap.icount, 0);
+            assert_eq!(snap.vns, 0);
+            assert_eq!(snap.state_hash.unwrap().hash.len(), 32);
+            assert_eq!(snap.machine_config_hash.len(), 32);
+            assert_eq!(snap.dirty_pages, 512);
+            assert_eq!(snap.frame_counter, 0);
+            assert_eq!(
+                svc.slot_manager()
+                    .slot_info(lease.slot_id)
+                    .unwrap()
+                    .base_snapshot_id,
+                Some(snapshot.hash.try_into().unwrap())
+            );
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn take_snapshot_defaults_to_sealing_and_rejects_capture() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xA5; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+
+            let capture_err = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: Some(proto::CaptureSpec::default()),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(capture_err.code(), tonic::Code::Unimplemented);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease),
+                    seal_input_log: None,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(snap.input_log_id.len(), 32);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn restore_rejects_explicit_zero_entropy_seed() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let err = svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(proto::SnapshotRef {
+                    hash: vec![0x11; 32],
+                }),
+                entropy_seed: vec![0; 32],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("omit it to continue"));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1315,6 +2235,42 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn fork_rejects_parent_that_advanced_within_segment() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let svc = WorkerService::new(test_config(2)).unwrap();
+        let parent = svc
+            .install_allocated_runtime("CreateVm", |_| {
+                make_runtime(
+                    0x23,
+                    SlotPosition {
+                        cumulative_icount: 100,
+                        segment_icount: 100,
+                        vns: 100,
+                        epoch_index: 0,
+                        frame_counter: 0,
+                    },
+                    Some(snapstore_types::SnapshotRef::from_bytes([0x23; 32])),
+                )
+            })
+            .await
+            .unwrap();
+
+        let err = svc
+            .fork(Request::new(proto::ForkRequest {
+                parent: Some(lease_to_proto(&parent)),
+                count: 1,
+                entropy_seeds: vec![],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("take a snapshot before forking"));
     }
 
     #[cfg(target_arch = "x86_64")]

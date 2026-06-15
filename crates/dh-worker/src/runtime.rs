@@ -160,6 +160,9 @@ pub struct SlotRuntime {
     pub slot: dh_vmm::kvm::SlotVm,
     pub bus: dh_devices::MmioBus,
     pub entropy: dh_devices::entropy::DetEntropy,
+    /// Active DHILOG segment for this slot. Lifecycle RPCs create a fresh
+    /// segment; Run wiring records into it and TakeSnapshot seals it.
+    pub log: Option<dh_inputlog::dhilog::LogWriter>,
     pub machine_config: dh_vmm::config::MachineConfig,
     pub dirty_ring: dh_vmm::dirty::DirtyRing,
     pub dirty: dh_vmm::dirty::DirtyPageSet,
@@ -189,6 +192,7 @@ impl SlotRuntime {
             slot,
             bus,
             entropy,
+            log: None,
             machine_config,
             dirty_ring,
             dirty,
@@ -206,6 +210,7 @@ impl SlotRuntime {
             slot: parts.slot,
             bus: parts.bus,
             entropy: parts.entropy,
+            log: parts.log,
             machine_config: parts.machine_config,
             dirty_ring: parts.dirty_ring,
             dirty: parts.dirty,
@@ -270,6 +275,7 @@ pub struct SlotRuntimeParts {
     pub slot: dh_vmm::kvm::SlotVm,
     pub bus: dh_devices::MmioBus,
     pub entropy: dh_devices::entropy::DetEntropy,
+    pub log: Option<dh_inputlog::dhilog::LogWriter>,
     pub machine_config: dh_vmm::config::MachineConfig,
     pub dirty_ring: dh_vmm::dirty::DirtyRing,
     pub dirty: dh_vmm::dirty::DirtyPageSet,
