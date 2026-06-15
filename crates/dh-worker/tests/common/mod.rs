@@ -61,6 +61,28 @@ impl dh_devices::ctx::GuestMem for VmMem {
     }
 }
 
+impl detguest_host::GuestMem for VmMem {
+    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), detguest_host::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .read_slice(out, vm_memory::GuestAddress(gpa))
+            .map_err(|_| detguest_host::MemError::Unmapped {
+                gpa,
+                len: out.len(),
+            })
+    }
+
+    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), detguest_host::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .write_slice(data, vm_memory::GuestAddress(gpa))
+            .map_err(|_| detguest_host::MemError::Unmapped {
+                gpa,
+                len: data.len(),
+            })
+    }
+}
+
 /// Real store on a side runtime; the engines stay synchronous and reach
 /// it via the blocking facade (the production shape).
 // Each test target compiles this module independently; not every target

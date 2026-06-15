@@ -7,9 +7,16 @@
 
 mod common;
 
-use common::{kvm_available, spawn_store_blocking, test_bus, CLOCK_BASE};
+use common::{kvm_available, spawn_store_blocking, test_bus, VmMem, CLOCK_BASE};
+use detguest_host::LogFaultPlan;
+use detguest_wire::header::{
+    ChannelHeader, CHANNEL_SIZE, CHANNEL_SIZE_PAGES, OFF_MANIFEST, OFF_RESERVED,
+};
+use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
+use detguest_wire::ports::{PORT_INIT_GO, PORT_INIT_HI, PORT_INIT_LO};
 use dh_devices::clock::{REG_TIMER_DEADLINE, REG_VNS};
 use dh_devices::ctx::VecGuestMem;
+use dh_devices::detchannel::DetChannelDevice;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::{DevCtx, EntropySource, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
@@ -24,9 +31,13 @@ use dh_worker::snapshot_engine::{
 };
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;
-use vm_memory::{Bytes, GuestAddress};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
+const DETCHANNEL_MMIO_BASE: u64 = 0xD000_5000;
+const DETCHANNEL_GPA: u64 = 0;
+
+type TestDetChannel = DetChannelDevice<VmMem, LogFaultPlan, fn() -> LogFaultPlan>;
 
 fn test_config() -> MachineConfig {
     MachineConfig::new(
@@ -76,6 +87,41 @@ fn bus_state(bus: &MmioBus) -> Vec<(u16, Vec<u8>)> {
             (d.device_id(), s)
         })
         .collect()
+}
+
+fn detchannel_for_slot(slot: &dh_vmm::kvm::SlotVm) -> TestDetChannel {
+    DetChannelDevice::new(
+        VmMem(slot.guest_mem.clone()),
+        LogFaultPlan::default(),
+        LogFaultPlan::default,
+    )
+}
+
+fn add_detchannel(bus: &mut MmioBus, slot: &dh_vmm::kvm::SlotVm) {
+    bus.register(DETCHANNEL_MMIO_BASE, Box::new(detchannel_for_slot(slot)))
+        .unwrap();
+}
+
+fn detchannel_mut(bus: &mut MmioBus) -> &mut TestDetChannel {
+    bus.devices_mut()
+        .find_map(|(_base, dev)| dev.as_any_mut()?.downcast_mut::<TestDetChannel>())
+        .expect("DetChannelDevice on bus")
+}
+
+fn write_channel_page(mem: &GuestMemoryMmap<()>) {
+    assert!(CHANNEL_SIZE as u64 <= MEM);
+    let mut header = [0u8; OFF_RESERVED];
+    ChannelHeader::canonical().write_to(&mut header).unwrap();
+    mem.write_slice(&header, GuestAddress(DETCHANNEL_GPA))
+        .unwrap();
+
+    let mut manifest = vec![0u8; MANIFEST_TOTAL_SIZE];
+    init_manifest(&mut manifest).unwrap();
+    mem.write_slice(
+        &manifest,
+        GuestAddress(DETCHANNEL_GPA + OFF_MANIFEST as u64),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -180,6 +226,65 @@ fn full_restore_is_transparent_and_reseeds_the_segment_clocks() {
         u64::from_le_bytes(buf)
     });
     assert_eq!(vns_read, 1_000_000);
+}
+
+#[test]
+fn restore_device_loop_reattaches_detchannel_evtc_after_ram_load() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let sys = KvmSystem::open().unwrap();
+    let config = test_config();
+
+    let slot_a = sys.create_slot_vm(MEM).unwrap();
+    write_channel_page(&slot_a.guest_mem);
+    let mut bus_a = test_bus();
+    add_detchannel(&mut bus_a, &slot_a);
+    with_ctx(0, |ctx| {
+        let host = detchannel_mut(&mut bus_a).host_mut();
+        host.pio_out(PORT_INIT_LO, DETCHANNEL_GPA as u32, ctx);
+        host.pio_out(PORT_INIT_HI, (DETCHANNEL_GPA >> 32) as u32, ctx);
+        host.pio_out(PORT_INIT_GO, CHANNEL_SIZE_PAGES, ctx);
+        assert_eq!(host.channel_gpa(), Some(DETCHANNEL_GPA));
+        assert!(host.manifest().is_some());
+    });
+
+    let entropy_a = DetEntropy::from_seed([0x42; 32]);
+    let snap = take_snapshot(
+        &slot_a,
+        SlotState::Paused,
+        &bus_a,
+        &entropy_a,
+        &config,
+        boundary(),
+        PageSource::Full,
+        &store,
+    )
+    .expect("take_snapshot A");
+
+    let slot_b = sys.create_slot_vm(MEM).unwrap();
+    let mut bus_b = test_bus();
+    add_detchannel(&mut bus_b, &slot_b);
+    let outcome = restore_snapshot(
+        &slot_b,
+        SlotState::Paused,
+        &mut bus_b,
+        &config,
+        snap.snapshot_ref.clone(),
+        None,
+        None,
+        &store,
+    )
+    .expect("restore_snapshot");
+
+    let restored = detchannel_mut(&mut bus_b).host();
+    assert_eq!(restored.channel_gpa(), Some(DETCHANNEL_GPA));
+    assert!(restored.manifest().is_some());
+    assert_eq!(restored.metrics.manifest_read_failures, 0);
+    assert_eq!(outcome.pages_loaded, MEM / PAGE_SIZE);
+    assert_eq!(bus_state(&bus_b), bus_state(&bus_a));
 }
 
 /// The headline M4 property, isolated: the restored entropy stays at its

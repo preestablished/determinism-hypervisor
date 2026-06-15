@@ -502,6 +502,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "detguest-host",
+ "detguest-wire",
  "dh-detclock",
  "dh-devices",
  "dh-inputlog",

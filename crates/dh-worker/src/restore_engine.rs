@@ -5,12 +5,10 @@
 //! `from_value`, counter re-zero).
 //!
 //! ORDER IS LOAD-BEARING: §8.3 fixes RAM → devices → vCPU because device
-//! restore is allowed to validate against live guest RAM. No bus device
-//! exercises that yet — DetChannelHost's EVTC re-attach (detchannel.rs) is
-//! the intended consumer, but it does not implement `DetDevice` today (its
-//! restore needs a fault plan; putting it on the bus is slot-manager
-//! integration, bead ol1) — the engine honors the contract NOW so that
-//! landing never reorders this function.
+//! restore is allowed to validate against live guest RAM. DetChannelDevice's
+//! EVTC re-attach (detchannel.rs) is the load-bearing consumer: its restore
+//! needs the restored RAM page to hold the guest-sdk channel header before
+//! the device loop supplies a fresh fault plan and re-attaches.
 //! The vCPU goes last; `vcpu_state::restore` owns the §8.3 KVM_SET_* order
 //! internally (SREGS→REGS→FPU→XCRS→XSAVE→DEBUGREGS→EVENTS→MSRs last,
 //! IA32_TSC ← vns).
