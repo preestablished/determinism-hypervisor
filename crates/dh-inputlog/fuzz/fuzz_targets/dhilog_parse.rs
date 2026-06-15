@@ -9,6 +9,20 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    if let Ok(inspection) = dh_inputlog::reader::LogInspection::parse_unsealed(data) {
+        let _ = inspection.header();
+        let _ = inspection.stop();
+        for rec in inspection.records() {
+            let _ = rec.kind();
+            let _ = rec.rflags();
+            let _ = rec.seq();
+            let _ = rec.icount();
+            let _ = rec.boundary_rip();
+            let _ = rec.is_aux();
+            let _ = rec.body();
+        }
+    }
+
     let Ok(log) = dh_inputlog::reader::LogReader::parse(data) else {
         return;
     };
