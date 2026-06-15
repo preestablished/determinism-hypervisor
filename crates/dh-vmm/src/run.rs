@@ -170,6 +170,9 @@ pub enum PinError {
 /// Pin the CURRENT thread to `core` (the vCPU thread calls this with its
 /// slot's dedicated isolated core before first guest entry).
 pub fn pin_current_thread(core: u32) -> Result<(), PinError> {
+    if core as usize >= libc::CPU_SETSIZE as usize {
+        return Err(PinError::Affinity(libc::EINVAL));
+    }
     // SAFETY: cpu_set_t is plain data, zero-initialized on the stack and
     // populated through libc's CPU_SET accessor; sched_setaffinity(0, ..)
     // targets the calling thread only.
@@ -220,6 +223,19 @@ mod tests {
         #[allow(unsafe_code)]
         unsafe {
             libc::syscall(libc::SYS_gettid) as i32
+        }
+    }
+
+    #[test]
+    fn pin_current_thread_rejects_cpu_set_overflow() {
+        let first_invalid = u32::try_from(libc::CPU_SETSIZE)
+            .unwrap_or(u32::MAX)
+            .min(u32::MAX - 1);
+        for core in [first_invalid, first_invalid + 1] {
+            assert_eq!(
+                pin_current_thread(core),
+                Err(PinError::Affinity(libc::EINVAL))
+            );
         }
     }
 

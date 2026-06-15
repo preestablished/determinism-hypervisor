@@ -14,6 +14,7 @@ use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
 use prost::Message;
 use std::convert::TryFrom;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -194,8 +195,12 @@ fn prepare_uds_path(path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("refusing to remove non-socket UDS path {}", path.display()),
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -263,6 +268,9 @@ pub fn slot_error_to_status(e: SlotError) -> Status {
         SlotError::ZeroChildFork { .. } => {
             Status::with_details(Code::InvalidArgument, message, details)
         }
+        SlotError::DuplicateCore { .. } => {
+            Status::with_details(Code::InvalidArgument, message, details)
+        }
         SlotError::NoSuchSlot(_)
         | SlotError::State(_)
         | SlotError::StaleLease { .. }
@@ -282,7 +290,10 @@ fn slot_error_id(e: &SlotError) -> Option<u64> {
         | SlotError::LiveChildren { slot_id, .. }
         | SlotError::CowChildCannotFork { slot_id }
         | SlotError::ZeroChildFork { slot_id } => Some(*slot_id),
-        SlotError::State(_) | SlotError::NoFreeSlot | SlotError::NotEnoughCores { .. } => None,
+        SlotError::State(_)
+        | SlotError::NoFreeSlot
+        | SlotError::NotEnoughCores { .. }
+        | SlotError::DuplicateCore { .. } => None,
     }
 }
 
@@ -297,6 +308,7 @@ fn slot_error_code(e: &SlotError) -> &'static str {
         SlotError::ZeroChildFork { .. } => "zero_child_fork",
         SlotError::NoFreeSlot => "no_free_slot",
         SlotError::NotEnoughCores { .. } => "not_enough_cores",
+        SlotError::DuplicateCore { .. } => "duplicate_core",
     }
 }
 
@@ -356,15 +368,21 @@ impl WorkerService {
         let manager = self.inner.manager.clone();
         let runtimes = self.inner.runtimes.clone();
         blocking_lifecycle("DestroyVm", move || {
-            runtimes
-                .ensure_occupied(lease.slot_id)
-                .map_err(runtime_error_to_status)?;
+            let now_ms = lease_now_ms();
             manager
-                .destroy(&lease, lease_now_ms())
+                .check_destroy(&lease, now_ms)
                 .map_err(slot_error_to_status)?;
-            let _runtime = runtimes
+            let runtime = runtimes
                 .take(lease.slot_id)
                 .map_err(runtime_error_to_status)?;
+            if let Err(e) = manager.destroy(&lease, now_ms) {
+                if let Err(reinsert) = runtimes.insert(lease.slot_id, runtime) {
+                    return Err(Status::internal(format!(
+                        "DestroyVm failed after runtime removal: {e:?}; runtime restore failed: {reinsert}"
+                    )));
+                }
+                return Err(slot_error_to_status(e));
+            }
             Ok(())
         })
         .await
@@ -617,9 +635,52 @@ mod tests {
             tonic::Code::InvalidArgument
         );
         assert_eq!(
+            slot_error_to_status(SlotError::DuplicateCore { core: 2 }).code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
             slot_error_to_status(SlotError::StaleLease { slot_id: 3 }).code(),
             tonic::Code::FailedPrecondition
         );
+    }
+
+    #[test]
+    fn uds_prepare_removes_only_stale_sockets() {
+        let root = std::env::temp_dir().join(format!(
+            "dh-worker-uds-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("anon")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("worker.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let err = prepare_uds_path(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "regular file must not be removed");
+        std::fs::remove_file(&path).unwrap();
+
+        let target = root.join("target.sock");
+        let target_listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = prepare_uds_path(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must not be followed and removed"
+        );
+        std::fs::remove_file(&path).unwrap();
+        drop(target_listener);
+        std::fs::remove_file(&target).unwrap();
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        prepare_uds_path(&path).unwrap();
+        assert!(!path.exists(), "stale socket should be removed");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

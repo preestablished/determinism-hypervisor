@@ -36,6 +36,7 @@
 //! fd death) cascades by marking every live child Faulted first.
 
 use dh_vmm::{SlotState, SlotStateError};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// 16 random bytes, the proto `Lease.token` payload.
@@ -127,6 +128,10 @@ pub enum SlotError {
         slots: usize,
         cores: usize,
     },
+    /// Core map assigns the same physical core to more than one slot.
+    DuplicateCore {
+        core: u32,
+    },
 }
 
 impl From<SlotStateError> for SlotError {
@@ -188,6 +193,7 @@ pub fn default_slot_count(physical_cores: usize) -> usize {
 /// the `preflight::SLOT_CORES` format.
 pub fn parse_core_list(spec: &str) -> Option<Vec<u32>> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for part in spec.split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -199,9 +205,20 @@ pub fn parse_core_list(spec: &str) -> Option<Vec<u32>> {
                 if a > b {
                     return None;
                 }
-                out.extend(a..=b);
+                for core in a..=b {
+                    if !seen.insert(core) {
+                        return None;
+                    }
+                    out.push(core);
+                }
             }
-            None => out.push(part.parse().ok()?),
+            None => {
+                let core = part.parse().ok()?;
+                if !seen.insert(core) {
+                    return None;
+                }
+                out.push(core);
+            }
         }
     }
     (!out.is_empty()).then_some(out)
@@ -221,6 +238,12 @@ impl SlotManager {
         policy: LeasePolicy,
         tokens: TokenSource,
     ) -> Result<Self, SlotError> {
+        let mut seen = HashSet::new();
+        for &core in &cores {
+            if !seen.insert(core) {
+                return Err(SlotError::DuplicateCore { core });
+            }
+        }
         if n_slots > cores.len() {
             return Err(SlotError::NotEnoughCores {
                 slots: n_slots,
@@ -248,7 +271,10 @@ impl SlotManager {
 
     fn mint(&self, now_ms: u64) -> (LeaseToken, Option<u64>) {
         let token = (self.tokens)();
-        (token, self.policy.ttl_ms.map(|ttl| now_ms + ttl))
+        (
+            token,
+            self.policy.ttl_ms.map(|ttl| now_ms.saturating_add(ttl)),
+        )
     }
 
     /// Token + expiry check for `lease` against its slot. Every mutating
@@ -309,7 +335,7 @@ impl SlotManager {
             .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
         Self::validate_entry(entry, lease, now_ms)?;
         if let (Some(ttl), Some((_, expires))) = (self.policy.ttl_ms, entry.lease.as_mut()) {
-            *expires = Some(now_ms + ttl);
+            *expires = Some(now_ms.saturating_add(ttl));
         }
         Ok(())
     }
@@ -469,17 +495,34 @@ impl SlotManager {
         if idx >= slots.len() {
             return Err(SlotError::NoSuchSlot(lease.slot_id));
         }
-        Self::validate_entry(&slots[idx], lease, now_ms)?;
-        if slots[idx].live_children > 0 {
+        Self::check_destroy_entry(&slots[idx], lease, now_ms)?;
+        Self::release(&mut slots, idx);
+        Ok(())
+    }
+
+    /// Validate that `destroy` would be accepted without publishing the
+    /// slot as Empty. The daemon uses this before removing runtime
+    /// resources so runtime teardown and slot-manager release cannot
+    /// diverge.
+    pub fn check_destroy(&self, lease: &Lease, now_ms: u64) -> Result<(), SlotError> {
+        let slots = self.slots.lock().expect("slot table poisoned");
+        let idx = lease.slot_id as usize;
+        if idx >= slots.len() {
+            return Err(SlotError::NoSuchSlot(lease.slot_id));
+        }
+        Self::check_destroy_entry(&slots[idx], lease, now_ms)
+    }
+
+    fn check_destroy_entry(entry: &SlotEntry, lease: &Lease, now_ms: u64) -> Result<(), SlotError> {
+        Self::validate_entry(entry, lease, now_ms)?;
+        if entry.live_children > 0 {
             return Err(SlotError::LiveChildren {
                 slot_id: lease.slot_id,
-                children: slots[idx].live_children,
+                children: entry.live_children,
             });
         }
-        // Gate-only: the Ok value is discarded on purpose — release()
-        // below resets the whole entry (including state) to Empty.
-        slots[idx].state.transition(SlotState::Empty)?;
-        Self::release(&mut slots, idx);
+        // Gate-only: destroy() later resets the whole entry to Empty.
+        entry.state.transition(SlotState::Empty)?;
         Ok(())
     }
 
@@ -689,10 +732,16 @@ mod tests {
         assert_eq!(parse_core_list("2,4-5"), Some(vec![2, 4, 5]));
         assert_eq!(parse_core_list(""), None);
         assert_eq!(parse_core_list("5-2"), None);
+        assert_eq!(parse_core_list("2,2"), None);
+        assert_eq!(parse_core_list("2-3,3"), None);
         // Dedicated core per slot, no oversubscription.
         assert!(matches!(
             SlotManager::new(5, vec![2, 3, 4, 5], LeasePolicy::default()),
             Err(SlotError::NotEnoughCores { slots: 5, cores: 4 })
+        ));
+        assert!(matches!(
+            SlotManager::new(2, vec![2, 2], LeasePolicy::default()),
+            Err(SlotError::DuplicateCore { core: 2 })
         ));
     }
 
@@ -706,6 +755,8 @@ mod tests {
         assert_eq!(m.allocate(0), Err(SlotError::NoFreeSlot));
         assert_eq!(m.slot_info(a.slot_id).unwrap().state, SlotState::Paused);
         // Destroy returns the slot to the pool.
+        m.check_destroy(&a, 0).unwrap();
+        assert_eq!(m.slot_info(a.slot_id).unwrap().state, SlotState::Paused);
         m.destroy(&a, 0).unwrap();
         assert_eq!(m.slot_info(a.slot_id).unwrap().state, SlotState::Empty);
         assert!(m.allocate(0).is_ok());
@@ -974,6 +1025,16 @@ mod tests {
         assert_eq!(m.slot_info(b.slot_id).unwrap().state, SlotState::Empty);
         assert!(m.validate(&a, 150).is_ok());
         assert_eq!(m.reclaim_expired(190), vec![a.slot_id]);
+
+        let overflow = manager(1, LeasePolicy::with_ttl(100));
+        let lease = overflow.allocate(u64::MAX - 1).unwrap();
+        assert!(overflow.validate(&lease, u64::MAX - 1).is_ok());
+        assert_eq!(
+            overflow.validate(&lease, u64::MAX),
+            Err(SlotError::LeaseExpired {
+                slot_id: lease.slot_id
+            })
+        );
     }
 
     #[test]
