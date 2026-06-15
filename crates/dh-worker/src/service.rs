@@ -3058,24 +3058,13 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn epoch_hashes(log_bytes: &[u8]) -> Vec<(u64, u64, [u8; 32])> {
-        dh_inputlog::reader::LogReader::parse(log_bytes)
-            .unwrap()
-            .aux()
-            .filter_map(|rec| match rec.body() {
-                dh_inputlog::reader::RecordBody::EpochHash {
-                    epoch_index,
-                    chain_value,
-                } => Some((epoch_index, rec.icount(), chain_value)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[cfg(target_arch = "x86_64")]
     fn capture_epoch_leg(
         capture: bool,
-    ) -> (dh_vmm::runctl::SegmentOutcome, Vec<(u64, u64, [u8; 32])>) {
+    ) -> (
+        dh_vmm::runctl::SegmentOutcome,
+        Vec<(u64, u64, [u8; 32])>,
+        [u8; 32],
+    ) {
         dh_vmm::run::install_kick_handler().unwrap();
         let sys = dh_vmm::kvm::KvmSystem::open().unwrap();
         let mut slot = sys.create_slot_vm(8 * 1024 * 1024).unwrap();
@@ -3207,7 +3196,17 @@ mod tests {
             assert_eq!(out.feature_bytes, capture_fixture_bytes(8, 24));
             assert!(!out.fb_lz4.is_empty());
         }
-        (outcome, epochs)
+        let mut post_capture_chain = dh_vmm::hash::StateHashChain::from_value(outcome.state_hash);
+        let device_sections = dh_vmm::hash::device_sections(&rail.bus);
+        post_capture_chain
+            .push_final_link(
+                &slot,
+                &device_sections,
+                outcome.boundary.icount,
+                outcome.vns,
+            )
+            .unwrap();
+        (outcome, epochs, post_capture_chain.value())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3215,7 +3214,6 @@ mod tests {
         run: proto::RunResponse,
         snap: proto::TakeSnapshotResponse,
         log_bytes: Vec<u8>,
-        epoch_hashes: Vec<(u64, u64, [u8; 32])>,
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3274,7 +3272,6 @@ mod tests {
         })
         .await
         .unwrap();
-        let epoch_hashes = epoch_hashes(&log_bytes);
         svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
             .await
             .unwrap();
@@ -3282,7 +3279,6 @@ mod tests {
             run,
             snap,
             log_bytes,
-            epoch_hashes,
         }
     }
 
@@ -3981,8 +3977,9 @@ mod tests {
             return;
         }
 
-        let (plain_epoch_out, plain_epochs) = capture_epoch_leg(false);
-        let (captured_epoch_out, captured_epochs) = capture_epoch_leg(true);
+        let (plain_epoch_out, plain_epochs, plain_post_capture_hash) = capture_epoch_leg(false);
+        let (captured_epoch_out, captured_epochs, captured_post_capture_hash) =
+            capture_epoch_leg(true);
         assert!(
             !plain_epochs.is_empty(),
             "acceptance fixture must exercise epoch hash records"
@@ -3991,6 +3988,10 @@ mod tests {
         assert_eq!(
             captured_epochs, plain_epochs,
             "capture must not perturb epoch hashes"
+        );
+        assert_eq!(
+            captured_post_capture_hash, plain_post_capture_hash,
+            "capture must not perturb state/device hash after the capture boundary"
         );
 
         let image_cache = tempfile::TempDir::new().unwrap();
@@ -4054,10 +4055,6 @@ mod tests {
             assert_eq!(
                 captured.log_bytes, plain.log_bytes,
                 "capture must not perturb the sealed DHILOG"
-            );
-            assert_eq!(
-                captured.epoch_hashes, plain.epoch_hashes,
-                "capture must not perturb service DHILOG epoch records"
             );
 
             let bad_capture =
