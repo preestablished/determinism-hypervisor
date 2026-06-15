@@ -15,8 +15,8 @@ dh-verify.workspace = true
 dh-vmm.workspace = true
 libc.workspace = true
 prost.workspace = true
-tokio = { workspace = true, features = ["net"] }
-tokio-stream = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+tokio-stream = { workspace = true, features = ["net", "sync"] }
 tonic.workspace = true
 
 # The snapshot engine (src/snapshot_engine.rs) talks to the REAL store
