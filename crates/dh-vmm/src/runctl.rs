@@ -56,6 +56,17 @@ pub enum Until {
 // mapping job, never runctl's — wiring a raw proto 0 through here caps
 // the run at the start boundary.
 
+/// Per-run audit knobs that do not change the machine identity. They are
+/// caller policy, not [`MachineConfig`] preimage: replay/soak drivers must
+/// pass the same options when comparing audit chains.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Force full-memory epoch links even when `MachineConfig.hash_epochs`
+    /// is `FinalOnly`. This is deliberately expensive: it is a soak-run
+    /// audit mode for dirty-tracking misses (risk R8).
+    pub paranoid_hash: bool,
+}
+
 /// Why the segment stopped (mirrors proto StopReason).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -205,7 +216,18 @@ pub fn run_segment(
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
-    run_segment_with_epochs(seg, until, goal, on_exit, &mut |_, _, _| Ok(()))
+    run_segment_with_options(seg, until, RunOptions::default(), goal, on_exit)
+}
+
+/// [`run_segment`] with caller-supplied audit options and no epoch sink.
+pub fn run_segment_with_options(
+    seg: &mut Segment<'_>,
+    until: Until,
+    options: RunOptions,
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
+    run_segment_with_epoch_options(seg, until, options, goal, on_exit, &mut |_, _, _| Ok(()))
 }
 
 /// `run_segment` plus the M5 epoch-link sink (bead y62): every §8.5
@@ -229,6 +251,18 @@ pub fn run_segment(
 pub fn run_segment_with_epochs(
     seg: &mut Segment<'_>,
     until: Until,
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
+    run_segment_with_epoch_options(seg, until, RunOptions::default(), goal, on_exit, epoch_sink)
+}
+
+/// [`run_segment_with_epochs`] plus non-canonical run audit options.
+pub fn run_segment_with_epoch_options(
+    seg: &mut Segment<'_>,
+    until: Until,
+    options: RunOptions,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
@@ -310,14 +344,18 @@ pub fn run_segment_with_epochs(
         None => None,
     };
     let injection_icounts: Vec<u64> = all_injections.iter().map(|i| i.icount).collect();
+    let epoch_hashes_enabled =
+        seg.config.hash_epochs == crate::config::HashEpochs::EpochsOn || options.paranoid_hash;
     let inputs = AgendaInputs {
         start_icount: seg.start_icount,
         injections: &injection_icounts,
-        // FinalOnly drops the epoch HASH grid; the pause roll-forward grid
-        // below is independent config arithmetic either way.
-        epoch_len: match seg.config.hash_epochs {
-            crate::config::HashEpochs::EpochsOn => std::num::NonZeroU64::new(seg.config.epoch_len),
-            crate::config::HashEpochs::FinalOnly => None,
+        // FinalOnly drops the epoch HASH grid unless paranoid audit mode
+        // forces it back on; the pause roll-forward grid below is
+        // independent config arithmetic either way.
+        epoch_len: if epoch_hashes_enabled {
+            std::num::NonZeroU64::new(seg.config.epoch_len)
+        } else {
+            None
         },
         goal_poll_period,
         final_stop,
@@ -507,6 +545,17 @@ pub fn run_segment_with_epochs(
         // Asynchronous Pause (§3.3): honored at deterministic points only —
         // roll FORWARD to the next epoch boundary, hash it, report Paused.
         if seg.pause.load(Ordering::Relaxed) {
+            if point.epoch_hash {
+                return Ok(SegmentOutcome {
+                    reason: StopReason::Paused,
+                    boundary,
+                    vns,
+                    state_hash: seg.chain.value(),
+                    injections_delivered: delivered,
+                    timer_fired,
+                    frames_elapsed: frames_seen,
+                });
+            }
             let epoch = seg.config.epoch_len.max(1);
             let next_epoch = point.icount.div_ceil(epoch).max(1) * epoch;
             let b = unwind_or!(
@@ -527,11 +576,10 @@ pub fn run_segment_with_epochs(
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             // The roll-forward lands ON the epoch grid by construction —
             // this link IS an epoch hash (b.icount is a grid multiple) —
-            // but only EpochsOn configs RECORD epoch hashes: under
-            // FinalOnly the link still seeds the chain while the sink
-            // stays empty, or a paused FinalOnly log would falsely carry
-            // an EPOCH_HASH record + FLAG (iteration-87 review I1).
-            if seg.config.hash_epochs == crate::config::HashEpochs::EpochsOn {
+            // but only EpochsOn configs normally RECORD epoch hashes. The
+            // paranoid audit option deliberately overrides that for soak
+            // runs that want every full-memory link observable.
+            if epoch_hashes_enabled {
                 epoch_sink(b.icount / epoch, b.icount, seg.chain.value())
                     .map_err(RunError::Boundary)?;
             }
@@ -785,6 +833,97 @@ mod tests {
         assert!(
             out.boundary.icount <= 2 * epoch,
             "pause latency must be <= epoch_len from the first checked point"
+        );
+    }
+
+    #[test]
+    fn paranoid_hash_forces_epoch_grid_under_final_only_live() {
+        let Some((mut slot, counter)) = rig() else {
+            return;
+        };
+        let mut config = test_config();
+        config.hash_epochs = crate::config::HashEpochs::FinalOnly;
+        config.epoch_len = 50_000;
+        let epoch = config.epoch_len;
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let mut epochs = Vec::new();
+        let out = run_segment_with_epoch_options(
+            &mut seg,
+            Until::IcountBudget(3 * epoch),
+            RunOptions {
+                paranoid_hash: true,
+            },
+            &mut never,
+            &mut no_exits,
+            &mut |idx, icount, _value| {
+                epochs.push((idx, icount));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::BudgetReached);
+        assert_eq!(
+            epochs,
+            vec![(1, epoch), (2, 2 * epoch), (3, 3 * epoch)],
+            "paranoid audit mode must force full-memory epoch links even under FinalOnly"
+        );
+    }
+
+    #[test]
+    fn pause_at_paranoid_epoch_does_not_double_hash_live() {
+        let Some((mut slot, counter)) = rig() else {
+            return;
+        };
+        let mut config = test_config();
+        config.hash_epochs = crate::config::HashEpochs::FinalOnly;
+        config.epoch_len = 50_000;
+        let epoch = config.epoch_len;
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(true);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let mut epochs = Vec::new();
+        let out = run_segment_with_epoch_options(
+            &mut seg,
+            Until::IcountBudget(3 * epoch),
+            RunOptions {
+                paranoid_hash: true,
+            },
+            &mut never,
+            &mut no_exits,
+            &mut |idx, icount, _value| {
+                epochs.push((idx, icount));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::Paused);
+        assert_eq!(out.boundary.icount, epoch);
+        assert_eq!(
+            epochs,
+            vec![(1, epoch)],
+            "pause at an already-hashed epoch must not emit a duplicate link"
         );
     }
 
