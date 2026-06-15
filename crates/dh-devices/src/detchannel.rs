@@ -762,6 +762,26 @@ fn wire_view(p: &OwnedPayload) -> Option<(EventKind, EventPayload<'_>)> {
     })
 }
 
+/// Canonical StreamGuestEvents payload bytes for a drained event.
+///
+/// Returns `(EventKind, payload bytes)` where the bytes are exactly the
+/// post-header record payload section, including the wire format's
+/// 8-byte-alignment zero padding. This is the same canonical re-encoding
+/// used for AUX SDK_EVENT digests.
+pub fn stream_guest_event_payload(ev: &GuestEvent) -> Option<(u16, Vec<u8>)> {
+    let (kind, payload) = wire_view(&ev.payload)?;
+    let extra_flags = match &ev.payload {
+        OwnedPayload::NameIntern {
+            reachable_decl: true,
+            ..
+        } => FLAG_REACHABLE_DECL,
+        _ => 0,
+    };
+    let mut buf = vec![0u8; MAX_RECORD_LEN];
+    let n = encode_event(&mut buf, ev.seq, ev.vnanos, extra_flags, &payload).ok()?;
+    Some((kind as u16, buf[RECORD_HEADER_LEN..n].to_vec()))
+}
+
 /// SDK_EVENT fields for a drained event: (stream = EventKind, payload len,
 /// digest8 over the payload bytes).
 ///
@@ -803,24 +823,14 @@ pub fn wire_encoder_fingerprint() -> u64 {
 }
 
 fn sdk_event_digest(ev: &GuestEvent) -> Option<(u16, u32, u64)> {
-    let (kind, payload) = wire_view(&ev.payload)?;
-    let extra_flags = match &ev.payload {
-        OwnedPayload::NameIntern {
-            reachable_decl: true,
-            ..
-        } => FLAG_REACHABLE_DECL,
-        _ => 0,
-    };
-    let mut buf = vec![0u8; MAX_RECORD_LEN];
-    let n = encode_event(&mut buf, ev.seq, ev.vnanos, extra_flags, &payload).ok()?;
     // `len` and the digest cover the record's payload section as framed on
     // the wire — i.e. INCLUDING its 8-byte-alignment zero padding — by
     // design (one definition: "the bytes after the record header").
-    let payload_bytes = &buf[RECORD_HEADER_LEN..n];
+    let (kind, payload_bytes) = stream_guest_event_payload(ev)?;
     Some((
-        kind as u16,
+        kind,
         payload_bytes.len() as u32,
-        LogWriter::digest8(payload_bytes),
+        LogWriter::digest8(&payload_bytes),
     ))
 }
 

@@ -367,6 +367,14 @@ impl Default for RuntimeThreadState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainedGuestEvent {
+    pub stream: u32,
+    pub icount: u64,
+    pub vns: u64,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuedInputAt {
     Icount(u64),
@@ -413,6 +421,7 @@ pub struct SlotRuntime {
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
     pub queued_inputs: Vec<QueuedInput>,
+    pub guest_events: Vec<DrainedGuestEvent>,
     pub next_input_order: u64,
     pub thread: RuntimeThreadState,
     pause: Arc<AtomicBool>,
@@ -445,6 +454,7 @@ impl SlotRuntime {
             base_snapshot,
             position,
             queued_inputs: Vec::new(),
+            guest_events: Vec::new(),
             next_input_order: 0,
             thread: RuntimeThreadState::Parked,
             pause: Arc::new(AtomicBool::new(false)),
@@ -465,6 +475,7 @@ impl SlotRuntime {
             base_snapshot: parts.base_snapshot,
             position: parts.position,
             queued_inputs: parts.queued_inputs,
+            guest_events: parts.guest_events,
             next_input_order: parts.next_input_order,
             thread: parts.thread,
             pause: parts.pause,
@@ -532,6 +543,7 @@ pub struct SlotRuntimeParts {
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
     pub queued_inputs: Vec<QueuedInput>,
+    pub guest_events: Vec<DrainedGuestEvent>,
     pub next_input_order: u64,
     pub thread: RuntimeThreadState,
     pub pause: Arc<AtomicBool>,
