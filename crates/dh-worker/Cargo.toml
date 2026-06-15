@@ -32,6 +32,8 @@ vm-memory.workspace = true
 # segments on the landing-loop guest; it lives HERE because ARCH §1's
 # "nothing depends on dh-worker" rule forbids tests/determinism from
 # importing the engines.
+detguest-host.workspace = true
+detguest-wire.workspace = true
 kvm-ioctls.workspace = true
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }

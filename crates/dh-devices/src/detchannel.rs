@@ -25,6 +25,7 @@
 //! consumes the handle and a failed attach must not cost it.
 
 use crate::ctx::DevCtx;
+use crate::{DetDevice, RestoreError};
 use detguest_host::{
     Channel, ChannelWriteSink, FaultPlan, GuestEvent, GuestMem, InjectResponder, OwnedPayload,
     RegionManifest,
@@ -37,7 +38,9 @@ use detguest_wire::ports::{
 };
 use detguest_wire::record::{EventKind, FLAG_REACHABLE_DECL, MAX_RECORD_LEN, RECORD_HEADER_LEN};
 use detguest_wire::RingId;
-use dh_inputlog::dhilog::{LogWriter, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP, EVENT_RING_PUSH};
+use dh_inputlog::dhilog::{LogWriter, EVENT_CONS_BUMP, EVENT_RING_PUSH};
+
+pub use dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL;
 
 /// `IN 0xD370` answer (guest-sdk owns this ABI value — single source).
 pub use detguest_wire::ports::IDENT_VALUE as IDENT_ANSWER;
@@ -118,6 +121,89 @@ pub struct DetChannelHost<M: GuestMem + Clone, P: FaultPlan> {
     /// Last drain failure, kept alongside the count for diagnostics.
     pub last_drain_error: Option<detguest_host::WireError>,
     pub metrics: DetChannelMetrics,
+}
+
+/// `MmioBus` adapter for the detchannel host state.
+///
+/// The live detchannel ABI is the PIO detcall window; this adapter exists so
+/// snapshot/restore engines can treat EVTC like every other device section.
+/// Device-specific MMIO offsets are therefore RAZ/WI, while the bus still
+/// serves MAGIC/VERSION from [`DetDevice`].
+pub struct DetChannelDevice<M, P, F>
+where
+    M: GuestMem + Clone,
+    P: FaultPlan,
+    F: FnMut() -> P,
+{
+    host: DetChannelHost<M, P>,
+    restore_plan: F,
+}
+
+impl<M, P, F> DetChannelDevice<M, P, F>
+where
+    M: GuestMem + Clone,
+    P: FaultPlan,
+    F: FnMut() -> P,
+{
+    /// Build a bus adapter. `initial_plan` is used for the current segment;
+    /// `restore_plan` must return a fresh plan for every EVTC restore so a
+    /// reused slot cannot leak old occurrence counters into replay decisions.
+    pub fn new(mem: M, initial_plan: P, restore_plan: F) -> Self {
+        Self {
+            host: DetChannelHost::new(mem, initial_plan),
+            restore_plan,
+        }
+    }
+
+    pub fn from_host(host: DetChannelHost<M, P>, restore_plan: F) -> Self {
+        Self { host, restore_plan }
+    }
+
+    pub fn host(&self) -> &DetChannelHost<M, P> {
+        &self.host
+    }
+
+    pub fn host_mut(&mut self) -> &mut DetChannelHost<M, P> {
+        &mut self.host
+    }
+
+    pub fn into_host(self) -> DetChannelHost<M, P> {
+        self.host
+    }
+}
+
+impl<M, P, F> DetDevice for DetChannelDevice<M, P, F>
+where
+    M: GuestMem + Clone + Send + 'static,
+    P: FaultPlan + Send + 'static,
+    F: FnMut() -> P + Send + 'static,
+{
+    fn device_id(&self) -> u16 {
+        DEVICE_ID_DETCHANNEL
+    }
+
+    fn section_version(&self) -> u16 {
+        DetChannelHost::<M, P>::EVTC_VERSION
+    }
+
+    fn mmio_read(&mut self, _off: u64, data: &mut [u8], _ctx: &mut DevCtx) {
+        data.fill(0);
+    }
+
+    fn mmio_write(&mut self, _off: u64, _data: &[u8], _ctx: &mut DevCtx) {}
+
+    fn snapshot(&self, out: &mut Vec<u8>) {
+        self.host.snapshot(out);
+    }
+
+    fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError> {
+        let plan = (self.restore_plan)();
+        self.host.restore(bytes, sec_version, plan)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
@@ -705,6 +791,7 @@ mod tests {
     use super::*;
     use crate::ctx::test_support::FakeEntropy;
     use crate::ctx::VecGuestMem;
+    use crate::MmioBus;
     use detguest_host::{LogFaultPlan, MemError, MockGuestMem, TableFaultPlan};
     use detguest_wire::events::QuiesceMode;
     use detguest_wire::header::OFF_MANIFEST;
@@ -714,6 +801,8 @@ mod tests {
     use dh_inputlog::dhilog::{SegmentHeader, KIND_DEV_EVENT, KIND_SDK_EVENT};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// 2 MiB-aligned channel base for tests.
     const BASE: u64 = 0x1000_0000;
@@ -740,6 +829,30 @@ mod tests {
         init_manifest(&mut area).unwrap();
         gm.write(BASE + OFF_MANIFEST as u64, &area).unwrap();
         SharedMem(Rc::new(RefCell::new(gm)))
+    }
+
+    #[derive(Clone)]
+    struct SendMem(Arc<Mutex<MockGuestMem>>);
+
+    impl GuestMem for SendMem {
+        fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<(), MemError> {
+            self.0.lock().unwrap().read(gpa, buf)
+        }
+
+        fn write(&mut self, gpa: u64, buf: &[u8]) -> Result<(), MemError> {
+            self.0.lock().unwrap().write(gpa, buf)
+        }
+    }
+
+    fn send_channel_page() -> SendMem {
+        let mut gm = MockGuestMem::with_zeroed(BASE, CHANNEL_SIZE);
+        let mut hdr = [0u8; OFF_RESERVED];
+        ChannelHeader::canonical().write_to(&mut hdr).unwrap();
+        gm.write(BASE, &hdr).unwrap();
+        let mut area = vec![0u8; MANIFEST_TOTAL_SIZE];
+        init_manifest(&mut area).unwrap();
+        gm.write(BASE + OFF_MANIFEST as u64, &area).unwrap();
+        SendMem(Arc::new(Mutex::new(gm)))
     }
 
     fn log() -> LogWriter {
@@ -855,6 +968,90 @@ mod tests {
             wire_encoder_fingerprint(),
             "fingerprint must be a pure function of the encoder"
         );
+    }
+
+    #[test]
+    fn detchannel_device_serves_magic_version_and_raz_wi_mmio() {
+        let mut bus = MmioBus::new();
+        bus.register(
+            0xD000_3000,
+            Box::new(DetChannelDevice::new(
+                send_channel_page(),
+                LogFaultPlan::default(),
+                LogFaultPlan::default,
+            )),
+        )
+        .unwrap();
+
+        let mut l = log();
+        with_ctx(&mut l, 0, |ctx| {
+            let mut v4 = [0u8; 4];
+            bus.read(0xD000_3000, &mut v4, ctx).unwrap();
+            assert_eq!(u32::from_le_bytes(v4), u32::from(DEVICE_ID_DETCHANNEL));
+            bus.read(0xD000_3004, &mut v4, ctx).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(v4),
+                u32::from(DetChannelHost::<SendMem, LogFaultPlan>::EVTC_VERSION)
+            );
+
+            bus.write(0xD000_3008, &0xA5A5_A5A5u32.to_le_bytes(), ctx)
+                .unwrap();
+            bus.read(0xD000_3008, &mut v4, ctx).unwrap();
+            assert_eq!(u32::from_le_bytes(v4), 0);
+        });
+    }
+
+    #[test]
+    fn detchannel_device_restores_evtc_with_fresh_plan_factory() {
+        let mut l = log();
+        let mut source = DetChannelDevice::new(
+            send_channel_page(),
+            LogFaultPlan::default(),
+            LogFaultPlan::default,
+        );
+        with_ctx(&mut l, 10, |ctx| {
+            source.host_mut().pio_out(PORT_INIT_LO, BASE as u32, ctx);
+            source
+                .host_mut()
+                .pio_out(PORT_INIT_HI, (BASE >> 32) as u32, ctx);
+            source
+                .host_mut()
+                .pio_out(PORT_INIT_GO, CHANNEL_SIZE_PAGES, ctx);
+            assert_eq!(
+                source.host_mut().pio_in(PORT_INIT_GO, ctx),
+                InitStatus::Ok as u32
+            );
+        });
+
+        let mut section = Vec::new();
+        DetDevice::snapshot(&source, &mut section);
+        assert_eq!(
+            section.len(),
+            DetChannelHost::<SendMem, LogFaultPlan>::EVTC_LEN
+        );
+
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let restore_calls_for_factory = restore_calls.clone();
+        let mut restored =
+            DetChannelDevice::new(send_channel_page(), LogFaultPlan::default(), move || {
+                restore_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                LogFaultPlan::default()
+            });
+        DetDevice::restore(
+            &mut restored,
+            &section,
+            DetChannelHost::<SendMem, LogFaultPlan>::EVTC_VERSION,
+        )
+        .unwrap();
+
+        assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(restored.host().channel_gpa(), Some(BASE));
+        assert!(restored.host().manifest().is_some());
+        assert_eq!(restored.host().metrics.manifest_read_failures, 0);
+
+        let mut restored_section = Vec::new();
+        DetDevice::snapshot(&restored, &mut restored_section);
+        assert_eq!(restored_section, section);
     }
 
     #[test]

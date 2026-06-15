@@ -21,7 +21,7 @@ pub mod serial;
 
 pub use bus::{BusError, MmioBus, WINDOW_LEN};
 pub use ctx::{DevCtx, EntropySource, GuestMem, IrqRequest, MemError};
-pub use detchannel::{DetChannelHost, DetChannelMetrics};
+pub use detchannel::{DetChannelDevice, DetChannelHost, DetChannelMetrics};
 pub use serial::DebugSerial;
 
 pub const DEVICE_MODEL_COMPONENT: &str = "dh-devices";
