@@ -421,6 +421,9 @@ pub struct SlotRuntime {
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
     pub queued_inputs: Vec<QueuedInput>,
+    /// Drained detchannel events not yet selected by StreamGuestEvents.
+    /// The worker keeps only the newest capped backlog per slot; matching
+    /// events are consumed when the RPC response is constructed.
     pub guest_events: Vec<DrainedGuestEvent>,
     pub next_input_order: u64,
     pub thread: RuntimeThreadState,

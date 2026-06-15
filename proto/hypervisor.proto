@@ -312,7 +312,12 @@ enum PixelFormat { PF_UNSPECIFIED = 0; XRGB8888 = 1; RGB565 = 2; }
 message StreamGuestEventsRequest {
   Lease lease = 1;
   repeated uint32 streams = 2;         // detchannel EventKind values
-                                       // (guest-sdk API.md §3.1); empty ⇒ all
+                                       // (guest-sdk API.md §3.1); empty ⇒ all.
+                                       // Selected events are consumed before
+                                       // the response stream is returned;
+                                       // cancellation does not requeue them.
+                                       // Unselected events remain buffered,
+                                       // capped to the newest 1024 per slot.
 }
 message GuestEvent {
   uint32 stream = 1;                   // the record's detchannel EventKind
