@@ -37,7 +37,9 @@ use dh_vmm::config::MachineConfig;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
 use dh_vmm::recording::{DeviceRail, RecordError};
-use dh_vmm::runctl::{run_segment_with_epochs, RunError, Segment, StopReason, Until};
+use dh_vmm::runctl::{
+    run_segment_with_epoch_options, RunError, RunOptions, Segment, StopReason, Until,
+};
 use dh_vmm::SlotState;
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
@@ -230,7 +232,7 @@ pub fn replay_segment_with_epoch_progress<M, F>(
     counter: &InstRetired,
     store: &SnapstoreClient,
     log_bytes: &[u8],
-    mut on_epoch_ok: F,
+    on_epoch_ok: F,
 ) -> Result<ReplayOutcome, ReplayError>
 where
     M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
@@ -292,6 +294,28 @@ where
             _ => None,
         })
         .collect();
+    let mut epoch_after_canonical_icounts = Vec::new();
+    let mut current_icount = None;
+    let mut saw_canonical_at_icount = false;
+    for rec in log.records() {
+        if current_icount != Some(rec.icount()) {
+            current_icount = Some(rec.icount());
+            saw_canonical_at_icount = false;
+        }
+        match rec.body() {
+            RecordBody::PadSet { .. } | RecordBody::NetRx { .. } | RecordBody::DevEvent { .. } => {
+                saw_canonical_at_icount = true;
+            }
+            RecordBody::EpochHash { .. } if saw_canonical_at_icount => {
+                if !epoch_after_canonical_icounts.contains(&rec.icount()) {
+                    epoch_after_canonical_icounts.push(rec.icount());
+                }
+            }
+            RecordBody::End { .. } => break,
+            _ => {}
+        }
+    }
+    let on_epoch_ok = std::cell::RefCell::new(on_epoch_ok);
 
     let pause = AtomicBool::new(false);
     let mut records_applied = 0u64;
@@ -301,11 +325,14 @@ where
     // LINK POINT (the sink) and re-landed in the replay's own log; a
     // mismatch aborts the quantum loudly through the sink error.
     let verified = std::cell::Cell::new(0usize);
+    let last_epoch_icount = std::cell::Cell::new(None);
     let divergence: DivergenceCell = std::cell::Cell::new(None);
     let progress_error = std::cell::RefCell::new(None);
-    let mut run_to = |slot: &mut SlotVm,
-                      chain: &mut StateHashChain,
-                      target: u64|
+    let run_to = |slot: &mut SlotVm,
+                  chain: &mut StateHashChain,
+                  target: u64,
+                  hash_final_stop: bool,
+                  hash_final_epoch: bool|
      -> Result<Option<dh_vmm::runctl::SegmentOutcome>, ReplayError> {
         let start = counter
             .read()
@@ -331,9 +358,14 @@ where
                 pause: &pause,
                 sdk_events: None,
             };
-            run_segment_with_epochs(
+            run_segment_with_epoch_options(
                 &mut seg,
                 Until::IcountBudget(target - start),
+                RunOptions {
+                    hash_final_stop,
+                    hash_final_epoch,
+                    ..RunOptions::default()
+                },
                 &mut || false,
                 &mut |exit| {
                     let icount = counter
@@ -366,10 +398,11 @@ where
                         }
                     }
                     verified.set(i + 1);
+                    last_epoch_icount.set(Some(icount));
                     rail.borrow_mut()
                         .log_epoch_hash(idx, icount, value)
                         .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))?;
-                    if let Err(e) = on_epoch_ok(idx, icount, value) {
+                    if let Err(e) = on_epoch_ok.borrow_mut()(idx, icount, value) {
                         progress_error.replace(Some(e));
                         return Err(BoundaryError::Exit("replay progress stopped".into()));
                     }
@@ -396,6 +429,42 @@ where
         };
         Ok(Some(out))
     };
+    macro_rules! verify_current_epoch {
+        ($slot:expr, $chain:expr, $icount:expr) => {{
+            let i = verified.get();
+            match expected_epochs.get(i) {
+                Some((_, e_icount, _)) if *e_icount != $icount => Ok(false),
+                Some((e_idx, e_icount, e_value)) => {
+                    let vns = machine_config
+                        .clock
+                        .vns_from_icount($icount)
+                        .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
+                    $chain
+                        .push_final_link($slot, &[], $icount, vns)
+                        .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+                    let epoch = machine_config.epoch_len.max(1);
+                    let idx = $icount / epoch;
+                    let value = $chain.value();
+                    if *e_idx != idx || *e_icount != $icount || *e_value != value {
+                        return Err(ReplayError::Divergence {
+                            what: "EPOCH_HASH chain value",
+                            at_icount: $icount,
+                            expected: *e_value,
+                            got: value,
+                        });
+                    }
+                    verified.set(i + 1);
+                    last_epoch_icount.set(Some($icount));
+                    rail.borrow_mut()
+                        .log_epoch_hash(idx, $icount, value)
+                        .map_err(|e| ReplayError::Apply(format!("epoch log: {e:?}")))?;
+                    on_epoch_ok.borrow_mut()(idx, $icount, value)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }};
+    }
     // Intermediate quanta must land exactly (BudgetReached at the
     // record's icount); the TAIL has its own contract at the call site.
     let require_landed =
@@ -411,9 +480,12 @@ where
         };
 
     // ── Walk the canonical records ────────────────────────────────────────
-    for rec in log.canonical() {
+    let canonical: Vec<_> = log.canonical().collect();
+    let mut last_canonical_icount = None;
+    for (index, rec) in canonical.iter().copied().enumerate() {
         let icount = rec.icount();
         let rip = rec.boundary_rip();
+        let epoch_after_canonical = epoch_after_canonical_icounts.contains(&icount);
         match rec.body() {
             RecordBody::End { .. } => break, // handled after the loop
             RecordBody::PadSet {
@@ -421,14 +493,14 @@ where
                 buttons,
                 frame_hint,
             } => {
-                let o = run_to(slot, &mut chain, icount)?;
+                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_pad_set(icount, rip, port, buttons, frame_hint)
                     .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
             }
             RecordBody::NetRx { frame } => {
-                let o = run_to(slot, &mut chain, icount)?;
+                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_net_rx(icount, rip, frame)
@@ -445,7 +517,7 @@ where
                 if detchannel_will_regenerate {
                     continue;
                 }
-                let o = run_to(slot, &mut chain, icount)?;
+                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_dev_event(icount, rip, device_id, event_type, data)
@@ -462,6 +534,14 @@ where
                 "vectored input replay needs run control's injection scheduling",
             ));
         }
+        last_canonical_icount = Some(icount);
+        if canonical
+            .get(index + 1)
+            .map_or(true, |next| next.icount() != icount)
+            && epoch_after_canonical
+        {
+            let _ = verify_current_epoch!(slot, &mut chain, icount)?;
+        }
         records_applied += 1;
     }
 
@@ -470,7 +550,7 @@ where
     let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
     let verified_before_tail = verified.get();
     let chain_before_tail = chain.clone();
-    let tail = run_to(slot, &mut chain, header.end_icount)?;
+    let tail = run_to(slot, &mut chain, header.end_icount, true, true)?;
     if let Some(out) = &tail {
         // A GuestHalted recording legitimately stops ON its halt at
         // end_icount; anything else must land the budget exactly. Either
@@ -497,6 +577,18 @@ where
             });
         }
     }
+    if tail.is_none()
+        && last_canonical_icount == Some(header.end_icount)
+        && last_epoch_icount.get() != Some(header.end_icount)
+    {
+        let vns = machine_config
+            .clock
+            .vns_from_icount(header.end_icount)
+            .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
+        chain
+            .push_final_link(slot, &[], header.end_icount, vns)
+            .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+    }
     let mut live_end = chain.value();
     if live_end != header.end_state_hash
         && expected_reason == StopReason::BudgetReached
@@ -519,7 +611,7 @@ where
             .end_icount
             .checked_add(1)
             .ok_or_else(|| ReplayError::Apply("BudgetReached HLT retry overflows".into()))?;
-        let halt_tail = run_to(slot, &mut chain, halt_target)?;
+        let halt_tail = run_to(slot, &mut chain, halt_target, true, true)?;
         if let Some(out) = &halt_tail {
             if out.reason == StopReason::GuestHalted && out.boundary.icount == header.end_icount {
                 if out.vns != header.end_vns {

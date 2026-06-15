@@ -59,12 +59,31 @@ pub enum Until {
 /// Per-run audit knobs that do not change the machine identity. They are
 /// caller policy, not [`MachineConfig`] preimage: replay/soak drivers must
 /// pass the same options when comparing audit chains.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunOptions {
     /// Force full-memory epoch links even when `MachineConfig.hash_epochs`
     /// is `FinalOnly`. This is deliberately expensive: it is a soak-run
     /// audit mode for dirty-tracking misses (risk R8).
     pub paranoid_hash: bool,
+    /// Push the segment-final hash link when the requested `until` stop is
+    /// reached at a non-epoch boundary. Normal recording runs do this; replay
+    /// disables it for intermediate canonical-record landings because those
+    /// are quantization points, not recorded segment stops.
+    pub hash_final_stop: bool,
+    /// Push an epoch hash when the requested `until` stop is itself an epoch
+    /// boundary. Replay disables this for canonical-record landings so it can
+    /// apply all records at that icount before verifying/logging the epoch.
+    pub hash_final_epoch: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            paranoid_hash: false,
+            hash_final_stop: true,
+            hash_final_epoch: true,
+        }
+    }
 }
 
 /// Why the segment stopped (mirrors proto StopReason).
@@ -667,7 +686,9 @@ fn run_segment_inner(
             .vns_from_icount(point.icount)
             .ok_or(RunError::ClockOverflow)?;
 
-        if point.epoch_hash {
+        let hashed_epoch =
+            point.epoch_hash && (point.final_stop.is_none() || options.hash_final_epoch);
+        if hashed_epoch {
             seg.chain
                 .push_final_link(seg.slot, &[], point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
@@ -687,8 +708,9 @@ fn run_segment_inner(
                 vns,
                 delivered,
                 timer_fired,
-                point.epoch_hash,
+                hashed_epoch,
                 frames_seen,
+                options.hash_final_stop,
             );
         }
 
@@ -704,8 +726,9 @@ fn run_segment_inner(
                 vns,
                 delivered,
                 timer_fired,
-                point.epoch_hash,
+                hashed_epoch,
                 frames_seen,
+                options.hash_final_stop,
             );
         }
 
@@ -774,11 +797,12 @@ fn finish(
     timer_fired: Option<TimerFired>,
     already_hashed: bool,
     frames_elapsed: u64,
+    hash_final_stop: bool,
 ) -> Result<SegmentOutcome, RunError> {
     // Every segment ends with a hash link at its stop boundary (§8.5: "at
     // every final pause") — exactly ONE link per boundary: a stop point
     // that is also an epoch-hash point was linked in the walk already.
-    if !already_hashed {
+    if hash_final_stop && !already_hashed {
         seg.chain
             .push_final_link(seg.slot, &[], boundary.icount, vns)
             .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
@@ -833,6 +857,7 @@ fn finish_at_counter(
         timer_fired,
         false,
         frames_elapsed,
+        true,
     )
 }
 
@@ -1031,6 +1056,7 @@ mod tests {
             Until::IcountBudget(3 * epoch),
             RunOptions {
                 paranoid_hash: true,
+                ..RunOptions::default()
             },
             &mut never,
             &mut no_exits,
@@ -1076,6 +1102,7 @@ mod tests {
             Until::IcountBudget(3 * epoch),
             RunOptions {
                 paranoid_hash: true,
+                ..RunOptions::default()
             },
             &mut never,
             &mut no_exits,

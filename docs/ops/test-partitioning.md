@@ -54,6 +54,7 @@ These self-skip elsewhere; on the box they run for real:
 | M1 device-surface acceptance | `cargo test -p determinism-tests --test m1_acceptance` | <1s |
 | Phase-1 gate (one command) | `cargo run -p dh-cli -- gate [--runs N]` | ~32s at 100 runs |
 | M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
+| M7 fork/VerifyReplay acceptance | `cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | long |
 
 ## Intel-box runbook (condensed)
 
@@ -65,8 +66,9 @@ These self-skip elsewhere; on the box they run for real:
 3. **Confirm the determinism class**: `bash ci/check-determinism-class.sh`
    — must report 7/7 keys ok. Drift ⇒ the re-baseline procedure in
    `host-config-intel-box.md` (it is a procedure, not an incident).
-4. **Run the gates**: `cargo test --workspace` (everything above), or
-   the individual commands per table.
+4. **Run the gates**: `cargo test --workspace` for non-ignored workspace
+   tests, plus the hardware-gated/ignored rows above with their explicit
+   commands (for example the M7 `-- --ignored` acceptance command).
 5. CI wiring: pushes run `.github/workflows/ci.yaml` (hosted matrix +
    kvm-intel lane); nightly drift + canary run via
    `.github/workflows/nightly-drift.yaml`. The kvm-intel job is a
