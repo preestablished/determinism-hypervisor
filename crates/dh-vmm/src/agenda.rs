@@ -44,7 +44,14 @@ pub enum StopKind {
 pub struct AgendaInputs<'a> {
     /// Current position (segment-relative). The agenda covers (start, final].
     pub start_icount: u64,
-    /// Scheduled injection points (from InjectInputs + pv timer arms),
+    /// Scheduled input landing points, segment-relative icounts. Entries
+    /// outside (start, final] stay pending with the caller; they are not this
+    /// agenda's business.
+    ///
+    /// ORDER CONTRACT mirrors `injections`: `StopPoint::inputs` stores indices
+    /// into this slice, so same-boundary inputs land in caller-provided order.
+    pub scheduled_inputs: &'a [u64],
+    /// Scheduled injection points (precomputed vectors plus pv timer arms),
     /// segment-relative icounts. Entries outside (start, final] stay pending
     /// with the caller; they are not this agenda's business.
     ///
@@ -74,6 +81,9 @@ pub struct AgendaInputs<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopPoint {
     pub icount: u64,
+    /// Indices into `AgendaInputs::scheduled_inputs` that land here,
+    /// ascending.
+    pub inputs: Vec<usize>,
     /// Indices into `AgendaInputs::injections` that fire here, ascending.
     /// More than one index means multiple injections share this boundary;
     /// ARCH §3.4 delivers ONE vector per VM entry, so run control must chain
@@ -134,6 +144,7 @@ pub fn compile(inputs: &AgendaInputs<'_>) -> Result<Vec<StopPoint>, AgendaError>
         Err(i) => {
             let mut p = StopPoint {
                 icount,
+                inputs: Vec::new(),
                 injections: Vec::new(),
                 epoch_hash: false,
                 goal_poll: false,
@@ -146,6 +157,13 @@ pub fn compile(inputs: &AgendaInputs<'_>) -> Result<Vec<StopPoint>, AgendaError>
 
     // Final stop first — it defines the agenda's end and always exists.
     push(final_icount, &|p| p.final_stop = Some(stop_kind));
+
+    // Scheduled inputs within (start, final].
+    for (idx, &at) in inputs.scheduled_inputs.iter().enumerate() {
+        if at > start && at <= final_icount {
+            push(at, &|p| p.inputs.push(idx));
+        }
+    }
 
     // Scheduled injections within (start, final].
     for (idx, &at) in inputs.injections.iter().enumerate() {
@@ -209,6 +227,7 @@ mod tests {
     fn inputs<'a>(injections: &'a [u64]) -> AgendaInputs<'a> {
         AgendaInputs {
             start_icount: 0,
+            scheduled_inputs: &[],
             injections,
             epoch_len: Some(nz(1000)),
             goal_poll_period: None,
@@ -221,6 +240,7 @@ mod tests {
     fn merges_all_sources_sorted() {
         let agenda = compile(&AgendaInputs {
             start_icount: 0,
+            scheduled_inputs: &[1500, 3000],
             injections: &[1500, 500, 3000],
             epoch_len: Some(nz(1000)),
             goal_poll_period: Some(nz(1500)),
@@ -234,11 +254,13 @@ mod tests {
 
         // 1500: injection idx 0 + goal poll (run-relative: 0 + 1*1500).
         let p1500 = &agenda[2];
+        assert_eq!(p1500.inputs, vec![0]);
         assert_eq!(p1500.injections, vec![0]);
         assert!(p1500.goal_poll && !p1500.epoch_hash && p1500.final_stop.is_none());
 
         // 3000: injection idx 2 + epoch + poll + final all coincide.
         let p3000 = agenda.last().unwrap();
+        assert_eq!(p3000.inputs, vec![1]);
         assert_eq!(p3000.injections, vec![2]);
         assert!(p3000.epoch_hash && p3000.goal_poll);
         assert_eq!(p3000.final_stop, Some(StopKind::Budget));
@@ -306,6 +328,7 @@ mod tests {
         // overflow the k counter (debug panic / release wraparound).
         let a = compile(&AgendaInputs {
             start_icount: u64::MAX - 2,
+            scheduled_inputs: &[],
             injections: &[],
             epoch_len: Some(nz(1)),
             goal_poll_period: Some(nz(1)),
@@ -324,6 +347,7 @@ mod tests {
         let clock = ClockRatio::new(1, 3).unwrap(); // 3 instructions per vns
         let agenda = compile(&AgendaInputs {
             start_icount: 10,
+            scheduled_inputs: &[],
             injections: &[],
             epoch_len: None,
             goal_poll_period: None,
@@ -366,6 +390,7 @@ mod tests {
         assert_eq!(
             compile(&AgendaInputs {
                 start_icount: u64::MAX / 2,
+                scheduled_inputs: &[],
                 injections: &[],
                 epoch_len: None,
                 goal_poll_period: None,
@@ -402,8 +427,18 @@ mod tests {
                     }
                 })
                 .collect();
+            let scheduled_inputs: Vec<u64> = (0..rng.next() % 20)
+                .map(|_| {
+                    if edge {
+                        start.saturating_add(rng.next() % 2_000)
+                    } else {
+                        rng.next() % 2_000_000
+                    }
+                })
+                .collect();
             let in1 = AgendaInputs {
                 start_icount: start,
+                scheduled_inputs: &scheduled_inputs,
                 injections: &injections,
                 epoch_len: (!rng.next().is_multiple_of(4)).then(|| nz(1 + rng.next() % 50_000)),
                 goal_poll_period: (rng.next().is_multiple_of(2))
@@ -437,12 +472,26 @@ mod tests {
                 assert!(p.icount > start || (p.icount == start && p.final_stop.is_some()));
                 assert!(
                     !p.injections.is_empty()
+                        || !p.inputs.is_empty()
                         || p.epoch_hash
                         || p.goal_poll
                         || p.final_stop.is_some()
                 );
                 // Injection indices are ascending (input order).
+                assert!(p.inputs.windows(2).all(|w| w[0] < w[1]));
                 assert!(p.injections.windows(2).all(|w| w[0] < w[1]));
+            }
+
+            // Every in-window scheduled input appears exactly once, at its icount.
+            for (idx, &at) in scheduled_inputs.iter().enumerate() {
+                let hits: Vec<&StopPoint> =
+                    a.iter().filter(|p| p.inputs.contains(&idx)).collect();
+                if at > start && at <= last.icount {
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].icount, at);
+                } else {
+                    assert!(hits.is_empty());
+                }
             }
 
             // Every in-window injection appears exactly once, at its icount.

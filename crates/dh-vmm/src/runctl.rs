@@ -258,6 +258,30 @@ pub fn run_segment_with_epochs(
     run_segment_with_epoch_options(seg, until, RunOptions::default(), goal, on_exit, epoch_sink)
 }
 
+/// [`run_segment`] plus scheduled canonical input landing points. At each
+/// scheduled input boundary, `input_sink(index, boundary)` must apply the
+/// caller-owned payload to device state/logging and return any edge IRQ
+/// vectors the device queued for deterministic delivery at that boundary.
+pub fn run_segment_with_scheduled_inputs(
+    seg: &mut Segment<'_>,
+    until: Until,
+    scheduled_inputs: &[u64],
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
+    run_segment_inner(
+        seg,
+        until,
+        RunOptions::default(),
+        scheduled_inputs,
+        goal,
+        on_exit,
+        input_sink,
+        &mut |_, _, _| Ok(()),
+    )
+}
+
 /// [`run_segment_with_epochs`] plus non-canonical run audit options.
 pub fn run_segment_with_epoch_options(
     seg: &mut Segment<'_>,
@@ -265,6 +289,29 @@ pub fn run_segment_with_epoch_options(
     options: RunOptions,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
+    run_segment_inner(
+        seg,
+        until,
+        options,
+        &[],
+        goal,
+        on_exit,
+        &mut |_, _| Ok(Vec::new()),
+        epoch_sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_segment_inner(
+    seg: &mut Segment<'_>,
+    until: Until,
+    options: RunOptions,
+    scheduled_inputs: &[u64],
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
     epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
@@ -348,6 +395,7 @@ pub fn run_segment_with_epoch_options(
         seg.config.hash_epochs == crate::config::HashEpochs::EpochsOn || options.paranoid_hash;
     let inputs = AgendaInputs {
         start_icount: seg.start_icount,
+        scheduled_inputs,
         injections: &injection_icounts,
         // FinalOnly drops the epoch HASH grid unless paranoid audit mode
         // forces it back on; the pause roll-forward grid below is
@@ -448,14 +496,27 @@ pub fn run_segment_with_epoch_options(
             RunError::Boundary
         );
 
-        // Scheduled injections at this point (§3.4). KVM holds ONE queued
-        // vector, and a second KVM_INTERRUPT before the next entry
-        // silently OVERWRITES it (review, live-proven) — so between
-        // vectors sharing a boundary the guest is entered for exactly one
-        // retirement, delivering the queued vector before the next is
-        // queued ("chained across consecutive entries", agenda docs).
+        // Scheduled inputs and injections at this point (§3.4). Inputs land
+        // first (payload state/logging), and any edge IRQ vectors they queue
+        // are delivered before precomputed vectors such as timers. KVM holds
+        // ONE queued vector, and a second KVM_INTERRUPT before the next entry
+        // silently OVERWRITES it (review, live-proven) — so between vectors
+        // sharing a boundary the guest is entered for exactly one retirement,
+        // delivering the queued vector before the next is queued ("chained
+        // across consecutive entries", agenda docs).
         let mut at = boundary;
-        for (i, idx) in point.injections.iter().enumerate() {
+        let mut vectors: Vec<(u8, Option<usize>)> = Vec::new();
+        for idx in &point.inputs {
+            let queued = unwind_or!(input_sink(*idx, boundary), RunError::Boundary);
+            vectors.extend(queued.into_iter().map(|vector| (vector, None)));
+        }
+        vectors.extend(
+            point
+                .injections
+                .iter()
+                .map(|idx| (all_injections[*idx].vector, Some(*idx))),
+        );
+        for (i, (vector, injection_idx)) in vectors.into_iter().enumerate() {
             if i > 0 {
                 // ONE ENTRY, not one retirement: the entry delivering the
                 // previously queued vector runs its whole ISR before the
@@ -473,7 +534,7 @@ pub fn run_segment_with_epoch_options(
                 inject_at_boundary(
                     &mut seg.slot.vcpu,
                     seg.counter,
-                    all_injections[*idx].vector,
+                    vector,
                     &at,
                     &margins,
                     INJECT_DEFER_BUDGET,
@@ -482,7 +543,7 @@ pub fn run_segment_with_epoch_options(
                 RunError::Inject
             );
             delivered += 1;
-            if timer_slot == Some(*idx) {
+            if timer_slot == injection_idx {
                 timer_fired = Some(TimerFired {
                     vector: inj.vector,
                     armed_deadline_vns: seg.timer.expect("timer_slot implies timer").deadline_vns,

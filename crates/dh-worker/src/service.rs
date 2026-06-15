@@ -11,10 +11,13 @@ use crate::proto_map::slot_info_to_proto;
 #[cfg(target_arch = "x86_64")]
 use crate::proto_map::{
     fork_entropy_seeds_from_proto, lease_to_proto, machine_config_from_proto,
-    machine_config_to_proto,
+    machine_config_to_proto, stop_reason_to_proto,
 };
 #[cfg(target_arch = "x86_64")]
-use crate::runtime::{RuntimeError, RuntimeThreadState, SlotRuntime, WorkerRuntimeTable};
+use crate::runtime::{
+    QueuedInput, QueuedInputKind, RuntimeActorError, RuntimeError, RuntimeThreadState, SlotActor,
+    SlotRuntime, WorkerRuntimeTable,
+};
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
@@ -28,6 +31,27 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone)]
+struct RuntimeVmMem(vm_memory::GuestMemoryMmap<()>);
+
+#[cfg(target_arch = "x86_64")]
+impl dh_devices::ctx::GuestMem for RuntimeVmMem {
+    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .read_slice(out, vm_memory::GuestAddress(gpa))
+            .map_err(|_| dh_devices::ctx::MemError)
+    }
+
+    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
+        use vm_memory::Bytes;
+        self.0
+            .write_slice(data, vm_memory::GuestAddress(gpa))
+            .map_err(|_| dh_devices::ctx::MemError)
+    }
+}
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
@@ -482,6 +506,177 @@ fn segment_vns_from_icount(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn hard_icount_cap(raw: u64) -> u64 {
+    if raw == 0 {
+        10_000_000_000
+    } else {
+        raw
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn until_from_run_request(req: &proto::RunRequest) -> Result<dh_vmm::runctl::Until, Status> {
+    use proto::run_request::Until as WireUntil;
+    match req
+        .until
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("RunRequest.until is required"))?
+    {
+        WireUntil::IcountBudget(budget) => Ok(dh_vmm::runctl::Until::IcountBudget(*budget)),
+        WireUntil::VnsBudget(budget) => Ok(dh_vmm::runctl::Until::VnsBudget(*budget)),
+        WireUntil::FrameBudget(frames) => Ok(dh_vmm::runctl::Until::FrameBudget {
+            frames: u64::from(*frames),
+            hard_cap: hard_icount_cap(req.hard_icount_cap),
+        }),
+        WireUntil::NextSdkEvent(_) => Err(unimplemented_status("Run next_sdk_event")),
+        WireUntil::Goal(_) => Err(unimplemented_status("Run goal")),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
+    i32::from(stop_reason_to_proto(reason))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn queued_input_from_proto(
+    index: usize,
+    event: &proto::ScheduledEvent,
+    current_icount: u64,
+    config: &dh_vmm::config::MachineConfig,
+) -> Result<QueuedInput, Status> {
+    use proto::scheduled_event::{At as WireAt, Event as WireEvent};
+
+    let icount = match event
+        .at
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument(format!("events[{index}].at is required")))?
+    {
+        WireAt::AtIcount(icount) => *icount,
+        WireAt::AtVns(vns) => config
+            .clock
+            .icount_for_vns_target(*vns)
+            .ok_or_else(|| Status::invalid_argument(format!("events[{index}].at_vns overflows")))?,
+        WireAt::AtFrame(_) => return Err(unimplemented_status("InjectInputs at_frame")),
+    };
+    if icount <= current_icount {
+        return Err(Status::invalid_argument(format!(
+            "events[{index}] must land after current segment icount {current_icount}, got {icount}"
+        )));
+    }
+
+    let kind = match event
+        .event
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument(format!("events[{index}].event is required")))?
+    {
+        WireEvent::PadSet(pad) => {
+            let port = u8::try_from(pad.port).map_err(|_| {
+                Status::invalid_argument(format!("events[{index}].pad_set.port must be 0..3"))
+            })?;
+            if usize::from(port) >= dh_devices::pad::NUM_PORTS {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].pad_set.port must be 0..3"
+                )));
+            }
+            QueuedInputKind::PadSet {
+                port,
+                buttons: pad.buttons,
+                frame_hint: dh_inputlog::dhilog::FRAME_HINT_NONE,
+            }
+        }
+        WireEvent::NetRx(net) => {
+            if net.frame.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].net_rx.frame must not be empty"
+                )));
+            }
+            if net.frame.len() > dh_devices::net::MAX_FRAME as usize {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].net_rx.frame exceeds {} bytes",
+                    dh_devices::net::MAX_FRAME
+                )));
+            }
+            QueuedInputKind::NetRx {
+                frame: net.frame.clone(),
+            }
+        }
+        WireEvent::DevEvent(_) => return Err(unimplemented_status("InjectInputs dev_event")),
+    };
+
+    Ok(QueuedInput {
+        icount,
+        order: 0,
+        kind,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn queue_inputs_from_proto(
+    runtime: &mut SlotRuntime,
+    events: Vec<proto::ScheduledEvent>,
+) -> Result<u32, Status> {
+    let scheduled = u32::try_from(events.len())
+        .map_err(|_| Status::invalid_argument("too many scheduled events"))?;
+    let current_icount = runtime.position.segment_icount;
+    let mut queued = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        let mut input =
+            queued_input_from_proto(index, event, current_icount, &runtime.machine_config)?;
+        input.order = runtime.next_input_order;
+        runtime.next_input_order = runtime
+            .next_input_order
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("scheduled input order exhausted"))?;
+        queued.push(input);
+    }
+    runtime.queued_inputs.extend(queued);
+    runtime
+        .queued_inputs
+        .sort_by_key(|input| (input.icount, input.order));
+    Ok(scheduled)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn record_error_to_boundary(e: dh_vmm::recording::RecordError) -> dh_vmm::boundary::BoundaryError {
+    dh_vmm::boundary::BoundaryError::Exit(format!("device rail: {e:?}"))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn apply_queued_input<M: dh_devices::ctx::GuestMem>(
+    rail: &mut dh_vmm::recording::DeviceRail<M>,
+    input: &QueuedInput,
+    boundary: dh_vmm::boundary::Boundary,
+) -> Result<Vec<u8>, dh_vmm::boundary::BoundaryError> {
+    let vector = match &input.kind {
+        QueuedInputKind::PadSet {
+            port,
+            buttons,
+            frame_hint,
+        } => rail
+            .apply_pad_set(boundary.icount, boundary.rip, *port, *buttons, *frame_hint)
+            .map_err(record_error_to_boundary)?,
+        QueuedInputKind::NetRx { frame } => rail
+            .apply_net_rx(boundary.icount, boundary.rip, frame)
+            .map_err(record_error_to_boundary)?,
+    };
+    Ok(vector.into_iter().collect())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_error_to_status(e: dh_vmm::runctl::RunError) -> Status {
+    use dh_vmm::runctl::RunError;
+    match e {
+        RunError::Agenda(_) | RunError::ClockOverflow | RunError::MissingSdkEventFeed => {
+            Status::failed_precondition(e.to_string())
+        }
+        RunError::Boundary(_) | RunError::Inject(_) | RunError::Kvm(_) => {
+            Status::data_loss(e.to_string())
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn fault_runtime_after_snapshot_loss(
     manager: &SlotManager,
     runtime: &mut SlotRuntime,
@@ -680,7 +875,63 @@ fn runtime_error_to_status(e: RuntimeError) -> Status {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(dead_code)] // Wired by determinism-hypervisor-rfv after this runtime-table bead.
+fn runtime_actor_error_to_status(e: RuntimeActorError) -> Status {
+    Status::failed_precondition(e.to_string())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_core(manager: &SlotManager, slot_id: u64) -> Result<u32, Status> {
+    manager
+        .core_for(slot_id)
+        .ok_or_else(|| Status::failed_precondition(format!("slot {slot_id} has no dedicated core")))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn start_slot_actor(
+    method: &'static str,
+    manager: &SlotManager,
+    slot_id: u64,
+    runtime: SlotRuntime,
+) -> Result<Arc<SlotActor>, Status> {
+    let core = runtime_core(manager, slot_id)?;
+    SlotActor::start(slot_id, core, runtime)
+        .map(Arc::new)
+        .map_err(|e| Status::failed_precondition(format!("{method}: {e}")))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn with_runtime<R>(
+    runtimes: &WorkerRuntimeTable,
+    slot_id: u64,
+    f: impl FnOnce(&SlotRuntime) -> R + Send + 'static,
+) -> Result<R, Status>
+where
+    R: Send + 'static,
+{
+    let actor = runtimes
+        .with(slot_id, Arc::clone)
+        .map_err(runtime_error_to_status)?;
+    actor.with_runtime(f).map_err(runtime_actor_error_to_status)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn with_runtime_mut<R>(
+    runtimes: &WorkerRuntimeTable,
+    slot_id: u64,
+    f: impl FnOnce(&mut SlotRuntime) -> R + Send + 'static,
+) -> Result<R, Status>
+where
+    R: Send + 'static,
+{
+    let actor = runtimes
+        .with(slot_id, Arc::clone)
+        .map_err(runtime_error_to_status)?;
+    actor
+        .with_runtime_mut(f)
+        .map_err(runtime_actor_error_to_status)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn runtime_position(runtime: &SlotRuntime) -> (u64, Option<[u8; 32]>) {
     (
         runtime.position.cumulative_icount,
@@ -839,7 +1090,19 @@ impl WorkerService {
             }
 
             let (icount, base_snapshot_id) = runtime_position(&runtime);
-            if let Err(e) = runtimes.insert(lease.slot_id, runtime) {
+            let actor = match start_slot_actor(method, manager.as_ref(), lease.slot_id, runtime) {
+                Ok(actor) => actor,
+                Err(e) => {
+                    let rollback = rollback_manager_leases(
+                        method,
+                        manager.as_ref(),
+                        std::slice::from_ref(&lease),
+                        allocated_at_ms,
+                    );
+                    return Err(original_or_rollback(method, e, rollback));
+                }
+            };
+            if let Err(e) = runtimes.insert(lease.slot_id, actor) {
                 let rollback = rollback_manager_leases(
                     method,
                     manager.as_ref(),
@@ -953,11 +1216,23 @@ impl WorkerService {
             }
 
             let positions: Vec<_> = child_runtimes.iter().map(runtime_position).collect();
-            let entries = child_leases
-                .iter()
-                .map(|lease| lease.slot_id)
-                .zip(child_runtimes)
-                .collect();
+            let mut entries = Vec::with_capacity(child_runtimes.len());
+            for (lease, runtime) in child_leases.iter().zip(child_runtimes) {
+                let actor = match start_slot_actor("Fork", manager.as_ref(), lease.slot_id, runtime)
+                {
+                    Ok(actor) => actor,
+                    Err(e) => {
+                        let rollback = rollback_manager_leases(
+                            "Fork",
+                            manager.as_ref(),
+                            &child_leases,
+                            forked_at_ms,
+                        );
+                        return Err(original_or_rollback("Fork", e, rollback));
+                    }
+                };
+                entries.push((lease.slot_id, actor));
+            }
             if let Err(e) = runtimes.insert_many(entries) {
                 let rollback =
                     rollback_manager_leases("Fork", manager.as_ref(), &child_leases, forked_at_ms);
@@ -999,17 +1274,33 @@ impl WorkerService {
             manager
                 .check_destroy(&lease, now_ms)
                 .map_err(slot_error_to_status)?;
-            let runtime = runtimes
+            let actor = runtimes
                 .take(lease.slot_id)
                 .map_err(runtime_error_to_status)?;
+            let outstanding = Arc::strong_count(&actor);
+            if outstanding != 1 {
+                if let Err(reinsert) = runtimes.insert(lease.slot_id, actor) {
+                    return Err(Status::internal(format!(
+                        "DestroyVm found slot {} actor busy ({outstanding} references); runtime restore failed: {reinsert}",
+                        lease.slot_id
+                    )));
+                }
+                return Err(Status::failed_precondition(format!(
+                    "DestroyVm cannot stop slot {} actor while {outstanding} references exist",
+                    lease.slot_id
+                )));
+            }
             if let Err(e) = manager.destroy(&lease, now_ms) {
-                if let Err(reinsert) = runtimes.insert(lease.slot_id, runtime) {
+                if let Err(reinsert) = runtimes.insert(lease.slot_id, actor) {
                     return Err(Status::internal(format!(
                         "DestroyVm failed after runtime removal: {e:?}; runtime restore failed: {reinsert}"
                     )));
                 }
                 return Err(slot_error_to_status(e));
             }
+            let actor = Arc::try_unwrap(actor)
+                .map_err(|_| Status::internal("DestroyVm actor reference count changed"))?;
+            actor.shutdown().map_err(runtime_actor_error_to_status)?;
             Ok(())
         })
         .await
@@ -1160,17 +1451,14 @@ impl HypervisorWorker for WorkerService {
                     )
                 })
                 .await?;
-            let (config, state_hash, frame_counter) = self
-                .inner
-                .runtimes
-                .with(lease.slot_id, |runtime| {
+            let (config, state_hash, frame_counter) =
+                with_runtime(self.inner.runtimes.as_ref(), lease.slot_id, |runtime| {
                     (
                         machine_config_to_proto(&runtime.machine_config),
                         runtime.state_hash(),
                         runtime.position.frame_counter,
                     )
-                })
-                .map_err(runtime_error_to_status)?;
+                })?;
             Ok(Response::new(proto::RestoreSnapshotResponse {
                 lease: Some(lease_to_proto(&lease)),
                 config: Some(config),
@@ -1203,8 +1491,7 @@ impl HypervisorWorker for WorkerService {
             let image_resolver = self.inner.image_resolver.clone();
             let child_leases = self
                 .install_forked_runtimes(parent.clone(), count, move |table, _leases| {
-                    table
-                        .with_mut(parent.slot_id, |parent_runtime| {
+                    with_runtime_mut(table, parent.slot_id, move |parent_runtime| {
                             parent_runtime
                                 .slot
                                 .freeze_ram()
@@ -1217,7 +1504,8 @@ impl HypervisorWorker for WorkerService {
                                 ));
                             }
                             let parent_base = parent_runtime.base_snapshot.clone();
-                            let parent_boundary = parent_runtime.boundary_state(true);
+                            let parent_boundary =
+                                parent_runtime.boundary_state(parent_runtime.queued_inputs.is_empty());
                             let mut out = Vec::with_capacity(entropy_seeds.len());
                             for seed in entropy_seeds {
                                 let assets = image_resolver
@@ -1256,8 +1544,7 @@ impl HypervisorWorker for WorkerService {
                                 )?);
                             }
                             Ok(out)
-                        })
-                        .map_err(runtime_error_to_status)?
+                        })?
                 })
                 .await?;
             Ok(Response::new(proto::ForkResponse {
@@ -1290,23 +1577,265 @@ impl HypervisorWorker for WorkerService {
 
     async fn inject_inputs(
         &self,
-        _request: Request<proto::InjectInputsRequest>,
+        request: Request<proto::InjectInputsRequest>,
     ) -> Result<Response<proto::InjectInputsResponse>, Status> {
-        Err(unimplemented_status("InjectInputs"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            let lease = lease_from_proto(request.lease)?;
+            let manager = self.inner.manager.clone();
+            let runtimes = self.inner.runtimes.clone();
+            let scheduled = blocking_lifecycle("InjectInputs", move || {
+                manager
+                    .checkout_write(&lease, "InjectInputs", lease_now_ms())
+                    .map_err(slot_error_to_status)?;
+                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+                    queue_inputs_from_proto(runtime, request.events)
+                })?
+            })
+            .await?;
+            Ok(Response::new(proto::InjectInputsResponse { scheduled }))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("InjectInputs"))
+        }
     }
 
     async fn run(
         &self,
-        _request: Request<proto::RunRequest>,
+        request: Request<proto::RunRequest>,
     ) -> Result<Response<proto::RunResponse>, Status> {
-        Err(unimplemented_status("Run"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            if request.capture.is_some() {
+                return Err(unimplemented_status("Run capture"));
+            }
+            let lease = lease_from_proto(request.lease.clone())?;
+            let until = until_from_run_request(&request)?;
+            let manager = self.inner.manager.clone();
+            let runtimes = self.inner.runtimes.clone();
+            let response = blocking_lifecycle("Run", move || {
+                manager
+                    .checkout_write(&lease, "Run", lease_now_ms())
+                    .map_err(slot_error_to_status)?;
+                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+                    let tid = dh_vmm::run::current_tid();
+                    let start_segment_icount = runtime.position.segment_icount;
+                    let start_cumulative_icount = runtime.position.cumulative_icount;
+                    let start_vns = runtime.position.vns;
+                    let start_segment_vns =
+                        segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
+                    let epoch_len = runtime.machine_config.epoch_len.max(1);
+                    let start_segment_epoch = start_segment_icount / epoch_len;
+                    manager
+                        .mark_running(&lease, lease_now_ms())
+                        .map_err(slot_error_to_status)?;
+                    runtime.thread = RuntimeThreadState::Running { tid };
+                    runtime.clear_pause_request();
+                    let pause = runtime.pause_flag();
+                    let counter = runtime.counter.as_ref().ok_or_else(|| {
+                        Status::failed_precondition("slot actor has no InstRetired counter")
+                    })?;
+
+                    let mut goal = || false;
+                    let log = runtime.log.take().ok_or_else(|| {
+                        Status::failed_precondition("slot has no active DHILOG segment")
+                    })?;
+                    let bus = std::mem::take(&mut runtime.bus);
+                    let entropy = std::mem::replace(
+                        &mut runtime.entropy,
+                        dh_devices::entropy::DetEntropy::from_seed([0; 32]),
+                    );
+                    let pending_inputs = runtime.queued_inputs.clone();
+                    let scheduled_input_icounts: Vec<u64> =
+                        pending_inputs.iter().map(|input| input.icount).collect();
+                    let (run_result, consumed_input_orders, rail) = {
+                        let rail = std::cell::RefCell::new(dh_vmm::recording::DeviceRail::new(
+                            bus,
+                            entropy,
+                            log,
+                            RuntimeVmMem(runtime.slot.guest_mem.clone()),
+                        ));
+                        let mut consumed_input_orders = Vec::new();
+                        let counter_ref = counter;
+                        let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
+                            let icount = counter_ref.read().map_err(|e| {
+                                dh_vmm::boundary::BoundaryError::Exit(format!(
+                                    "counter read: {e:?}"
+                                ))
+                            })?;
+                            rail.borrow_mut().service_exit(icount, exit)
+                        };
+                        let mut input_sink = |idx: usize, boundary| {
+                            let input = pending_inputs.get(idx).ok_or_else(|| {
+                                dh_vmm::boundary::BoundaryError::Exit(format!(
+                                    "scheduled input index {idx} out of range"
+                                ))
+                            })?;
+                            let vectors =
+                                apply_queued_input(&mut *rail.borrow_mut(), input, boundary)?;
+                            consumed_input_orders.push(input.order);
+                            Ok(vectors)
+                        };
+                        let run_result = {
+                            let mut segment = dh_vmm::runctl::Segment {
+                                slot: &mut runtime.slot,
+                                counter,
+                                chain: &mut runtime.chain,
+                                config: &runtime.machine_config,
+                                start_icount: start_segment_icount,
+                                injections: &[],
+                                timer: None,
+                                pause: pause.as_ref(),
+                                sdk_events: None,
+                            };
+                            dh_vmm::runctl::run_segment_with_scheduled_inputs(
+                                &mut segment,
+                                until,
+                                &scheduled_input_icounts,
+                                &mut goal,
+                                &mut on_exit,
+                                &mut input_sink,
+                            )
+                        };
+                        (run_result, consumed_input_orders, rail.into_inner())
+                    };
+                    runtime.bus = rail.bus;
+                    runtime.entropy = rail.entropy;
+                    runtime.log = Some(rail.log);
+
+                    match run_result {
+                        Ok(outcome) => {
+                            runtime.thread = RuntimeThreadState::Parked;
+                            runtime.clear_pause_request();
+                            let segment_delta =
+                                outcome.boundary.icount.saturating_sub(start_segment_icount);
+                            let vns_delta = outcome.vns.saturating_sub(start_segment_vns);
+                            let segment_epoch = outcome.boundary.icount / epoch_len;
+                            let epoch_delta = segment_epoch.saturating_sub(start_segment_epoch);
+                            let cumulative_icount =
+                                start_cumulative_icount.saturating_add(segment_delta);
+                            let cumulative_vns = start_vns.saturating_add(vns_delta);
+                            let cumulative_epoch =
+                                runtime.position.epoch_index.saturating_add(epoch_delta);
+                            runtime.set_boundary(
+                                cumulative_icount,
+                                outcome.boundary.icount,
+                                cumulative_vns,
+                                cumulative_epoch,
+                                runtime.chain.clone(),
+                            );
+                            runtime.position.frame_counter =
+                                runtime.position.frame_counter.saturating_add(
+                                    u32::try_from(outcome.frames_elapsed).unwrap_or(u32::MAX),
+                                );
+                            if !consumed_input_orders.is_empty() {
+                                runtime
+                                    .queued_inputs
+                                    .retain(|input| !consumed_input_orders.contains(&input.order));
+                            }
+                            manager
+                                .mark_paused(&lease, lease_now_ms())
+                                .map_err(slot_error_to_status)?;
+                            manager
+                                .set_position(
+                                    &lease,
+                                    cumulative_icount,
+                                    runtime
+                                        .base_snapshot
+                                        .as_ref()
+                                        .map(snapstore_types::SnapshotRef::to_bytes),
+                                    lease_now_ms(),
+                                )
+                                .map_err(slot_error_to_status)?;
+                            Ok(proto::RunResponse {
+                                reason: proto_stop_reason(outcome.reason),
+                                icount: cumulative_icount,
+                                vns: cumulative_vns,
+                                state_hash: Some(proto::StateHash {
+                                    hash: outcome.state_hash.to_vec(),
+                                }),
+                                frames_elapsed: outcome.frames_elapsed,
+                                sdk_event: None,
+                                feature_bytes: Vec::new(),
+                                fb_lz4: Vec::new(),
+                                fb_info: None,
+                            })
+                        }
+                        Err(e) => {
+                            runtime.thread = RuntimeThreadState::Faulted(e.to_string());
+                            let _ = manager.mark_faulted(lease.slot_id);
+                            Err(run_error_to_status(e))
+                        }
+                    }
+                })?
+            })
+            .await?;
+            Ok(Response::new(response))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("Run"))
+        }
     }
 
     async fn pause(
         &self,
-        _request: Request<proto::PauseRequest>,
+        request: Request<proto::PauseRequest>,
     ) -> Result<Response<proto::PauseResponse>, Status> {
-        Err(unimplemented_status("Pause"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let lease = lease_from_proto(request.into_inner().lease)?;
+            let manager = self.inner.manager.clone();
+            let runtimes = self.inner.runtimes.clone();
+            let response = blocking_lifecycle("Pause", move || {
+                manager
+                    .validate(&lease, lease_now_ms())
+                    .map_err(slot_error_to_status)?;
+                let state = manager
+                    .slot_info(lease.slot_id)
+                    .map_err(slot_error_to_status)?
+                    .state;
+                if !matches!(
+                    state,
+                    dh_vmm::SlotState::Paused | dh_vmm::SlotState::Running
+                ) {
+                    return Err(Status::failed_precondition(format!(
+                        "Pause requires Paused or Running slot, got {state:?}"
+                    )));
+                }
+                let actor = runtimes
+                    .with(lease.slot_id, Arc::clone)
+                    .map_err(runtime_error_to_status)?;
+                actor.request_pause();
+                actor
+                    .with_runtime_mut(|runtime| {
+                        runtime.clear_pause_request();
+                        if matches!(runtime.thread, RuntimeThreadState::PauseRequested { .. }) {
+                            runtime.thread = RuntimeThreadState::Parked;
+                        }
+                        proto::PauseResponse {
+                            icount: runtime.position.cumulative_icount,
+                            vns: runtime.position.vns,
+                            state_hash: Some(proto::StateHash {
+                                hash: runtime.state_hash().to_vec(),
+                            }),
+                        }
+                    })
+                    .map_err(runtime_actor_error_to_status)
+            })
+            .await?;
+            Ok(Response::new(response))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("Pause"))
+        }
     }
 
     async fn take_snapshot(
@@ -1326,9 +1855,6 @@ impl HypervisorWorker for WorkerService {
             let runtimes = self.inner.runtimes.clone();
             let class = self.inner.class.clone();
             let snapshot = blocking_lifecycle("TakeSnapshot", move || {
-                let store = store
-                    .lock()
-                    .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
                 let now_ms = lease_now_ms();
                 manager
                     .validate(&lease, now_ms)
@@ -1337,123 +1863,119 @@ impl HypervisorWorker for WorkerService {
                     .slot_info(lease.slot_id)
                     .map_err(slot_error_to_status)?
                     .state;
-                runtimes
-                    .with_mut(lease.slot_id, |runtime| {
-                        let boundary = runtime.boundary_state(true);
-                        let segment_icount = runtime.position.segment_icount;
-                        let segment_vns =
-                            segment_vns_from_icount(&runtime.machine_config, segment_icount)?;
-                        let machine_config_hash = runtime
-                            .machine_config
-                            .config_hash()
-                            .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
-                        let source = match runtime.base_snapshot.clone() {
-                            Some(parent) => crate::snapshot_engine::PageSource::Incremental {
-                                parent,
-                                ring: &mut runtime.dirty_ring,
-                                dirty: &mut runtime.dirty,
-                            },
-                            None => crate::snapshot_engine::PageSource::Full,
-                        };
-                        let out = crate::snapshot_engine::take_snapshot(
-                            &runtime.slot,
-                            slot_state,
-                            &runtime.bus,
-                            &runtime.entropy,
-                            &runtime.machine_config,
-                            boundary,
-                            source,
-                            &store,
-                        )
-                        .map_err(snapshot_engine_error_to_status)?;
-                        let input_log_id = if seal_input_log {
-                            match (|| {
-                                let log = runtime.log.take().ok_or_else(|| {
-                                    Status::failed_precondition("no active DHILOG segment to seal")
-                                })?;
-                                let log_bytes = log
-                                    .seal(dh_inputlog::dhilog::SealParams {
-                                        end_snapshot_id: out.snapshot_ref.to_bytes(),
-                                        end_icount: segment_icount,
-                                        end_vns: segment_vns,
-                                        end_state_hash: out.hash_chain,
-                                        stop_reason: dh_vmm::recording::stop_reason_u8(
-                                            dh_vmm::runctl::StopReason::BudgetReached,
-                                        ),
-                                    })
-                                    .map_err(|e| {
-                                        Status::data_loss(format!("seal DHILOG: {e:?}"))
-                                    })?;
-                                let log_container =
-                                    snapstore_client::helpers::build_input_log_container(
-                                        dh_inputlog::DHILOG_FORMAT_VERSION,
-                                        &log_bytes,
-                                    );
-                                let (log_id, _deduped) = store
-                                    .put_input_log(log_container)
-                                    .map_err(|e| store_error_to_status("put_input_log", e))?;
-                                Ok::<_, Status>(log_id.to_bytes().to_vec())
-                            })() {
-                                Ok(log_id) => log_id,
-                                Err(e) => {
-                                    return Err(fault_runtime_after_snapshot_loss(
-                                        manager.as_ref(),
-                                        runtime,
-                                        lease.slot_id,
-                                        "TakeSnapshot lost active DHILOG",
-                                        e,
-                                    ));
-                                }
+                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+                    let store = store
+                        .lock()
+                        .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
+                    let boundary = runtime.boundary_state(runtime.queued_inputs.is_empty());
+                    let segment_icount = runtime.position.segment_icount;
+                    let segment_vns =
+                        segment_vns_from_icount(&runtime.machine_config, segment_icount)?;
+                    let machine_config_hash = runtime
+                        .machine_config
+                        .config_hash()
+                        .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
+                    let source = match runtime.base_snapshot.clone() {
+                        Some(parent) => crate::snapshot_engine::PageSource::Incremental {
+                            parent,
+                            ring: &mut runtime.dirty_ring,
+                            dirty: &mut runtime.dirty,
+                        },
+                        None => crate::snapshot_engine::PageSource::Full,
+                    };
+                    let out = crate::snapshot_engine::take_snapshot(
+                        &runtime.slot,
+                        slot_state,
+                        &runtime.bus,
+                        &runtime.entropy,
+                        &runtime.machine_config,
+                        boundary,
+                        source,
+                        &store,
+                    )
+                    .map_err(snapshot_engine_error_to_status)?;
+                    let input_log_id = if seal_input_log {
+                        match (|| {
+                            let log = runtime.log.take().ok_or_else(|| {
+                                Status::failed_precondition("no active DHILOG segment to seal")
+                            })?;
+                            let log_bytes = log
+                                .seal(dh_inputlog::dhilog::SealParams {
+                                    end_snapshot_id: out.snapshot_ref.to_bytes(),
+                                    end_icount: segment_icount,
+                                    end_vns: segment_vns,
+                                    end_state_hash: out.hash_chain,
+                                    stop_reason: dh_vmm::recording::stop_reason_u8(
+                                        dh_vmm::runctl::StopReason::BudgetReached,
+                                    ),
+                                })
+                                .map_err(|e| Status::data_loss(format!("seal DHILOG: {e:?}")))?;
+                            let log_container =
+                                snapstore_client::helpers::build_input_log_container(
+                                    dh_inputlog::DHILOG_FORMAT_VERSION,
+                                    &log_bytes,
+                                );
+                            let (log_id, _deduped) = store
+                                .put_input_log(log_container)
+                                .map_err(|e| store_error_to_status("put_input_log", e))?;
+                            Ok::<_, Status>(log_id.to_bytes().to_vec())
+                        })() {
+                            Ok(log_id) => log_id,
+                            Err(e) => {
+                                return Err(fault_runtime_after_snapshot_loss(
+                                    manager.as_ref(),
+                                    runtime,
+                                    lease.slot_id,
+                                    "TakeSnapshot lost active DHILOG",
+                                    e,
+                                ));
                             }
-                        } else {
-                            Vec::new()
-                        };
-                        let next_log = new_segment_log(
-                            &runtime.machine_config,
-                            Some(&out.snapshot_ref),
-                            [0; 32],
-                        )
-                        .map_err(|e| {
-                            fault_runtime_after_snapshot_loss(
-                                manager.as_ref(),
-                                runtime,
-                                lease.slot_id,
-                                "TakeSnapshot could not open next DHILOG segment",
-                                e,
-                            )
-                        })?;
-                        if let Err(e) = manager
-                            .set_position(
-                                &lease,
-                                boundary.icount,
-                                Some(out.snapshot_ref.to_bytes()),
-                                lease_now_ms(),
-                            )
-                            .map_err(slot_error_to_status)
-                        {
-                            return Err(fault_runtime_after_snapshot_loss(
-                                manager.as_ref(),
-                                runtime,
-                                lease.slot_id,
-                                "TakeSnapshot could not publish snapshot position",
-                                e,
-                            ));
                         }
-                        runtime.base_snapshot = Some(out.snapshot_ref.clone());
-                        runtime.log = Some(next_log);
-                        runtime.position.segment_icount = 0;
-                        Ok((
-                            out,
-                            machine_config_hash,
-                            input_log_id,
-                            runtime.position.frame_counter,
+                    } else {
+                        Vec::new()
+                    };
+                    let next_log =
+                        new_segment_log(&runtime.machine_config, Some(&out.snapshot_ref), [0; 32])
+                            .map_err(|e| {
+                                fault_runtime_after_snapshot_loss(
+                                    manager.as_ref(),
+                                    runtime,
+                                    lease.slot_id,
+                                    "TakeSnapshot could not open next DHILOG segment",
+                                    e,
+                                )
+                            })?;
+                    if let Err(e) = manager
+                        .set_position(
+                            &lease,
                             boundary.icount,
-                            boundary.vns,
-                        ))
-                    })
-                    .map_err(runtime_error_to_status)?
+                            Some(out.snapshot_ref.to_bytes()),
+                            lease_now_ms(),
+                        )
+                        .map_err(slot_error_to_status)
+                    {
+                        return Err(fault_runtime_after_snapshot_loss(
+                            manager.as_ref(),
+                            runtime,
+                            lease.slot_id,
+                            "TakeSnapshot could not publish snapshot position",
+                            e,
+                        ));
+                    }
+                    runtime.base_snapshot = Some(out.snapshot_ref.clone());
+                    runtime.log = Some(next_log);
+                    runtime.position.segment_icount = 0;
+                    Ok((
+                        out,
+                        machine_config_hash,
+                        input_log_id,
+                        runtime.position.frame_counter,
+                        boundary.icount,
+                        boundary.vns,
+                    ))
+                })
             })
-            .await?;
+            .await??;
             let (out, machine_config_hash, input_log_id, frame_counter, icount, vns) = snapshot;
             Ok(Response::new(proto::TakeSnapshotResponse {
                 snapshot: Some(proto::SnapshotRef {
@@ -1563,7 +2085,7 @@ impl HypervisorWorker for WorkerService {
 mod tests {
     use super::*;
     #[cfg(target_arch = "x86_64")]
-    use crate::runtime::{SlotPosition, SlotRuntime};
+    use crate::runtime::{SlotActor, SlotPosition, SlotRuntime};
     use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 
     fn test_config(slots: usize) -> WorkerConfig {
@@ -1845,6 +2367,122 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn run_rpc_reuses_actor_counter_across_sequential_runs() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0x5A; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let injected = svc
+                .inject_inputs(Request::new(proto::InjectInputsRequest {
+                    lease: Some(lease.clone()),
+                    events: vec![proto::ScheduledEvent {
+                        at: Some(proto::scheduled_event::At::AtIcount(25_000)),
+                        event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                            port: 0,
+                            buttons: 0xA5A5,
+                        })),
+                    }],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(injected.scheduled, 1);
+            assert_eq!(
+                svc.runtime_table()
+                    .with(lease.slot_id, |actor| actor
+                        .with_runtime(|runtime| runtime.queued_inputs.len())
+                        .unwrap())
+                    .unwrap(),
+                1
+            );
+            let first = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(20_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                first.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::BudgetReached)
+            );
+            assert_eq!(first.icount, 20_000);
+            assert_eq!(first.state_hash.unwrap().hash.len(), 32);
+            assert_eq!(
+                svc.runtime_table()
+                    .with(lease.slot_id, |actor| actor
+                        .with_runtime(|runtime| runtime.queued_inputs.len())
+                        .unwrap())
+                    .unwrap(),
+                1,
+                "future input should stay queued after a shorter run"
+            );
+
+            let second = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(30_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                second.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::BudgetReached)
+            );
+            assert_eq!(second.icount, 50_000);
+            assert_eq!(second.state_hash.unwrap().hash.len(), 32);
+            assert_eq!(
+                svc.runtime_table()
+                    .with(lease.slot_id, |actor| actor
+                        .with_runtime(|runtime| runtime.queued_inputs.len())
+                        .unwrap())
+                    .unwrap(),
+                0,
+                "scheduled input should drain inside the second run"
+            );
+            assert_eq!(
+                svc.slot_manager().slot_info(lease.slot_id).unwrap().icount,
+                50_000
+            );
+            assert_eq!(
+                svc.runtime_table()
+                    .with(lease.slot_id, |actor| actor
+                        .with_runtime(|runtime| runtime.position.segment_icount)
+                        .unwrap())
+                    .unwrap(),
+                50_000
+            );
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn take_snapshot_defaults_to_sealing_and_rejects_capture() {
         if !runtime_tests_available() {
             return;
@@ -2028,6 +2666,85 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn make_actor(
+        slot_id: u64,
+        seed: u8,
+        position: SlotPosition,
+        base_snapshot: Option<snapstore_types::SnapshotRef>,
+    ) -> Result<Arc<SlotActor>, Status> {
+        SlotActor::start(
+            slot_id,
+            u32::try_from(slot_id).unwrap(),
+            make_runtime(seed, position, base_snapshot)?,
+        )
+        .map(Arc::new)
+        .map_err(|e| Status::internal(format!("start slot actor: {e}")))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn slot_actors_own_distinct_threads_and_counters() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let svc = WorkerService::new(test_config(2)).unwrap();
+        let a = svc
+            .install_allocated_runtime("CreateVm", |_| {
+                make_runtime(0x41, SlotPosition::default(), None)
+            })
+            .await
+            .unwrap();
+        let b = svc
+            .install_allocated_runtime("CreateVm", |_| {
+                make_runtime(0x42, SlotPosition::default(), None)
+            })
+            .await
+            .unwrap();
+
+        let table = svc.runtime_table();
+        let a_info = table
+            .with(a.slot_id, |actor| {
+                (
+                    actor.tid(),
+                    actor
+                        .with_runtime(|runtime| {
+                            (
+                                dh_vmm::run::current_tid(),
+                                runtime.counter.is_some(),
+                                runtime.position.segment_icount,
+                            )
+                        })
+                        .unwrap(),
+                )
+            })
+            .unwrap();
+        let b_info = table
+            .with(b.slot_id, |actor| {
+                (
+                    actor.tid(),
+                    actor
+                        .with_runtime(|runtime| {
+                            (
+                                dh_vmm::run::current_tid(),
+                                runtime.counter.is_some(),
+                                runtime.position.segment_icount,
+                            )
+                        })
+                        .unwrap(),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(a_info.0, a_info.1 .0);
+        assert_eq!(b_info.0, b_info.1 .0);
+        assert_ne!(a_info.0, b_info.0);
+        assert!(a_info.1 .1);
+        assert!(b_info.1 .1);
+        assert_eq!(a_info.1 .2, 0);
+        assert_eq!(b_info.1 .2, 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn runtime_status_detail(status: &Status) -> proto::ErrorDetail {
         <proto::ErrorDetail as prost::Message>::decode(status.details()).unwrap()
     }
@@ -2155,7 +2872,7 @@ mod tests {
             ..SlotPosition::default()
         };
         svc.runtime_table()
-            .insert(0, make_runtime(0x13, existing_position, None).unwrap())
+            .insert(0, make_actor(0, 0x13, existing_position, None).unwrap())
             .unwrap();
 
         let err = svc
@@ -2169,7 +2886,9 @@ mod tests {
         assert_eq!(svc.runtime_table().occupied_count(), 1);
         assert_eq!(
             svc.runtime_table()
-                .with(0, |runtime| runtime.position.cumulative_icount)
+                .with(0, |actor| actor
+                    .with_runtime(|runtime| runtime.position.cumulative_icount)
+                    .unwrap())
                 .unwrap(),
             existing_position.cumulative_icount
         );
@@ -2291,7 +3010,7 @@ mod tests {
             ..SlotPosition::default()
         };
         svc.runtime_table()
-            .insert(1, make_runtime(0x25, existing_position, None).unwrap())
+            .insert(1, make_actor(1, 0x25, existing_position, None).unwrap())
             .unwrap();
 
         let err = svc
@@ -2305,7 +3024,9 @@ mod tests {
         assert_eq!(svc.runtime_table().occupied_count(), 2);
         assert_eq!(
             svc.runtime_table()
-                .with(1, |runtime| runtime.position.cumulative_icount)
+                .with(1, |actor| actor
+                    .with_runtime(|runtime| runtime.position.cumulative_icount)
+                    .unwrap())
                 .unwrap(),
             existing_position.cumulative_icount
         );

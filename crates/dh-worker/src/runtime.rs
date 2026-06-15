@@ -7,9 +7,11 @@
 //! `SlotManager`, then enter this table from a blocking worker thread before
 //! driving KVM or snapshot-store work.
 
+use std::any::Any;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -128,7 +130,217 @@ impl<T> RuntimeTable<T> {
     }
 }
 
-pub type WorkerRuntimeTable = RuntimeTable<SlotRuntime>;
+pub type WorkerRuntimeTable = RuntimeTable<Arc<SlotActor>>;
+
+#[derive(Debug)]
+pub enum RuntimeActorError {
+    Start(String),
+    Send(String),
+    Recv(String),
+    TypeMismatch,
+    Join(String),
+}
+
+impl std::fmt::Display for RuntimeActorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeActorError::Start(e) => write!(f, "runtime actor start failed: {e}"),
+            RuntimeActorError::Send(e) => write!(f, "runtime actor send failed: {e}"),
+            RuntimeActorError::Recv(e) => write!(f, "runtime actor receive failed: {e}"),
+            RuntimeActorError::TypeMismatch => write!(f, "runtime actor reply type mismatch"),
+            RuntimeActorError::Join(e) => write!(f, "runtime actor join failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeActorError {}
+
+type ActorReply = mpsc::Sender<Box<dyn Any + Send>>;
+type RuntimeOp = Box<dyn FnOnce(&mut SlotRuntime) -> Box<dyn Any + Send> + Send + 'static>;
+
+enum ActorCommand {
+    WithRuntime { op: RuntimeOp, reply: ActorReply },
+    Shutdown { reply: mpsc::Sender<SlotRuntime> },
+}
+
+/// Stable per-slot execution owner.
+///
+/// The actor thread owns the `SlotRuntime`, the vCPU fd, and the
+/// thread-attached `InstRetired` counter. RPC handlers communicate by
+/// sending closures to this thread; they never run guest work on Tokio's
+/// blocking pool.
+pub struct SlotActor {
+    slot_id: u64,
+    tid: i32,
+    pause: Arc<AtomicBool>,
+    tx: mpsc::Sender<ActorCommand>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl SlotActor {
+    pub fn start(slot_id: u64, core: u32, runtime: SlotRuntime) -> Result<Self, RuntimeActorError> {
+        let pause = runtime.pause_flag();
+        let (tx, rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let builder = thread::Builder::new().name(format!("dh-slot-{slot_id}"));
+        let join = builder
+            .spawn(move || actor_main(slot_id, core, runtime, rx, started_tx))
+            .map_err(|e| RuntimeActorError::Start(e.to_string()))?;
+        let tid = match started_rx.recv() {
+            Ok(Ok(tid)) => tid,
+            Ok(Err(e)) => {
+                let _ = join.join();
+                return Err(RuntimeActorError::Start(e));
+            }
+            Err(e) => {
+                let _ = join.join();
+                return Err(RuntimeActorError::Recv(e.to_string()));
+            }
+        };
+        Ok(Self {
+            slot_id,
+            tid,
+            pause,
+            tx,
+            join: Mutex::new(Some(join)),
+        })
+    }
+
+    pub fn slot_id(&self) -> u64 {
+        self.slot_id
+    }
+
+    pub fn tid(&self) -> i32 {
+        self.tid
+    }
+
+    pub fn request_pause(&self) {
+        self.pause.store(true, Ordering::SeqCst);
+    }
+
+    pub fn with_runtime<R>(
+        &self,
+        f: impl FnOnce(&SlotRuntime) -> R + Send + 'static,
+    ) -> Result<R, RuntimeActorError>
+    where
+        R: Send + 'static,
+    {
+        self.with_runtime_mut(move |runtime| f(runtime))
+    }
+
+    pub fn with_runtime_mut<R>(
+        &self,
+        f: impl FnOnce(&mut SlotRuntime) -> R + Send + 'static,
+    ) -> Result<R, RuntimeActorError>
+    where
+        R: Send + 'static,
+    {
+        let (reply, rx) = mpsc::channel();
+        let op: RuntimeOp = Box::new(move |runtime| Box::new(f(runtime)));
+        self.tx
+            .send(ActorCommand::WithRuntime { op, reply })
+            .map_err(|e| RuntimeActorError::Send(e.to_string()))?;
+        let boxed = rx
+            .recv()
+            .map_err(|e| RuntimeActorError::Recv(e.to_string()))?;
+        boxed
+            .downcast::<R>()
+            .map(|boxed| *boxed)
+            .map_err(|_| RuntimeActorError::TypeMismatch)
+    }
+
+    pub fn shutdown(self) -> Result<SlotRuntime, RuntimeActorError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(ActorCommand::Shutdown { reply })
+            .map_err(|e| RuntimeActorError::Send(e.to_string()))?;
+        let runtime = rx
+            .recv()
+            .map_err(|e| RuntimeActorError::Recv(e.to_string()))?;
+        if let Some(join) = self
+            .join
+            .lock()
+            .expect("runtime actor join poisoned")
+            .take()
+        {
+            join.join().map_err(|e| {
+                RuntimeActorError::Join(
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| e.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("panic")
+                        .to_string(),
+                )
+            })?;
+        }
+        Ok(runtime)
+    }
+}
+
+impl Drop for SlotActor {
+    fn drop(&mut self) {
+        let Some(join) = self
+            .join
+            .lock()
+            .expect("runtime actor join poisoned")
+            .take()
+        else {
+            return;
+        };
+        let (reply, _rx) = mpsc::channel();
+        let _ = self.tx.send(ActorCommand::Shutdown { reply });
+        let _ = join.join();
+    }
+}
+
+fn actor_main(
+    slot_id: u64,
+    core: u32,
+    mut runtime: SlotRuntime,
+    rx: mpsc::Receiver<ActorCommand>,
+    started: mpsc::Sender<Result<i32, String>>,
+) {
+    let tid = dh_vmm::run::current_tid();
+    let start = (|| {
+        dh_vmm::run::install_kick_handler().map_err(|e| format!("install kick handler: {e}"))?;
+        dh_vmm::run::pin_current_thread(core)
+            .map_err(|e| format!("pin slot {slot_id} actor to core {core}: {e:?}"))?;
+        let _ = dh_vmm::run::set_current_thread_fifo();
+        let counter = dh_detclock::counter::InstRetired::open_for_current_thread()
+            .map_err(|e| format!("open InstRetired on slot {slot_id} actor: {e:?}"))?;
+        counter
+            .route_overflow_to_thread(tid, dh_vmm::run::kick_signal())
+            .map_err(|e| format!("route InstRetired overflow to tid {tid}: {e:?}"))?;
+        counter
+            .reset()
+            .map_err(|e| format!("reset InstRetired on slot {slot_id}: {e:?}"))?;
+        counter
+            .arm_period(dh_detclock::counter::NEVER_FIRES_PERIOD)
+            .map_err(|e| format!("arm InstRetired on slot {slot_id}: {e:?}"))?;
+        counter
+            .enable()
+            .map_err(|e| format!("enable InstRetired on slot {slot_id}: {e:?}"))?;
+        runtime.counter = Some(counter);
+        runtime.thread = RuntimeThreadState::Parked;
+        runtime.pause.store(false, Ordering::SeqCst);
+        Ok(tid)
+    })();
+    if started.send(start).is_err() {
+        return;
+    }
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            ActorCommand::WithRuntime { op, reply } => {
+                let _ = reply.send(op(&mut runtime));
+            }
+            ActorCommand::Shutdown { reply } => {
+                let _ = reply.send(runtime);
+                break;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SlotPosition {
@@ -155,6 +367,25 @@ impl Default for RuntimeThreadState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueuedInputKind {
+    PadSet {
+        port: u8,
+        buttons: u32,
+        frame_hint: u32,
+    },
+    NetRx {
+        frame: Vec<u8>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub icount: u64,
+    pub order: u64,
+    pub kind: QueuedInputKind,
+}
+
 /// The real resources owned by one worker slot.
 pub struct SlotRuntime {
     pub slot: dh_vmm::kvm::SlotVm,
@@ -170,6 +401,8 @@ pub struct SlotRuntime {
     pub counter: Option<dh_detclock::counter::InstRetired>,
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
+    pub queued_inputs: Vec<QueuedInput>,
+    pub next_input_order: u64,
     pub thread: RuntimeThreadState,
     pause: Arc<AtomicBool>,
 }
@@ -200,6 +433,8 @@ impl SlotRuntime {
             counter,
             base_snapshot,
             position,
+            queued_inputs: Vec::new(),
+            next_input_order: 0,
             thread: RuntimeThreadState::Parked,
             pause: Arc::new(AtomicBool::new(false)),
         }))
@@ -218,6 +453,8 @@ impl SlotRuntime {
             counter: parts.counter,
             base_snapshot: parts.base_snapshot,
             position: parts.position,
+            queued_inputs: parts.queued_inputs,
+            next_input_order: parts.next_input_order,
             thread: parts.thread,
             pause: parts.pause,
         }
@@ -283,6 +520,8 @@ pub struct SlotRuntimeParts {
     pub counter: Option<dh_detclock::counter::InstRetired>,
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
+    pub queued_inputs: Vec<QueuedInput>,
+    pub next_input_order: u64,
     pub thread: RuntimeThreadState,
     pub pause: Arc<AtomicBool>,
 }
