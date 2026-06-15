@@ -469,6 +469,11 @@ dependencies = [
  "blake3",
  "dh-devices",
  "snapstore-client",
+ "snapstore-manifest",
+ "snapstore-server",
+ "snapstore-types",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
