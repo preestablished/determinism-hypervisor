@@ -2994,6 +2994,19 @@ mod tests {
         base_hash: [u8; 32],
         kernel_hash: [u8; 32],
     ) -> proto::MachineConfig {
+        capture_fixture_machine_config_with_epoch_len(
+            base_hash,
+            kernel_hash,
+            dh_vmm::config::DEFAULT_EPOCH_LEN,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_fixture_machine_config_with_epoch_len(
+        base_hash: [u8; 32],
+        kernel_hash: [u8; 32],
+        epoch_len: u64,
+    ) -> proto::MachineConfig {
         let mut config = dh_vmm::config::MachineConfig::new(
             8 * 1024 * 1024,
             base_hash,
@@ -3002,6 +3015,7 @@ mod tests {
                 cmdline: Vec::new(),
             },
         );
+        config.epoch_len = epoch_len;
         config.device_set = vec![
             dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
             dh_devices::clock::DEVICE_ID_PV_CLOCK,
@@ -3019,6 +3033,253 @@ mod tests {
             fb.extend_from_slice(&(nanokernel::CAPTURE_FIXTURE_FB_QWORD_BASE + j).to_le_bytes());
         }
         fb[offset..offset + len].to_vec()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_fixture_spec(layout_version: u32) -> proto::CaptureSpec {
+        proto::CaptureSpec {
+            ranges: vec![proto::ExtractRange {
+                region: "framebuffer".into(),
+                layout_version,
+                offset: 8,
+                len: 24,
+            }],
+            framebuffer: true,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn stored_input_log_payload(svc: &WorkerService, input_log_id: Vec<u8>) -> Vec<u8> {
+        let log_id = log_id_from_bytes(input_log_id).unwrap();
+        let store = svc.store().unwrap();
+        let store = store.lock().unwrap();
+        let container = store.get_input_log(log_id).unwrap();
+        input_log_payload_from_container(&container).unwrap()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_epoch_leg(
+        capture: bool,
+    ) -> (
+        dh_vmm::runctl::SegmentOutcome,
+        Vec<(u64, u64, [u8; 32])>,
+        [u8; 32],
+    ) {
+        dh_vmm::run::install_kick_handler().unwrap();
+        let sys = dh_vmm::kvm::KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(8 * 1024 * 1024).unwrap();
+        dh_vmm::boot::load_and_enter(&slot, nanokernel::capture_fixture_elf(), b"").unwrap();
+        let counter = dh_detclock::counter::InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(dh_vmm::run::current_tid(), dh_vmm::run::kick_signal())
+            .unwrap();
+        counter
+            .arm_period(dh_detclock::counter::NEVER_FIRES_PERIOD)
+            .unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+
+        let mut config = dh_vmm::config::MachineConfig::new(
+            8 * 1024 * 1024,
+            [0xCE; 32],
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash: [0xCF; 32],
+                cmdline: Vec::new(),
+            },
+        );
+        config.epoch_len = 64;
+        config.device_set = vec![
+            dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+        let config_hash = config.config_hash().unwrap();
+
+        let mem = RuntimeVmMem(slot.guest_mem.clone());
+        let mut bus = dh_devices::MmioBus::new();
+        bus.register(
+            DETCHANNEL_MMIO_BASE,
+            Box::new(RuntimeDetChannel::new(
+                mem.clone(),
+                detguest_host::LogFaultPlan::default(),
+                detguest_host::LogFaultPlan::default,
+            )),
+        )
+        .unwrap();
+        bus.register(
+            dh_devices::clock::PV_CLOCK_BASE,
+            Box::new(dh_devices::clock::PvClock::new(
+                config.clock.num(),
+                config.clock.den(),
+            )),
+        )
+        .unwrap();
+        bus.register(
+            dh_devices::pad::PV_PAD_BASE,
+            Box::new(dh_devices::pad::PvPad::new()),
+        )
+        .unwrap();
+        bus.register(
+            dh_devices::entropy::PV_ENTROPY_BASE,
+            Box::new(dh_devices::entropy::PvEntropy::new()),
+        )
+        .unwrap();
+        bus.register(0xD000_6000, Box::new(dh_devices::DebugSerial::new()))
+            .unwrap();
+
+        let header = dh_inputlog::dhilog::SegmentHeader {
+            base_snapshot_id: [0; 32],
+            entropy_seed: [0xC5; 32],
+            machine_config_hash: config_hash,
+            clock_num: config.clock.num(),
+            clock_den: config.clock.den(),
+            encoder_fingerprint: 0,
+        };
+        let rail = std::cell::RefCell::new(dh_vmm::recording::DeviceRail::new(
+            bus,
+            dh_devices::entropy::DetEntropy::from_seed([0xC5; 32]),
+            dh_inputlog::dhilog::LogWriter::new(header),
+            mem,
+        ));
+        let pause = std::sync::atomic::AtomicBool::new(false);
+        let mut chain = dh_vmm::hash::StateHashChain::new(&config_hash, &[0; 32]);
+        let mut epochs = Vec::new();
+        let outcome = {
+            let mut segment = dh_vmm::runctl::Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: None,
+            };
+            dh_vmm::runctl::run_segment_with_epochs(
+                &mut segment,
+                dh_vmm::runctl::Until::IcountBudget(100_000),
+                &mut || false,
+                &mut |exit| {
+                    let icount = counter.read().map_err(|e| {
+                        dh_vmm::boundary::BoundaryError::Exit(format!("counter read: {e:?}"))
+                    })?;
+                    service_exit_with_detchannel(&mut rail.borrow_mut(), icount, exit)
+                },
+                &mut |epoch_index, icount, chain_value| {
+                    epochs.push((epoch_index, icount, chain_value));
+                    rail.borrow_mut()
+                        .log_epoch_hash(epoch_index, icount, chain_value)
+                        .map_err(|e| {
+                            dh_vmm::boundary::BoundaryError::Exit(format!("epoch log: {e:?}"))
+                        })
+                },
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            outcome.reason,
+            dh_vmm::runctl::StopReason::BudgetReached | dh_vmm::runctl::StopReason::GuestHalted
+        ));
+        let mut rail = rail.into_inner();
+        if capture {
+            let out = capture_at_boundary(
+                &mut rail.bus,
+                Some(&capture_fixture_spec(
+                    nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                )),
+                0,
+            )
+            .unwrap();
+            assert_eq!(out.feature_bytes, capture_fixture_bytes(8, 24));
+            assert!(!out.fb_lz4.is_empty());
+        }
+        let mut post_capture_chain = dh_vmm::hash::StateHashChain::from_value(outcome.state_hash);
+        let device_sections = dh_vmm::hash::device_sections(&rail.bus);
+        post_capture_chain
+            .push_final_link(
+                &slot,
+                &device_sections,
+                outcome.boundary.icount,
+                outcome.vns,
+            )
+            .unwrap();
+        (outcome, epochs, post_capture_chain.value())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    struct CaptureNeutralityLeg {
+        run: proto::RunResponse,
+        snap: proto::TakeSnapshotResponse,
+        log_bytes: Vec<u8>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn capture_neutrality_leg(
+        svc: &WorkerService,
+        base_snapshot: proto::SnapshotRef,
+        capture: Option<proto::CaptureSpec>,
+    ) -> CaptureNeutralityLeg {
+        let restored = svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(base_snapshot),
+                entropy_seed: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let lease = restored.lease.unwrap();
+        let had_capture = capture.is_some();
+        let run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                hard_icount_cap: 0,
+                capture,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            run.reason,
+            proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+        );
+        if had_capture {
+            assert_eq!(run.feature_bytes, capture_fixture_bytes(8, 24));
+            assert!(!run.fb_lz4.is_empty());
+            assert!(run.fb_info.is_some());
+        } else {
+            assert!(run.feature_bytes.is_empty());
+            assert!(run.fb_lz4.is_empty());
+            assert!(run.fb_info.is_none());
+        }
+
+        let snap = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let svc_for_log = svc.clone();
+        let input_log_id = snap.input_log_id.clone();
+        let log_bytes = tokio::task::spawn_blocking(move || {
+            stored_input_log_payload(&svc_for_log, input_log_id)
+        })
+        .await
+        .unwrap();
+        svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+            .await
+            .unwrap();
+        CaptureNeutralityLeg {
+            run,
+            snap,
+            log_bytes,
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3706,6 +3967,152 @@ mod tests {
                 proto_pixel_format(proto::PixelFormat::PfUnspecified)
             );
             assert_eq!(fb_info.frame_counter, 0);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn m6_accept_capture_neutrality_and_layout_precondition() {
+        if !runtime_tests_available() {
+            return;
+        }
+
+        let (plain_epoch_out, plain_epochs, plain_post_capture_hash) = capture_epoch_leg(false);
+        let (captured_epoch_out, captured_epochs, captured_post_capture_hash) =
+            capture_epoch_leg(true);
+        assert!(
+            !plain_epochs.is_empty(),
+            "acceptance fixture must exercise epoch hash records"
+        );
+        assert_eq!(captured_epoch_out.state_hash, plain_epoch_out.state_hash);
+        assert_eq!(
+            captured_epochs, plain_epochs,
+            "capture must not perturb epoch hashes"
+        );
+        assert_eq!(
+            captured_post_capture_hash, plain_post_capture_hash,
+            "capture must not perturb state/device hash after the capture boundary"
+        );
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::capture_fixture_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            3,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xCA; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let root_lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(root_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(root_lease),
+            }))
+            .await
+            .unwrap();
+
+            let plain = capture_neutrality_leg(&svc, base_snapshot.clone(), None).await;
+            let captured = capture_neutrality_leg(
+                &svc,
+                base_snapshot.clone(),
+                Some(capture_fixture_spec(
+                    nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                )),
+            )
+            .await;
+
+            assert_eq!(captured.run.icount, plain.run.icount);
+            assert_eq!(captured.run.vns, plain.run.vns);
+            assert_eq!(captured.run.state_hash, plain.run.state_hash);
+            assert_eq!(
+                captured.snap.snapshot.as_ref().unwrap().hash,
+                plain.snap.snapshot.as_ref().unwrap().hash,
+                "capture must not perturb the child snapshot ref"
+            );
+            assert_eq!(captured.snap.state_hash, plain.snap.state_hash);
+            assert_eq!(
+                captured.log_bytes, plain.log_bytes,
+                "capture must not perturb the sealed DHILOG"
+            );
+
+            let bad_capture =
+                capture_fixture_spec(nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION + 1);
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(base_snapshot.clone()),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = restored.lease.unwrap();
+            let err = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: Some(bad_capture.clone()),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(err.message().contains("layout_version"));
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(base_snapshot),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = restored.lease.unwrap();
+            svc.run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                hard_icount_cap: 0,
+                capture: None,
+            }))
+            .await
+            .unwrap();
+            let err = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: Some(bad_capture),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(err.message().contains("layout_version"));
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
         });
     }
 
