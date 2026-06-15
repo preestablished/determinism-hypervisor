@@ -26,6 +26,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dhilog_splice"
+path = "fuzz_targets/dhilog_splice.rs"
+test = false
+doc = false
+bench = false
+
 # Line tables for symbolized fuzz backtraces — do not "optimize" to 0.
 # (cargo-fuzz itself turns on debug-assertions + overflow-checks; this
 # profile only needs the symbols.)

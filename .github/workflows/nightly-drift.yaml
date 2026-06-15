@@ -107,12 +107,12 @@ jobs:
         run: cargo test -p dh-worker --test m5_record_replay record_replay_corpus_pad_echo_6s_reverifies -- --nocapture
         working-directory: repo
 
-  # 1h libFuzzer run over the DHILOG read path (bead 1j4): arbitrary
-  # bytes -> LogReader::parse -> full record walk; the invariant is no
-  # panics / no unbounded allocation on hostile input. Hosted by
-  # default — fuzzing needs no KVM and must not occupy the kvm-intel
-  # box. The golden v1 fixtures seed the corpus past the header magic
-  # (cov 31 -> 350 in the bring-up smoke).
+  # 1h libFuzzer budget over the DHILOG read and splice paths (beads
+  # 1j4, 6zm): arbitrary bytes -> LogReader::parse / Lineage
+  # composition; the invariant is no panics / no unbounded allocation on
+  # hostile input. Hosted by default — fuzzing needs no KVM and must not
+  # occupy the kvm-intel box. The shell splits fuzz_seconds across both
+  # targets so the operator 24h dispatch remains a 24h wall-clock job.
   dhilog-fuzz:
     runs-on: ${{ inputs.fuzz_runner || 'ubuntu-latest' }}
     # Expressions have no arithmetic, so one ceiling serves every
@@ -132,16 +132,40 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: repo/crates/dh-inputlog/fuzz/corpus/dhilog_parse
-          key: dhilog-fuzz-corpus-${{ github.run_id }}
-          restore-keys: dhilog-fuzz-corpus-
+          key: dhilog-fuzz-corpus-dhilog_parse-${{ github.run_id }}
+          restore-keys: dhilog-fuzz-corpus-dhilog_parse-
+      - uses: actions/cache@v4
+        with:
+          path: repo/crates/dh-inputlog/fuzz/corpus/dhilog_splice
+          key: dhilog-fuzz-corpus-dhilog_splice-${{ github.run_id }}
+          restore-keys: dhilog-fuzz-corpus-dhilog_splice-
+      - name: ensure corpus directories exist
+        working-directory: repo/crates/dh-inputlog
+        run: mkdir -p fuzz/corpus/dhilog_parse fuzz/corpus/dhilog_splice
       - name: seed fixtures must exist and be non-empty
         working-directory: repo/crates/dh-inputlog
         run: test -s tests/fixtures/v1_minimal.dhilog && test -s tests/fixtures/v1_kitchen_sink.dhilog
-      - name: fuzz the DHILOG parser
+      - name: fuzz DHILOG parser and splice
         working-directory: repo/crates/dh-inputlog
         run: |
+          set -euo pipefail
+          total_seconds="${{ inputs.fuzz_seconds || '3600' }}"
+          case "$total_seconds" in
+            ''|*[!0-9]*)
+              echo "::error::fuzz_seconds must be a positive integer, got '$total_seconds'"
+              exit 1
+              ;;
+          esac
+          if [ "$total_seconds" -lt 2 ]; then
+            total_seconds=2
+          fi
+          parse_seconds=$(( total_seconds / 2 ))
+          splice_seconds=$(( total_seconds - parse_seconds ))
+          echo "DHILOG fuzz budget: ${parse_seconds}s parser + ${splice_seconds}s splice = ${total_seconds}s total"
           cargo +nightly fuzz run dhilog_parse fuzz/corpus/dhilog_parse tests/fixtures \
-            -- -max_total_time=${{ inputs.fuzz_seconds || '3600' }} -rss_limit_mb=4096
+            -- -max_total_time="$parse_seconds" -rss_limit_mb=4096
+          cargo +nightly fuzz run dhilog_splice fuzz/corpus/dhilog_splice tests/fixtures \
+            -- -max_total_time="$splice_seconds" -rss_limit_mb=4096
       - name: keep crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
