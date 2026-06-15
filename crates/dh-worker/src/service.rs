@@ -1,12 +1,14 @@
 //! dh-workerd gRPC service shell (bead rfv).
 //!
 //! This module is the daemon-owned API seam: tonic transport, worker
-//! identity, slot table visibility, and status-code mapping. The guest
-//! mutating RPCs stay `UNIMPLEMENTED` until they own real per-slot KVM,
-//! device, counter, DHILOG, and snapshot-store state; returning success
-//! before that would fake the M6 acceptance surface.
+//! identity, slot table visibility, status-code mapping, and runtime-table
+//! ownership. Guest mutating RPCs stay `UNIMPLEMENTED` until each path owns
+//! real per-slot KVM, device, counter, DHILOG, and snapshot-store state;
+//! returning success before that would fake the M6 acceptance surface.
 
 use crate::proto_map::slot_info_to_proto;
+#[cfg(target_arch = "x86_64")]
+use crate::runtime::{RuntimeError, WorkerRuntimeTable};
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
@@ -112,6 +114,8 @@ pub struct WorkerService {
 
 struct WorkerInner {
     manager: Arc<SlotManager>,
+    #[cfg(target_arch = "x86_64")]
+    runtimes: Arc<WorkerRuntimeTable>,
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
@@ -119,14 +123,17 @@ struct WorkerInner {
 
 impl WorkerService {
     pub fn new(config: WorkerConfig) -> Result<Self, ConfigError> {
+        let slot_count = config.slot_cores.len();
         let manager = Arc::new(SlotManager::new(
-            config.slot_cores.len(),
+            slot_count,
             config.slot_cores,
             config.lease_policy,
         )?);
         Ok(Self {
             inner: Arc::new(WorkerInner {
                 manager,
+                #[cfg(target_arch = "x86_64")]
+                runtimes: Arc::new(WorkerRuntimeTable::new(slot_count)),
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -136,6 +143,11 @@ impl WorkerService {
 
     pub fn slot_manager(&self) -> Arc<SlotManager> {
         self.inner.manager.clone()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn runtime_table(&self) -> Arc<WorkerRuntimeTable> {
+        self.inner.runtimes.clone()
     }
 
     fn slots_total(&self) -> u32 {
@@ -294,6 +306,71 @@ fn unimplemented_status(method: &'static str) -> Status {
     ))
 }
 
+fn lease_now_ms() -> u64 {
+    let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return 0;
+    };
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_error_to_status(e: RuntimeError) -> Status {
+    let slot_id = match &e {
+        RuntimeError::NoSuchSlot(slot_id)
+        | RuntimeError::Empty { slot_id }
+        | RuntimeError::Occupied { slot_id } => *slot_id,
+    };
+    let code = match &e {
+        RuntimeError::NoSuchSlot(_) => "runtime_no_such_slot",
+        RuntimeError::Empty { .. } => "runtime_missing",
+        RuntimeError::Occupied { .. } => "runtime_occupied",
+    };
+    let detail = proto::ErrorDetail {
+        slot_id,
+        icount: 0,
+        code: code.into(),
+    };
+    Status::with_details(
+        Code::FailedPrecondition,
+        e.to_string(),
+        detail.encode_to_vec().into(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+async fn blocking_lifecycle<T>(
+    method: &'static str,
+    f: impl FnOnce() -> Result<T, Status> + Send + 'static,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Status::internal(format!("{method} blocking worker failed: {e}")))?
+}
+
+#[cfg(target_arch = "x86_64")]
+impl WorkerService {
+    async fn destroy_runtime_slot(&self, lease: Lease) -> Result<(), Status> {
+        let manager = self.inner.manager.clone();
+        let runtimes = self.inner.runtimes.clone();
+        blocking_lifecycle("DestroyVm", move || {
+            runtimes
+                .ensure_occupied(lease.slot_id)
+                .map_err(runtime_error_to_status)?;
+            manager
+                .destroy(&lease, lease_now_ms())
+                .map_err(slot_error_to_status)?;
+            let _runtime = runtimes
+                .take(lease.slot_id)
+                .map_err(runtime_error_to_status)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
 #[tonic::async_trait]
 impl HypervisorWorker for WorkerService {
     type StreamGuestEventsStream = ResponseStream<proto::GuestEvent>;
@@ -324,9 +401,19 @@ impl HypervisorWorker for WorkerService {
 
     async fn destroy_vm(
         &self,
-        _request: Request<proto::DestroyVmRequest>,
+        request: Request<proto::DestroyVmRequest>,
     ) -> Result<Response<proto::DestroyVmResponse>, Status> {
-        Err(unimplemented_status("DestroyVm"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let lease = lease_from_proto(request.into_inner().lease)?;
+            self.destroy_runtime_slot(lease).await?;
+            return Ok(Response::new(proto::DestroyVmResponse {}));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("DestroyVm"))
+        }
     }
 
     async fn inject_inputs(
@@ -543,6 +630,29 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn destroy_requires_runtime_before_releasing_slot() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let lease = svc.slot_manager().allocate(0).unwrap();
+        let err = svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(proto::Lease {
+                    slot_id: lease.slot_id,
+                    token: lease.token.to_vec(),
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.message(), "runtime slot 0 is empty");
+        assert_eq!(
+            svc.slot_manager().slot_info(lease.slot_id).unwrap().state,
+            dh_vmm::SlotState::Paused
+        );
+        assert_eq!(svc.runtime_table().occupied_count(), 0);
     }
 
     #[tokio::test]

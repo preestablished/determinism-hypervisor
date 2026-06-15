@@ -134,3 +134,58 @@ Verification for this slice:
 - `cargo fmt --check -p dh-worker`
 - `cargo test -p dh-worker service -- --nocapture`
 - `cargo test -p dh-worker proto_map -- --nocapture`
+
+## Iteration 104: `determinism-hypervisor-8kb` runtime-table start
+
+Branch: `ralph/iteration-104-dh-workerd-runtime-table`, stacked on
+`ralph/iteration-103-dh-workerd-grpc-service`.
+
+Beads:
+
+- Checked `bd list` before starting.
+- Claimed `determinism-hypervisor-8kb`, the P0 per-slot runtime table blocker
+  for `determinism-hypervisor-rfv`.
+
+Two subagent reviews were completed for the phase-2/gap plan:
+
+- Dependency-order review confirmed `8kb` is the correct next concrete slice
+  before any honest `rfv` lifecycle success, with `p8g`, `797`, and `3pk`
+  still blocking full lifecycle semantics.
+- Implementation/verification review agreed M7 must not start yet and called
+  out the same runtime ownership shape: `SlotVm`, bus, entropy, config, dirty
+  tracking, hash chain, counters/thread state, base snapshot, pause/fault state,
+  and off-reactor KVM work.
+
+Implementation progress:
+
+- Added `crates/dh-worker/src/runtime.rs` with a fixed-size `RuntimeTable<T>`
+  keyed by slot id and a concrete `SlotRuntime` owner for the real x86 runtime
+  resources: `SlotVm`, `MmioBus`, `DetEntropy`, `MachineConfig`, dirty ring/set,
+  `StateHashChain`, optional counter, base snapshot, boundary position,
+  pause flag, and thread state.
+- `WorkerService` now owns a runtime table alongside `SlotManager` on x86.
+- Added a `spawn_blocking` lifecycle helper and routed `DestroyVm` through the
+  runtime table before releasing the slot-manager lease. A missing runtime now
+  returns `FAILED_PRECONDITION` and leaves the slot allocated instead of
+  silently freeing bookkeeping state.
+- Tightened `DetDevice` and `BlockBase` to `Send` so daemon-owned runtime buses
+  can live behind the tonic service safely; updated the pv-blk test base from
+  `Rc` to `Arc`.
+
+Verification for this slice:
+
+- `cargo check -p dh-worker`
+- `cargo fmt --check -p dh-worker`
+- `cargo fmt --check -p dh-devices`
+- `cargo test -p dh-worker runtime -- --nocapture`
+- `cargo test -p dh-worker service -- --nocapture`
+- `cargo test -p dh-devices`
+- `cargo test -p dh-vmm blk_fixture -- --nocapture`
+- `cargo test -p dh-worker`
+
+Remaining:
+
+- `8kb` still needs the next lifecycle wiring slice to populate the table from
+  real `CreateVm`/`RestoreSnapshot`/`Fork` construction paths.
+- `rfv` remains blocked by `p8g` image/kernel resolution, `797` MCFG decode, and
+  `3pk` fork entropy semantics before full API success can be claimed.
