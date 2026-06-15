@@ -4,7 +4,9 @@
 use dh_worker::image_resolver::DEFAULT_IMAGE_CACHE_DIR;
 #[cfg(target_arch = "x86_64")]
 use dh_worker::service::DEFAULT_SNAPSTORE_TCP;
-use dh_worker::service::{WorkerConfig, DEFAULT_TCP_ADDR, DEFAULT_UDS_PATH};
+use dh_worker::service::{
+    PreflightHealth, WorkerConfig, DEFAULT_HTTP_ADDR, DEFAULT_TCP_ADDR, DEFAULT_UDS_PATH,
+};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -12,6 +14,7 @@ enum Command {
     Preflight,
     Serve {
         tcp_addr: std::net::SocketAddr,
+        http_addr: std::net::SocketAddr,
         uds_path: Option<PathBuf>,
         skip_preflight: bool,
         #[cfg(target_arch = "x86_64")]
@@ -37,6 +40,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Serve {
             tcp_addr,
+            http_addr,
             uds_path,
             skip_preflight,
             #[cfg(target_arch = "x86_64")]
@@ -44,32 +48,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_arch = "x86_64")]
             snapstore,
         } => {
-            if !skip_preflight {
-                run_preflight_or_exit();
-            }
+            let preflight = if skip_preflight {
+                PreflightHealth::skipped("dh-workerd started with --skip-preflight")
+            } else {
+                run_preflight_or_exit()
+            };
             #[cfg(target_arch = "x86_64")]
-            let config = {
+            let mut config = {
                 let mut config = WorkerConfig::from_host_defaults()?;
                 config.image_cache_dir = image_cache_dir;
                 config.snapstore = snapstore;
                 config
             };
             #[cfg(not(target_arch = "x86_64"))]
-            let config = WorkerConfig::from_host_defaults()?;
+            let mut config = WorkerConfig::from_host_defaults()?;
+            config.preflight = preflight;
             eprintln!(
-                "dh-workerd serving TCP {tcp_addr}{}",
+                "dh-workerd serving gRPC TCP {tcp_addr}, HTTP {http_addr}{}",
                 uds_path
                     .as_ref()
                     .map(|p| format!(" and UDS {}", p.display()))
                     .unwrap_or_else(|| " without UDS".into())
             );
-            dh_worker::service::serve(config, tcp_addr, uds_path).await?;
+            dh_worker::service::serve(config, tcp_addr, uds_path, http_addr).await?;
             Ok(())
         }
     }
 }
 
-fn run_preflight_or_exit() {
+fn run_preflight_or_exit() -> PreflightHealth {
     let (results, ok) = dh_worker::preflight::run_preflight();
     for r in &results {
         println!("{r}");
@@ -79,6 +86,7 @@ fn run_preflight_or_exit() {
         std::process::exit(1);
     }
     println!("preflight OK");
+    PreflightHealth::passed(&results)
 }
 
 fn parse_args<I>(args: I) -> Result<Command, String>
@@ -96,6 +104,9 @@ where
     let mut tcp_addr = DEFAULT_TCP_ADDR
         .parse()
         .map_err(|e| format!("invalid default TCP addr {DEFAULT_TCP_ADDR}: {e}"))?;
+    let mut http_addr = DEFAULT_HTTP_ADDR
+        .parse()
+        .map_err(|e| format!("invalid default HTTP addr {DEFAULT_HTTP_ADDR}: {e}"))?;
     let mut uds_path = Some(PathBuf::from(DEFAULT_UDS_PATH));
     let mut skip_preflight = false;
     #[cfg(target_arch = "x86_64")]
@@ -113,6 +124,13 @@ where
                 tcp_addr = value
                     .parse()
                     .map_err(|e| format!("invalid --tcp address {value}: {e}"))?;
+            }
+            "--http" => {
+                i += 1;
+                let value = args.get(i).ok_or("--http requires an address")?;
+                http_addr = value
+                    .parse()
+                    .map_err(|e| format!("invalid --http address {value}: {e}"))?;
             }
             "--uds" => {
                 i += 1;
@@ -149,6 +167,7 @@ where
 
     Ok(Command::Serve {
         tcp_addr,
+        http_addr,
         uds_path,
         skip_preflight,
         #[cfg(target_arch = "x86_64")]
@@ -161,14 +180,14 @@ where
 #[cfg(target_arch = "x86_64")]
 fn usage() -> String {
     format!(
-        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--uds PATH|--no-uds] [--image-cache PATH] [--snapstore-tcp URI|--snapstore-uds PATH|--no-snapstore] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --uds {DEFAULT_UDS_PATH} --image-cache {DEFAULT_IMAGE_CACHE_DIR} --snapstore-tcp {DEFAULT_SNAPSTORE_TCP}"
+        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--image-cache PATH] [--snapstore-tcp URI|--snapstore-uds PATH|--no-snapstore] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH} --image-cache {DEFAULT_IMAGE_CACHE_DIR} --snapstore-tcp {DEFAULT_SNAPSTORE_TCP}"
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn usage() -> String {
     format!(
-        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--uds PATH|--no-uds] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --uds {DEFAULT_UDS_PATH}"
+        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH}"
     )
 }
 
@@ -181,6 +200,7 @@ mod tests {
         let command = parse_args(Vec::<String>::new()).unwrap();
         let Command::Serve {
             tcp_addr,
+            http_addr,
             uds_path,
             skip_preflight,
             #[cfg(target_arch = "x86_64")]
@@ -192,6 +212,7 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(tcp_addr, DEFAULT_TCP_ADDR.parse().unwrap());
+        assert_eq!(http_addr, DEFAULT_HTTP_ADDR.parse().unwrap());
         assert_eq!(uds_path, Some(PathBuf::from(DEFAULT_UDS_PATH)));
         assert!(!skip_preflight);
         #[cfg(target_arch = "x86_64")]
@@ -219,6 +240,8 @@ mod tests {
             "serve".to_owned(),
             "--tcp".to_owned(),
             "127.0.0.1:7500".to_owned(),
+            "--http".to_owned(),
+            "127.0.0.1:7501".to_owned(),
             "--no-uds".to_owned(),
             "--image-cache".to_owned(),
             "/tmp/dh-images".to_owned(),
@@ -229,6 +252,7 @@ mod tests {
         .unwrap();
         let Command::Serve {
             tcp_addr,
+            http_addr,
             uds_path,
             skip_preflight,
             image_cache_dir,
@@ -238,6 +262,7 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(tcp_addr, "127.0.0.1:7500".parse().unwrap());
+        assert_eq!(http_addr, "127.0.0.1:7501".parse().unwrap());
         assert_eq!(uds_path, None);
         assert!(skip_preflight);
         assert_eq!(image_cache_dir, PathBuf::from("/tmp/dh-images"));
@@ -253,5 +278,7 @@ mod tests {
     fn parse_missing_value_reports_specific_flag() {
         let err = parse_args(["--tcp".to_owned()]).unwrap_err();
         assert_eq!(err, "--tcp requires an address");
+        let err = parse_args(["--http".to_owned()]).unwrap_err();
+        assert_eq!(err, "--http requires an address");
     }
 }

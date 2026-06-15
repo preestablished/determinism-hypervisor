@@ -38,6 +38,7 @@
 use dh_vmm::{SlotState, SlotStateError};
 use std::collections::HashSet;
 use std::sync::Mutex;
+use tokio::sync::broadcast;
 
 /// 16 random bytes, the proto `Lease.token` payload.
 pub type LeaseToken = [u8; 16];
@@ -181,6 +182,7 @@ pub struct SlotManager {
     cores: Vec<u32>,
     policy: LeasePolicy,
     tokens: TokenSource,
+    events: broadcast::Sender<SlotInfo>,
 }
 
 /// ARCH §9 default slot count: `physical_cores - 2` (the two reserved
@@ -255,6 +257,7 @@ impl SlotManager {
             cores,
             policy,
             tokens,
+            events: broadcast::channel(1024).0,
         })
     }
 
@@ -265,6 +268,18 @@ impl SlotManager {
     /// The dedicated core for a slot's vCPU thread.
     pub fn core_for(&self, slot_id: u64) -> Option<u32> {
         self.cores.get(slot_id as usize).copied()
+    }
+
+    /// Subscribe to slot transition events. `ListSlots` is the current-state
+    /// source; this stream is only for subsequent state transitions.
+    pub fn subscribe(&self) -> broadcast::Receiver<SlotInfo> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, events: impl IntoIterator<Item = SlotInfo>) {
+        for event in events {
+            let _ = self.events.send(event);
+        }
     }
 
     // ── Lease mechanics ──────────────────────────────────────────────────
@@ -346,13 +361,17 @@ impl SlotManager {
     /// lands Paused with a fresh lease. The caller then drives the
     /// engines; a failure there must `destroy` to return the slot.
     pub fn allocate(&self, now_ms: u64) -> Result<Lease, SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let idx = slots
-            .iter()
-            .position(|e| e.state == SlotState::Empty)
-            .ok_or(SlotError::NoFreeSlot)?;
-        slots[idx].state = slots[idx].state.transition(SlotState::Paused)?;
-        let lease = self.lease_into(&mut slots[idx], idx as u64, now_ms);
+        let (lease, event) = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let idx = slots
+                .iter()
+                .position(|e| e.state == SlotState::Empty)
+                .ok_or(SlotError::NoFreeSlot)?;
+            slots[idx].state = slots[idx].state.transition(SlotState::Paused)?;
+            let lease = self.lease_into(&mut slots[idx], idx as u64, now_ms);
+            (lease, Self::info_of(&slots[idx], idx as u64))
+        };
+        self.publish([event]);
         Ok(lease)
     }
 
@@ -376,32 +395,39 @@ impl SlotManager {
         children: usize,
         now_ms: u64,
     ) -> Result<Vec<Lease>, SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let (parent_idx, frozen, free) =
-            Self::check_fork_entries(&slots, parent, children, now_ms)?;
-        slots[parent_idx].state = frozen;
-        let parent_position = (slots[parent_idx].icount, slots[parent_idx].base_snapshot_id);
-        let mut leases = Vec::with_capacity(children);
-        for idx in free {
-            let entry = &mut slots[idx];
-            entry.state = entry
-                .state
-                .transition(SlotState::Paused)
-                .expect("Empty → Paused is always legal");
-            entry.parent = Some(parent.slot_id);
-            entry.ram_is_cow = true;
-            // Children resume at the parent's position (fork_engine's
-            // cumulative_icount contract).
-            entry.icount = parent_position.0;
-            entry.base_snapshot_id = parent_position.1;
-            let lease = self.lease_into(entry, idx as u64, now_ms);
-            leases.push(lease);
-        }
-        // Bounded by the free-slot count (≤ slot table length), so the
-        // narrowing is total; try_from keeps it honest.
-        slots[parent_idx].live_children = slots[parent_idx]
-            .live_children
-            .saturating_add(u32::try_from(children).expect("children ≤ slot count"));
+        let (leases, events) = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let (parent_idx, frozen, free) =
+                Self::check_fork_entries(&slots, parent, children, now_ms)?;
+            slots[parent_idx].state = frozen;
+            let parent_position = (slots[parent_idx].icount, slots[parent_idx].base_snapshot_id);
+            let mut leases = Vec::with_capacity(children);
+            let mut events = Vec::with_capacity(children + 1);
+            for idx in free {
+                let entry = &mut slots[idx];
+                entry.state = entry
+                    .state
+                    .transition(SlotState::Paused)
+                    .expect("Empty -> Paused is always legal");
+                entry.parent = Some(parent.slot_id);
+                entry.ram_is_cow = true;
+                // Children resume at the parent's position (fork_engine's
+                // cumulative_icount contract).
+                entry.icount = parent_position.0;
+                entry.base_snapshot_id = parent_position.1;
+                let lease = self.lease_into(entry, idx as u64, now_ms);
+                events.push(Self::info_of(entry, idx as u64));
+                leases.push(lease);
+            }
+            // Bounded by the free-slot count (≤ slot table length), so the
+            // narrowing is total; try_from keeps it honest.
+            slots[parent_idx].live_children = slots[parent_idx]
+                .live_children
+                .saturating_add(u32::try_from(children).expect("children ≤ slot count"));
+            events.push(Self::info_of(&slots[parent_idx], parent.slot_id));
+            (leases, events)
+        };
+        self.publish(events);
         Ok(leases)
     }
 
@@ -458,23 +484,31 @@ impl SlotManager {
     /// Run / Pause crossings (lease-gated; the run side is write-path
     /// guarded — a Frozen or Faulted slot must never enter the guest).
     pub fn mark_running(&self, lease: &Lease, now_ms: u64) -> Result<(), SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let entry = slots
-            .get_mut(lease.slot_id as usize)
-            .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
-        Self::validate_entry(entry, lease, now_ms)?;
-        entry.state.ensure_write_path("Run")?;
-        entry.state = entry.state.transition(SlotState::Running)?;
+        let event = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let entry = slots
+                .get_mut(lease.slot_id as usize)
+                .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
+            Self::validate_entry(entry, lease, now_ms)?;
+            entry.state.ensure_write_path("Run")?;
+            entry.state = entry.state.transition(SlotState::Running)?;
+            Self::info_of(entry, lease.slot_id)
+        };
+        self.publish([event]);
         Ok(())
     }
 
     pub fn mark_paused(&self, lease: &Lease, now_ms: u64) -> Result<(), SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let entry = slots
-            .get_mut(lease.slot_id as usize)
-            .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
-        Self::validate_entry(entry, lease, now_ms)?;
-        entry.state = entry.state.transition(SlotState::Paused)?;
+        let event = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let entry = slots
+                .get_mut(lease.slot_id as usize)
+                .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
+            Self::validate_entry(entry, lease, now_ms)?;
+            entry.state = entry.state.transition(SlotState::Paused)?;
+            Self::info_of(entry, lease.slot_id)
+        };
+        self.publish([event]);
         Ok(())
     }
 
@@ -502,11 +536,15 @@ impl SlotManager {
     /// revocation) and must land even when the orchestrator's lease has
     /// expired mid-run.
     pub fn mark_faulted(&self, slot_id: u64) -> Result<(), SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let entry = slots
-            .get_mut(slot_id as usize)
-            .ok_or(SlotError::NoSuchSlot(slot_id))?;
-        entry.state = entry.state.transition(SlotState::Faulted)?;
+        let event = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let entry = slots
+                .get_mut(slot_id as usize)
+                .ok_or(SlotError::NoSuchSlot(slot_id))?;
+            entry.state = entry.state.transition(SlotState::Faulted)?;
+            Self::info_of(entry, slot_id)
+        };
+        self.publish([event]);
         Ok(())
     }
 
@@ -515,13 +553,18 @@ impl SlotManager {
     /// (no deterministic boundary; pause first — the transition relation
     /// enforces that). Destroying the last child auto-thaws its parent.
     pub fn destroy(&self, lease: &Lease, now_ms: u64) -> Result<(), SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let idx = lease.slot_id as usize;
-        if idx >= slots.len() {
-            return Err(SlotError::NoSuchSlot(lease.slot_id));
-        }
-        Self::check_destroy_entry(&slots[idx], lease, now_ms)?;
-        Self::release(&mut slots, idx);
+        let events = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let idx = lease.slot_id as usize;
+            if idx >= slots.len() {
+                return Err(SlotError::NoSuchSlot(lease.slot_id));
+            }
+            Self::check_destroy_entry(&slots[idx], lease, now_ms)?;
+            let mut events = Vec::new();
+            Self::release(&mut slots, idx, &mut events);
+            events
+        };
+        self.publish(events);
         Ok(())
     }
 
@@ -557,42 +600,50 @@ impl SlotManager {
     /// (never silently destroyed — the orchestrator must observe the
     /// fault). Running slots still refuse: stop the vCPU first.
     pub fn force_destroy(&self, slot_id: u64) -> Result<(), SlotError> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let idx = slot_id as usize;
-        if idx >= slots.len() {
-            return Err(SlotError::NoSuchSlot(slot_id));
-        }
-        // Gate-only (as in destroy): release() resets the entry below.
-        slots[idx].state.transition(SlotState::Empty)?;
-        if slots[idx].live_children > 0 {
-            for i in 0..slots.len() {
-                if slots[i].parent == Some(slot_id) && slots[i].state != SlotState::Empty {
-                    // Paused/Running → Faulted are the legal fault edges;
-                    // a child already Faulted stays put.
-                    if slots[i].state.can_transition(SlotState::Faulted) {
-                        slots[i].state = SlotState::Faulted;
+        let events = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let idx = slot_id as usize;
+            if idx >= slots.len() {
+                return Err(SlotError::NoSuchSlot(slot_id));
+            }
+            // Gate-only (as in destroy): release() resets the entry below.
+            slots[idx].state.transition(SlotState::Empty)?;
+            let mut events = Vec::new();
+            if slots[idx].live_children > 0 {
+                for i in 0..slots.len() {
+                    if slots[i].parent == Some(slot_id) && slots[i].state != SlotState::Empty {
+                        // Paused/Running -> Faulted are the legal fault edges;
+                        // a child already Faulted stays put.
+                        if slots[i].state.can_transition(SlotState::Faulted) {
+                            slots[i].state = SlotState::Faulted;
+                            events.push(Self::info_of(&slots[i], i as u64));
+                        }
+                        // Orphaned either way: the parent slot id is being
+                        // reused; the fault, not the link, carries the truth.
+                        slots[i].parent = None;
                     }
-                    // Orphaned either way: the parent slot id is being
-                    // reused; the fault, not the link, carries the truth.
-                    slots[i].parent = None;
                 }
             }
-        }
-        Self::release(&mut slots, idx);
+            Self::release(&mut slots, idx, &mut events);
+            events
+        };
+        self.publish(events);
         Ok(())
     }
 
     /// Slot release bookkeeping shared by every destroy/reclaim path:
     /// resets the entry and auto-thaws the parent on last-child release.
-    fn release(slots: &mut [SlotEntry], idx: usize) {
+    fn release(slots: &mut [SlotEntry], idx: usize, events: &mut Vec<SlotInfo>) {
         let parent = slots[idx].parent;
         slots[idx] = SlotEntry::empty();
+        events.push(Self::info_of(&slots[idx], idx as u64));
         if let Some(pid) = parent {
             if let Some(p) = slots.get_mut(pid as usize) {
                 p.live_children = p.live_children.saturating_sub(1);
                 if p.live_children == 0 && p.state == SlotState::Frozen {
                     // §2.2: freeing the last child unfreezes the parent.
                     p.state = SlotState::Paused;
+                    events.push(Self::info_of(p, pid));
                 }
             }
         }
@@ -616,42 +667,48 @@ impl SlotManager {
     /// the staging and free slots the daemon has not yet observed as
     /// Faulted.
     pub fn reclaim_expired(&self, now_ms: u64) -> Vec<u64> {
-        let mut slots = self.slots.lock().expect("slot table poisoned");
-        let sweep: Vec<(bool, SlotState)> = slots
-            .iter()
-            .map(|slot| {
-                (
-                    matches!(slot.lease, Some((_, Some(at))) if now_ms >= at),
-                    slot.state,
-                )
-            })
-            .collect();
-        let mut reclaimed = Vec::new();
-        for idx in 0..slots.len() {
-            let (expired, state_at_sweep_start) = sweep[idx];
-            if !expired {
-                continue;
-            }
-            match state_at_sweep_start {
-                SlotState::Paused | SlotState::Faulted if slots[idx].live_children == 0 => {
-                    Self::release(&mut slots, idx);
-                    reclaimed.push(idx as u64);
+        let (reclaimed, events) = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let sweep: Vec<(bool, SlotState)> = slots
+                .iter()
+                .map(|slot| {
+                    (
+                        matches!(slot.lease, Some((_, Some(at))) if now_ms >= at),
+                        slot.state,
+                    )
+                })
+                .collect();
+            let mut reclaimed = Vec::new();
+            let mut events = Vec::new();
+            for idx in 0..slots.len() {
+                let (expired, state_at_sweep_start) = sweep[idx];
+                if !expired {
+                    continue;
                 }
-                SlotState::Running => {
-                    // The lease stays in place (expired): the NEXT sweep
-                    // finds the now-Faulted slot still expired and frees
-                    // it — clearing it here would strand the slot where
-                    // only force_destroy could reach.
-                    slots[idx].state = SlotState::Faulted;
+                match state_at_sweep_start {
+                    SlotState::Paused | SlotState::Faulted if slots[idx].live_children == 0 => {
+                        Self::release(&mut slots, idx, &mut events);
+                        reclaimed.push(idx as u64);
+                    }
+                    SlotState::Running => {
+                        // The lease stays in place (expired): the NEXT sweep
+                        // finds the now-Faulted slot still expired and frees
+                        // it — clearing it here would strand the slot where
+                        // only force_destroy could reach.
+                        slots[idx].state = SlotState::Faulted;
+                        events.push(Self::info_of(&slots[idx], idx as u64));
+                    }
+                    // Frozen with live children: wait — each child's own
+                    // expiry releases it, and the last release auto-thaws
+                    // this parent into a reclaimable Paused. (Paused with
+                    // live_children > 0 cannot exist: fork freezes the
+                    // parent atomically under the table lock.)
+                    _ => {}
                 }
-                // Frozen with live children: wait — each child's own
-                // expiry releases it, and the last release auto-thaws
-                // this parent into a reclaimable Paused. (Paused with
-                // live_children > 0 cannot exist: fork freezes the
-                // parent atomically under the table lock.)
-                _ => {}
             }
-        }
+            (reclaimed, events)
+        };
+        self.publish(events);
         reclaimed
     }
 

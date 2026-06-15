@@ -24,6 +24,7 @@ use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerS
 #[cfg(target_arch = "x86_64")]
 use dh_verify::verify::VerifyProgress;
 use prost::Message;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(target_arch = "x86_64")]
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
@@ -99,11 +101,43 @@ const MAX_CAPTURE_FEATURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAPTURE_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
+pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:7401";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
 #[cfg(target_arch = "x86_64")]
 pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
 #[cfg(target_arch = "x86_64")]
 const VERIFY_REPLAY_INLINE_LOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+pub const ARCH_S9_METRIC_FAMILIES: &[&str] = &[
+    "dh_worker_slot_icount_total",
+    "dh_worker_slot_icount_rate",
+    "dh_worker_exits_total",
+    "dh_worker_landing_single_steps_total",
+    "dh_worker_snapshot_duration_milliseconds",
+    "dh_worker_fork_duration_milliseconds",
+    "dh_worker_restore_duration_milliseconds",
+    "dh_worker_snapshot_dirty_pages",
+    "dh_worker_verification_failures_total",
+    "dh_pmi_skid_instructions",
+];
+
+const EXIT_REASON_LABELS: &[&str] = &[
+    "debug",
+    "dirty_ring_full",
+    "fail_entry",
+    "hlt",
+    "internal_error",
+    "io_in",
+    "io_out",
+    "irq_window_open",
+    "mmio_read",
+    "mmio_write",
+    "shutdown",
+    "system_event",
+    "unknown",
+    "x86_rdmsr",
+    "x86_wrmsr",
+];
 
 type ResponseStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -114,6 +148,7 @@ pub struct WorkerConfig {
     pub slot_cores: Vec<u32>,
     pub lease_policy: LeasePolicy,
     pub class: proto::DeterminismClass,
+    pub preflight: PreflightHealth,
     #[cfg(target_arch = "x86_64")]
     pub image_cache_dir: PathBuf,
     #[cfg(target_arch = "x86_64")]
@@ -129,6 +164,7 @@ impl WorkerConfig {
             slot_cores,
             lease_policy: LeasePolicy::default(),
             class: detect_determinism_class(),
+            preflight: PreflightHealth::skipped("preflight not run by this process"),
             #[cfg(target_arch = "x86_64")]
             image_cache_dir: crate::image_resolver::DEFAULT_IMAGE_CACHE_DIR.into(),
             #[cfg(target_arch = "x86_64")]
@@ -136,6 +172,334 @@ impl WorkerConfig {
                 DEFAULT_SNAPSTORE_TCP.into(),
             )),
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreflightHealth {
+    ok: bool,
+    status: String,
+    detail: Vec<String>,
+}
+
+impl PreflightHealth {
+    pub fn passed(results: &[crate::preflight::CheckResult]) -> Self {
+        Self {
+            ok: true,
+            status: "passed".into(),
+            detail: results.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    pub fn failed(results: &[crate::preflight::CheckResult]) -> Self {
+        Self {
+            ok: false,
+            status: "failed".into(),
+            detail: results.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            status: "skipped".into(),
+            detail: vec![reason.into()],
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.ok
+    }
+
+    fn healthz_body(&self) -> String {
+        let mut out = String::new();
+        out.push_str(if self.ok { "ok\n" } else { "failed\n" });
+        out.push_str("preflight=");
+        out.push_str(&self.status);
+        out.push('\n');
+        for line in &self.detail {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+#[derive(Default)]
+struct WorkerMetrics {
+    exits: Mutex<BTreeMap<(u64, &'static str), u64>>,
+    slot_icount_samples: Mutex<BTreeMap<u64, (u64, Instant)>>,
+    landing_single_steps_total: std::sync::atomic::AtomicU64,
+    verification_failures_total: std::sync::atomic::AtomicU64,
+    snapshot_ms: Mutex<MetricHistogram>,
+    fork_ms: Mutex<MetricHistogram>,
+    restore_ms: Mutex<MetricHistogram>,
+    snapshot_dirty_pages: Mutex<MetricHistogram>,
+}
+
+impl WorkerMetrics {
+    fn record_exit(&self, slot_id: u64, reason: &'static str) {
+        let mut exits = self.exits.lock().expect("metrics mutex poisoned");
+        *exits.entry((slot_id, reason)).or_insert(0) += 1;
+    }
+
+    fn observe_snapshot(&self, elapsed: Duration, dirty_pages: u64) {
+        self.snapshot_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(elapsed.as_secs_f64() * 1000.0, MS_BUCKETS);
+        self.snapshot_dirty_pages
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(dirty_pages as f64, DIRTY_PAGE_BUCKETS);
+    }
+
+    fn observe_fork(&self, elapsed: Duration) {
+        self.fork_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(elapsed.as_secs_f64() * 1000.0, MS_BUCKETS);
+    }
+
+    fn observe_restore(&self, elapsed: Duration) {
+        self.restore_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(elapsed.as_secs_f64() * 1000.0, MS_BUCKETS);
+    }
+
+    fn record_verification_failure(&self) {
+        self.verification_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn render(&self, manager: &SlotManager) -> String {
+        let mut out = String::new();
+        let slots = manager.list();
+        push_help_type(
+            &mut out,
+            "dh_worker_slot_icount_total",
+            "Cumulative canonical retired-instruction count by slot.",
+            "counter",
+        );
+        for slot in &slots {
+            out.push_str(&format!(
+                "dh_worker_slot_icount_total{{slot_id=\"{}\"}} {}\n",
+                slot.slot_id, slot.icount
+            ));
+        }
+        push_help_type(
+            &mut out,
+            "dh_worker_slot_icount_rate",
+            "Observed per-slot canonical retired-instruction rate between metrics scrapes.",
+            "gauge",
+        );
+        let now = Instant::now();
+        let mut samples = self
+            .slot_icount_samples
+            .lock()
+            .expect("metrics mutex poisoned");
+        for slot in &slots {
+            let rate = samples
+                .get(&slot.slot_id)
+                .and_then(|(last_icount, last_at)| {
+                    let elapsed = now.saturating_duration_since(*last_at).as_secs_f64();
+                    (elapsed > 0.0 && slot.icount >= *last_icount)
+                        .then_some((slot.icount - *last_icount) as f64 / elapsed)
+                })
+                .unwrap_or(0.0);
+            samples.insert(slot.slot_id, (slot.icount, now));
+            out.push_str(&format!(
+                "dh_worker_slot_icount_rate{{slot_id=\"{}\"}} {}\n",
+                slot.slot_id,
+                format_metric_float(rate)
+            ));
+        }
+        drop(samples);
+
+        push_help_type(
+            &mut out,
+            "dh_worker_exits_total",
+            "KVM exits handled by dh-workerd, partitioned by slot and reason.",
+            "counter",
+        );
+        let exits = self.exits.lock().expect("metrics mutex poisoned");
+        for slot in &slots {
+            for reason in EXIT_REASON_LABELS {
+                let value = exits.get(&(slot.slot_id, *reason)).copied().unwrap_or(0);
+                out.push_str(&format!(
+                    "dh_worker_exits_total{{slot_id=\"{}\",reason=\"{}\"}} {}\n",
+                    slot.slot_id, reason, value
+                ));
+            }
+        }
+
+        push_help_type(
+            &mut out,
+            "dh_worker_landing_single_steps_total",
+            "Boundary-engine single-step refinements.",
+            "counter",
+        );
+        out.push_str(&format!(
+            "dh_worker_landing_single_steps_total {}\n",
+            self.landing_single_steps_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ));
+
+        self.snapshot_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .render(
+                &mut out,
+                "dh_worker_snapshot_duration_milliseconds",
+                "Snapshot commit latency in milliseconds.",
+                MS_BUCKETS,
+            );
+        self.fork_ms.lock().expect("metrics mutex poisoned").render(
+            &mut out,
+            "dh_worker_fork_duration_milliseconds",
+            "Tier-A fork latency in milliseconds.",
+            MS_BUCKETS,
+        );
+        self.restore_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .render(
+                &mut out,
+                "dh_worker_restore_duration_milliseconds",
+                "Restore latency in milliseconds.",
+                MS_BUCKETS,
+            );
+        self.snapshot_dirty_pages
+            .lock()
+            .expect("metrics mutex poisoned")
+            .render(
+                &mut out,
+                "dh_worker_snapshot_dirty_pages",
+                "Dirty pages shipped by snapshot commits.",
+                DIRTY_PAGE_BUCKETS,
+            );
+
+        push_help_type(
+            &mut out,
+            "dh_worker_verification_failures_total",
+            "VerifyReplay failures or divergences.",
+            "counter",
+        );
+        out.push_str(&format!(
+            "dh_worker_verification_failures_total {}\n",
+            self.verification_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ));
+
+        push_empty_skid_histogram(&mut out);
+        out
+    }
+}
+
+#[derive(Default)]
+struct MetricHistogram {
+    count: u64,
+    sum: f64,
+    bucket_counts: BTreeMap<OrderedF64, u64>,
+}
+
+impl MetricHistogram {
+    fn observe(&mut self, value: f64, buckets: &[f64]) {
+        self.count += 1;
+        self.sum += value;
+        for &bucket in buckets.iter().filter(|bucket| value <= **bucket) {
+            *self.bucket_counts.entry(OrderedF64(bucket)).or_insert(0) += 1;
+        }
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str, buckets: &[f64]) {
+        push_help_type(out, name, help, "histogram");
+        for &bucket in buckets {
+            let count = self
+                .bucket_counts
+                .get(&OrderedF64(bucket))
+                .copied()
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "{name}_bucket{{le=\"{}\"}} {count}\n",
+                format_bucket(bucket)
+            ));
+        }
+        out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {}\n", self.count));
+        out.push_str(&format!("{name}_sum {}\n", format_metric_float(self.sum)));
+        out.push_str(&format!("{name}_count {}\n", self.count));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrderedF64(f64);
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+const MS_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+const DIRTY_PAGE_BUCKETS: &[f64] = &[0.0, 1.0, 8.0, 64.0, 512.0, 4096.0, 8192.0, 16384.0];
+
+fn push_help_type(out: &mut String, name: &str, help: &str, kind: &str) {
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} {kind}\n"));
+}
+
+fn push_empty_skid_histogram(out: &mut String) {
+    push_help_type(
+        out,
+        "dh_pmi_skid_instructions",
+        "PMI landing skid distribution in retired instructions.",
+        "histogram",
+    );
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"+Inf\"} 0\n");
+    out.push_str("dh_pmi_skid_instructions_sum 0\n");
+    out.push_str("dh_pmi_skid_instructions_count 0\n");
+}
+
+fn format_bucket(bucket: f64) -> String {
+    if bucket.fract() == 0.0 {
+        format!("{bucket:.0}")
+    } else {
+        format_metric_float(bucket)
+    }
+}
+
+fn format_metric_float(value: f64) -> String {
+    let raw = format!("{value:.6}");
+    raw.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn vcpu_exit_reason_label(exit: &kvm_ioctls::VcpuExit<'_>) -> &'static str {
+    match exit {
+        kvm_ioctls::VcpuExit::Debug(_) => "debug",
+        kvm_ioctls::VcpuExit::FailEntry(..) => "fail_entry",
+        kvm_ioctls::VcpuExit::Hlt => "hlt",
+        kvm_ioctls::VcpuExit::InternalError => "internal_error",
+        kvm_ioctls::VcpuExit::IoIn(_, _) => "io_in",
+        kvm_ioctls::VcpuExit::IoOut(_, _) => "io_out",
+        kvm_ioctls::VcpuExit::IrqWindowOpen => "irq_window_open",
+        kvm_ioctls::VcpuExit::MmioRead(_, _) => "mmio_read",
+        kvm_ioctls::VcpuExit::MmioWrite(_, _) => "mmio_write",
+        kvm_ioctls::VcpuExit::Shutdown => "shutdown",
+        kvm_ioctls::VcpuExit::SystemEvent(_, _) => "system_event",
+        kvm_ioctls::VcpuExit::Unsupported(_) => "unknown",
+        kvm_ioctls::VcpuExit::X86Rdmsr(_) => "x86_rdmsr",
+        kvm_ioctls::VcpuExit::X86Wrmsr(_) => "x86_wrmsr",
+        _ => "unknown",
     }
 }
 
@@ -221,6 +585,8 @@ struct WorkerInner {
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
+    preflight: PreflightHealth,
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl WorkerService {
@@ -253,6 +619,8 @@ impl WorkerService {
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
+                preflight: config.preflight,
+                metrics: Arc::new(WorkerMetrics::default()),
             }),
         })
     }
@@ -296,30 +664,126 @@ impl WorkerService {
             .count();
         u32::try_from(free).expect("slot count fits u32")
     }
+
+    fn healthz_body(&self) -> String {
+        self.inner.preflight.healthz_body()
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.inner.preflight.is_healthy()
+    }
+
+    fn metrics_text(&self) -> String {
+        self.inner.metrics.render(self.inner.manager.as_ref())
+    }
 }
 
 pub async fn serve(
     config: WorkerConfig,
     tcp_addr: std::net::SocketAddr,
     uds_path: Option<PathBuf>,
+    http_addr: std::net::SocketAddr,
 ) -> Result<(), ServeError> {
     let service = WorkerService::new(config)?;
     let tcp_service = HypervisorWorkerServer::new(service.clone());
-    let tcp = Server::builder().add_service(tcp_service).serve(tcp_addr);
+    let tcp = async move {
+        Server::builder()
+            .add_service(tcp_service)
+            .serve(tcp_addr)
+            .await
+            .map_err(ServeError::Transport)
+    };
+    let http_service = service.clone();
+    let http = async move {
+        serve_health_metrics(http_service, http_addr)
+            .await
+            .map_err(ServeError::Io)
+    };
 
     if let Some(uds_path) = uds_path {
         prepare_uds_path(&uds_path)?;
         let listener = tokio::net::UnixListener::bind(&uds_path)?;
         let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
         let uds_service = HypervisorWorkerServer::new(service);
-        let uds = Server::builder()
-            .add_service(uds_service)
-            .serve_with_incoming(incoming);
-        tokio::try_join!(tcp, uds)?;
+        let uds = async move {
+            Server::builder()
+                .add_service(uds_service)
+                .serve_with_incoming(incoming)
+                .await
+                .map_err(ServeError::Transport)
+        };
+        tokio::try_join!(tcp, uds, http)?;
     } else {
-        tcp.await?;
+        tokio::try_join!(tcp, http)?;
     }
     Ok(())
+}
+
+async fn serve_health_metrics(
+    service: WorkerService,
+    http_addr: std::net::SocketAddr,
+) -> Result<(), std::io::Error> {
+    let listener = tokio::net::TcpListener::bind(http_addr).await?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let service = service.clone();
+        tokio::spawn(async move {
+            let _ = handle_health_metrics_connection(service, stream).await;
+        });
+    }
+}
+
+async fn handle_health_metrics_connection(
+    service: WorkerService,
+    mut stream: tokio::net::TcpStream,
+) -> Result<(), std::io::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 2048];
+    let n = stream.read(&mut buf).await?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let response = http_response_for_request(&service, &request);
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+fn http_response_for_request(service: &WorkerService, request: &str) -> String {
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    match (method, path) {
+        ("GET", "/healthz") => {
+            let body = service.healthz_body();
+            let status = if service.is_healthy() {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            http_response(status, "text/plain; charset=utf-8", &body)
+        }
+        ("GET", "/metrics") => http_response(
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &service.metrics_text(),
+        ),
+        ("GET", "/") => http_response(
+            "200 OK",
+            "text/plain; charset=utf-8",
+            "dh-workerd health endpoints: /healthz /metrics\n",
+        ),
+        _ => http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
+    }
+}
+
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn prepare_uds_path(path: &Path) -> Result<(), std::io::Error> {
@@ -2112,6 +2576,7 @@ impl HypervisorWorker for WorkerService {
     ) -> Result<Response<proto::RestoreSnapshotResponse>, Status> {
         #[cfg(target_arch = "x86_64")]
         {
+            let started = Instant::now();
             let request = request.into_inner();
             let snapshot_ref = snapshot_ref_from_proto(request.snapshot)?;
             let requested_seed =
@@ -2187,6 +2652,7 @@ impl HypervisorWorker for WorkerService {
                     )
                 })
                 .await?;
+            self.inner.metrics.observe_restore(started.elapsed());
             let (config, state_hash, frame_counter) =
                 with_runtime(self.inner.runtimes.as_ref(), lease.slot_id, |runtime| {
                     (
@@ -2217,6 +2683,7 @@ impl HypervisorWorker for WorkerService {
     ) -> Result<Response<proto::ForkResponse>, Status> {
         #[cfg(target_arch = "x86_64")]
         {
+            let started = Instant::now();
             let request = request.into_inner();
             let parent = lease_from_proto(request.parent)?;
             let count = usize::try_from(request.count)
@@ -2288,6 +2755,7 @@ impl HypervisorWorker for WorkerService {
                         })?
                 })
                 .await?;
+            self.inner.metrics.observe_fork(started.elapsed());
             Ok(Response::new(proto::ForkResponse {
                 children: child_leases.iter().map(lease_to_proto).collect(),
             }))
@@ -2356,6 +2824,7 @@ impl HypervisorWorker for WorkerService {
             let until = until_from_run_request(&request)?;
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
+            let metrics = self.inner.metrics.clone();
             let response = blocking_lifecycle("Run", move || {
                 manager
                     .checkout_write(&lease, "Run", lease_now_ms())
@@ -2416,6 +2885,7 @@ impl HypervisorWorker for WorkerService {
                         let mut consumed_input_orders = Vec::new();
                         let counter_ref = counter;
                         let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
+                            metrics.record_exit(lease.slot_id, vcpu_exit_reason_label(&exit));
                             let icount = counter_ref.read().map_err(|e| {
                                 dh_vmm::boundary::BoundaryError::Exit(format!(
                                     "counter read: {e:?}"
@@ -2603,6 +3073,7 @@ impl HypervisorWorker for WorkerService {
     ) -> Result<Response<proto::TakeSnapshotResponse>, Status> {
         #[cfg(target_arch = "x86_64")]
         {
+            let started = Instant::now();
             let request = request.into_inner();
             let capture = request.capture.clone();
             let lease = lease_from_proto(request.lease)?;
@@ -2740,6 +3211,9 @@ impl HypervisorWorker for WorkerService {
             .await??;
             let (out, machine_config_hash, input_log_id, frame_counter, icount, vns, capture) =
                 snapshot;
+            self.inner
+                .metrics
+                .observe_snapshot(started.elapsed(), out.pages_shipped.into());
             Ok(Response::new(proto::TakeSnapshotResponse {
                 snapshot: Some(proto::SnapshotRef {
                     hash: out.snapshot_ref.to_bytes().to_vec(),
@@ -2807,6 +3281,7 @@ impl HypervisorWorker for WorkerService {
             let transport = self.snapstore_transport()?;
             let image_resolver = self.inner.image_resolver.clone();
             let manager = self.inner.manager.clone();
+            let metrics = self.inner.metrics.clone();
             let reserved_at_ms = lease_now_ms();
             let verify_lease = manager
                 .allocate(reserved_at_ms)
@@ -2867,9 +3342,24 @@ impl HypervisorWorker for WorkerService {
                 ));
             }
 
-            let events = rx
+            let events = match rx
                 .await
-                .map_err(|_| Status::internal("VerifyReplay thread ended without response"))??;
+                .map_err(|_| Status::internal("VerifyReplay thread ended without response"))?
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    metrics.record_verification_failure();
+                    return Err(e);
+                }
+            };
+            if events.iter().any(|event| {
+                matches!(
+                    event.msg,
+                    Some(proto::verify_replay_progress::Msg::Divergence(_))
+                )
+            }) {
+                metrics.record_verification_failure();
+            }
             let stream = tokio_stream::iter(events.into_iter().map(Ok));
             Ok(Response::new(Box::pin(stream) as Self::VerifyReplayStream))
         }
@@ -2919,7 +3409,19 @@ impl HypervisorWorker for WorkerService {
         &self,
         _request: Request<proto::WatchSlotsRequest>,
     ) -> Result<Response<Self::WatchSlotsStream>, Status> {
-        Err(unimplemented_status("WatchSlots"))
+        use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+        use tokio_stream::StreamExt;
+
+        let stream = tokio_stream::wrappers::BroadcastStream::new(self.inner.manager.subscribe())
+            .map(|event| match event {
+                Ok(slot) => Ok(proto::SlotEvent {
+                    slot: Some(slot_info_to_proto(&slot)),
+                }),
+                Err(BroadcastStreamRecvError::Lagged(n)) => Err(Status::data_loss(format!(
+                    "WatchSlots receiver lagged by {n} slot transitions"
+                ))),
+            });
+        Ok(Response::new(Box::pin(stream) as Self::WatchSlotsStream))
     }
 }
 
@@ -2943,6 +3445,7 @@ mod tests {
                 host_kernel: "test-kernel".into(),
                 vmm_version: "test-vmm".into(),
             },
+            preflight: PreflightHealth::skipped("test config"),
             #[cfg(target_arch = "x86_64")]
             image_cache_dir: std::env::temp_dir(),
             #[cfg(target_arch = "x86_64")]
@@ -3594,6 +4097,88 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn healthz_reflects_preflight_status() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let ok = http_response_for_request(&svc, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(ok.starts_with("HTTP/1.1 200 OK"));
+        assert!(ok.contains("preflight=skipped\n"));
+
+        let failed_check = crate::preflight::CheckResult {
+            name: "test.check",
+            ok: false,
+            got: "bad".into(),
+            want: "good".into(),
+        };
+        let mut config = test_config(1);
+        config.preflight = PreflightHealth::failed(&[failed_check]);
+        let svc = WorkerService::new(config).unwrap();
+        let failed = http_response_for_request(&svc, "GET /healthz HTTP/1.1\r\n\r\n");
+        assert!(failed.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(failed.contains("preflight=failed\n"));
+    }
+
+    #[test]
+    fn metrics_endpoint_exposes_arch_s9_families() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let lease = svc.slot_manager().allocate(0).unwrap();
+        svc.inner.metrics.record_exit(lease.slot_id, "hlt");
+        svc.inner
+            .metrics
+            .observe_snapshot(Duration::from_millis(3), 8);
+        svc.inner.metrics.observe_fork(Duration::from_millis(4));
+        svc.inner.metrics.observe_restore(Duration::from_millis(5));
+        svc.inner.metrics.record_verification_failure();
+
+        let response = http_response_for_request(&svc, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        for family in ARCH_S9_METRIC_FAMILIES {
+            assert!(
+                response.contains(&format!("# TYPE {family} ")),
+                "missing metric family {family}\n{response}"
+            );
+        }
+        assert!(response.contains("dh_worker_slot_icount_total{slot_id=\"0\"} 0\n"));
+        assert!(response.contains("dh_worker_slot_icount_rate{slot_id=\"0\"} 0\n"));
+        assert!(response.contains("dh_worker_exits_total{slot_id=\"0\",reason=\"hlt\"} 1\n"));
+        assert!(response.contains("dh_worker_snapshot_duration_milliseconds_count 1\n"));
+        assert!(response.contains("dh_worker_snapshot_dirty_pages_bucket{le=\"8\"} 1\n"));
+        assert!(response.contains("dh_worker_verification_failures_total 1\n"));
+        assert!(response.contains("dh_pmi_skid_instructions_bucket{le=\"+Inf\"} 0\n"));
+    }
+
+    #[tokio::test]
+    async fn watch_slots_streams_state_transitions() {
+        use tokio_stream::StreamExt;
+
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let response = svc
+            .watch_slots(Request::new(proto::WatchSlotsRequest {}))
+            .await
+            .unwrap();
+        let mut stream = response.into_inner();
+
+        let lease = svc.slot_manager().allocate(0).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.as_mut().next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let slot = event.slot.unwrap();
+        assert_eq!(slot.slot_id, lease.slot_id);
+        assert_eq!(slot.state, i32::from(proto::SlotState::PausedS));
+
+        svc.slot_manager().mark_running(&lease, 0).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.as_mut().next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let slot = event.slot.unwrap();
+        assert_eq!(slot.slot_id, lease.slot_id);
+        assert_eq!(slot.state, i32::from(proto::SlotState::Running));
     }
 
     #[test]
