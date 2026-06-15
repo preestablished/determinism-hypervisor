@@ -53,6 +53,7 @@ These self-skip elsewhere; on the box they run for real:
 | M2 landing precision (10k targets + REP torture) | `cargo test -p determinism-tests --test landing_precision` | ~71s |
 | M1 device-surface acceptance | `cargo test -p determinism-tests --test m1_acceptance` | <1s |
 | Phase-1 gate (one command) | `cargo run -p dh-cli -- gate [--runs N]` | ~32s at 100 runs |
+| M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
 
 ## Intel-box runbook (condensed)
 

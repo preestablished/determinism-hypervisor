@@ -71,7 +71,7 @@ the `.path` file and restart the service.)
 | Tool | Needed by | Status (2026-06-12) | Install (pinned to Status) |
 |---|---|---|---|
 | `protoc` | tonic codegen | **Not needed** — `dh-proto` and `snapstore-client` vendor it via `protoc-bin-vendored` (proto-seam decision, iteration 60) | — |
-| `grpcurl` | M6 smoke tests | ✅ v1.9.3 at `~/go/bin/grpcurl` | `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3` |
+| `grpcurl` | M6 smoke tests ([runbook](./m6-grpcurl-metrics-smoke.md)) | ✅ v1.9.3 at `~/go/bin/grpcurl` | `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3` |
 | `cargo-fuzz` | M5 DHILOG fuzz | ✅ v0.13.2 at `~/.cargo/bin/cargo-fuzz` | `cargo install cargo-fuzz --version 0.13.2 --locked` |
 | Rust nightly | M5 fuzz (cargo-fuzz requires nightly) | ✅ 1.98.0-nightly (2026-06-08) | `rustup toolchain install nightly` |
 | `stress-ng` | M7 soak / chaos load | ✅ 0.17.06-1build1 (operator-installed 2026-06-12, verified as `infra-admin`) | `sudo apt-get install -y stress-ng=0.17.06-1build1` |
@@ -94,10 +94,13 @@ Notes:
   after any incident (or surprising tool behavior), treat the Status column
   as a fingerprint and re-verify the binaries rather than trusting what is
   in place.
-- **grpcurl and stress-ng are pre-staged, not yet exercised**: no workflow
-  invokes them yet (M6/M7 jobs land later), so "✅ installed" does not mean
-  "proven in a runner job" — unlike the `protoc` row, which every build
-  exercises via the vendored binary. cargo-fuzz + nightly ARE exercised:
+- **grpcurl and stress-ng are pre-staged, not yet exercised by workflow**:
+  the M6 grpcurl/manual metrics smoke has a runbook
+  ([m6-grpcurl-metrics-smoke.md](./m6-grpcurl-metrics-smoke.md)), but no
+  workflow invokes it yet. M7 stress-ng jobs also land later, so "✅
+  installed" does not mean "proven in a runner job" — unlike the `protoc`
+  row, which every build exercises via the vendored binary. cargo-fuzz +
+  nightly ARE exercised:
   `nightly-drift.yaml`'s `dhilog-fuzz` job runs 1h nightly on a HOSTED
   runner (this box's install serves local runs and the 24h operator
   dispatch: `gh workflow run nightly-drift.yaml -f fuzz_seconds=86400
