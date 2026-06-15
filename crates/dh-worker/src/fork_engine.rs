@@ -50,6 +50,8 @@ pub enum ForkError {
     /// Building the child slot (CoW mapping, fresh KVM fds) failed —
     /// includes the unsealed-parent kernel check.
     Kvm(String),
+    /// Building the child device bus failed after the child mapping exists.
+    BuildBus(String),
     /// Stuffing the child from the DHSNAP failed; the child is scrap.
     Apply(String),
 }
@@ -95,6 +97,77 @@ pub fn fork_slot(
     child_bus: &mut dh_devices::MmioBus,
     counter: Option<&InstRetired>,
 ) -> Result<ForkOutcome, ForkError> {
+    let dhsnap = prepare_parent_dhsnap(
+        parent,
+        parent_state,
+        parent_bus,
+        parent_entropy,
+        machine_config,
+        boundary,
+    )?;
+    let child = sys
+        .fork_slot_vm(parent)
+        .map_err(|e| ForkError::Kvm(format!("{e:?}")))?;
+    finish_fork(
+        child,
+        child_bus,
+        machine_config,
+        &dhsnap,
+        entropy_seed,
+        counter,
+    )
+}
+
+/// Variant for callers whose child bus needs the freshly-created child
+/// mapping (DetChannelDevice's guest-memory handle is the concrete case).
+#[allow(clippy::too_many_arguments)]
+pub fn fork_slot_with_child_bus<F>(
+    sys: &KvmSystem,
+    parent: &SlotVm,
+    parent_state: SlotState,
+    parent_bus: &dh_devices::MmioBus,
+    parent_entropy: &DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    entropy_seed: Option<[u8; 32]>,
+    counter: Option<&InstRetired>,
+    build_child_bus: F,
+) -> Result<(ForkOutcome, dh_devices::MmioBus), ForkError>
+where
+    F: FnOnce(&SlotVm) -> Result<dh_devices::MmioBus, String>,
+{
+    let dhsnap = prepare_parent_dhsnap(
+        parent,
+        parent_state,
+        parent_bus,
+        parent_entropy,
+        machine_config,
+        boundary,
+    )?;
+    let child = sys
+        .fork_slot_vm(parent)
+        .map_err(|e| ForkError::Kvm(format!("{e:?}")))?;
+    let mut child_bus = build_child_bus(&child).map_err(ForkError::BuildBus)?;
+    let outcome = finish_fork(
+        child,
+        &mut child_bus,
+        machine_config,
+        &dhsnap,
+        entropy_seed,
+        counter,
+    )?;
+    Ok((outcome, child_bus))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_parent_dhsnap(
+    parent: &SlotVm,
+    parent_state: SlotState,
+    parent_bus: &dh_devices::MmioBus,
+    parent_entropy: &DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+) -> Result<Vec<u8>, ForkError> {
     if !boundary.agenda_empty {
         return Err(ForkError::AgendaNotEmpty);
     }
@@ -106,7 +179,7 @@ pub fn fork_slot(
 
     // ── 1. The parent's in-memory DHSNAP (§8.4: "decode the parent's
     //       in-memory DHSNAP, cheap, ~tens of KiB") ───────────────────────
-    let dhsnap = build_dhsnap(
+    build_dhsnap(
         parent,
         parent_bus,
         parent_entropy,
@@ -116,13 +189,17 @@ pub fn fork_slot(
     .map_err(|e| match e {
         EngineError::Codec(m) => ForkError::Capture(m),
         other => ForkError::Capture(format!("{other:?}")),
-    })?;
+    })
+}
 
-    // ── 2. Child slot: CoW RAM + fresh KVM fds (seal-checked inside) ─────
-    let child = sys
-        .fork_slot_vm(parent)
-        .map_err(|e| ForkError::Kvm(format!("{e:?}")))?;
-
+fn finish_fork(
+    child: SlotVm,
+    child_bus: &mut dh_devices::MmioBus,
+    machine_config: &dh_vmm::config::MachineConfig,
+    dhsnap: &[u8],
+    entropy_seed: Option<[u8; 32]>,
+    counter: Option<&InstRetired>,
+) -> Result<ForkOutcome, ForkError> {
     // ── 3. Stuff the child through the one true codec (§8.3 order: RAM
     //       is already live via CoW, then devices, then vCPU) ─────────────
     let applied = apply_dhsnap(&child, child_bus, machine_config, &dhsnap, counter, None).map_err(

@@ -55,6 +55,45 @@ impl dh_devices::ctx::GuestMem for RuntimeVmMem {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+impl detguest_host::GuestMem for RuntimeVmMem {
+    fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), detguest_host::MemError> {
+        if gpa.checked_add(out.len() as u64).is_none() {
+            return Err(detguest_host::MemError::Overflow);
+        }
+        use vm_memory::Bytes;
+        self.0
+            .read_slice(out, vm_memory::GuestAddress(gpa))
+            .map_err(|_| detguest_host::MemError::Unmapped {
+                gpa,
+                len: out.len(),
+            })
+    }
+
+    fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), detguest_host::MemError> {
+        if gpa.checked_add(data.len() as u64).is_none() {
+            return Err(detguest_host::MemError::Overflow);
+        }
+        use vm_memory::Bytes;
+        self.0
+            .write_slice(data, vm_memory::GuestAddress(gpa))
+            .map_err(|_| detguest_host::MemError::Unmapped {
+                gpa,
+                len: data.len(),
+            })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+type RuntimeDetChannel = dh_devices::detchannel::DetChannelDevice<
+    RuntimeVmMem,
+    detguest_host::LogFaultPlan,
+    fn() -> detguest_host::LogFaultPlan,
+>;
+
+#[cfg(target_arch = "x86_64")]
+const DETCHANNEL_MMIO_BASE: u64 = 0xD000_3000;
+
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
 #[cfg(target_arch = "x86_64")]
@@ -497,7 +536,7 @@ fn fork_engine_error_to_status(e: crate::fork_engine::ForkError) -> Status {
             Status::failed_precondition(format!("{e:?}"))
         }
         ForkError::Capture(m) | ForkError::Apply(m) => Status::data_loss(m),
-        ForkError::Kvm(m) => Status::failed_precondition(m),
+        ForkError::Kvm(m) | ForkError::BuildBus(m) => Status::failed_precondition(m),
     }
 }
 
@@ -650,6 +689,15 @@ fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn proto_pixel_format(format: proto::PixelFormat) -> i32 {
+    match format {
+        proto::PixelFormat::PfUnspecified => 0,
+        proto::PixelFormat::Xrgb8888 => 1,
+        proto::PixelFormat::Rgb565 => 2,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn hex32(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
@@ -782,7 +830,11 @@ fn run_verify_replay_on_current_thread(
     let mut slot = sys
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
-    let bus = build_bus(&config, assets.base_image)?;
+    let bus = build_bus(
+        &config,
+        assets.base_image,
+        RuntimeVmMem(slot.guest_mem.clone()),
+    )?;
     let rail = dh_vmm::recording::DeviceRail::new(
         bus,
         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
@@ -1165,6 +1217,7 @@ fn runtime_with_log(
 fn build_bus(
     config: &dh_vmm::config::MachineConfig,
     base_image: dh_vmm::blkfile::FileBase,
+    mem: RuntimeVmMem,
 ) -> Result<dh_devices::MmioBus, Status> {
     let mut bus = dh_devices::MmioBus::new();
     let mut base_image = Some(base_image);
@@ -1210,6 +1263,16 @@ fn build_bus(
                     Box::new(dh_devices::net::PvNet::new()),
                 )
                 .map_err(|e| Status::internal(format!("register pv-net: {e:?}")))?,
+            dh_devices::detchannel::DEVICE_ID_DETCHANNEL => bus
+                .register(
+                    DETCHANNEL_MMIO_BASE,
+                    Box::new(RuntimeDetChannel::new(
+                        mem.clone(),
+                        detguest_host::LogFaultPlan::default(),
+                        detguest_host::LogFaultPlan::default,
+                    )),
+                )
+                .map_err(|e| Status::internal(format!("register detchannel: {e:?}")))?,
             other => {
                 return Err(Status::failed_precondition(format!(
                     "device id {other:#06x} is not supported by dh-workerd bus builder"
@@ -1247,6 +1310,242 @@ fn frame_counter_from_bus(bus: &mut dh_devices::MmioBus) -> u32 {
         }
     }
     0
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_detchannel_mut(bus: &mut dh_devices::MmioBus) -> Option<&mut RuntimeDetChannel> {
+    bus.devices_mut().find_map(|(_base, dev)| {
+        if dev.device_id() != dh_devices::detchannel::DEVICE_ID_DETCHANNEL {
+            return None;
+        }
+        dev.as_any_mut()?.downcast_mut::<RuntimeDetChannel>()
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn service_exit_with_detchannel(
+    rail: &mut dh_vmm::recording::DeviceRail<RuntimeVmMem>,
+    icount: u64,
+    exit: kvm_ioctls::VcpuExit<'_>,
+) -> Result<(), dh_vmm::boundary::BoundaryError> {
+    let serial_end = dh_vmm::kvm::PIO_SERIAL_BASE + dh_vmm::kvm::PIO_SERIAL_LEN;
+    let detcall_end = dh_vmm::kvm::PIO_DETCALL_BASE + dh_vmm::kvm::PIO_DETCALL_LEN;
+    let mut ctx = dh_devices::DevCtx::new(
+        icount,
+        0,
+        &mut rail.log,
+        &mut rail.mem,
+        &mut rail.entropy,
+        &mut rail.irqs,
+    );
+
+    match exit {
+        kvm_ioctls::VcpuExit::IoOut(port, data)
+            if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
+        {
+            rail.serial.pio_write(port, data);
+        }
+        kvm_ioctls::VcpuExit::IoIn(port, data)
+            if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
+        {
+            rail.serial.pio_read(port, data);
+        }
+        kvm_ioctls::VcpuExit::IoOut(port, data)
+            if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
+        {
+            let host = runtime_detchannel_mut(&mut rail.bus).ok_or_else(|| {
+                dh_vmm::boundary::BoundaryError::Exit(
+                    "detchannel PIO without DetChannelDevice".into(),
+                )
+            })?;
+            let mut word = [0u8; 4];
+            let n = data.len().min(4);
+            word[..n].copy_from_slice(&data[..n]);
+            let _events = host
+                .host_mut()
+                .pio_out(port, u32::from_le_bytes(word), &mut ctx);
+            if host.host().metrics.any_anomaly() {
+                return Err(dh_vmm::boundary::BoundaryError::Exit(
+                    "detchannel drain anomaly".into(),
+                ));
+            }
+        }
+        kvm_ioctls::VcpuExit::IoIn(port, data)
+            if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
+        {
+            let host = runtime_detchannel_mut(&mut rail.bus).ok_or_else(|| {
+                dh_vmm::boundary::BoundaryError::Exit(
+                    "detchannel PIO without DetChannelDevice".into(),
+                )
+            })?;
+            let value = host.host_mut().pio_in(port, &mut ctx);
+            data.fill(0);
+            let bytes = value.to_le_bytes();
+            let n = data.len().min(4);
+            data[..n].copy_from_slice(&bytes[..n]);
+            if host.host().metrics.any_anomaly() {
+                return Err(dh_vmm::boundary::BoundaryError::Exit(
+                    "detchannel drain anomaly".into(),
+                ));
+            }
+        }
+        kvm_ioctls::VcpuExit::MmioRead(gpa, data) => {
+            rail.bus.read(gpa, data, &mut ctx).map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!("bus read {gpa:#x}: {e:?}"))
+            })?;
+        }
+        kvm_ioctls::VcpuExit::MmioWrite(gpa, data) => {
+            rail.bus.write(gpa, data, &mut ctx).map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!("bus write {gpa:#x}: {e:?}"))
+            })?;
+        }
+        other => {
+            return Err(dh_vmm::boundary::BoundaryError::Exit(format!(
+                "unexpected exit: {other:?}"
+            )));
+        }
+    }
+    if let Some(e) = ctx.log_fault() {
+        return Err(dh_vmm::boundary::BoundaryError::Exit(format!(
+            "log fault: {e:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct CaptureOutput {
+    feature_bytes: Vec<u8>,
+    fb_lz4: Vec<u8>,
+    fb_info: Option<proto::FbInfo>,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn capture_region_error(region: &str, e: detguest_host::RegionReadError) -> Status {
+    match e {
+        detguest_host::RegionReadError::NameNotFound => {
+            Status::failed_precondition(format!("capture region {region:?} is not published"))
+        }
+        detguest_host::RegionReadError::OutOfBounds => {
+            Status::invalid_argument(format!("capture region {region:?} range is out of bounds"))
+        }
+        detguest_host::RegionReadError::Wire(e) => {
+            Status::failed_precondition(format!("read capture manifest: {e:?}"))
+        }
+        detguest_host::RegionReadError::Mem(e) => {
+            Status::failed_precondition(format!("read capture region {region:?}: {e:?}"))
+        }
+        _ => Status::failed_precondition(format!("read capture region {region:?}: {e:?}")),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn capture_at_boundary(
+    bus: &mut dh_devices::MmioBus,
+    capture: Option<&proto::CaptureSpec>,
+    frame_counter: u32,
+) -> Result<CaptureOutput, Status> {
+    let Some(capture) = capture else {
+        return Ok(CaptureOutput::default());
+    };
+    if capture.ranges.is_empty() && !capture.framebuffer {
+        return Ok(CaptureOutput::default());
+    }
+
+    let detchannel = runtime_detchannel_mut(bus).ok_or_else(|| {
+        Status::failed_precondition("CaptureSpec requires DetChannelDevice in machine_config")
+    })?;
+    let channel = detchannel.host().channel().ok_or_else(|| {
+        Status::failed_precondition("CaptureSpec requires an attached detchannel")
+    })?;
+    let manifest = channel
+        .read_manifest()
+        .map_err(|e| Status::failed_precondition(format!("read capture manifest: {e:?}")))?;
+    let feature_len = capture
+        .ranges
+        .iter()
+        .try_fold(0usize, |acc, range| acc.checked_add(range.len as usize))
+        .ok_or_else(|| Status::invalid_argument("CaptureSpec ranges are too large"))?;
+    let mut out = CaptureOutput {
+        feature_bytes: Vec::with_capacity(feature_len),
+        fb_lz4: Vec::new(),
+        fb_info: None,
+    };
+
+    for (index, range) in capture.ranges.iter().enumerate() {
+        if range.region.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "capture.ranges[{index}].region must not be empty"
+            )));
+        }
+        let region = manifest.resolve(&range.region).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "capture.ranges[{index}].region {:?} is not published",
+                range.region
+            ))
+        })?;
+        if region.layout_version != range.layout_version {
+            return Err(Status::failed_precondition(format!(
+                "capture.ranges[{index}] layout_version {} != manifest {} for region {:?}",
+                range.layout_version, region.layout_version, range.region
+            )));
+        }
+        let end = range
+            .offset
+            .checked_add(u64::from(range.len))
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("capture.ranges[{index}] overflows"))
+            })?;
+        if end > region.len {
+            return Err(Status::invalid_argument(format!(
+                "capture.ranges[{index}] exceeds region {:?} length {}",
+                range.region, region.len
+            )));
+        }
+        let start = out.feature_bytes.len();
+        out.feature_bytes.resize(start + range.len as usize, 0);
+        channel
+            .read_region(&range.region, range.offset, &mut out.feature_bytes[start..])
+            .map_err(|e| capture_region_error(&range.region, e))?;
+    }
+
+    if capture.framebuffer {
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.is_live()
+                    && entry.flags & detguest_wire::manifest::REGION_FLAG_FRAMEBUFFER != 0
+            })
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "CaptureSpec.framebuffer requested but no framebuffer region is published",
+                )
+            })?;
+        let name = std::str::from_utf8(entry.name_bytes()).map_err(|_| {
+            Status::failed_precondition("framebuffer region name is not valid UTF-8")
+        })?;
+        let region = manifest.resolve(name).ok_or_else(|| {
+            Status::failed_precondition("framebuffer region could not be resolved")
+        })?;
+        let fb_len = usize::try_from(region.len)
+            .map_err(|_| Status::invalid_argument("framebuffer region is too large"))?;
+        let mut pixels = vec![0u8; fb_len];
+        channel
+            .read_region(name, 0, &mut pixels)
+            .map_err(|e| capture_region_error(name, e))?;
+        out.fb_lz4 = lz4_flex::compress_prepend_size(&pixels);
+        out.fb_info = Some(proto::FbInfo {
+            width: 0,
+            height: 0,
+            stride: 0,
+            format: proto_pixel_format(proto::PixelFormat::PfUnspecified),
+            frame_counter,
+        });
+    }
+
+    Ok(out)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1753,7 +2052,11 @@ impl HypervisorWorker for WorkerService {
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
                     boot_slot(&slot, assets.boot)?;
-                    let bus = build_bus(&config, assets.base_image)?;
+                    let bus = build_bus(
+                        &config,
+                        assets.base_image,
+                        RuntimeVmMem(slot.guest_mem.clone()),
+                    )?;
                     let config_hash = config.config_hash().map_err(|e| {
                         Status::invalid_argument(format!("MachineConfig hash: {e:?}"))
                     })?;
@@ -1818,7 +2121,11 @@ impl HypervisorWorker for WorkerService {
                     let slot = sys
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
-                    let mut bus = build_bus(&config, assets.base_image)?;
+                    let mut bus = build_bus(
+                        &config,
+                        assets.base_image,
+                        RuntimeVmMem(slot.guest_mem.clone()),
+                    )?;
                     let mut dirty = dh_vmm::dirty::DirtyPageSet::new(slot.mem_bytes);
                     let outcome = {
                         let store = store.lock().map_err(|_| {
@@ -1918,9 +2225,7 @@ impl HypervisorWorker for WorkerService {
                                 let assets = image_resolver
                                     .resolve_create_vm(&parent_runtime.machine_config)
                                     .map_err(image_error_to_status)?;
-                                let mut child_bus =
-                                    build_bus(&parent_runtime.machine_config, assets.base_image)?;
-                                let forked = crate::fork_engine::fork_slot(
+                                let (forked, child_bus) = crate::fork_engine::fork_slot_with_child_bus(
                                     &sys,
                                     &parent_runtime.slot,
                                     dh_vmm::SlotState::Frozen,
@@ -1929,8 +2234,15 @@ impl HypervisorWorker for WorkerService {
                                     &parent_runtime.machine_config,
                                     parent_boundary,
                                     seed,
-                                    &mut child_bus,
                                     None,
+                                    |child| {
+                                        build_bus(
+                                            &parent_runtime.machine_config,
+                                            assets.base_image,
+                                            RuntimeVmMem(child.guest_mem.clone()),
+                                        )
+                                        .map_err(|e| format!("{}: {}", e.code(), e.message()))
+                                    },
                                 )
                                 .map_err(fork_engine_error_to_status)?;
                                 out.push(runtime_with_log(
@@ -2017,9 +2329,7 @@ impl HypervisorWorker for WorkerService {
         #[cfg(target_arch = "x86_64")]
         {
             let request = request.into_inner();
-            if request.capture.is_some() {
-                return Err(unimplemented_status("Run capture"));
-            }
+            let capture = request.capture.clone();
             let lease = lease_from_proto(request.lease.clone())?;
             let until = until_from_run_request(&request)?;
             let manager = self.inner.manager.clone();
@@ -2089,7 +2399,7 @@ impl HypervisorWorker for WorkerService {
                                     "counter read: {e:?}"
                                 ))
                             })?;
-                            rail.borrow_mut().service_exit(icount, exit)
+                            service_exit_with_detchannel(&mut rail.borrow_mut(), icount, exit)
                         };
                         let mut input_sink = |idx: usize, boundary| {
                             let input = pending_inputs.get(idx).ok_or_else(|| {
@@ -2173,6 +2483,11 @@ impl HypervisorWorker for WorkerService {
                                     lease_now_ms(),
                                 )
                                 .map_err(slot_error_to_status)?;
+                            let capture = capture_at_boundary(
+                                &mut runtime.bus,
+                                capture.as_ref(),
+                                runtime.position.frame_counter,
+                            )?;
                             Ok(proto::RunResponse {
                                 reason: proto_stop_reason(outcome.reason),
                                 icount: cumulative_icount,
@@ -2182,9 +2497,9 @@ impl HypervisorWorker for WorkerService {
                                 }),
                                 frames_elapsed: outcome.frames_elapsed,
                                 sdk_event: None,
-                                feature_bytes: Vec::new(),
-                                fb_lz4: Vec::new(),
-                                fb_info: None,
+                                feature_bytes: capture.feature_bytes,
+                                fb_lz4: capture.fb_lz4,
+                                fb_info: capture.fb_info,
                             })
                         }
                         Err(e) => {
@@ -2267,9 +2582,7 @@ impl HypervisorWorker for WorkerService {
         #[cfg(target_arch = "x86_64")]
         {
             let request = request.into_inner();
-            if request.capture.is_some() {
-                return Err(unimplemented_status("TakeSnapshot capture"));
-            }
+            let capture = request.capture.clone();
             let lease = lease_from_proto(request.lease)?;
             let seal_input_log = request.seal_input_log.unwrap_or(true);
             let store = self.store()?;
@@ -2286,13 +2599,17 @@ impl HypervisorWorker for WorkerService {
                     .map_err(slot_error_to_status)?
                     .state;
                 with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
-                    let store = store
-                        .lock()
-                        .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
                     let boundary = runtime.boundary_state(runtime.queued_inputs.is_empty());
                     let segment_icount = runtime.position.segment_icount;
                     let segment_vns =
                         segment_vns_from_icount(&runtime.machine_config, segment_icount)?;
+                    let frame_counter = frame_counter_from_bus(&mut runtime.bus);
+                    runtime.position.frame_counter = frame_counter;
+                    let capture =
+                        capture_at_boundary(&mut runtime.bus, capture.as_ref(), frame_counter)?;
+                    let store = store
+                        .lock()
+                        .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
                     let machine_config_hash = runtime
                         .machine_config
                         .config_hash()
@@ -2391,14 +2708,16 @@ impl HypervisorWorker for WorkerService {
                         out,
                         machine_config_hash,
                         input_log_id,
-                        runtime.position.frame_counter,
+                        frame_counter,
                         boundary.icount,
                         boundary.vns,
+                        capture,
                     ))
                 })
             })
             .await??;
-            let (out, machine_config_hash, input_log_id, frame_counter, icount, vns) = snapshot;
+            let (out, machine_config_hash, input_log_id, frame_counter, icount, vns, capture) =
+                snapshot;
             Ok(Response::new(proto::TakeSnapshotResponse {
                 snapshot: Some(proto::SnapshotRef {
                     hash: out.snapshot_ref.to_bytes().to_vec(),
@@ -2412,9 +2731,9 @@ impl HypervisorWorker for WorkerService {
                 dirty_pages: u32::try_from(out.pages_shipped).unwrap_or(u32::MAX),
                 machine_config_hash: machine_config_hash.to_vec(),
                 determinism_class: Some(class),
-                feature_bytes: Vec::new(),
-                fb_lz4: Vec::new(),
-                fb_info: None,
+                feature_bytes: capture.feature_bytes,
+                fb_lz4: capture.fb_lz4,
+                fb_info: capture.fb_info,
                 frame_counter,
             }))
         }
@@ -2646,6 +2965,38 @@ mod tests {
             dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
         ];
         machine_config_to_proto(&config)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_fixture_machine_config(
+        base_hash: [u8; 32],
+        kernel_hash: [u8; 32],
+    ) -> proto::MachineConfig {
+        let mut config = dh_vmm::config::MachineConfig::new(
+            8 * 1024 * 1024,
+            base_hash,
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash,
+                cmdline: Vec::new(),
+            },
+        );
+        config.device_set = vec![
+            dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+        machine_config_to_proto(&config)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn capture_fixture_bytes(offset: usize, len: usize) -> Vec<u8> {
+        let mut fb = Vec::with_capacity(nanokernel::CAPTURE_FIXTURE_FB_BYTES as usize);
+        for j in 0..nanokernel::CAPTURE_FIXTURE_FB_BYTES / 8 {
+            fb.extend_from_slice(&(nanokernel::CAPTURE_FIXTURE_FB_QWORD_BASE + j).to_le_bytes());
+        }
+        fb[offset..offset + len].to_vec()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3203,7 +3554,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn take_snapshot_defaults_to_sealing_and_rejects_capture() {
+    fn take_snapshot_defaults_to_sealing() {
         if !runtime_tests_available() {
             return;
         }
@@ -3230,16 +3581,6 @@ mod tests {
                 .into_inner();
             let lease = created.lease.unwrap();
 
-            let capture_err = svc
-                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease.clone()),
-                    seal_input_log: Some(true),
-                    capture: Some(proto::CaptureSpec::default()),
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(capture_err.code(), tonic::Code::Unimplemented);
-
             let snap = svc
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
                     lease: Some(lease),
@@ -3249,6 +3590,164 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
+            assert_eq!(snap.input_log_id.len(), 32);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn run_capture_spec_reads_manifest_ranges_and_lz4_framebuffer() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::capture_fixture_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xC6; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                            offset: 8,
+                            len: 24,
+                        }],
+                        framebuffer: true,
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+            );
+            assert_eq!(run.feature_bytes, capture_fixture_bytes(8, 24));
+            let pixels = lz4_flex::decompress_size_prepended(&run.fb_lz4).unwrap();
+            assert_eq!(pixels.len(), nanokernel::CAPTURE_FIXTURE_FB_BYTES as usize);
+            assert_eq!(&pixels[..32], &capture_fixture_bytes(0, 32));
+            let fb_info = run.fb_info.unwrap();
+            assert_eq!(
+                fb_info.format,
+                proto_pixel_format(proto::PixelFormat::PfUnspecified)
+            );
+            assert_eq!(fb_info.frame_counter, 0);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn take_snapshot_capture_checks_layout_version_and_returns_features() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::capture_fixture_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xC7; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+            );
+
+            let bad = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION + 1,
+                            offset: 0,
+                            len: 8,
+                        }],
+                        framebuffer: false,
+                    }),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(bad.code(), tonic::Code::FailedPrecondition);
+            assert!(bad.message().contains("layout_version"));
+            assert_eq!(
+                svc.slot_manager()
+                    .slot_info(lease.slot_id)
+                    .unwrap()
+                    .base_snapshot_id,
+                None,
+                "failed capture must not publish a snapshot"
+            );
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease),
+                    seal_input_log: Some(true),
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                            offset: 16,
+                            len: 16,
+                        }],
+                        framebuffer: false,
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(snap.feature_bytes, capture_fixture_bytes(16, 16));
+            assert!(snap.fb_lz4.is_empty());
+            assert!(snap.fb_info.is_none());
             assert_eq!(snap.input_log_id.len(), 32);
         });
     }
