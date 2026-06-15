@@ -292,8 +292,10 @@ fn set_singlestep(vcpu: &mut VcpuFd, on: bool) -> Result<(), BoundaryError> {
 mod tests {
     use super::*;
     use crate::boot::load_and_enter;
+    use crate::inject::inject_at_boundary;
     use crate::kvm::KvmSystem;
     use crate::run::install_kick_handler;
+    use vm_memory::{Bytes, GuestAddress};
 
     fn gettid() -> i32 {
         // SAFETY: argless syscall.
@@ -480,6 +482,251 @@ mod tests {
             }
             other => Err(BoundaryError::Exit(format!("unexpected exit {other:?}"))),
         }
+    }
+
+    fn irq_stepper_rig() -> Option<(crate::kvm::SlotVm, InstRetired)> {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return None;
+        }
+        install_kick_handler().unwrap();
+        let sys = KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(16 << 20).unwrap();
+        load_and_enter(&slot, nanokernel::mmio_irq_stepper_elf(), b"").unwrap();
+        let counter = InstRetired::open_for_current_thread().unwrap();
+        counter
+            .route_overflow_to_thread(gettid(), crate::run::kick_signal())
+            .unwrap();
+        counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        Some((slot, counter))
+    }
+
+    fn read_irq_stepper_table(slot: &crate::kvm::SlotVm) -> (u64, Vec<u8>) {
+        let mut head = [0u8; 8];
+        slot.guest_mem
+            .read_slice(
+                &mut head,
+                GuestAddress(nanokernel::MMIO_IRQ_STEPPER_TABLE_GPA),
+            )
+            .unwrap();
+        let count = u64::from_le_bytes(head);
+        let mut vecs = vec![0u8; count as usize];
+        slot.guest_mem
+            .read_slice(
+                &mut vecs,
+                GuestAddress(nanokernel::MMIO_IRQ_STEPPER_TABLE_GPA + 8),
+            )
+            .unwrap();
+        (count, vecs)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StepExit {
+        MmioWrite(u64),
+        MmioRead(u64),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct StepProfile {
+        before: Boundary,
+        after: Boundary,
+        exits: Vec<StepExit>,
+    }
+
+    const IRQ_STEPPER_MMIO_BASE: u64 = 0xD000_1000;
+    const IRQ_STEPPER_MMIO_CLUSTER: [StepExit; 3] = [
+        StepExit::MmioWrite(IRQ_STEPPER_MMIO_BASE + 0x14),
+        StepExit::MmioWrite(IRQ_STEPPER_MMIO_BASE + 0x08),
+        StepExit::MmioRead(IRQ_STEPPER_MMIO_BASE + 0x18),
+    ];
+
+    fn current_boundary(slot: &crate::kvm::SlotVm, counter: &InstRetired) -> Boundary {
+        let regs = slot.vcpu.get_regs().unwrap();
+        Boundary {
+            icount: counter.read().unwrap(),
+            rip: regs.rip,
+            rcx: regs.rcx,
+        }
+    }
+
+    fn profile_step(slot: &mut crate::kvm::SlotVm, counter: &InstRetired) -> StepProfile {
+        let before = current_boundary(slot, counter);
+        let mut exits = Vec::new();
+        let after = step_one_entry(&mut slot.vcpu, counter, &mut |exit| match exit {
+            VcpuExit::MmioWrite(gpa, _) => {
+                exits.push(StepExit::MmioWrite(gpa));
+                Ok(())
+            }
+            VcpuExit::MmioRead(gpa, data) => {
+                exits.push(StepExit::MmioRead(gpa));
+                data.fill(0);
+                Ok(())
+            }
+            other => Err(BoundaryError::Exit(format!("unexpected exit {other:?}"))),
+        })
+        .unwrap();
+        StepProfile {
+            before,
+            after,
+            exits,
+        }
+    }
+
+    fn measure_isr_delta(pure: &StepProfile) -> Option<u64> {
+        let (mut slot, counter) = irq_stepper_rig()?;
+        let at = land_at(
+            &mut slot.vcpu,
+            &counter,
+            pure.before.icount,
+            &Margins::default(),
+            &mut ack_mmio,
+        )
+        .unwrap();
+        assert_eq!(at, pure.before, "pure-step measurement landed elsewhere");
+
+        let inj = inject_at_boundary(
+            &mut slot.vcpu,
+            &counter,
+            0x40,
+            &at,
+            &Margins::default(),
+            16,
+            &mut ack_mmio,
+        )
+        .unwrap();
+        assert_eq!(inj.delivered_icount, pure.before.icount);
+        assert_eq!(inj.delivered_rip, pure.before.rip);
+
+        let after = profile_step(&mut slot, &counter);
+        assert!(after.exits.is_empty(), "ISR delta step should stay in NOPs");
+        assert_eq!(after.before, pure.before);
+        assert_eq!(after.after.rip, pure.after.rip);
+        assert_eq!(after.after.rcx, pure.after.rcx);
+        assert!(
+            after.after.icount > pure.after.icount,
+            "interrupt delivery must retire the ISR before the guest step"
+        );
+        let (_, vecs) = read_irq_stepper_table(&slot);
+        assert_eq!(vecs, vec![0x40]);
+        Some(after.after.icount - pure.after.icount)
+    }
+
+    fn discover_mmio_profiles() -> Option<(StepProfile, StepProfile, u64)> {
+        let (mut slot, counter) = irq_stepper_rig()?;
+        let mut pre_mmio_pure = None;
+        for _ in 0..512 {
+            let mmio = profile_step(&mut slot, &counter);
+            if mmio.exits.as_slice() == IRQ_STEPPER_MMIO_CLUSTER.as_slice() {
+                let pre_mmio_pure =
+                    pre_mmio_pure.expect("mmio_irq_stepper should have pure setup steps");
+                let post_mmio_pure = profile_step(&mut slot, &counter);
+                assert_eq!(
+                    post_mmio_pure.before, mmio.after,
+                    "the post-MMIO boundary should be the next step's start"
+                );
+                assert!(
+                    post_mmio_pure.exits.is_empty(),
+                    "post-MMIO step should be a NOP"
+                );
+                assert_eq!(
+                    post_mmio_pure.after.icount,
+                    post_mmio_pure.before.icount + 1,
+                    "post-MMIO pure step should retire one instruction"
+                );
+                let isr_delta = measure_isr_delta(&pre_mmio_pure)?;
+                return Some((mmio, post_mmio_pure, isr_delta));
+            }
+            if mmio.exits.is_empty() {
+                pre_mmio_pure = Some(mmio);
+            }
+        }
+        panic!("mmio_irq_stepper did not expose an MMIO-crossing entry");
+    }
+
+    #[test]
+    fn step_one_entry_chained_injection_crosses_mmio_exactly_live() {
+        let Some((mmio, pure, isr_delta)) = discover_mmio_profiles() else {
+            return;
+        };
+        assert!(isr_delta > 0);
+
+        let run = || {
+            let (mut slot, counter) = irq_stepper_rig()?;
+            let at = land_at(
+                &mut slot.vcpu,
+                &counter,
+                mmio.before.icount,
+                &Margins::default(),
+                &mut ack_mmio,
+            )
+            .unwrap();
+            assert_eq!(at, mmio.before, "fresh run must land at the same RIP");
+
+            let inj1 = inject_at_boundary(
+                &mut slot.vcpu,
+                &counter,
+                0x40,
+                &at,
+                &Margins::default(),
+                16,
+                &mut ack_mmio,
+            )
+            .unwrap();
+            assert_eq!(
+                inj1.delivered_icount, mmio.before.icount,
+                "open window queues at the requested MMIO-adjacent boundary"
+            );
+            assert_eq!(inj1.delivered_rip, mmio.before.rip);
+
+            let after_first = profile_step(&mut slot, &counter);
+            assert_eq!(after_first.before, mmio.before);
+            assert_eq!(after_first.exits, mmio.exits);
+            assert_eq!(after_first.after.rip, mmio.after.rip);
+            assert_eq!(after_first.after.rcx, mmio.after.rcx);
+            assert_eq!(
+                after_first.after.icount,
+                mmio.after.icount + isr_delta,
+                "MMIO-crossing entry must stop at the exact baseline boundary plus ISR retirements"
+            );
+
+            let inj2 = inject_at_boundary(
+                &mut slot.vcpu,
+                &counter,
+                0x41,
+                &after_first.after,
+                &Margins::default(),
+                16,
+                &mut ack_mmio,
+            )
+            .unwrap();
+            assert_eq!(
+                inj2.delivered_icount, after_first.after.icount,
+                "second same-boundary vector queues at step_one_entry's boundary"
+            );
+            assert_eq!(inj2.delivered_rip, pure.before.rip);
+
+            let after_second = profile_step(&mut slot, &counter);
+            assert_eq!(after_second.before, after_first.after);
+            assert!(after_second.exits.is_empty());
+            assert_eq!(after_second.after.rip, pure.after.rip);
+            assert_eq!(after_second.after.rcx, pure.after.rcx);
+            assert_eq!(
+                after_second.after.icount,
+                after_first.after.icount + (pure.after.icount - pure.before.icount) + isr_delta,
+                "second chained entry must stop after exactly one guest instruction plus ISR"
+            );
+            let (count, vecs) = read_irq_stepper_table(&slot);
+            assert_eq!(count, 2);
+            assert_eq!(vecs, vec![0x40, 0x41]);
+
+            Some((at, after_first, after_second, vecs))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "MMIO-adjacent chained delivery must replay exactly");
     }
 
     /// The iteration-82 repro shape: one landing at 4096, mid-loop.

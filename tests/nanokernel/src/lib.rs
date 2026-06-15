@@ -129,6 +129,16 @@ pub fn mmio_stepper_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/mmio_stepper.elf"))
 }
 
+/// mmio_irq_stepper (bead ife): mmio_stepper's emulated-MMIO cluster
+/// plus an IDT/STI and recording ISRs for vectors 0x40/0x41.
+pub fn mmio_irq_stepper_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/mmio_irq_stepper.elf"))
+}
+
+/// mmio_irq_stepper's delivery table GPA: u64 count, then one vector byte
+/// per delivery in order. Mirrors the asm %define (drift-tested).
+pub const MMIO_IRQ_STEPPER_TABLE_GPA: u64 = 0x21_0000;
+
 /// page_dirtier (bead 28i): writes one byte to each of 3072 consecutive
 /// pages starting at the GPA below, then parks in HLT — the dirty-ring
 /// chaos load (3x a 1024-entry ring).

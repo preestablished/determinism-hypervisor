@@ -28,6 +28,7 @@ const PROGRAMS: &[&str] = &[
     "pad_echo",
     "entropy_draw",
     "mmio_stepper",
+    "mmio_irq_stepper",
     "page_dirtier",
 ];
 

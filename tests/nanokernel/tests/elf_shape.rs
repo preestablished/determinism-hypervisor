@@ -69,6 +69,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("pad_echo", pad_echo_elf());
     assert_guest_shape("entropy_draw", entropy_draw_elf());
     assert_guest_shape("mmio_stepper", mmio_stepper_elf());
+    assert_guest_shape("mmio_irq_stepper", mmio_irq_stepper_elf());
     assert_guest_shape("page_dirtier", page_dirtier_elf());
 }
 
@@ -216,6 +217,26 @@ fn timer_guest_table_gpa_matches() {
         .expect("missing %define TABLE_GPA");
     let parsed = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
     assert_eq!(parsed, TIMER_GUEST_TABLE_GPA);
+}
+
+/// mmio_irq_stepper's TABLE_GPA %define must match the Rust constant.
+#[test]
+fn mmio_irq_stepper_table_gpa_matches() {
+    let asm = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/asm/mmio_irq_stepper.asm"
+    ))
+    .unwrap();
+    let v = asm
+        .lines()
+        .find_map(|l| {
+            let mut t = l.split_whitespace();
+            (t.next() == Some("%define") && t.next() == Some("TABLE_GPA"))
+                .then(|| t.next().unwrap())
+        })
+        .expect("missing %define TABLE_GPA");
+    let parsed = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(parsed, MMIO_IRQ_STEPPER_TABLE_GPA);
 }
 
 /// hello's emitted bytes live in .rodata — the ELF must literally contain
