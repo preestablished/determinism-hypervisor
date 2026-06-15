@@ -298,6 +298,7 @@ fn fork_roundtrip_is_invisible_to_the_hash_chain() {
             hash_chain: chain.value(),
             agenda_empty: true,
         },
+        None,
         &mut bus_c,
         None, // keep the shared counter axis — see the module doc note
     )
@@ -373,6 +374,7 @@ fn frozen_parent_children_replay_identical_inputs_identically() {
             &entropy_p,
             &cfg,
             fork_boundary,
+            None,
             &mut bus_c,
             Some(&counter), // §3.1: each child's segment counts from 0
         )

@@ -138,6 +138,7 @@ fn m4_perf_gates_p50_128mib() {
             &entropy_p,
             &config,
             boundary(),
+            None,
             &mut bus_c,
             None,
         )

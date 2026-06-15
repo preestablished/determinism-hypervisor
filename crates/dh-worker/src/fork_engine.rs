@@ -24,7 +24,9 @@
 //! parent is the FORK POINT, recorded by run control), the DHILOG (the
 //! caller opens a fresh segment with `base_snapshot_id` = the fork
 //! point's ref, §8.4), and the counter axis (pass `counter` to re-zero —
-//! the same §3.1 latch as a restore).
+//! the same §3.1 latch as a restore). By default, entropy continues from
+//! the fork-point ENTR state; an explicit child segment seed starts a fresh
+//! deterministic PRNG stream after the snapshot-equivalent fork is built.
 
 use dh_detclock::counter::InstRetired;
 use dh_devices::entropy::DetEntropy;
@@ -68,9 +70,10 @@ pub struct ForkOutcome {
     pub epoch_index: u64,
     /// The child's chain resumes from the fork point (`from_value`).
     pub chain: StateHashChain,
-    /// The child's PRNG — the parent's stream position, continued. Both
-    /// continuing identically is CORRECT (§5): divergence between
-    /// siblings comes from injected inputs, never from the fork itself.
+    /// The child's PRNG. Without an explicit segment seed it is the
+    /// parent's stream position, continued. That identity is CORRECT (§5):
+    /// divergence between siblings comes from inputs or from a caller-chosen
+    /// new segment seed, never from host entropy or the fork operation itself.
     pub entropy: DetEntropy,
 }
 
@@ -88,6 +91,7 @@ pub fn fork_slot(
     parent_entropy: &DetEntropy,
     machine_config: &dh_vmm::config::MachineConfig,
     boundary: BoundaryState,
+    entropy_seed: Option<[u8; 32]>,
     child_bus: &mut dh_devices::MmioBus,
     counter: Option<&InstRetired>,
 ) -> Result<ForkOutcome, ForkError> {
@@ -128,12 +132,17 @@ pub fn fork_slot(
         },
     )?;
 
+    let entropy = entropy_seed
+        .filter(|seed| *seed != [0u8; 32])
+        .map(DetEntropy::from_seed)
+        .unwrap_or(applied.entropy);
+
     Ok(ForkOutcome {
         child,
         cumulative_icount: applied.cumulative_icount,
         vns: applied.vns,
         epoch_index: applied.epoch_index,
         chain: applied.chain,
-        entropy: applied.entropy,
+        entropy,
     })
 }

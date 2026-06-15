@@ -87,6 +87,7 @@ mod imp {
                         &entropy_p,
                         &config,
                         boundary(),
+                        None,
                         &mut bus_c,
                         None,
                     )

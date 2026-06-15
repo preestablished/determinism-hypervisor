@@ -77,6 +77,64 @@ impl From<ConfigError> for MachineConfigWireError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForkRequestWireError {
+    EntropySeedCountMismatch { count: u32, seeds: usize },
+    BadEntropySeed { index: usize, len: usize },
+}
+
+impl std::fmt::Display for ForkRequestWireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForkRequestWireError::EntropySeedCountMismatch { count, seeds } => {
+                write!(
+                    f,
+                    "fork entropy_seeds must be empty or match count {count}, got {seeds}"
+                )
+            }
+            ForkRequestWireError::BadEntropySeed { index, len } => {
+                write!(f, "fork entropy_seeds[{index}] must be 32 bytes, got {len}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForkRequestWireError {}
+
+/// ForkRequest entropy contract (API.md §2.2): absent seeds continue the
+/// fork-point PRNG for every child. When present, there is one 32-byte entry
+/// per child; an all-zero entry also means "continue", and a non-zero entry
+/// starts that child segment from the given seed. Slot-manager capacity checks
+/// own the public `count` range before RPC wiring calls this helper.
+pub fn fork_entropy_seeds_from_proto(
+    count: u32,
+    entropy_seeds: &[Vec<u8>],
+) -> Result<Vec<Option<[u8; 32]>>, ForkRequestWireError> {
+    if entropy_seeds.is_empty() {
+        return Ok(vec![None; count as usize]);
+    }
+    if entropy_seeds.len() != count as usize {
+        return Err(ForkRequestWireError::EntropySeedCountMismatch {
+            count,
+            seeds: entropy_seeds.len(),
+        });
+    }
+    entropy_seeds
+        .iter()
+        .enumerate()
+        .map(|(index, seed)| {
+            let seed: [u8; 32] =
+                seed.as_slice()
+                    .try_into()
+                    .map_err(|_| ForkRequestWireError::BadEntropySeed {
+                        index,
+                        len: seed.len(),
+                    })?;
+            Ok((seed != [0u8; 32]).then_some(seed))
+        })
+        .collect()
+}
+
 pub fn machine_config_to_proto(config: &MachineConfig) -> proto::MachineConfig {
     proto::MachineConfig {
         version: config.version,
@@ -438,6 +496,46 @@ mod tests {
         assert_eq!(
             machine_config_from_proto(&wire),
             Err(MachineConfigWireError::MissingBoot)
+        );
+    }
+
+    #[test]
+    fn fork_entropy_seed_contract_normalizes_and_rejects_bad_shapes() {
+        assert_eq!(
+            fork_entropy_seeds_from_proto(3, &[]).unwrap(),
+            vec![None, None, None]
+        );
+
+        let explicit = fork_entropy_seeds_from_proto(
+            2,
+            &[vec![0; 32], {
+                let mut seed = vec![0xA7; 32];
+                seed[0] = 1;
+                seed
+            }],
+        )
+        .unwrap();
+        assert_eq!(explicit[0], None);
+        assert_eq!(
+            explicit[1],
+            Some({
+                let mut seed = [0xA7; 32];
+                seed[0] = 1;
+                seed
+            })
+        );
+
+        assert_eq!(
+            fork_entropy_seeds_from_proto(2, &[vec![0; 32]]),
+            Err(ForkRequestWireError::EntropySeedCountMismatch { count: 2, seeds: 1 })
+        );
+        assert_eq!(
+            fork_entropy_seeds_from_proto(1, &[vec![0; 31]]),
+            Err(ForkRequestWireError::BadEntropySeed { index: 0, len: 31 })
+        );
+        assert_eq!(
+            fork_entropy_seeds_from_proto(1, &[vec![0; 33]]),
+            Err(ForkRequestWireError::BadEntropySeed { index: 0, len: 33 })
         );
     }
 

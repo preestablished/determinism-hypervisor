@@ -391,9 +391,11 @@ This rule makes interrupt delivery exactly as deterministic as the guest itself.
 - PRNG **state** — exactly `{seed: [u8;32], stream: u64, word_pos: u128}` (56 bytes),
   `rand_chacha`'s exportable state via `get_seed`/`get_stream`/`get_word_pos` — is
   captured in every DHSNAP blob (`ENTR` section, API.md §4), so a fork resumes the
-  stream exactly; a golden test asserts restore reproduces the next N draws
+  stream exactly by default; a golden test asserts restore reproduces the next N draws
   bit-identically (IMPLEMENTATION-PLAN M4). A *new* segment may override the seed
-  (new DHILOG header) — that's how the orchestrator diversifies branches.
+  (new DHILOG header; `ForkRequest.entropy_seeds` / `RestoreSnapshotRequest.entropy_seed`)
+  — that's how the orchestrator diversifies branches. Omitted/all-zero seeds continue
+  the base snapshot or fork-point stream.
 - CPUID mask clears RDRAND (leaf 1 ECX[30]) and RDSEED (leaf 7 EBX[18]). A guest that
   executes RDRAND anyway still gets hardware randomness (no trap exists without a VMX
   control KVM doesn't expose) — this is a guest-contract violation, caught by
@@ -706,6 +708,10 @@ The MAP.md milestone-1 operation. Two tiers:
   KVM detail: each child is its own `VmFd` (KVM VMs don't share EPT across fds; CoW
   happens at the host-pagetable level — EPT violations fault pages in lazily; first-
   touch cost is the page-fault, measured in §10).
+  Entropy detail: the in-memory DHSNAP restores the fork-point ENTR state first.
+  Public `ForkRequest.entropy_seeds` may then reseed each child segment; empty or
+  all-zero seeds keep the fork snapshot-equivalent, non-zero seeds start fresh
+  deterministic child streams.
 - **Tier B — cross-worker / cold restore.** §8.3 via snapshot-store. The store's
   materialized-file fast path (`ResolvePages` to a per-ref read-only flat file on NVMe,
   cached) lets restore be a single `mmap(MAP_PRIVATE)` of that file: lazy page-in from
