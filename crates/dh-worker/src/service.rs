@@ -2249,10 +2249,12 @@ fn framebuffer_response_from_region_bytes(
 fn descriptor_framebuffer_capture(
     region: &[u8],
     frame_counter: u32,
-) -> Option<(Vec<u8>, proto::FbInfo)> {
-    let (width, height, stride, format, pixels) =
-        framebuffer_response_from_region_bytes(region).ok()?;
-    Some((
+) -> Result<Option<(Vec<u8>, proto::FbInfo)>, Status> {
+    if !framebuffer_region_advertises_descriptor(region) {
+        return Ok(None);
+    }
+    let (width, height, stride, format, pixels) = framebuffer_response_from_region_bytes(region)?;
+    Ok(Some((
         pixels,
         proto::FbInfo {
             width,
@@ -2261,7 +2263,28 @@ fn descriptor_framebuffer_capture(
             format,
             frame_counter,
         },
-    ))
+    )))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn framebuffer_region_advertises_descriptor(region: &[u8]) -> bool {
+    let Some(descriptor) = region.get(..FRAMEBUFFER_DESCRIPTOR_BYTES) else {
+        return false;
+    };
+    let width = u32::from_le_bytes(descriptor[0..4].try_into().unwrap());
+    let height = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+    let stride = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+    let format = u32::from_le_bytes(descriptor[12..16].try_into().unwrap());
+    let known_format = matches!(
+        i32::try_from(format)
+            .ok()
+            .and_then(|format| proto::PixelFormat::try_from(format).ok()),
+        Some(proto::PixelFormat::PfUnspecified)
+            | Some(proto::PixelFormat::Xrgb8888)
+            | Some(proto::PixelFormat::Rgb565)
+    );
+    let plausible_dimensions = width != 0 && height != 0 && stride >= width;
+    known_format || plausible_dimensions
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2339,7 +2362,7 @@ fn capture_at_boundary(
 
     if capture.framebuffer {
         let region = read_framebuffer_region_from_bus(bus, FramebufferCaller::CaptureSpec)?;
-        match descriptor_framebuffer_capture(&region, frame_counter) {
+        match descriptor_framebuffer_capture(&region, frame_counter)? {
             Some((pixels, fb_info)) => {
                 out.fb_lz4 = lz4_flex::compress_prepend_size(&pixels);
                 out.fb_info = Some(fb_info);
@@ -4485,11 +4508,46 @@ mod tests {
         assert_eq!(stride, 16);
         assert_eq!(format, proto_pixel_format(proto::PixelFormat::Xrgb8888));
         assert_eq!(pixels, (0u8..32).collect::<Vec<_>>());
+        let (capture_pixels, capture_info) =
+            descriptor_framebuffer_capture(&region, 7).unwrap().unwrap();
+        assert_eq!(capture_pixels, pixels);
+        assert_eq!(capture_info.width, 4);
+        assert_eq!(capture_info.height, 2);
+        assert_eq!(capture_info.stride, 16);
+        assert_eq!(
+            capture_info.format,
+            proto_pixel_format(proto::PixelFormat::Xrgb8888)
+        );
+        assert_eq!(capture_info.frame_counter, 7);
 
         let raw = capture_fixture_bytes(0, FRAMEBUFFER_DESCRIPTOR_BYTES + 32);
         let err = framebuffer_response_from_region_bytes(&raw).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("framebuffer descriptor"));
+        assert!(descriptor_framebuffer_capture(&raw, 7).unwrap().is_none());
+
+        let mut zero_width = region.clone();
+        zero_width[0..4].copy_from_slice(&0u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&zero_width, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("zero dimensions"));
+
+        let mut bad_stride = region.clone();
+        bad_stride[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&bad_stride, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("stride"));
+
+        let mut bad_format = region.clone();
+        bad_format[12..16].copy_from_slice(&99u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&bad_format, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("unsupported pixel_format"));
+
+        let truncated = &region[..region.len() - 1];
+        let err = descriptor_framebuffer_capture(truncated, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("truncated"));
     }
 
     #[cfg(target_arch = "x86_64")]
