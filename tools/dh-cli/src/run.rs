@@ -9,7 +9,7 @@ use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::KvmSystem;
-use dh_vmm::runctl::{run_segment, Segment, StopReason, Until};
+use dh_vmm::runctl::{run_segment_with_options, RunOptions, Segment, StopReason, Until};
 use kvm_ioctls::VcpuExit;
 
 pub struct RunReport {
@@ -21,7 +21,13 @@ pub struct RunReport {
     pub serial: Vec<u8>,
 }
 
-pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<RunReport, String> {
+pub fn run(
+    elf: &[u8],
+    mem_bytes: u64,
+    cmdline: &[u8],
+    until: Until,
+    paranoid_hash: bool,
+) -> Result<RunReport, String> {
     use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 
     dh_vmm::run::install_kick_handler().map_err(|e| format!("kick handler: {e}"))?;
@@ -77,7 +83,14 @@ pub fn run(elf: &[u8], mem_bytes: u64, cmdline: &[u8], until: Until) -> Result<R
             }
             other => Err(BoundaryError::Exit(format!("unexpected exit: {other:?}"))),
         };
-        run_segment(&mut seg, until, &mut || false, &mut on_exit).map_err(|e| format!("{e}"))?
+        run_segment_with_options(
+            &mut seg,
+            until,
+            RunOptions { paranoid_hash },
+            &mut || false,
+            &mut on_exit,
+        )
+        .map_err(|e| format!("{e}"))?
     };
 
     Ok(RunReport {

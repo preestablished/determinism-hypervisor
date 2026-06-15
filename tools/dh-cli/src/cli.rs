@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli snapshot --lease SLOT:TOKEN_HEX [--endpoint URL] [--no-seal-input-log] [--json]\n  dh-cli restore --snapshot SNAPSHOT_HEX [--endpoint URL] [--entropy-seed HEX] [--json]\n  dh-cli fork --parent SLOT:TOKEN_HEX --count N [--endpoint URL] [--entropy-seed HEX]... [--json]\n  dh-cli replay --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--json]\n  dh-cli verify --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--bisect|--no-bisect] [--json]\n  dh-cli skid [--samples N]\n  dh-cli gate [--runs N]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S] [--paranoid-hash]\n  dh-cli snapshot --lease SLOT:TOKEN_HEX [--endpoint URL] [--no-seal-input-log] [--json]\n  dh-cli restore --snapshot SNAPSHOT_HEX [--endpoint URL] [--entropy-seed HEX] [--json]\n  dh-cli fork --parent SLOT:TOKEN_HEX --count N [--endpoint URL] [--entropy-seed HEX]... [--json]\n  dh-cli replay --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--json]\n  dh-cli verify --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--bisect|--no-bisect] [--json]\n  dh-cli skid [--samples N]\n  dh-cli gate [--runs N]"
     );
     std::process::exit(2);
 }
@@ -104,6 +104,7 @@ fn run_cmd(args: &[String]) {
     let mut mem_mib = 16u64;
     let mut cmdline = String::new();
     let mut until = None;
+    let mut paranoid_hash = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -128,6 +129,7 @@ fn run_cmd(args: &[String]) {
                     .unwrap_or_else(|| usage());
                 until = Some(dh_vmm::runctl::Until::VnsBudget(n));
             }
+            "--paranoid-hash" => paranoid_hash = true,
             p if path.is_none() && !p.starts_with("--") => path = Some(p.to_string()),
             _ => usage(),
         }
@@ -141,7 +143,7 @@ fn run_cmd(args: &[String]) {
             std::process::exit(1);
         }
     };
-    match crate::run::run(&elf, mem_mib << 20, cmdline.as_bytes(), until) {
+    match crate::run::run(&elf, mem_mib << 20, cmdline.as_bytes(), until, paranoid_hash) {
         Ok(r) => println!(
             "{{\"reason\":\"{}\",\"icount\":{},\"rip\":\"{:#x}\",\"vns\":{},\"state_hash\":\"{}\",\"serial\":\"{}\"}}",
             r.reason,
