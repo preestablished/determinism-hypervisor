@@ -367,6 +367,12 @@ impl Default for RuntimeThreadState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedInputAt {
+    Icount(u64),
+    Frame(u32),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueuedInputKind {
     PadSet {
@@ -377,11 +383,16 @@ pub enum QueuedInputKind {
     NetRx {
         frame: Vec<u8>,
     },
+    DevEvent {
+        device_id: u16,
+        event_type: u16,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedInput {
-    pub icount: u64,
+    pub at: QueuedInputAt,
     pub order: u64,
     pub kind: QueuedInputKind,
 }

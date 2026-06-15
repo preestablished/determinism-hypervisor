@@ -208,6 +208,22 @@ impl<M: GuestMem> DeviceRail<M> {
         Ok(vector)
     }
 
+    /// Canonical DEV_EVENT landing at `icount`: record a caller-supplied
+    /// device mutation payload in the DHILOG device-event rail.
+    pub fn apply_dev_event(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        device_id: u16,
+        event_type: u16,
+        payload: &[u8],
+    ) -> Result<Option<u8>, RecordError> {
+        self.log
+            .dev_event(icount, boundary_rip, device_id, event_type, payload)
+            .map_err(RecordError::Log)?;
+        Ok(None)
+    }
+
     /// The loopback drain (§6.7): at a TX-doorbell exit, read the frame
     /// back from guest RAM through the still-live TX regs. Run control
     /// calls this AT THAT EXIT (the guest may overwrite its buffer the
@@ -338,6 +354,63 @@ mod tests {
             clock_num: 1,
             clock_den: 1,
             encoder_fingerprint: 0,
+        }
+    }
+
+    #[test]
+    fn dev_event_application_records_canonical_device_event() {
+        let mut rail = DeviceRail::new(
+            MmioBus::new(),
+            DetEntropy::from_seed([7; 32]),
+            LogWriter::new(header()),
+            VecGuestMem(vec![0u8; 64]),
+        );
+        let payload = [1, 2, 3, 4, 5];
+        assert_eq!(
+            rail.apply_dev_event(
+                77,
+                0x1000,
+                dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL,
+                dh_inputlog::dhilog::EVENT_RING_PUSH,
+                &payload,
+            )
+            .unwrap(),
+            None
+        );
+        let sealed = rail
+            .seal(
+                &SegmentOutcome {
+                    reason: StopReason::BudgetReached,
+                    boundary: crate::boundary::Boundary {
+                        icount: 100,
+                        rip: 0,
+                        rcx: 0,
+                    },
+                    vns: 100,
+                    state_hash: [0xAB; 32],
+                    injections_delivered: 0,
+                    timer_fired: None,
+                    frames_elapsed: 0,
+                },
+                [0x33; 32],
+            )
+            .unwrap();
+        let r = LogReader::parse(&sealed).unwrap();
+        let canon: Vec<_> = r.canonical().collect();
+        assert_eq!(canon.len(), 1);
+        assert_eq!(canon[0].icount(), 77);
+        assert_eq!(canon[0].boundary_rip(), 0x1000);
+        match canon[0].body() {
+            RecordBody::DevEvent {
+                device_id,
+                event_type,
+                data,
+            } => {
+                assert_eq!(device_id, dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL);
+                assert_eq!(event_type, dh_inputlog::dhilog::EVENT_RING_PUSH);
+                assert_eq!(data, &payload);
+            }
+            other => panic!("wrong record: {other:?}"),
         }
     }
 
