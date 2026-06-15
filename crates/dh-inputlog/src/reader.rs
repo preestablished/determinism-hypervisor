@@ -14,8 +14,11 @@
 //! unknown CANONICAL kinds are inputs a replayer cannot apply, so parsing
 //! rejects them (`UnknownCanonicalKind`).
 //!
-//! Like the writer, this module is no_std-compatible by construction (core
-//! idioms only; iteration is allocation-free over borrowed payloads).
+//! Like the writer, the sealed replay path is no_std-compatible by
+//! construction (core idioms only; iteration is allocation-free over
+//! borrowed payloads). The inspection-only crash-artifact path allocates a
+//! bounded prefix of validated records so it can stop cleanly at the first
+//! corruption without exposing a replay-capable `LogReader`.
 
 use crate::dhilog::{
     FLAG_EPOCH_HASHES, FLAG_HAS_AUX, FLAG_SEALED, HEADER_LEN, KIND_DEV_EVENT, KIND_END,
@@ -151,9 +154,10 @@ impl<'a> Record<'a> {
         self.rflags & RFLAG_AUX != 0
     }
 
-    /// Typed view of the payload. Infallible: records only come out of a
-    /// `LogReader` whose `parse` validated every known layout, and unknown
-    /// kinds (AUX-only) surface as [`RecordBody::Unknown`].
+    /// Typed view of the payload. Infallible: records only come out of
+    /// `LogReader::parse` or `LogInspection::parse_unsealed`, both of
+    /// which validate every exposed known-kind layout; unknown AUX kinds
+    /// surface as [`RecordBody::Unknown`].
     pub fn body(&self) -> RecordBody<'a> {
         let p = self.payload;
         let u16at = |o: usize| u16::from_le_bytes(p[o..o + 2].try_into().unwrap());
@@ -270,6 +274,27 @@ pub struct LogReader<'a> {
     body: &'a [u8],
 }
 
+/// Inspection-only view of a DHILOG crash artifact. This is deliberately
+/// NOT a `LogReader`: replay and verification only accept sealed logs
+/// through [`LogReader::parse`].
+#[derive(Clone, Debug)]
+pub struct LogInspection<'a> {
+    header: Header,
+    records: Vec<Record<'a>>,
+    stop: InspectionStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectionStop {
+    /// Reached EOF after a valid record prefix. For unsealed artifacts this
+    /// does not imply replayability: body_hash, record_count, HAS_AUX,
+    /// EPOCH_HASHES, and END presence/cross-checks were intentionally not
+    /// enforced.
+    Eof,
+    /// The first record-level corruption after the returned prefix.
+    Corrupt(ReadError),
+}
+
 impl<'a> LogReader<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, ReadError> {
         let header = parse_header(bytes)?;
@@ -320,6 +345,46 @@ impl<'a> LogReader<'a> {
     }
 }
 
+impl<'a> LogInspection<'a> {
+    /// Parse an unsealed or partially-corrupt artifact for diagnostics.
+    ///
+    /// Header shape is still validated, but replay-only gates are skipped:
+    /// SEALED, body_hash, record_count/HAS_AUX/EPOCH_HASHES consistency,
+    /// END presence, END-last, and END/header cross-checks. Records are
+    /// returned only while their framing, watermark, flags, and known-kind
+    /// layouts are safe to expose through [`Record::body`].
+    pub fn parse_unsealed(bytes: &'a [u8]) -> Result<Self, ReadError> {
+        let header = parse_header_for_inspection(bytes)?;
+        let body = &bytes[HEADER_LEN..];
+        let mut state = RecordScan::default();
+        let mut records = Vec::new();
+        let stop = loop {
+            match scan_next_record(body, &mut state) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => break InspectionStop::Eof,
+                Err(err) => break InspectionStop::Corrupt(err),
+            }
+        };
+        Ok(Self {
+            header,
+            records,
+            stop,
+        })
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    pub fn stop(&self) -> InspectionStop {
+        self.stop
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = Record<'a>> + '_ {
+        self.records.iter().copied()
+    }
+}
+
 /// Infallible record iterator over the validated body.
 #[derive(Clone, Debug)]
 pub struct Records<'a> {
@@ -354,6 +419,14 @@ fn pad_len(payload_len: usize) -> usize {
 }
 
 fn parse_header(bytes: &[u8]) -> Result<Header, ReadError> {
+    parse_header_with_seal(bytes, true)
+}
+
+fn parse_header_for_inspection(bytes: &[u8]) -> Result<Header, ReadError> {
+    parse_header_with_seal(bytes, false)
+}
+
+fn parse_header_with_seal(bytes: &[u8], require_sealed: bool) -> Result<Header, ReadError> {
     if bytes.len() < HEADER_LEN {
         return Err(ReadError::TooShort);
     }
@@ -372,7 +445,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header, ReadError> {
     if flags & !(FLAG_SEALED | FLAG_HAS_AUX | FLAG_EPOCH_HASHES) != 0 {
         return Err(ReadError::UnknownHeaderFlags { flags });
     }
-    if flags & FLAG_SEALED == 0 {
+    if require_sealed && flags & FLAG_SEALED == 0 {
         return Err(ReadError::NotSealed);
     }
     if bytes[248..256] != [0u8; 8] {
@@ -403,79 +476,40 @@ fn parse_header(bytes: &[u8]) -> Result<Header, ReadError> {
 /// consistency, END semantics. Every slice index below is dominated by the
 /// explicit length checks at the top of the loop body.
 fn validate_records(header: &Header, body: &[u8]) -> Result<(), ReadError> {
-    let mut offset = 0usize;
-    let mut count: u64 = 0;
-    let mut last_icount = 0u64;
+    let mut scan = RecordScan::default();
     let mut saw_end = false;
     let mut saw_aux_non_end = false;
     let mut saw_epoch_hash = false;
 
-    while offset < body.len() {
-        let seq_for_err = u32::try_from(count).unwrap_or(u32::MAX);
+    while scan.offset < body.len() {
         if saw_end {
             return Err(ReadError::EndNotLast);
         }
-        if body.len() - offset < 24 {
-            return Err(ReadError::Truncated { seq: seq_for_err });
-        }
-        let b = &body[offset..];
-        let kind = b[0];
-        let rflags = b[1];
-        let payload_len = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
-        let seq = u32::from_le_bytes(b[4..8].try_into().unwrap());
-        let icount = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let boundary_rip = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let rec = scan_next_record(body, &mut scan)?.expect("offset < len");
 
-        if payload_len > MAX_PAYLOAD {
-            return Err(ReadError::PayloadTooLong { seq: seq_for_err });
-        }
-        let padded = 24 + payload_len + pad_len(payload_len);
-        if body.len() - offset < padded {
-            return Err(ReadError::Truncated { seq: seq_for_err });
-        }
-        if u64::from(seq) != count {
-            return Err(ReadError::SeqMismatch {
-                expected: seq_for_err,
-                found: seq,
-            });
-        }
-        if count > 0 && icount < last_icount {
-            return Err(ReadError::IcountRegressed { seq });
-        }
-        if rflags & !RFLAG_AUX != 0 {
-            return Err(ReadError::UnknownRecordFlags { rflags, seq });
-        }
-        if b[24 + payload_len..padded].iter().any(|&x| x != 0) {
-            return Err(ReadError::NonzeroPadding { seq });
-        }
-
-        let aux = rflags & RFLAG_AUX != 0;
-        let payload = &b[24..24 + payload_len];
-        validate_kind(kind, aux, payload, seq)?;
-
-        match kind {
+        match rec.kind {
             KIND_END => {
                 // §3.3 END ruling: AUX-flagged, boundary_rip = 0, zero pad
                 // bytes, payload cross-checked against the header. The
                 // stop_reason byte (payload[0]) is intentionally NOT range-
                 // checked: it mirrors proto StopReason, which grows without a
                 // format bump (forward-compatible by design).
-                if boundary_rip != 0 {
+                if rec.boundary_rip != 0 {
                     return Err(ReadError::EndMismatch {
                         what: "boundary_rip != 0",
                     });
                 }
-                if payload[1..8] != [0u8; 7] {
+                if rec.payload[1..8] != [0u8; 7] {
                     return Err(ReadError::EndMismatch {
                         what: "nonzero pad bytes",
                     });
                 }
-                if icount != header.end_icount {
+                if rec.icount != header.end_icount {
                     return Err(ReadError::EndMismatch {
                         what: "icount != header.end_icount",
                     });
                 }
-                if payload[8..40] != header.end_state_hash {
+                if rec.payload[8..40] != header.end_state_hash {
                     return Err(ReadError::EndMismatch {
                         what: "end_state_hash != header.end_state_hash",
                     });
@@ -483,22 +517,18 @@ fn validate_records(header: &Header, body: &[u8]) -> Result<(), ReadError> {
                 saw_end = true;
             }
             KIND_EPOCH_HASH => saw_epoch_hash = true,
-            _ if aux => saw_aux_non_end = true,
+            _ if rec.is_aux() => saw_aux_non_end = true,
             _ => {}
         }
-
-        offset += padded;
-        last_icount = icount;
-        count += 1;
     }
 
     if !saw_end {
         return Err(ReadError::EndNotLast);
     }
-    if count != header.record_count {
+    if scan.count != header.record_count {
         return Err(ReadError::RecordCountMismatch {
             header: header.record_count,
-            actual: count,
+            actual: scan.count,
         });
     }
     // EPOCH_HASH records are AUX too, so fold them into the HAS_AUX check.
@@ -509,6 +539,73 @@ fn validate_records(header: &Header, body: &[u8]) -> Result<(), ReadError> {
         return Err(ReadError::EpochHashesFlagMismatch);
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct RecordScan {
+    offset: usize,
+    count: u64,
+    last_icount: u64,
+}
+
+fn scan_next_record<'a>(
+    body: &'a [u8],
+    scan: &mut RecordScan,
+) -> Result<Option<Record<'a>>, ReadError> {
+    if scan.offset >= body.len() {
+        return Ok(None);
+    }
+    let seq_for_err = u32::try_from(scan.count).unwrap_or(u32::MAX);
+    if body.len() - scan.offset < 24 {
+        return Err(ReadError::Truncated { seq: seq_for_err });
+    }
+    let b = &body[scan.offset..];
+    let kind = b[0];
+    let rflags = b[1];
+    let payload_len = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
+    let seq = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    let icount = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let boundary_rip = u64::from_le_bytes(b[16..24].try_into().unwrap());
+
+    if payload_len > MAX_PAYLOAD {
+        return Err(ReadError::PayloadTooLong { seq: seq_for_err });
+    }
+    let padded = 24 + payload_len + pad_len(payload_len);
+    if body.len() - scan.offset < padded {
+        return Err(ReadError::Truncated { seq: seq_for_err });
+    }
+    if u64::from(seq) != scan.count {
+        return Err(ReadError::SeqMismatch {
+            expected: seq_for_err,
+            found: seq,
+        });
+    }
+    if scan.count > 0 && icount < scan.last_icount {
+        return Err(ReadError::IcountRegressed { seq });
+    }
+    if rflags & !RFLAG_AUX != 0 {
+        return Err(ReadError::UnknownRecordFlags { rflags, seq });
+    }
+    if b[24 + payload_len..padded].iter().any(|&x| x != 0) {
+        return Err(ReadError::NonzeroPadding { seq });
+    }
+
+    let aux = rflags & RFLAG_AUX != 0;
+    let payload = &b[24..24 + payload_len];
+    validate_kind(kind, aux, payload, seq)?;
+
+    let record = Record {
+        kind,
+        rflags,
+        seq,
+        icount,
+        boundary_rip,
+        payload,
+    };
+    scan.offset += padded;
+    scan.last_icount = icount;
+    scan.count += 1;
+    Ok(Some(record))
 }
 
 /// Per-kind §3.3 layout validation. `payload` length is already ≤ 4096 and

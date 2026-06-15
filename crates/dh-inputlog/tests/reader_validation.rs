@@ -4,7 +4,7 @@
 //! check is what fails, not the hash gate in front of it.
 
 use dh_inputlog::dhilog::*;
-use dh_inputlog::reader::{LogReader, ReadError, RecordBody};
+use dh_inputlog::reader::{InspectionStop, LogInspection, LogReader, ReadError, RecordBody};
 
 fn header() -> SegmentHeader {
     SegmentHeader {
@@ -164,6 +164,92 @@ fn empty_log_parses_with_just_end() {
     assert_eq!(r.canonical().count(), 0);
     assert_eq!(r.aux().count(), 1); // END only
     assert!(!r.header().has_aux()); // END alone does not set HAS_AUX
+}
+
+#[test]
+fn inspection_walks_unsealed_artifacts_without_creating_a_reader() {
+    let mut log = full_log();
+    let flags = u32::from_le_bytes(log[12..16].try_into().unwrap()) & !FLAG_SEALED;
+    log[12..16].copy_from_slice(&flags.to_le_bytes());
+    assert_eq!(LogReader::parse(&log).unwrap_err(), ReadError::NotSealed);
+
+    let inspection = LogInspection::parse_unsealed(&log).unwrap();
+    assert_eq!(inspection.header().flags & FLAG_SEALED, 0);
+    assert_eq!(inspection.stop(), InspectionStop::Eof);
+    assert_eq!(inspection.records().count(), 8);
+    let first = inspection.records().next().unwrap();
+    assert_eq!(first.kind(), KIND_PAD_SET);
+    assert!(matches!(first.body(), RecordBody::PadSet { .. }));
+}
+
+#[test]
+fn inspection_ignores_replay_only_hash_and_end_gates() {
+    let mut bad_hash = full_log();
+    bad_hash[HEADER_LEN + 24] ^= 1; // mutate PAD_SET payload without resealing
+    assert_eq!(
+        LogReader::parse(&bad_hash).unwrap_err(),
+        ReadError::BodyHashMismatch
+    );
+    let inspection = LogInspection::parse_unsealed(&bad_hash).unwrap();
+    assert_eq!(inspection.stop(), InspectionStop::Eof);
+    assert_eq!(inspection.records().count(), 8);
+
+    let full = full_log();
+    let stripped = full[..full.len() - 64].to_vec();
+    let inspection = LogInspection::parse_unsealed(&stripped).unwrap();
+    assert_eq!(inspection.stop(), InspectionStop::Eof);
+    assert_eq!(inspection.records().count(), 7);
+
+    let mut end_cross_check = full_log();
+    let end_rec_off = end_cross_check.len() - 64;
+    end_cross_check[end_rec_off + 16..end_rec_off + 24].copy_from_slice(&1u64.to_le_bytes());
+    reseal(&mut end_cross_check);
+    assert_eq!(
+        LogReader::parse(&end_cross_check).unwrap_err(),
+        ReadError::EndMismatch {
+            what: "boundary_rip != 0"
+        }
+    );
+    let inspection = LogInspection::parse_unsealed(&end_cross_check).unwrap();
+    assert_eq!(inspection.stop(), InspectionStop::Eof);
+    assert_eq!(inspection.records().last().unwrap().kind(), KIND_END);
+}
+
+#[test]
+fn inspection_returns_valid_prefix_until_record_corruption() {
+    let mut log = full_log();
+    // Corrupt the second record's seq without resealing. Inspection ignores
+    // body_hash but still stops at record-level corruption.
+    let off = HEADER_LEN + 40;
+    log[off + 4..off + 8].copy_from_slice(&7u32.to_le_bytes());
+
+    let inspection = LogInspection::parse_unsealed(&log).unwrap();
+    assert_eq!(inspection.records().count(), 1);
+    assert_eq!(
+        inspection.stop(),
+        InspectionStop::Corrupt(ReadError::SeqMismatch {
+            expected: 1,
+            found: 7
+        })
+    );
+}
+
+#[test]
+fn inspection_treats_empty_net_rx_as_corrupt() {
+    // Bead 206 made zero-length NET_RX invalid for replay; inspection uses
+    // the same known-kind layout gate and reports the corrupt boundary
+    // instead of leniently manufacturing a typed frame.
+    let rec = make_record(KIND_NET_RX, 0, 0, 10, 0x1000, &[]);
+    let log = splice_before_end(&[rec], FLAG_SEALED);
+    let inspection = LogInspection::parse_unsealed(&log).unwrap();
+    assert_eq!(inspection.records().count(), 0);
+    assert_eq!(
+        inspection.stop(),
+        InspectionStop::Corrupt(ReadError::BadPayloadLayout {
+            kind: KIND_NET_RX,
+            seq: 0
+        })
+    );
 }
 
 // ---- header negatives -------------------------------------------------------
@@ -682,6 +768,7 @@ fn arbitrary_truncations_never_panic() {
     let log = full_log();
     for len in 0..log.len() {
         let _ = LogReader::parse(&log[..len]); // must return Err, not panic
+        let _ = LogInspection::parse_unsealed(&log[..len]);
     }
 }
 
@@ -692,7 +779,9 @@ fn single_byte_corruptions_never_panic() {
         let mut m = log.clone();
         m[i] ^= 0xFF;
         let _ = LogReader::parse(&m); // Ok or Err both fine; no panic
+        let _ = LogInspection::parse_unsealed(&m);
         reseal(&mut m);
         let _ = LogReader::parse(&m);
+        let _ = LogInspection::parse_unsealed(&m);
     }
 }
