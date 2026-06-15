@@ -49,6 +49,113 @@ use crate::restore_engine::{restore_snapshot, RestoreError};
 /// `(what, at_icount, expected, got)`.
 type DivergenceCell = std::cell::Cell<Option<(&'static str, u64, [u8; 32], [u8; 32])>>;
 
+type ReplayDetChannel<M> = dh_devices::detchannel::DetChannelDevice<
+    M,
+    detguest_host::LogFaultPlan,
+    fn() -> detguest_host::LogFaultPlan,
+>;
+
+fn replay_detchannel_mut<M>(bus: &mut dh_devices::MmioBus) -> Option<&mut ReplayDetChannel<M>>
+where
+    M: detguest_host::GuestMem + Clone + Send + 'static,
+{
+    bus.devices_mut().find_map(|(_base, dev)| {
+        if dev.device_id() != dh_devices::detchannel::DEVICE_ID_DETCHANNEL {
+            return None;
+        }
+        dev.as_any_mut()?.downcast_mut::<ReplayDetChannel<M>>()
+    })
+}
+
+fn replay_service_exit<M>(
+    rail: &mut DeviceRail<M>,
+    icount: u64,
+    exit: kvm_ioctls::VcpuExit<'_>,
+) -> Result<(), BoundaryError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
+    let serial_end = dh_vmm::kvm::PIO_SERIAL_BASE + dh_vmm::kvm::PIO_SERIAL_LEN;
+    let detcall_end = dh_vmm::kvm::PIO_DETCALL_BASE + dh_vmm::kvm::PIO_DETCALL_LEN;
+    let mut ctx = dh_devices::DevCtx::new(
+        icount,
+        0,
+        &mut rail.log,
+        &mut rail.mem,
+        &mut rail.entropy,
+        &mut rail.irqs,
+    );
+
+    match exit {
+        kvm_ioctls::VcpuExit::IoOut(port, data)
+            if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
+        {
+            rail.serial.pio_write(port, data);
+        }
+        kvm_ioctls::VcpuExit::IoIn(port, data)
+            if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
+        {
+            rail.serial.pio_read(port, data);
+        }
+        kvm_ioctls::VcpuExit::IoOut(port, data)
+            if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
+        {
+            let host = replay_detchannel_mut::<M>(&mut rail.bus).ok_or_else(|| {
+                BoundaryError::Exit("detchannel PIO without DetChannelDevice".into())
+            })?;
+            let mut word = [0u8; 4];
+            let n = data.len().min(4);
+            word[..n].copy_from_slice(&data[..n]);
+            let _events = host
+                .host_mut()
+                .pio_out(port, u32::from_le_bytes(word), &mut ctx);
+            if host.host().metrics.any_anomaly() {
+                return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
+            }
+        }
+        kvm_ioctls::VcpuExit::IoIn(port, data)
+            if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
+        {
+            let host = replay_detchannel_mut::<M>(&mut rail.bus).ok_or_else(|| {
+                BoundaryError::Exit("detchannel PIO without DetChannelDevice".into())
+            })?;
+            let value = host.host_mut().pio_in(port, &mut ctx);
+            data.fill(0);
+            let bytes = value.to_le_bytes();
+            let n = data.len().min(4);
+            data[..n].copy_from_slice(&bytes[..n]);
+            if host.host().metrics.any_anomaly() {
+                return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
+            }
+        }
+        kvm_ioctls::VcpuExit::MmioRead(gpa, data) => {
+            rail.bus
+                .read(gpa, data, &mut ctx)
+                .map_err(|e| BoundaryError::Exit(format!("bus read {gpa:#x}: {e:?}")))?;
+        }
+        kvm_ioctls::VcpuExit::MmioWrite(gpa, data) => {
+            rail.bus
+                .write(gpa, data, &mut ctx)
+                .map_err(|e| BoundaryError::Exit(format!("bus write {gpa:#x}: {e:?}")))?;
+        }
+        other => {
+            return Err(BoundaryError::Exit(format!("unexpected exit: {other:?}")));
+        }
+    }
+    if let Some(e) = ctx.log_fault() {
+        return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
+    }
+    Ok(())
+}
+
+fn detchannel_exit_generated_event(device_id: u16, event_type: u16) -> bool {
+    device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
+        && matches!(
+            event_type,
+            dh_inputlog::dhilog::EVENT_PIO_ANSWER | dh_inputlog::dhilog::EVENT_CONS_BUMP
+        )
+}
+
 #[derive(Debug)]
 pub enum ReplayError {
     Restore(RestoreError),
@@ -84,7 +191,7 @@ pub struct ReplayOutcome {
 /// are FRESH (the restore engine's preconditions); the counter is
 /// routed to this thread and will be reset by the restore (§3.1).
 #[allow(clippy::too_many_arguments)]
-pub fn replay_segment<M: GuestMem>(
+pub fn replay_segment<M>(
     slot: &mut SlotVm,
     rail: DeviceRail<M>,
     machine_config: &MachineConfig,
@@ -92,7 +199,10 @@ pub fn replay_segment<M: GuestMem>(
     counter: &InstRetired,
     store: &SnapstoreClient,
     log_bytes: &[u8],
-) -> Result<ReplayOutcome, ReplayError> {
+) -> Result<ReplayOutcome, ReplayError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
     let log = LogReader::parse(log_bytes).map_err(ReplayError::Log)?;
     let header = log.header();
 
@@ -195,7 +305,7 @@ pub fn replay_segment<M: GuestMem>(
                     let icount = counter
                         .read()
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
-                    rail.borrow_mut().service_exit(icount, exit)
+                    replay_service_exit(&mut rail.borrow_mut(), icount, exit)
                 },
                 &mut |idx, icount, value| {
                     let i = verified.get();
@@ -288,6 +398,12 @@ pub fn replay_segment<M: GuestMem>(
                 event_type,
                 data,
             } => {
+                let detchannel_will_regenerate =
+                    detchannel_exit_generated_event(device_id, event_type)
+                        && replay_detchannel_mut::<M>(&mut rail.borrow_mut().bus).is_some();
+                if detchannel_will_regenerate {
+                    continue;
+                }
                 let o = run_to(slot, &mut chain, icount)?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
@@ -311,6 +427,8 @@ pub fn replay_segment<M: GuestMem>(
     // ── Run out the tail and check the END identity ───────────────────────
     let (stop_reason_byte, _) = log.end();
     let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
+    let verified_before_tail = verified.get();
+    let chain_before_tail = chain.clone();
     let tail = run_to(slot, &mut chain, header.end_icount)?;
     if let Some(out) = &tail {
         // A GuestHalted recording legitimately stops ON its halt at
@@ -338,6 +456,43 @@ pub fn replay_segment<M: GuestMem>(
             });
         }
     }
+    let mut live_end = chain.value();
+    if live_end != header.end_state_hash
+        && expected_reason == StopReason::BudgetReached
+        && matches!(
+            tail,
+            Some(out)
+                if out.reason == StopReason::BudgetReached
+                    && out.boundary.icount == header.end_icount
+        )
+        && verified.get() == verified_before_tail
+    {
+        // TakeSnapshot seals the active segment as BudgetReached even when
+        // the preceding Run stopped on a terminal HLT. An exact replay tail
+        // can therefore land just before the HLT and hash the pre-HLT RIP.
+        // If no epoch links were emitted, restore the pre-tail chain and
+        // allow one more retired-instruction budget so the same-icount HLT
+        // exit can produce the recorded hash.
+        chain = chain_before_tail;
+        let halt_target = header
+            .end_icount
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::Apply("BudgetReached HLT retry overflows".into()))?;
+        let halt_tail = run_to(slot, &mut chain, halt_target)?;
+        if let Some(out) = &halt_tail {
+            if out.reason == StopReason::GuestHalted && out.boundary.icount == header.end_icount {
+                if out.vns != header.end_vns {
+                    return Err(ReplayError::Divergence {
+                        what: "end_vns",
+                        at_icount: header.end_icount,
+                        expected: u64_hash(header.end_vns),
+                        got: u64_hash(out.vns),
+                    });
+                }
+                live_end = chain.value();
+            }
+        }
+    }
     let verified = verified.get();
     if verified != expected_epochs.len() {
         return Err(ReplayError::Divergence {
@@ -347,7 +502,6 @@ pub fn replay_segment<M: GuestMem>(
             got: [0; 32],
         });
     }
-    let live_end = chain.value();
     if live_end != header.end_state_hash {
         return Err(ReplayError::Divergence {
             what: "end_state_hash",

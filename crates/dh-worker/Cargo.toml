@@ -22,7 +22,10 @@ tonic.workspace = true
 # The snapshot engine (src/snapshot_engine.rs) talks to the REAL store
 # (R12) through the blocking facade; x86-only alongside the KVM seams.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+detguest-host.workspace = true
+detguest-wire.workspace = true
 kvm-ioctls.workspace = true
+lz4_flex.workspace = true
 snapstore-client.workspace = true
 snapstore-manifest.workspace = true
 snapstore-types.workspace = true
