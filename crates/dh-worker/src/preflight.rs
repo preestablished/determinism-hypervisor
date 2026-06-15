@@ -211,11 +211,58 @@ pub fn host_checks() -> Vec<CheckResult> {
     out
 }
 
-/// §2.1 capability gate via dh-vmm (named-missing-caps on failure), plus a
-/// slot-VM construction smoke (memfd, NOHUGEPAGE, dirty ring, vCPU).
+/// Convert a live x86 kernel probe into the same printable preflight row as
+/// parser-backed host checks.
+#[cfg(target_arch = "x86_64")]
+fn probe_check<E: fmt::Debug>(
+    name: &'static str,
+    want: &'static str,
+    got: Result<String, E>,
+) -> CheckResult {
+    match got {
+        Ok(got) => CheckResult {
+            name,
+            ok: true,
+            got,
+            want: want.into(),
+        },
+        Err(e) => CheckResult {
+            name,
+            ok: false,
+            got: format!("{e:?}"),
+            want: want.into(),
+        },
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dirty_ring_check(got: Result<bool, impl fmt::Debug>) -> CheckResult {
+    match got {
+        Ok(present) => CheckResult {
+            name: "kvm.cap.dirty_ring",
+            ok: present,
+            got: if present {
+                "present".into()
+            } else {
+                "absent".into()
+            },
+            want: "KVM_CAP_DIRTY_LOG_RING_ACQ_REL present".into(),
+        },
+        Err(e) => CheckResult {
+            name: "kvm.cap.dirty_ring",
+            ok: false,
+            got: format!("{e:?}"),
+            want: "KVM_CAP_DIRTY_LOG_RING_ACQ_REL present".into(),
+        },
+    }
+}
+
+/// §2.1 capability gate via dh-vmm (named-missing-caps on failure), plus the
+/// M4/M6 kernel requirements that make dirty-ring, sealed-fork, and
+/// 4 KiB-granularity snapshot behavior load-bearing.
 #[cfg(target_arch = "x86_64")]
 pub fn kvm_checks() -> Vec<CheckResult> {
-    match dh_vmm::kvm::KvmSystem::open() {
+    let mut out = match dh_vmm::kvm::KvmSystem::open() {
         Ok(sys) => {
             let mut out = vec![CheckResult {
                 name: "kvm.caps(§2.1)",
@@ -223,12 +270,9 @@ pub fn kvm_checks() -> Vec<CheckResult> {
                 got: "all present".into(),
                 want: "all present".into(),
             }];
-            out.push(CheckResult {
-                name: "kvm.dirty_ring",
-                ok: sys.dirty_ring,
-                got: sys.dirty_ring.to_string(),
-                want: "true".into(),
-            });
+            out.push(dirty_ring_check(Ok::<bool, dh_vmm::kvm::KvmError>(
+                sys.dirty_ring,
+            )));
             out.push(match sys.create_slot_vm(2 * 1024 * 1024) {
                 Ok(_) => CheckResult {
                     name: "kvm.slot_vm_smoke",
@@ -245,13 +289,27 @@ pub fn kvm_checks() -> Vec<CheckResult> {
             });
             out
         }
-        Err(e) => vec![CheckResult {
-            name: "kvm.caps(§2.1)",
-            ok: false,
-            got: format!("{e:?}"),
-            want: "all present".into(),
-        }],
-    }
+        Err(e) => vec![
+            CheckResult {
+                name: "kvm.caps(§2.1)",
+                ok: false,
+                got: format!("{e:?}"),
+                want: "all present".into(),
+            },
+            dirty_ring_check(dh_vmm::kvm::probe_dirty_ring_cap()),
+        ],
+    };
+    out.push(probe_check(
+        "memfd.F_SEAL_FUTURE_WRITE",
+        "seal set; write denied; CoW mmap ok; shared writable mmap denied",
+        dh_vmm::kvm::probe_memfd_future_write_seal(),
+    ));
+    out.push(probe_check(
+        "vm.MADV_NOHUGEPAGE",
+        "accepted on memfd-backed slot mapping",
+        dh_vmm::kvm::probe_madv_nohugepage(),
+    ));
+    out
 }
 
 /// Non-x86_64 hosts can never satisfy §2.1 (VMX-shaped KVM): the check
@@ -324,6 +382,20 @@ mod tests {
             .any(|r| !r.ok));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dirty_ring_check_reports_every_probe_result() {
+        assert!(dirty_ring_check(Ok::<bool, &str>(true)).ok);
+
+        let absent = dirty_ring_check(Ok::<bool, &str>(false));
+        assert!(!absent.ok);
+        assert_eq!(absent.got, "absent");
+
+        let err = dirty_ring_check(Err::<bool, &str>("open failed"));
+        assert!(!err.ok);
+        assert_eq!(err.got, "\"open failed\"");
+    }
+
     /// HARDWARE-GATED acceptance: the full preflight passes on the §7.4
     /// box (and would fail loudly on a stock config — the parsers above
     /// prove the failure paths).
@@ -351,6 +423,15 @@ mod tests {
             eprintln!("{r}");
         }
         assert!(ok, "preflight must pass on the configured lab box");
-        assert!(results.len() >= 15);
+        assert!(results.len() >= 17);
+        assert!(results
+            .iter()
+            .any(|r| r.name == "kvm.cap.dirty_ring" && r.ok));
+        assert!(results
+            .iter()
+            .any(|r| r.name == "memfd.F_SEAL_FUTURE_WRITE" && r.ok));
+        assert!(results
+            .iter()
+            .any(|r| r.name == "vm.MADV_NOHUGEPAGE" && r.ok));
     }
 }
