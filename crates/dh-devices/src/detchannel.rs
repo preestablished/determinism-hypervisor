@@ -197,6 +197,7 @@ where
     }
 
     fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError> {
+        DetChannelHost::<M, P>::validate_evtc_section(bytes, sec_version)?;
         let plan = (self.restore_plan)();
         self.host.restore(bytes, sec_version, plan)
     }
@@ -289,6 +290,45 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
     pub const EVTC_LEN: usize = 4 + 4 + 4 + 5 + 5 + 1 + 16;
     pub const EVTC_VERSION: u16 = 1;
 
+    fn evtc_present_flag(
+        bytes: &[u8],
+        flag_at: usize,
+        absent_payload: core::ops::Range<usize>,
+    ) -> Result<bool, crate::RestoreError> {
+        match bytes[flag_at] {
+            0 => {
+                if bytes[absent_payload].iter().any(|&b| b != 0) {
+                    return Err(crate::RestoreError);
+                }
+                Ok(false)
+            }
+            1 => Ok(true),
+            _ => Err(crate::RestoreError),
+        }
+    }
+
+    fn validate_evtc_section(bytes: &[u8], version: u16) -> Result<(), crate::RestoreError> {
+        if version != Self::EVTC_VERSION || bytes.len() != Self::EVTC_LEN {
+            return Err(crate::RestoreError);
+        }
+
+        let init_status = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let status = if init_status == INIT_STATUS_NEVER_COMMITTED {
+            None
+        } else {
+            Some(InitStatus::from_u32(init_status).ok_or(crate::RestoreError)?)
+        };
+        Self::evtc_present_flag(bytes, 12, 13..17)?;
+        Self::evtc_present_flag(bytes, 17, 18..22)?;
+        let attached = Self::evtc_present_flag(bytes, 22, 23..39)?;
+
+        match (attached, status) {
+            (true, Some(InitStatus::Ok | InitStatus::AlreadyAttached)) => Ok(()),
+            (false, None | Some(InitStatus::BadGpa | InitStatus::BadMagicVersion)) => Ok(()),
+            _ => Err(crate::RestoreError),
+        }
+    }
+
     /// Restore from EVTC contents. PRECONDITION (§8.3 restore order):
     /// guest RAM is already restored — re-attach validates the live
     /// channel header at the recorded GPA, then the NON-RECONSTRUCTIBLE
@@ -308,9 +348,7 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         version: u16,
         plan: P,
     ) -> Result<(), crate::RestoreError> {
-        if version != Self::EVTC_VERSION || bytes.len() != Self::EVTC_LEN {
-            return Err(crate::RestoreError);
-        }
+        Self::validate_evtc_section(bytes, version)?;
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         let init_lo = u32_at(0);
         let init_hi = u32_at(4);
@@ -1655,6 +1693,69 @@ mod evtc_tests {
         assert!(
             h2.restore(&bad, 1, LogFaultPlan::default()).is_err(),
             "bad header at GPA refuses"
+        );
+    }
+
+    #[test]
+    fn evtc_restore_rejects_non_canonical_section_bytes() {
+        let host: DetChannelHost<SharedMem, LogFaultPlan> =
+            DetChannelHost::new(channel_page(), LogFaultPlan::default());
+        let mut detached = Vec::new();
+        host.snapshot(&mut detached);
+
+        let assert_bad = |section: &[u8], msg: &str| {
+            let mut restored: DetChannelHost<SharedMem, LogFaultPlan> =
+                DetChannelHost::new(channel_page(), LogFaultPlan::default());
+            assert!(
+                restored
+                    .restore(section, 1, LogFaultPlan::default())
+                    .is_err(),
+                "{msg}"
+            );
+        };
+
+        for flag_at in [12, 17, 22] {
+            let mut bad = detached.clone();
+            bad[flag_at] = 2;
+            assert_bad(&bad, "non-bool option flag refuses");
+        }
+
+        for payload_at in [13, 18, 23] {
+            let mut bad = detached.clone();
+            bad[payload_at] = 1;
+            assert_bad(&bad, "absent option payload must be zero");
+        }
+
+        let mut invalid_status = detached.clone();
+        invalid_status[8..12].copy_from_slice(&0xFEED_BEEFu32.to_le_bytes());
+        assert_bad(&invalid_status, "unknown init status refuses");
+
+        let mut detached_ok = detached.clone();
+        detached_ok[8..12].copy_from_slice(&(InitStatus::Ok as u32).to_le_bytes());
+        assert_bad(&detached_ok, "detached channel cannot restore Ok status");
+
+        let mut l = log();
+        let mem = channel_page();
+        let mut attached_host = DetChannelHost::new(mem.clone(), LogFaultPlan::default());
+        with_ctx(&mut l, 10, |ctx| {
+            attached_host.pio_out(PORT_INIT_LO, BASE as u32, ctx);
+            attached_host.pio_out(PORT_INIT_GO, CHANNEL_SIZE_PAGES, ctx);
+            assert_eq!(
+                attached_host.pio_in(PORT_INIT_GO, ctx),
+                InitStatus::Ok as u32
+            );
+        });
+        let mut attached = Vec::new();
+        attached_host.snapshot(&mut attached);
+
+        let mut attached_bad_status = attached.clone();
+        attached_bad_status[8..12].copy_from_slice(&(InitStatus::BadGpa as u32).to_le_bytes());
+        let mut restored = DetChannelHost::new(mem, LogFaultPlan::default());
+        assert!(
+            restored
+                .restore(&attached_bad_status, 1, LogFaultPlan::default())
+                .is_err(),
+            "attached channel cannot restore failure status"
         );
     }
 }
