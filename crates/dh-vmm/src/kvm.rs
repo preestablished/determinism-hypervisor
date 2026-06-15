@@ -43,8 +43,9 @@ pub enum KvmError {
     MemTooLarge,
 }
 
-/// §2.1 required capability table. (DIRTY_LOG_RING is preferred-optional —
-/// probed separately, bitmap fallback allowed.)
+/// §2.1 required capability table. Dirty-ring support is probed separately:
+/// it is an M4/M6 worker host requirement, but keeping it out of this table
+/// lets preflight report a dedicated `kvm.cap.dirty_ring` row.
 const REQUIRED_CAPS: &[(Cap, &str)] = &[
     (Cap::UserMemory, "KVM_CAP_USER_MEMORY"),
     (Cap::SetTssAddr, "KVM_CAP_SET_TSS_ADDR"),
@@ -83,20 +84,60 @@ const REQUIRED_RAW_CAPS: &[(u32, &str)] = &[
     ),
 ];
 
+fn frozen_ram_seals() -> i32 {
+    libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW
+}
+
+fn add_memfd_seals(file: &std::fs::File, seals: i32, label: &str) -> Result<(), KvmError> {
+    use std::os::fd::AsRawFd;
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+    if rc != 0 {
+        return Err(KvmError::Memory(format!(
+            "{label}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn get_memfd_seals(file: &std::fs::File) -> Result<i32, KvmError> {
+    use std::os::fd::AsRawFd;
+    #[allow(unsafe_code)]
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(KvmError::Memory(format!(
+            "F_GET_SEALS: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(seals)
+}
+
+fn open_checked_kvm() -> Result<Kvm, KvmError> {
+    let kvm = Kvm::new().map_err(|e| KvmError::Open(e.to_string()))?;
+    let version = kvm.get_api_version();
+    if version != KVM_API_VERSION as i32 {
+        return Err(KvmError::ApiVersionMismatch(version));
+    }
+    Ok(kvm)
+}
+
+fn has_dirty_ring_cap(kvm: &Kvm) -> bool {
+    kvm.check_extension_raw(u64::from(kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL)) > 0
+}
+
 /// Open /dev/kvm and enforce the §2.1 gate.
 pub struct KvmSystem {
     kvm: Kvm,
-    /// Dirty ring available (preferred); bitmap fallback otherwise.
+    /// Dirty ring available; M4/M6 preflight and worker service startup
+    /// require this to be true.
     pub dirty_ring: bool,
 }
 
 impl KvmSystem {
     pub fn open() -> Result<Self, KvmError> {
-        let kvm = Kvm::new().map_err(|e| KvmError::Open(e.to_string()))?;
-        let version = kvm.get_api_version();
-        if version != KVM_API_VERSION as i32 {
-            return Err(KvmError::ApiVersionMismatch(version));
-        }
+        let kvm = open_checked_kvm()?;
         let mut missing: Vec<&'static str> = REQUIRED_CAPS
             .iter()
             .filter(|(cap, _)| !kvm.check_extension(*cap))
@@ -111,8 +152,7 @@ impl KvmSystem {
         if !missing.is_empty() {
             return Err(KvmError::MissingCaps(missing));
         }
-        let dirty_ring =
-            kvm.check_extension_raw(u64::from(kvm_bindings::KVM_CAP_DIRTY_LOG_RING_ACQ_REL)) > 0;
+        let dirty_ring = has_dirty_ring_cap(&kvm);
         Ok(Self { kvm, dirty_ring })
     }
 
@@ -314,6 +354,127 @@ impl KvmSystem {
     }
 }
 
+/// Probe only the dirty-ring capability so preflight can emit a dedicated
+/// M4/M6 row even when an older §2.1 capability also fails.
+pub fn probe_dirty_ring_cap() -> Result<bool, KvmError> {
+    let kvm = open_checked_kvm()?;
+    Ok(has_dirty_ring_cap(&kvm))
+}
+
+/// Scratch probe for the §8.4 fork-parent kernel invariant, reported by
+/// `dh-workerd --preflight`: a memfd created with `MFD_ALLOW_SEALING` must
+/// accept `F_SEAL_FUTURE_WRITE`, deny future `write(2)`, keep CoW fork
+/// mappings possible, and deny new shared writable mappings after the seal
+/// is set.
+pub fn probe_memfd_future_write_seal() -> Result<String, KvmError> {
+    use std::io::{ErrorKind, Write};
+    use std::os::fd::AsRawFd;
+
+    let len = 4096;
+    let file = memfd_nohuge(len)?;
+    let _live_shared = vm_memory::MmapRegion::<()>::build(
+        Some(FileOffset::new(
+            file.try_clone()
+                .map_err(|e| KvmError::Memory(format!("memfd dup: {e}")))?,
+            0,
+        )),
+        len as usize,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+    )
+    .map_err(|e| KvmError::Memory(format!("scratch shared writable mmap: {e}")))?;
+
+    add_memfd_seals(
+        &file,
+        frozen_ram_seals(),
+        "F_ADD_SEALS(FUTURE_WRITE|SHRINK|GROW)",
+    )?;
+    let seals = get_memfd_seals(&file)?;
+    if seals & libc::F_SEAL_FUTURE_WRITE == 0 {
+        return Err(KvmError::Memory(format!(
+            "F_GET_SEALS missing F_SEAL_FUTURE_WRITE: {seals:#x}"
+        )));
+    }
+
+    let mut writer = file
+        .try_clone()
+        .map_err(|e| KvmError::Memory(format!("memfd dup: {e}")))?;
+    match writer.write_all(&[0x5A]) {
+        Ok(()) => {
+            return Err(KvmError::Memory(
+                "write(2) succeeded after F_SEAL_FUTURE_WRITE".into(),
+            ));
+        }
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(KvmError::Memory(format!(
+                "write(2) after F_SEAL_FUTURE_WRITE failed unexpectedly: {e}"
+            )));
+        }
+    }
+
+    let _cow = vm_memory::MmapRegion::<()>::build(
+        Some(FileOffset::new(
+            file.try_clone()
+                .map_err(|e| KvmError::Memory(format!("memfd dup: {e}")))?,
+            0,
+        )),
+        len as usize,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+    )
+    .map_err(|e| KvmError::Memory(format!("post-seal CoW mmap: {e}")))?;
+
+    #[allow(unsafe_code)]
+    let shared_after_seal = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if shared_after_seal != libc::MAP_FAILED {
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::munmap(shared_after_seal, len as usize);
+        }
+        return Err(KvmError::Memory(
+            "new shared writable mmap succeeded after F_SEAL_FUTURE_WRITE".into(),
+        ));
+    }
+    let mmap_err = std::io::Error::last_os_error();
+    if mmap_err.raw_os_error() != Some(libc::EPERM) {
+        return Err(KvmError::Memory(format!(
+            "new shared writable mmap failed with {mmap_err}; want EPERM from F_SEAL_FUTURE_WRITE"
+        )));
+    }
+
+    Ok(format!(
+        "seals={seals:#x}; write denied; CoW mmap ok; shared writable mmap denied"
+    ))
+}
+
+/// Scratch probe for the §7.4 THP convention used by slot RAM. This follows
+/// the production mapping shape closely enough to catch kernels that reject
+/// `MADV_NOHUGEPAGE` on the memfd-backed guest RAM mapping.
+pub fn probe_madv_nohugepage() -> Result<String, KvmError> {
+    let len = 2 * 1024 * 1024;
+    let memfd = memfd_nohuge(len)?;
+    let region = GuestMemoryMmap::<()>::from_ranges_with_files(&[(
+        GuestAddress(0),
+        len as usize,
+        Some(FileOffset::new(memfd, 0)),
+    )])
+    .map_err(|e| KvmError::Memory(format!("scratch memfd mmap: {e}")))?;
+    madvise_nohugepage(&region, len)?;
+    Ok(format!(
+        "MADV_NOHUGEPAGE accepted on {len} byte memfd mapping"
+    ))
+}
+
 /// One slot's KVM objects (the §2.2 Slot's kernel-facing third).
 pub struct SlotVm {
     pub vm: VmFd,
@@ -361,7 +522,6 @@ impl SlotVm {
     /// half. Idempotent: re-applying the same seals is a kernel no-op
     /// (which is also why `F_SEAL_SEAL` is not added).
     pub fn freeze_ram(&self) -> Result<(), KvmError> {
-        use std::os::fd::AsRawFd;
         if self.ram_is_cow {
             return Err(KvmError::Memory(
                 "freeze of a CoW child: its diverged pages live in anonymous \
@@ -372,33 +532,17 @@ impl SlotVm {
                     .into(),
             ));
         }
-        let fd = self.ram_memfd()?.as_raw_fd();
-        let seals = libc::F_SEAL_FUTURE_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) };
-        if rc != 0 {
-            return Err(KvmError::Memory(format!(
-                "F_ADD_SEALS(FUTURE_WRITE|SHRINK|GROW): {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
+        add_memfd_seals(
+            self.ram_memfd()?,
+            frozen_ram_seals(),
+            "F_ADD_SEALS(FUTURE_WRITE|SHRINK|GROW)",
+        )
     }
 
     /// Current seal set on the RAM memfd (`F_GET_SEALS`), for tests and the
     /// preflight probe (bead aup).
     pub fn ram_seals(&self) -> Result<i32, KvmError> {
-        use std::os::fd::AsRawFd;
-        let fd = self.ram_memfd()?.as_raw_fd();
-        #[allow(unsafe_code)]
-        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if seals < 0 {
-            return Err(KvmError::Memory(format!(
-                "F_GET_SEALS: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(seals)
+        get_memfd_seals(self.ram_memfd()?)
     }
 }
 
@@ -647,9 +791,23 @@ mod tests {
         let sys = KvmSystem::open().expect("§2.1 caps must hold on the lab box");
         // The lab box runs a 6.x kernel: dirty ring should be available.
         assert!(sys.dirty_ring, "dirty ring expected on this host");
+        assert!(
+            probe_dirty_ring_cap().expect("dirty-ring probe"),
+            "dedicated dirty-ring probe expected on this host"
+        );
         // And the TSC offset attribute (probed at vCPU creation) must hold:
         sys.create_slot_vm(2 * 1024 * 1024)
             .expect("slot VM incl. TSC offset attr");
+    }
+
+    #[test]
+    fn scratch_memfd_future_write_seal_probe_works() {
+        probe_memfd_future_write_seal().expect("scratch F_SEAL_FUTURE_WRITE probe");
+    }
+
+    #[test]
+    fn scratch_madv_nohugepage_probe_works() {
+        probe_madv_nohugepage().expect("scratch MADV_NOHUGEPAGE probe");
     }
 
     #[test]
