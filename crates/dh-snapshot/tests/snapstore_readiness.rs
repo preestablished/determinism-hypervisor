@@ -11,11 +11,10 @@
 //! that catch renames/removals/visibility changes but not signature drift.
 //!
 //! The page channel (localpath fast path) is internal to the client and not
-//! pinnable from here: `Transport::Auto`'s `page_channel_path` field is
-//! reserved for the M5/WI3 page-channel arm and currently unused at runtime
-//! (the sibling's `Transport::connect` destructures it as `_`). The
-//! Transport pin below locks only the field's existence and type, so the
-//! WI3 seam stays where INTEGRATION.md expects it.
+//! directly pinnable from here: `Transport::Auto`'s `page_channel_path`
+//! enables the sibling's SEQPACKET fast path for `put_pages` when a live
+//! page-channel socket is present. The Transport pin below locks the field's
+//! existence and type; dh-worker's store fixture owns the live-path coverage.
 
 use snapstore_client::{blocking, ClientError, SnapstoreClient, Transport};
 
@@ -52,10 +51,10 @@ fn _surface_pins() {
     let _ = blocking::SnapstoreClient::get_input_log;
 }
 
-/// Transport configuration surface: UDS / TCP / Auto with the reserved
+/// Transport configuration surface: UDS / TCP / Auto with the optional
 /// page-channel path (API.md §0: UDS at /run/snapstore/grpc.sock on-box).
-/// Both `page_channel_path` shapes are pinned: `Some` for the WI3 fast-path
-/// arm, `None` for the plain-gRPC engine construction.
+/// Both `page_channel_path` shapes are pinned: `Some` for the fast-path arm,
+/// `None` for plain-gRPC construction.
 fn _transport_pins(uds: std::path::PathBuf, tcp: String) -> [Transport; 4] {
     [
         Transport::Auto {

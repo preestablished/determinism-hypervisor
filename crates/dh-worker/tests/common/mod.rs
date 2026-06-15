@@ -12,7 +12,7 @@ use dh_devices::MmioBus;
 use snapstore_client::blocking::SnapstoreClient as BlockingClient;
 use snapstore_client::Transport;
 use snapstore_server::build_server::{serve_for_tests, ServerHandle};
-use snapstore_server::config::ServerConfig;
+use snapstore_server::config::{PageChannelConfig, ServerConfig};
 use tempfile::TempDir;
 
 // Not every test target uses every helper (replay_engine builds its own
@@ -108,16 +108,37 @@ pub fn spawn_store_at(
     data_root: std::path::PathBuf,
     sock_name: &str,
 ) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
+    spawn_store_at_inner(data_root, sock_name, false)
+}
+
+#[allow(dead_code)]
+pub fn spawn_store_at_with_corrupt_page_channel(
+    data_root: std::path::PathBuf,
+    sock_name: &str,
+) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
+    spawn_store_at_inner(data_root, sock_name, true)
+}
+
+fn spawn_store_at_inner(
+    data_root: std::path::PathBuf,
+    sock_name: &str,
+    corrupt_page_channel: bool,
+) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
     let rt = tokio::runtime::Runtime::new().expect("rt");
+    let uds_path = data_root.join(sock_name);
+    let page_channel_path = data_root.join(format!("{sock_name}.pages"));
     let config = ServerConfig {
         data_root: data_root.clone(),
         grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
-        grpc_uds_path: Some(data_root.join(sock_name)),
-        page_channel_path: None,
+        grpc_uds_path: Some(uds_path.clone()),
+        page_channel_path: Some(page_channel_path.clone()),
         http_addr: "127.0.0.1:0".parse().expect("addr"),
         pagestore: Default::default(),
         meta: Default::default(),
-        page_channel: Default::default(),
+        page_channel: PageChannelConfig {
+            ingest_queue_pages: None,
+            corrupt_cross_check_for_test: corrupt_page_channel.then_some(true),
+        },
     };
     let (handle, uds) = rt
         .block_on(serve_for_tests(config))
@@ -125,7 +146,16 @@ pub fn spawn_store_at(
     // Readiness probe (same shape as tests/determinism/store_joint.rs).
     let mut client = None;
     for _ in 0..50 {
-        match BlockingClient::connect(Transport::Uds(uds.clone())) {
+        #[cfg(target_os = "linux")]
+        if !page_channel_path.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        match BlockingClient::connect(Transport::Auto {
+            uds_path: uds.clone(),
+            tcp_addr: "http://127.0.0.1:1".into(),
+            page_channel_path: Some(page_channel_path.clone()),
+        }) {
             Ok(c) => {
                 client = Some(c);
                 break;

@@ -19,7 +19,8 @@
 
 mod common;
 
-use common::spawn_store_blocking;
+use common::{spawn_store_at_with_corrupt_page_channel, spawn_store_blocking};
+use snapstore_client::ClientError;
 use snapstore_manifest::DeviceBlob;
 
 const PAGES: u64 = 8192; // 32 MiB — the size that deadlocked
@@ -68,4 +69,19 @@ fn full_32mib_put_snapshot_from_parts_completes() {
     done_rx
         .recv_timeout(std::time::Duration::from_secs(120))
         .expect("32 MiB FULL put hung >120s — bead 0vl regressed");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn worker_store_fixture_uses_page_channel_for_put_pages() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (_rt, _handle, store) =
+        spawn_store_at_with_corrupt_page_channel(dir.path().to_path_buf(), "corrupt.sock");
+    let err = store
+        .put_pages(vec![(0, vec![0xA5; PAGE])])
+        .expect_err("corrupt page-channel cross-check must fail");
+    assert!(
+        matches!(err, ClientError::BatchBlake3Mismatch { .. }),
+        "expected page-channel cross-check failure, got {err:?}"
+    );
 }
