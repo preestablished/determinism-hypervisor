@@ -342,6 +342,10 @@ message VerifyReplayRequest {
   }
   bool bisect_on_divergence = 4;       // default true
 }
+// Server-streamed from the verifier worker thread with a bounded progress
+// buffer. EpochOk records are emitted as epoch links verify; Done or
+// Divergence is terminal. If the client drops the stream, the worker stops
+// at the next safe progress boundary and releases its temporary slot.
 message VerifyReplayProgress {
   oneof msg {
     EpochOk    epoch_ok   = 1;         // streamed per epoch

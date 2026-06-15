@@ -303,6 +303,33 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
+    run_segment_with_scheduled_inputs_frames_and_epochs(
+        seg,
+        until,
+        scheduled_inputs,
+        frame_inputs,
+        start_frame_counter,
+        goal,
+        on_exit,
+        input_sink,
+        &mut |_, _, _| Ok(()),
+    )
+}
+
+/// [`run_segment_with_scheduled_inputs_and_frames`] plus observable epoch
+/// links. Recorders use this to persist EPOCH_HASH records while preserving
+/// the scheduled input landing contract.
+pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
+    seg: &mut Segment<'_>,
+    until: Until,
+    scheduled_inputs: &[u64],
+    frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
+    epoch_sink: &mut dyn FnMut(u64, u64, [u8; 32]) -> Result<(), BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
         until,
@@ -313,7 +340,7 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
         goal,
         on_exit,
         input_sink,
-        &mut |_, _, _| Ok(()),
+        epoch_sink,
     )
 }
 
