@@ -43,10 +43,21 @@ pub type LeaseToken = [u8; 16];
 
 /// The lease handed to the orchestrator (proto `Lease` mirror; the wire
 /// crossing itself lives in `proto_map`, never here).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Lease {
     pub slot_id: u64,
     pub token: LeaseToken,
+}
+
+/// Manual Debug: the token gates every mutating RPC, so a `{lease:?}`
+/// at some future daemon log site must not leak it.
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("slot_id", &self.slot_id)
+            .field("token", &"[redacted; 16]")
+            .finish()
+    }
 }
 
 /// Expiry policy. v1 default: no timeout (INTEGRATION §2 — trusted
@@ -97,6 +108,16 @@ pub enum SlotError {
     LiveChildren {
         slot_id: u64,
         children: u32,
+    },
+    /// fork_engine contract: a tier-A CoW child's RAM cannot be frozen
+    /// or re-forked (snapshot → restore instead) — `FAILED_PRECONDITION`.
+    CowChildCannotFork {
+        slot_id: u64,
+    },
+    /// A zero-child fork would freeze the parent with nothing to ever
+    /// thaw it — `INVALID_ARGUMENT`.
+    ZeroChildFork {
+        slot_id: u64,
     },
     /// Every slot is occupied — `RESOURCE_EXHAUSTED`.
     NoFreeSlot,
@@ -258,6 +279,12 @@ impl SlotManager {
     /// mutate guest RAM / vCPU / device state (run, inject,
     /// restore-into, MMIO dispatch). `api` names the caller for the
     /// loud error.
+    ///
+    /// TOCTOU contract: the `Ok` is a point-in-time check — no lock is
+    /// held while the caller drives the engines. Safe under the v1
+    /// single-orchestrator no-timeout policy; the day a TTL policy is
+    /// enabled, the daemon must re-validate after any await/suspension
+    /// and serialize engine work per slot.
     pub fn checkout_write(
         &self,
         lease: &Lease,
@@ -314,7 +341,9 @@ impl SlotManager {
     /// fresh lease, all accounted against the parent. All-or-nothing:
     /// without enough Empty slots, nothing changes (RESOURCE_EXHAUSTED).
     /// A CoW child refuses to be a fork parent (fork_engine contract:
-    /// snapshot → restore instead).
+    /// snapshot → restore instead), and a zero-child fork is refused
+    /// outright — it would freeze the parent with nothing to ever thaw
+    /// it (the only exit from childless-Frozen is Destroy).
     pub fn fork(
         &self,
         parent: &Lease,
@@ -327,12 +356,15 @@ impl SlotManager {
             return Err(SlotError::NoSuchSlot(parent.slot_id));
         }
         Self::validate_entry(&slots[parent_idx], parent, now_ms)?;
+        if children == 0 {
+            return Err(SlotError::ZeroChildFork {
+                slot_id: parent.slot_id,
+            });
+        }
         if slots[parent_idx].ram_is_cow {
-            // fork_engine: a CoW child's RAM cannot be re-forked.
-            return Err(SlotError::State(SlotStateError::InvalidTransition {
-                from: slots[parent_idx].state,
-                to: SlotState::Frozen,
-            }));
+            return Err(SlotError::CowChildCannotFork {
+                slot_id: parent.slot_id,
+            });
         }
         // Transition check BEFORE claiming child slots (all-or-nothing).
         let frozen = slots[parent_idx].state.transition(SlotState::Frozen)?;
@@ -364,7 +396,11 @@ impl SlotManager {
             let lease = self.lease_into(entry, idx as u64, now_ms);
             leases.push(lease);
         }
-        slots[parent_idx].live_children += children as u32;
+        // Bounded by the free-slot count (≤ slot table length), so the
+        // narrowing is total; try_from keeps it honest.
+        slots[parent_idx].live_children = slots[parent_idx]
+            .live_children
+            .saturating_add(u32::try_from(children).expect("children ≤ slot count"));
         Ok(leases)
     }
 
@@ -440,6 +476,8 @@ impl SlotManager {
                 children: slots[idx].live_children,
             });
         }
+        // Gate-only: the Ok value is discarded on purpose — release()
+        // below resets the whole entry (including state) to Empty.
         slots[idx].state.transition(SlotState::Empty)?;
         Self::release(&mut slots, idx);
         Ok(())
@@ -456,6 +494,7 @@ impl SlotManager {
         if idx >= slots.len() {
             return Err(SlotError::NoSuchSlot(slot_id));
         }
+        // Gate-only (as in destroy): release() resets the entry below.
         slots[idx].state.transition(SlotState::Empty)?;
         if slots[idx].live_children > 0 {
             for i in 0..slots.len() {
@@ -499,16 +538,33 @@ impl SlotManager {
     /// skipped while children live (each child's own expiry releases it,
     /// and the last release auto-thaws the parent into a reclaimable
     /// Paused). Returns the reclaimed slot ids. A no-op under the v1
-    /// no-timeout policy.
+    /// no-timeout policy. Returned ids are slots actually released back
+    /// to Empty; slots newly marked Faulted are visible via `slot_info`
+    /// and are released on the next sweep.
+    ///
+    /// SINGLE-PASS INVARIANT: both staged handoffs (Running → Faulted →
+    /// freed, Frozen → thawed-by-last-child → freed) deliberately
+    /// complete on the NEXT sweep — a fixpoint loop here would collapse
+    /// the staging and free slots the daemon has not yet observed as
+    /// Faulted.
     pub fn reclaim_expired(&self, now_ms: u64) -> Vec<u64> {
         let mut slots = self.slots.lock().expect("slot table poisoned");
+        let sweep: Vec<(bool, SlotState)> = slots
+            .iter()
+            .map(|slot| {
+                (
+                    matches!(slot.lease, Some((_, Some(at))) if now_ms >= at),
+                    slot.state,
+                )
+            })
+            .collect();
         let mut reclaimed = Vec::new();
         for idx in 0..slots.len() {
-            let expired = matches!(slots[idx].lease, Some((_, Some(at))) if now_ms >= at);
+            let (expired, state_at_sweep_start) = sweep[idx];
             if !expired {
                 continue;
             }
-            match slots[idx].state {
+            match state_at_sweep_start {
                 SlotState::Paused | SlotState::Faulted if slots[idx].live_children == 0 => {
                     Self::release(&mut slots, idx);
                     reclaimed.push(idx as u64);
@@ -519,10 +575,12 @@ impl SlotManager {
                     // it — clearing it here would strand the slot where
                     // only force_destroy could reach.
                     slots[idx].state = SlotState::Faulted;
-                    reclaimed.push(idx as u64);
                 }
-                // Frozen (children live) and Paused parents mid-thaw race:
-                // wait for the children.
+                // Frozen with live children: wait — each child's own
+                // expiry releases it, and the last release auto-thaws
+                // this parent into a reclaimable Paused. (Paused with
+                // live_children > 0 cannot exist: fork freezes the
+                // parent atomically under the table lock.)
                 _ => {}
             }
         }
@@ -589,7 +647,10 @@ fn urandom_token() -> LeaseToken {
 /// incremental snapshot. Same-slot reuse is THIS module's job: harvest
 /// whatever the ring holds into a throwaway set, then reset the rings
 /// VM-wide. Returns the number of stale entries discarded. Call only
-/// while the slot is quiescent (Paused, vCPU thread parked).
+/// while the slot is quiescent (Paused, vCPU thread parked). (The
+/// restore engine's own host-side RAM writes bypass KVM dirty tracking
+/// by design and need no accounting here — this helper's job is solely
+/// the stale GUEST-dirtied entries a previous run left in the ring.)
 #[cfg(target_arch = "x86_64")]
 pub fn reset_slot_dirty_tracking(slot: &dh_vmm::kvm::SlotVm) -> Result<u32, dh_vmm::kvm::KvmError> {
     use dh_vmm::dirty::{harvest_at_boundary, DirtyPageSet, DirtyRing};
@@ -672,6 +733,10 @@ mod tests {
             m.fork(&stale, 1, 0),
             Err(SlotError::StaleLease { .. })
         ));
+        assert!(matches!(
+            m.fork(&stale, 0, 0),
+            Err(SlotError::StaleLease { .. })
+        ));
         // A second allocate cannot steal slot 0 (it is not Empty), and
         // the REAL token still works after every stale attempt.
         assert!(m.validate(&lease, 0).is_ok());
@@ -722,11 +787,15 @@ mod tests {
             })
         );
 
-        // A CoW child cannot be a fork parent.
-        assert!(matches!(
+        // A CoW child cannot be a fork parent — and the refusal names
+        // the REAL reason (the fork_engine CoW invariant), not a
+        // fabricated state-machine error.
+        assert_eq!(
             m.fork(&children[0], 1, 0),
-            Err(SlotError::State(_))
-        ));
+            Err(SlotError::CowChildCannotFork {
+                slot_id: children[0].slot_id
+            })
+        );
 
         // Destroying the last child auto-thaws the parent.
         m.destroy(&children[0], 0).unwrap();
@@ -764,6 +833,72 @@ mod tests {
         );
         // And a 1-child fork still works afterward.
         assert_eq!(m.fork(&parent, 1, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn zero_child_fork_is_refused_before_any_mutation() {
+        let m = manager(2, LeasePolicy::default());
+        let parent = m.allocate(0).unwrap();
+        let missing = Lease {
+            slot_id: 99,
+            token: parent.token,
+        };
+        assert_eq!(m.fork(&missing, 0, 0), Err(SlotError::NoSuchSlot(99)));
+        // A zero-child fork would freeze the parent with nothing to
+        // ever thaw it — refused outright, parent untouched.
+        assert_eq!(
+            m.fork(&parent, 0, 0),
+            Err(SlotError::ZeroChildFork {
+                slot_id: parent.slot_id
+            })
+        );
+        assert_eq!(
+            m.slot_info(parent.slot_id).unwrap().state,
+            SlotState::Paused
+        );
+        assert_eq!(m.slot_info(parent.slot_id).unwrap().live_children, 0);
+        // The parent still runs and forks normally afterward.
+        m.mark_running(&parent, 0).unwrap();
+        m.mark_paused(&parent, 0).unwrap();
+        assert_eq!(m.fork(&parent, 1, 0).unwrap().len(), 1);
+    }
+
+    /// Locks the cross-tenant invariant: force_destroying a frozen
+    /// parent orphans its children (parent = None), so destroying an
+    /// OLD orphan later can never decrement — or auto-thaw — a NEW
+    /// tenant that reuses the parent's slot id.
+    #[test]
+    fn orphaned_child_destroy_cannot_touch_a_reused_parent_slot() {
+        let m = manager(4, LeasePolicy::default());
+        let parent = m.allocate(0).unwrap();
+        let orphans = m.fork(&parent, 1, 0).unwrap();
+        m.force_destroy(parent.slot_id).unwrap();
+        assert_eq!(
+            m.slot_info(orphans[0].slot_id).unwrap().state,
+            SlotState::Faulted
+        );
+
+        // A NEW tenant claims the freed slot id and becomes a frozen
+        // parent itself.
+        let tenant = m.allocate(0).unwrap();
+        assert_eq!(tenant.slot_id, parent.slot_id, "slot id reused");
+        let tenant_children = m.fork(&tenant, 1, 0).unwrap();
+        assert_eq!(m.slot_info(tenant.slot_id).unwrap().live_children, 1);
+
+        // Destroying the OLD orphan must not touch the new tenant.
+        m.destroy(&orphans[0], 0).unwrap();
+        assert_eq!(
+            m.slot_info(tenant.slot_id).unwrap().state,
+            SlotState::Frozen
+        );
+        assert_eq!(m.slot_info(tenant.slot_id).unwrap().live_children, 1);
+
+        // And the real child still thaws it.
+        m.destroy(&tenant_children[0], 0).unwrap();
+        assert_eq!(
+            m.slot_info(tenant.slot_id).unwrap().state,
+            SlotState::Paused
+        );
     }
 
     #[test]
@@ -850,11 +985,12 @@ mod tests {
         let children = m.fork(&parent, 1, 0).unwrap();
 
         // At 100 everything is expired. The runner faults (the manager
-        // cannot stop a vCPU thread); the frozen parent waits; the
-        // child (Paused) frees — which auto-thaws the parent.
+        // cannot stop a vCPU thread) but is not reclaimed yet; the
+        // frozen parent waits; the child (Paused) frees — which
+        // auto-thaws the parent.
         let mut got = m.reclaim_expired(100);
         got.sort_unstable();
-        let mut want = vec![runner.slot_id, children[0].slot_id];
+        let mut want = vec![children[0].slot_id];
         want.sort_unstable();
         assert_eq!(got, want);
         assert_eq!(
@@ -872,6 +1008,28 @@ mod tests {
         let mut want = vec![runner.slot_id, parent.slot_id];
         want.sort_unstable();
         assert_eq!(got, want);
+        assert!(m.list().iter().all(|i| i.state == SlotState::Empty));
+    }
+
+    #[test]
+    fn reclaim_stages_parent_release_even_when_child_slot_is_lower() {
+        let m = manager(3, LeasePolicy::with_ttl(100));
+        let filler = m.allocate(0).unwrap();
+        let parent = m.allocate(0).unwrap();
+        m.destroy(&filler, 0).unwrap();
+        let children = m.fork(&parent, 1, 0).unwrap();
+        assert!(
+            children[0].slot_id < parent.slot_id,
+            "test needs child before parent in sweep order"
+        );
+
+        assert_eq!(m.reclaim_expired(100), vec![children[0].slot_id]);
+        assert_eq!(
+            m.slot_info(parent.slot_id).unwrap().state,
+            SlotState::Paused
+        );
+
+        assert_eq!(m.reclaim_expired(101), vec![parent.slot_id]);
         assert!(m.list().iter().all(|i| i.state == SlotState::Empty));
     }
 
