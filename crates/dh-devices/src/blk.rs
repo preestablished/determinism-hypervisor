@@ -72,7 +72,7 @@ const SECTION_PER_CLUSTER: usize = 8 + 32 + CLUSTER_SIZE;
 /// Read-only access to the base image. Implementations MUST be immutable
 /// and deterministic: same offset → same bytes, forever (the content hash
 /// is recorded in MachineConfig). Reads past `len_bytes` zero-fill.
-pub trait BlockBase {
+pub trait BlockBase: Send {
     /// Base image length in bytes (capacity = `len_bytes / 512` sectors;
     /// a trailing partial sector is not addressable).
     fn len_bytes(&self) -> u64;
@@ -313,11 +313,11 @@ mod tests {
     use crate::ctx::test_support::FakeEntropy;
     use crate::ctx::VecGuestMem;
     use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
-    use std::rc::Rc;
+    use std::sync::Arc;
 
-    /// Immutable shared base: the Rc proves the device cannot mutate it.
+    /// Immutable shared base: the Arc proves the device cannot mutate it.
     #[derive(Clone)]
-    struct VecBase(Rc<Vec<u8>>);
+    struct VecBase(Arc<Vec<u8>>);
 
     impl BlockBase for VecBase {
         fn len_bytes(&self) -> u64 {
@@ -358,7 +358,7 @@ mod tests {
 
     /// Patterned base: 3 clusters, byte = (absolute_offset % 251) as u8.
     fn patterned_base() -> VecBase {
-        VecBase(Rc::new(
+        VecBase(Arc::new(
             (0..3 * CLUSTER_SIZE).map(|i| (i % 251) as u8).collect(),
         ))
     }

@@ -18,7 +18,7 @@ use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::{enable_dirty_logging, DirtyPageSet, DirtyRing, PAGE_SIZE};
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem};
 use dh_vmm::{vcpu_state, SlotState};
-use dh_worker::restore_engine::{restore_snapshot, RestoreError};
+use dh_worker::restore_engine::{recover_machine_config, restore_snapshot, RestoreError};
 use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
@@ -545,6 +545,45 @@ fn rebuild(orig: &[u8], mutate: impl FnOnce(&mut Vec<([u8; 4], u16, Vec<u8>)>)) 
         w.push_section(*t, *v, contents).expect("rebuild section");
     }
     w.finish()
+}
+
+#[test]
+fn recovers_machine_config_from_snapshot_mcfg() {
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let config = test_config();
+    let config_bytes = config.canonical_encode().unwrap();
+    let zero_pages: Vec<(u64, Vec<u8>)> = (0..MEM / PAGE_SIZE)
+        .map(|i| (i, vec![0u8; PAGE_SIZE as usize]))
+        .collect();
+    let put_mcfg = |sec_version: u16, contents: &[u8]| {
+        let mut w = ContainerWriter::new();
+        w.push_section(tag::MCFG, sec_version, contents)
+            .expect("MCFG section");
+        let bytes = w.finish();
+        store
+            .put_snapshot_from_parts(
+                None,
+                MEM,
+                zero_pages.clone(),
+                DeviceBlob {
+                    format: DEVICE_BLOB_FORMAT_DHSNAP,
+                    zstd: false,
+                    raw_len: bytes.len() as u64,
+                    bytes,
+                },
+            )
+            .expect("put MCFG snapshot")
+    };
+
+    let recovered = recover_machine_config(put_mcfg(1, &config_bytes), &store).unwrap();
+    assert_eq!(recovered.canonical_encode().unwrap(), config_bytes);
+    assert_eq!(recovered.boot, config.boot);
+
+    let err = recover_machine_config(put_mcfg(2, &config_bytes), &store).unwrap_err();
+    assert!(
+        matches!(&err, RestoreError::Codec(m) if m.contains("MCFG")),
+        "{err:?}"
+    );
 }
 
 #[test]

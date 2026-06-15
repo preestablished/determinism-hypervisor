@@ -511,12 +511,15 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "nanokernel",
+ "prost",
  "snapstore-client",
  "snapstore-manifest",
  "snapstore-server",
  "snapstore-types",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "vm-memory",
 ]
 
