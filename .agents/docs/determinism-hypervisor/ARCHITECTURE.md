@@ -757,14 +757,19 @@ services; comparing chains compares full execution histories, not just endpoints
 - Metrics (Prometheus): per-slot icount rate, exits/sec by reason, landing
   single-steps/sec, snapshot ms, fork ms, restore ms, dirty pages per snapshot,
   verification failures (alert at > 0), PMI skid histogram.
-- **Image-cache population.** `CreateVm` requires `base_image_hash` to already be in
-  the local image cache (`/var/lib/dh/images/`, keyed by BLAKE3). In Phases 3–5 the
-  cache is populated **out-of-band** (the operator copies the image; the worker only
-  verifies the hash on open). From Phase 6, `dh-workerd` fetches missing images over
-  HTTP from control-plane's blob store using the `svc-hypervisor-host` service token,
-  verifies the BLAKE3 against `base_image_hash`, and caches locally. The fetch path is
-  deployment plumbing, never on the execution path — a missing, unfetched image fails
-  `CreateVm` with `NOT_FOUND`.
+- **Image-cache population.** `CreateVm` requires every content-addressed blob in
+  `MachineConfig` to already be in the local image cache (`/var/lib/dh/images/`):
+  `base_image_hash`, `ElfBoot.kernel_hash`, `BzImageBoot.kernel_hash`, and
+  `BzImageBoot.initramfs_hash`. The cache is flat and keyed by lowercase 64-character
+  BLAKE3 hex filenames; entries must be immutable, regular, non-symlink files
+  installed atomically. `dh-workerd` opens entries with symlink-following disabled,
+  verifies the file content against the requested hash before handing bytes/fds to
+  boot or pv-blk setup, and caps boot blobs before allocation. In Phases 3–5 the cache
+  is populated **out-of-band** (the operator copies the image; the worker only verifies
+  the hash on open). From Phase 6, `dh-workerd` fetches missing images over HTTP from
+  control-plane's blob store using the `svc-hypervisor-host` service token, verifies
+  the BLAKE3, and caches locally. The fetch path is deployment plumbing, never on the
+  execution path — a missing, unfetched image fails `CreateVm` with `NOT_FOUND`.
 
 ---
 

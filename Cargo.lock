@@ -500,6 +500,7 @@ dependencies = [
 name = "dh-worker"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "criterion",
  "dh-detclock",
  "dh-devices",
