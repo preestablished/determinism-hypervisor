@@ -173,6 +173,9 @@ pub enum ReplayError {
     /// A canonical record kind this executor cannot apply yet — loud,
     /// never skipped (a skipped input IS a divergence).
     NotYetWired(&'static str),
+    /// The caller stopped consuming progress; abort at a deterministic
+    /// progress boundary and let the owner clean up the temporary slot.
+    Cancelled(&'static str),
     Apply(String),
     Run(String),
 }
@@ -202,6 +205,36 @@ pub fn replay_segment<M>(
 ) -> Result<ReplayOutcome, ReplayError>
 where
     M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
+    replay_segment_with_epoch_progress(
+        slot,
+        rail,
+        machine_config,
+        base_snapshot,
+        counter,
+        store,
+        log_bytes,
+        |_epoch_index, _icount, _chain_value| Ok(()),
+    )
+}
+
+/// Same executor as [`replay_segment`], with a callback after every
+/// EPOCH_HASH link has matched and been written to the replay log. The
+/// worker RPC uses this to stream `EpochOk` without waiting for END.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_segment_with_epoch_progress<M, F>(
+    slot: &mut SlotVm,
+    rail: DeviceRail<M>,
+    machine_config: &MachineConfig,
+    base_snapshot: SnapshotRef,
+    counter: &InstRetired,
+    store: &SnapstoreClient,
+    log_bytes: &[u8],
+    mut on_epoch_ok: F,
+) -> Result<ReplayOutcome, ReplayError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+    F: FnMut(u64, u64, [u8; 32]) -> Result<(), ReplayError>,
 {
     let log = LogReader::parse(log_bytes).map_err(ReplayError::Log)?;
     let header = log.header();
@@ -269,9 +302,10 @@ where
     // mismatch aborts the quantum loudly through the sink error.
     let verified = std::cell::Cell::new(0usize);
     let divergence: DivergenceCell = std::cell::Cell::new(None);
-    let run_to = |slot: &mut SlotVm,
-                  chain: &mut StateHashChain,
-                  target: u64|
+    let progress_error = std::cell::RefCell::new(None);
+    let mut run_to = |slot: &mut SlotVm,
+                      chain: &mut StateHashChain,
+                      target: u64|
      -> Result<Option<dh_vmm::runctl::SegmentOutcome>, ReplayError> {
         let start = counter
             .read()
@@ -334,14 +368,21 @@ where
                     verified.set(i + 1);
                     rail.borrow_mut()
                         .log_epoch_hash(idx, icount, value)
-                        .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
+                        .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))?;
+                    if let Err(e) = on_epoch_ok(idx, icount, value) {
+                        progress_error.replace(Some(e));
+                        return Err(BoundaryError::Exit("replay progress stopped".into()));
+                    }
+                    Ok(())
                 },
             )
             .map_err(|e: RunError| {
                 // Structured side channel (iteration-88 review I1): the
                 // sink can only surface a BoundaryError; the real
                 // diagnostics travel through the Cell.
-                if let Some((what, at_icount, expected, got)) = divergence.take() {
+                if let Some(e) = progress_error.borrow_mut().take() {
+                    e
+                } else if let Some((what, at_icount, expected, got)) = divergence.take() {
                     ReplayError::Divergence {
                         what,
                         at_icount,

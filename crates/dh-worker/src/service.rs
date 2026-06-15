@@ -14,6 +14,8 @@ use crate::proto_map::{
     machine_config_to_proto, stop_reason_to_proto,
 };
 #[cfg(target_arch = "x86_64")]
+use crate::replay_engine::ReplayError;
+#[cfg(target_arch = "x86_64")]
 use crate::runtime::{
     DrainedGuestEvent, QueuedInput, QueuedInputAt, QueuedInputKind, RuntimeActorError,
     RuntimeError, RuntimeThreadState, SlotActor, SlotRuntime, WorkerRuntimeTable,
@@ -113,6 +115,8 @@ pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
 pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
 #[cfg(target_arch = "x86_64")]
 const VERIFY_REPLAY_INLINE_LOG_MAX_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(target_arch = "x86_64")]
+const VERIFY_REPLAY_PROGRESS_BUFFER: usize = 16;
 
 pub const ARCH_S9_METRIC_FAMILIES: &[&str] = &[
     "dh_worker_slot_icount",
@@ -1015,6 +1019,7 @@ fn replay_error_to_status(e: crate::replay_engine::ReplayError) -> Status {
             Status::internal("VerifyReplay divergence escaped report translation")
         }
         ReplayError::NotYetWired(what) => Status::unimplemented(what),
+        ReplayError::Cancelled(what) => Status::cancelled(what),
         ReplayError::Apply(m) | ReplayError::Run(m) => Status::data_loss(m),
     }
 }
@@ -1292,7 +1297,8 @@ fn run_verify_replay_on_current_thread(
     transport: snapstore_client::Transport,
     image_resolver: ImageResolver,
     bisect_on_divergence: bool,
-) -> Result<Vec<proto::VerifyReplayProgress>, Status> {
+    progress_tx: tokio::sync::mpsc::Sender<Result<proto::VerifyReplayProgress, Status>>,
+) -> Result<proto::VerifyReplayProgress, Status> {
     let store = snapstore_client::blocking::SnapstoreClient::connect(transport)
         .map_err(|e| store_error_to_status("connect snapstore", e))?;
     let log_bytes = verify_replay_log_bytes(log_input, &store)?;
@@ -1347,7 +1353,7 @@ fn run_verify_replay_on_current_thread(
         .enable()
         .map_err(|e| Status::failed_precondition(format!("enable InstRetired: {e:?}")))?;
 
-    let report = crate::verify_replay::verify_replay(
+    let terminal = crate::verify_replay::verify_replay_with_progress(
         &mut slot,
         rail,
         &config,
@@ -1355,13 +1361,21 @@ fn run_verify_replay_on_current_thread(
         &counter,
         &store,
         &log_bytes,
+        |event| {
+            let progress = verify_progress_to_proto(event, bisect_on_divergence).map_err(|e| {
+                ReplayError::Apply(format!(
+                    "VerifyReplay progress translation failed with {}: {}",
+                    e.code(),
+                    e.message()
+                ))
+            })?;
+            progress_tx
+                .blocking_send(Ok(progress))
+                .map_err(|_| ReplayError::Cancelled("VerifyReplay client cancelled"))
+        },
     )
     .map_err(replay_error_to_status)?;
-    report
-        .events
-        .into_iter()
-        .map(|event| verify_progress_to_proto(event, bisect_on_divergence))
-        .collect()
+    verify_progress_to_proto(terminal, bisect_on_divergence)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3341,6 +3355,15 @@ impl HypervisorWorker for WorkerService {
                             consumed_input_orders.push(input.order);
                             Ok(vectors)
                         };
+                        let mut epoch_sink = |epoch_index, icount, chain_value| {
+                            rail.borrow_mut()
+                                .log_epoch_hash(epoch_index, icount, chain_value)
+                                .map_err(|e| {
+                                    dh_vmm::boundary::BoundaryError::Exit(format!(
+                                        "epoch log: {e:?}"
+                                    ))
+                                })
+                        };
                         let run_result = {
                             let mut segment = dh_vmm::runctl::Segment {
                                 slot: &mut runtime.slot,
@@ -3353,7 +3376,7 @@ impl HypervisorWorker for WorkerService {
                                 pause: pause.as_ref(),
                                 sdk_events: None,
                             };
-                            dh_vmm::runctl::run_segment_with_scheduled_inputs_and_frames(
+                            dh_vmm::runctl::run_segment_with_scheduled_inputs_frames_and_epochs(
                                 &mut segment,
                                 until,
                                 &scheduled_input_icounts,
@@ -3362,6 +3385,7 @@ impl HypervisorWorker for WorkerService {
                                 &mut goal,
                                 &mut on_exit,
                                 &mut input_sink,
+                                &mut epoch_sink,
                             )
                         };
                         (
@@ -3943,11 +3967,12 @@ impl HypervisorWorker for WorkerService {
                 }
             };
 
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(VERIFY_REPLAY_PROGRESS_BUFFER);
             let thread_manager = manager.clone();
             let thread_lease = verify_lease.clone();
             let cleanup_manager = manager.clone();
             let cleanup_lease = verify_lease.clone();
+            let thread_metrics = metrics.clone();
             let spawn = std::thread::Builder::new()
                 .name(format!("dh-verify-{}", verify_lease.slot_id))
                 .spawn(move || {
@@ -3959,6 +3984,7 @@ impl HypervisorWorker for WorkerService {
                             transport,
                             image_resolver,
                             bisect_on_divergence,
+                            tx.clone(),
                         )
                     }))
                     .unwrap_or_else(|_| Err(Status::internal("VerifyReplay thread panicked")));
@@ -3966,8 +3992,8 @@ impl HypervisorWorker for WorkerService {
                         .destroy(&thread_lease, lease_now_ms())
                         .map_err(slot_error_to_status);
                     let result = match result {
-                        Ok(events) => match cleanup {
-                            Ok(()) => Ok(events),
+                        Ok(terminal) => match cleanup {
+                            Ok(()) => Ok(terminal),
                             Err(cleanup) => Err(Status::internal(format!(
                                 "VerifyReplay succeeded but slot cleanup failed with {}: {}",
                                 cleanup.code(),
@@ -3976,7 +4002,23 @@ impl HypervisorWorker for WorkerService {
                         },
                         Err(e) => Err(original_or_rollback("VerifyReplay", e, cleanup)),
                     };
-                    let _ = tx.send(result);
+                    match result {
+                        Ok(terminal) => {
+                            if matches!(
+                                terminal.msg,
+                                Some(proto::verify_replay_progress::Msg::Divergence(_))
+                            ) {
+                                thread_metrics.record_verification_failure();
+                            }
+                            let _ = tx.blocking_send(Ok(terminal));
+                        }
+                        Err(e) => {
+                            if e.code() != Code::Cancelled {
+                                thread_metrics.record_verification_failure();
+                            }
+                            let _ = tx.blocking_send(Err(e));
+                        }
+                    }
                 });
             if let Err(e) = spawn {
                 let cleanup = cleanup_manager
@@ -3988,26 +4030,7 @@ impl HypervisorWorker for WorkerService {
                     cleanup,
                 ));
             }
-
-            let events = match rx
-                .await
-                .map_err(|_| Status::internal("VerifyReplay thread ended without response"))?
-            {
-                Ok(events) => events,
-                Err(e) => {
-                    metrics.record_verification_failure();
-                    return Err(e);
-                }
-            };
-            if events.iter().any(|event| {
-                matches!(
-                    event.msg,
-                    Some(proto::verify_replay_progress::Msg::Divergence(_))
-                )
-            }) {
-                metrics.record_verification_failure();
-            }
-            let stream = tokio_stream::iter(events.into_iter().map(Ok));
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
             Ok(Response::new(Box::pin(stream) as Self::VerifyReplayStream))
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -4124,14 +4147,30 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     fn service_machine_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::MachineConfig {
-        let mut config = dh_vmm::config::MachineConfig::new(
+        service_machine_config_with_mem_epoch_len(
+            base_hash,
+            kernel_hash,
             2 * 1024 * 1024,
+            dh_vmm::config::DEFAULT_EPOCH_LEN,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn service_machine_config_with_mem_epoch_len(
+        base_hash: [u8; 32],
+        kernel_hash: [u8; 32],
+        mem_bytes: u64,
+        epoch_len: u64,
+    ) -> proto::MachineConfig {
+        let mut config = dh_vmm::config::MachineConfig::new(
+            mem_bytes,
             base_hash,
             dh_vmm::config::BootSpec::Elf {
                 kernel_hash,
                 cmdline: b"1000000".to_vec(),
             },
         );
+        config.epoch_len = epoch_len;
         config.device_set = vec![
             dh_devices::clock::DEVICE_ID_PV_CLOCK,
             dh_devices::pad::DEVICE_ID_PV_PAD,
@@ -6195,7 +6234,12 @@ mod tests {
         rt.block_on(async {
             let created = svc
                 .create_vm(Request::new(proto::CreateVmRequest {
-                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    config: Some(service_machine_config_with_mem_epoch_len(
+                        base_hash,
+                        kernel_hash,
+                        2 * 1024 * 1024,
+                        10_000,
+                    )),
                     entropy_seed: vec![0xA5; 32],
                 }))
                 .await
@@ -6261,16 +6305,246 @@ mod tests {
                 .unwrap()
                 .into_inner();
             let mut done = None;
+            let mut epoch_ok_count = 0;
             while let Some(item) = stream.next().await {
                 match item.unwrap().msg.unwrap() {
-                    VerifyMsg::EpochOk(_) => {}
+                    VerifyMsg::EpochOk(_) => {
+                        assert!(done.is_none(), "EpochOk must precede terminal Done");
+                        epoch_ok_count += 1;
+                    }
                     VerifyMsg::Done(msg) => done = Some(msg),
                     VerifyMsg::Divergence(div) => panic!("unexpected divergence: {div:?}"),
                 }
             }
+            assert!(
+                epoch_ok_count > 0,
+                "VerifyReplay must stream epoch progress before Done"
+            );
             let done = done.expect("VerifyReplay must stream Done");
             assert_eq!(done.total_icount, 50_000);
             assert_eq!(done.end_state_hash.unwrap().hash.len(), 32);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_streams_divergence_for_semantically_bad_log() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            2,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config_with_mem_epoch_len(
+                        base_hash,
+                        kernel_hash,
+                        8 * 1024 * 1024,
+                        10_000,
+                    )),
+                    entropy_seed: vec![0xB1; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+
+            svc.runtime_table()
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime_mut(|runtime| {
+                            use vm_memory::{Bytes, GuestAddress};
+                            runtime
+                                .slot
+                                .guest_mem
+                                .write_slice(&[0xDD; 64], GuestAddress(0x60_0000))
+                                .unwrap();
+                        })
+                        .unwrap()
+                })
+                .unwrap();
+
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(100_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(run.icount, 100_000);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let svc_for_log = svc.clone();
+            let input_log_id = snap.input_log_id;
+            let poisoned_log = tokio::task::spawn_blocking(move || {
+                stored_input_log_payload(&svc_for_log, input_log_id)
+            })
+            .await
+            .unwrap();
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLog(poisoned_log)),
+                    bisect_on_divergence: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut saw_divergence = false;
+            while let Some(item) = stream.next().await {
+                match item.unwrap().msg.unwrap() {
+                    VerifyMsg::EpochOk(_) => {}
+                    VerifyMsg::Done(done) => panic!("expected divergence, got Done {done:?}"),
+                    VerifyMsg::Divergence(divergence) => {
+                        assert!(divergence.suspected_cause.contains("EPOCH_HASH"));
+                        assert!(divergence.suspected_cause.contains("chain value"));
+                        assert_ne!(divergence.icount_lo, 0);
+                        saw_divergence = true;
+                    }
+                }
+            }
+            assert!(saw_divergence, "VerifyReplay must stream a divergence");
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_cancellation_releases_worker_slot() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_request::Log as VerifyLog;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            2,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let epoch_len = 10_000;
+            let run_budget = (VERIFY_REPLAY_PROGRESS_BUFFER as u64 + 8) * epoch_len;
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config_with_mem_epoch_len(
+                        base_hash,
+                        kernel_hash,
+                        8 * 1024 * 1024,
+                        epoch_len,
+                    )),
+                    entropy_seed: vec![0xB2; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(run_budget)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(run.icount, run_budget);
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+            assert_eq!(svc.slots_free(), 2);
+
+            let response = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLogId(snap.input_log_id)),
+                    bisect_on_divergence: false,
+                }))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                svc.slots_free(),
+                1,
+                "unconsumed VerifyReplay stream should hold the temporary slot"
+            );
+            drop(response);
+
+            for _ in 0..100 {
+                if svc.slots_free() == 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("VerifyReplay cancellation did not release its worker slot");
         });
     }
 
