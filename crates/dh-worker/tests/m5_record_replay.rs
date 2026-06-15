@@ -99,6 +99,10 @@ const CORPUS_DHSNAP: &str = "root.dhsnap";
 const CORPUS_DHILOG: &str = "recording.dhilog";
 const CORPUS_EXPECTED: &str = "expected.txt";
 const SPARSE_ROOT_MAGIC: &[u8; 8] = b"DHRRPG01";
+const DETERMINISM_CLASS_LOCK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../ci/determinism-class.lock"
+);
 
 fn hex(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -119,6 +123,10 @@ fn parse_hex32(s: &str) -> [u8; 32] {
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     Path::new(CORPUS_DIR).join(name)
+}
+
+fn determinism_class_lock_bytes() -> Vec<u8> {
+    fs::read(DETERMINISM_CLASS_LOCK).expect("ci/determinism-class.lock")
 }
 
 /// SplitMix64 — tiny, dependency-free, and fully determined by the seed.
@@ -210,6 +218,23 @@ fn decode_sparse_root(bytes: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, String> {
             "sparse root shape mismatch: mem={mem}, page_size={page_size}"
         ));
     }
+    if count > MEM / PAGE_SIZE {
+        return Err(format!("sparse page count out of range: {count}"));
+    }
+    let expected_len = 32usize
+        .checked_add(
+            usize::try_from(count)
+                .map_err(|_| "sparse page count does not fit usize".to_string())?
+                .checked_mul(8 + PAGE_SIZE as usize)
+                .ok_or_else(|| "sparse root length overflow".to_string())?,
+        )
+        .ok_or_else(|| "sparse root length overflow".to_string())?;
+    if bytes.len() != expected_len {
+        return Err(format!(
+            "sparse root length mismatch: got {}, want {expected_len}",
+            bytes.len()
+        ));
+    }
     let mut pages = Vec::with_capacity(count as usize);
     let mut prev = None;
     for _ in 0..count {
@@ -277,6 +302,37 @@ fn expected_map(bytes: &[u8]) -> BTreeMap<String, String> {
         );
     }
     out
+}
+
+fn assert_expected_key_set(m: &BTreeMap<String, String>) {
+    let epoch_count = expected_u64(m, "epoch_hashes_verified");
+    let mut allowed = [
+        "name",
+        "seconds",
+        "mem_bytes",
+        "page_size",
+        "nonzero_pages",
+        "determinism_class_lock_blake3",
+        "snapshot_ref",
+        "machine_config_hash",
+        "root_sparse_blake3",
+        "root_dhsnap_blake3",
+        "dhilog_blake3",
+        "dhilog_records",
+        "end_icount",
+        "end_vns",
+        "records_applied",
+        "epoch_hashes_verified",
+        "end_state_hash",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+    for i in 1..=epoch_count {
+        allowed.insert(format!("epoch_{i}"));
+    }
+    let actual = m.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, allowed, "expected.txt key set changed");
 }
 
 fn expected_value<'a>(m: &'a BTreeMap<String, String>, key: &str) -> &'a str {
@@ -621,6 +677,10 @@ fn expected_corpus_text(rec: &Recording, root_sparse: &[u8]) -> String {
     out.push_str(&format!("page_size={PAGE_SIZE}\n"));
     out.push_str(&format!("nonzero_pages={}\n", rec.root_nonzero_pages.len()));
     out.push_str(&format!(
+        "determinism_class_lock_blake3={}\n",
+        blake3_hex(&determinism_class_lock_bytes())
+    ));
+    out.push_str(&format!(
         "snapshot_ref={}\n",
         hex(&rec.snapshot_ref.to_bytes())
     ));
@@ -742,10 +802,15 @@ fn record_replay_corpus_pad_echo_6s_reverifies() {
     }
     let expected_bytes = fs::read(fixture_path(CORPUS_EXPECTED)).expect("expected corpus manifest");
     let expected = expected_map(&expected_bytes);
+    assert_expected_key_set(&expected);
     assert_eq!(expected_value(&expected, "name"), "pad_echo_6s");
     assert_eq!(expected_u64(&expected, "seconds"), CORPUS_SECONDS);
     assert_eq!(expected_u64(&expected, "mem_bytes"), MEM);
     assert_eq!(expected_u64(&expected, "page_size"), PAGE_SIZE);
+    assert_eq!(
+        expected_value(&expected, "determinism_class_lock_blake3"),
+        blake3_hex(&determinism_class_lock_bytes())
+    );
     assert_eq!(
         expected_value(&expected, "machine_config_hash"),
         hex(&config().config_hash().unwrap())
@@ -770,6 +835,7 @@ fn record_replay_corpus_pad_echo_6s_reverifies() {
     };
 
     let sys = KvmSystem::open().unwrap();
+    dh_vmm::run::install_kick_handler().unwrap();
     let counter = InstRetired::open_for_current_thread().unwrap();
     counter
         .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
@@ -778,7 +844,13 @@ fn record_replay_corpus_pad_echo_6s_reverifies() {
     counter.reset().unwrap();
     counter.enable().unwrap();
 
-    let slot = replay_once(&sys, &counter, &store, &rec, CORPUS_SECONDS);
+    let slot = replay_once(
+        &sys,
+        &counter,
+        &store,
+        &rec,
+        expected_u64(&expected, "records_applied") + 1,
+    );
     assert_table_eras(&slot, CORPUS_SECONDS);
 }
 
@@ -786,8 +858,7 @@ fn record_replay_corpus_pad_echo_6s_reverifies() {
 #[ignore = "explicit re-baseline only: DH_WORKER_REGEN_RR_CORPUS=1 cargo test -p dh-worker --test m5_record_replay regenerate_record_replay_corpus_pad_echo_6s -- --ignored --nocapture"]
 fn regenerate_record_replay_corpus_pad_echo_6s() {
     if std::env::var_os("DH_WORKER_REGEN_RR_CORPUS").is_none() {
-        eprintln!("set DH_WORKER_REGEN_RR_CORPUS=1 to rewrite corpus fixtures");
-        return;
+        panic!("set DH_WORKER_REGEN_RR_CORPUS=1 to rewrite corpus fixtures");
     }
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not usable");

@@ -83,6 +83,7 @@ jobs:
     # the corpus in the same reviewed commit.
     needs: determinism-class
     runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
