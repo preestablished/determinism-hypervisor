@@ -8,7 +8,7 @@
 
 use crate::proto_map::slot_info_to_proto;
 #[cfg(target_arch = "x86_64")]
-use crate::runtime::{RuntimeError, WorkerRuntimeTable};
+use crate::runtime::{RuntimeError, SlotRuntime, WorkerRuntimeTable};
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
@@ -350,6 +350,66 @@ fn runtime_error_to_status(e: RuntimeError) -> Status {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)] // Wired by determinism-hypervisor-rfv after this runtime-table bead.
+fn runtime_position(runtime: &SlotRuntime) -> (u64, Option<[u8; 32]>) {
+    (
+        runtime.position.cumulative_icount,
+        runtime
+            .base_snapshot
+            .as_ref()
+            .map(snapstore_types::SnapshotRef::to_bytes),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)] // Wired by determinism-hypervisor-rfv after this runtime-table bead.
+fn rollback_lifecycle_leases(
+    method: &'static str,
+    manager: &SlotManager,
+    runtimes: &WorkerRuntimeTable,
+    leases: &[Lease],
+    now_ms: u64,
+) -> Result<(), Status> {
+    let mut removed = Vec::new();
+    for lease in leases {
+        match runtimes.take(lease.slot_id) {
+            Ok(runtime) => removed.push((lease.slot_id, Some(runtime))),
+            Err(RuntimeError::Empty { .. }) => removed.push((lease.slot_id, None)),
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "{method} rollback could not inspect runtime slot {}: {e}",
+                    lease.slot_id
+                )));
+            }
+        }
+    }
+
+    for (idx, lease) in leases.iter().enumerate() {
+        if let Err(e) = manager.destroy(lease, now_ms) {
+            let mut restore_errors = Vec::new();
+            for (slot_id, runtime) in removed.into_iter().skip(idx) {
+                let Some(runtime) = runtime else {
+                    continue;
+                };
+                if let Err(reinsert) = runtimes.insert(slot_id, runtime) {
+                    restore_errors.push(format!("slot {slot_id}: {reinsert}"));
+                }
+            }
+            let restore = if restore_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; runtime restore failed: {}", restore_errors.join(", "))
+            };
+            return Err(Status::internal(format!(
+                "{method} rollback could not release slot {}: {e:?}{restore}",
+                lease.slot_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 async fn blocking_lifecycle<T>(
     method: &'static str,
     f: impl FnOnce() -> Result<T, Status> + Send + 'static,
@@ -364,6 +424,139 @@ where
 
 #[cfg(target_arch = "x86_64")]
 impl WorkerService {
+    #[allow(dead_code)] // Wired by determinism-hypervisor-rfv after this runtime-table bead.
+    pub(crate) async fn install_allocated_runtime(
+        &self,
+        method: &'static str,
+        build_runtime: impl FnOnce(Lease) -> Result<SlotRuntime, Status> + Send + 'static,
+    ) -> Result<Lease, Status> {
+        let manager = self.inner.manager.clone();
+        let runtimes = self.inner.runtimes.clone();
+        blocking_lifecycle(method, move || {
+            let now_ms = lease_now_ms();
+            let lease = manager.allocate(now_ms).map_err(slot_error_to_status)?;
+            let runtime = match build_runtime(lease.clone()) {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    rollback_lifecycle_leases(
+                        method,
+                        manager.as_ref(),
+                        runtimes.as_ref(),
+                        std::slice::from_ref(&lease),
+                        now_ms,
+                    )?;
+                    return Err(e);
+                }
+            };
+
+            let (icount, base_snapshot_id) = runtime_position(&runtime);
+            if let Err(e) = runtimes.insert(lease.slot_id, runtime) {
+                rollback_lifecycle_leases(
+                    method,
+                    manager.as_ref(),
+                    runtimes.as_ref(),
+                    std::slice::from_ref(&lease),
+                    now_ms,
+                )?;
+                return Err(runtime_error_to_status(e));
+            }
+            if let Err(e) = manager.set_position(&lease, icount, base_snapshot_id, now_ms) {
+                rollback_lifecycle_leases(
+                    method,
+                    manager.as_ref(),
+                    runtimes.as_ref(),
+                    std::slice::from_ref(&lease),
+                    now_ms,
+                )?;
+                return Err(slot_error_to_status(e));
+            }
+            Ok(lease)
+        })
+        .await
+    }
+
+    #[allow(dead_code)] // Wired by determinism-hypervisor-rfv after this runtime-table bead.
+    pub(crate) async fn install_forked_runtimes(
+        &self,
+        parent: Lease,
+        count: usize,
+        build_runtimes: impl FnOnce(&WorkerRuntimeTable, &[Lease]) -> Result<Vec<SlotRuntime>, Status>
+            + Send
+            + 'static,
+    ) -> Result<Vec<Lease>, Status> {
+        let manager = self.inner.manager.clone();
+        let runtimes = self.inner.runtimes.clone();
+        blocking_lifecycle("Fork", move || {
+            let now_ms = lease_now_ms();
+            runtimes
+                .ensure_occupied(parent.slot_id)
+                .map_err(runtime_error_to_status)?;
+            let child_leases = manager
+                .fork(&parent, count, now_ms)
+                .map_err(slot_error_to_status)?;
+
+            let child_runtimes = match build_runtimes(runtimes.as_ref(), &child_leases) {
+                Ok(child_runtimes) if child_runtimes.len() == child_leases.len() => child_runtimes,
+                Ok(child_runtimes) => {
+                    rollback_lifecycle_leases(
+                        "Fork",
+                        manager.as_ref(),
+                        runtimes.as_ref(),
+                        &child_leases,
+                        now_ms,
+                    )?;
+                    return Err(Status::internal(format!(
+                        "Fork built {} child runtimes for {} leases",
+                        child_runtimes.len(),
+                        child_leases.len()
+                    )));
+                }
+                Err(e) => {
+                    rollback_lifecycle_leases(
+                        "Fork",
+                        manager.as_ref(),
+                        runtimes.as_ref(),
+                        &child_leases,
+                        now_ms,
+                    )?;
+                    return Err(e);
+                }
+            };
+
+            let positions: Vec<_> = child_runtimes.iter().map(runtime_position).collect();
+            let entries = child_leases
+                .iter()
+                .map(|lease| lease.slot_id)
+                .zip(child_runtimes)
+                .collect();
+            if let Err(e) = runtimes.insert_many(entries) {
+                rollback_lifecycle_leases(
+                    "Fork",
+                    manager.as_ref(),
+                    runtimes.as_ref(),
+                    &child_leases,
+                    now_ms,
+                )?;
+                return Err(runtime_error_to_status(e));
+            }
+
+            for (lease, (icount, base_snapshot_id)) in child_leases.iter().zip(positions) {
+                if let Err(e) = manager.set_position(lease, icount, base_snapshot_id, now_ms) {
+                    rollback_lifecycle_leases(
+                        "Fork",
+                        manager.as_ref(),
+                        runtimes.as_ref(),
+                        &child_leases,
+                        now_ms,
+                    )?;
+                    return Err(slot_error_to_status(e));
+                }
+            }
+            Ok(child_leases)
+        })
+        .await
+    }
+
     async fn destroy_runtime_slot(&self, lease: Lease) -> Result<(), Status> {
         let manager = self.inner.manager.clone();
         let runtimes = self.inner.runtimes.clone();
@@ -543,6 +736,8 @@ impl HypervisorWorker for WorkerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::runtime::{SlotPosition, SlotRuntime};
     use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 
     fn test_config(slots: usize) -> WorkerConfig {
@@ -714,6 +909,246 @@ mod tests {
             dh_vmm::SlotState::Paused
         );
         assert_eq!(svc.runtime_table().occupied_count(), 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn runtime_tests_available() -> bool {
+        match dh_vmm::kvm::KvmSystem::open() {
+            Ok(sys) if sys.dirty_ring => true,
+            Ok(_) => {
+                eprintln!("skipping runtime service test: KVM dirty ring unavailable");
+                false
+            }
+            Err(e) => {
+                eprintln!("skipping runtime service test: KVM unavailable: {e:?}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn runtime_test_bus() -> dh_devices::MmioBus {
+        let mut bus = dh_devices::MmioBus::new();
+        bus.register(
+            dh_devices::clock::PV_CLOCK_BASE,
+            Box::new(dh_devices::clock::PvClock::new(1, 1)),
+        )
+        .unwrap();
+        bus.register(
+            dh_devices::pad::PV_PAD_BASE,
+            Box::new(dh_devices::pad::PvPad::new()),
+        )
+        .unwrap();
+        bus.register(
+            dh_devices::entropy::PV_ENTROPY_BASE,
+            Box::new(dh_devices::entropy::PvEntropy::new()),
+        )
+        .unwrap();
+        bus.register(0xD000_6000, Box::new(dh_devices::DebugSerial::new()))
+            .unwrap();
+        bus
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn make_runtime(
+        seed: u8,
+        position: SlotPosition,
+        base_snapshot: Option<snapstore_types::SnapshotRef>,
+    ) -> Result<SlotRuntime, Status> {
+        let sys = dh_vmm::kvm::KvmSystem::open()
+            .map_err(|e| Status::internal(format!("open KVM: {e:?}")))?;
+        if !sys.dirty_ring {
+            return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+        }
+        let mut config = dh_vmm::config::MachineConfig::new(
+            2 * 1024 * 1024,
+            [seed; 32],
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash: [seed.wrapping_add(1); 32],
+                cmdline: Vec::new(),
+            },
+        );
+        config.device_set = vec![
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+        let config_hash = config
+            .config_hash()
+            .map_err(|e| Status::internal(format!("config hash: {e:?}")))?;
+        let base_ref = base_snapshot
+            .as_ref()
+            .map(snapstore_types::SnapshotRef::to_bytes)
+            .unwrap_or([0; 32]);
+        let slot = sys
+            .create_slot_vm(config.mem_bytes)
+            .map_err(|e| Status::internal(format!("create slot VM: {e:?}")))?;
+        SlotRuntime::new(
+            slot,
+            runtime_test_bus(),
+            dh_devices::entropy::DetEntropy::from_seed([seed; 32]),
+            config,
+            dh_vmm::hash::StateHashChain::new(&config_hash, &base_ref),
+            None,
+            base_snapshot,
+            position,
+        )
+        .map_err(|e| Status::internal(format!("create slot runtime: {e:?}")))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn allocated_runtime_populates_manager_and_destroy_releases_both_tables() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let base_snapshot = snapstore_types::SnapshotRef::from_bytes([0x42; 32]);
+        let position = SlotPosition {
+            cumulative_icount: 1234,
+            segment_icount: 17,
+            vns: 1234,
+            epoch_index: 2,
+            frame_counter: 3,
+        };
+        let lease = svc
+            .install_allocated_runtime("CreateVm", move |_| {
+                make_runtime(0x11, position, Some(base_snapshot))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(svc.runtime_table().occupied_count(), 1);
+        let slot = svc.slot_manager().slot_info(lease.slot_id).unwrap();
+        assert_eq!(slot.state, dh_vmm::SlotState::Paused);
+        assert_eq!(slot.icount, position.cumulative_icount);
+        assert_eq!(slot.base_snapshot_id, Some([0x42; 32]));
+
+        svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+            lease: Some(proto::Lease {
+                slot_id: lease.slot_id,
+                token: lease.token.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.runtime_table().occupied_count(), 0);
+        assert_eq!(
+            svc.slot_manager().slot_info(lease.slot_id).unwrap().state,
+            dh_vmm::SlotState::Empty
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn allocated_runtime_build_failure_rolls_back_manager_lease() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let err = svc
+            .install_allocated_runtime("RestoreSnapshot", |_| {
+                Err(Status::internal("restore engine failed"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "restore engine failed");
+        assert_eq!(svc.runtime_table().occupied_count(), 0);
+        assert_eq!(svc.slot_manager().list()[0].state, dh_vmm::SlotState::Empty);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn fork_runtime_build_failure_rolls_back_children_and_thaws_parent() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let svc = WorkerService::new(test_config(3)).unwrap();
+        let parent = svc
+            .install_allocated_runtime("CreateVm", |_| {
+                make_runtime(0x21, SlotPosition::default(), None)
+            })
+            .await
+            .unwrap();
+
+        let err = svc
+            .install_forked_runtimes(parent.clone(), 2, |_table, _leases| {
+                Err(Status::internal("fork engine failed"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert_eq!(err.message(), "fork engine failed");
+        assert_eq!(svc.runtime_table().occupied_count(), 1);
+        let slots = svc.slot_manager().list();
+        assert_eq!(
+            slots[parent.slot_id as usize].state,
+            dh_vmm::SlotState::Paused
+        );
+        assert_eq!(slots[parent.slot_id as usize].live_children, 0);
+        assert_eq!(
+            slots
+                .iter()
+                .filter(|slot| slot.state == dh_vmm::SlotState::Empty)
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn fork_runtime_install_populates_children_until_destroy_thaws_parent() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let svc = WorkerService::new(test_config(2)).unwrap();
+        let parent = svc
+            .install_allocated_runtime("CreateVm", |_| {
+                make_runtime(0x31, SlotPosition::default(), None)
+            })
+            .await
+            .unwrap();
+        let fork_base = snapstore_types::SnapshotRef::from_bytes([0x55; 32]);
+        let child_position = SlotPosition {
+            cumulative_icount: 9001,
+            segment_icount: 0,
+            vns: 9001,
+            epoch_index: 9,
+            frame_counter: 44,
+        };
+
+        let children = svc
+            .install_forked_runtimes(parent.clone(), 1, move |_table, leases| {
+                assert_eq!(leases.len(), 1);
+                Ok(vec![make_runtime(0x32, child_position, Some(fork_base))?])
+            })
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(svc.runtime_table().occupied_count(), 2);
+        let slots = svc.slot_manager().list();
+        assert_eq!(
+            slots[parent.slot_id as usize].state,
+            dh_vmm::SlotState::Frozen
+        );
+        assert_eq!(slots[parent.slot_id as usize].live_children, 1);
+        let child_info = &slots[children[0].slot_id as usize];
+        assert_eq!(child_info.state, dh_vmm::SlotState::Paused);
+        assert_eq!(child_info.icount, child_position.cumulative_icount);
+        assert_eq!(child_info.base_snapshot_id, Some([0x55; 32]));
+
+        svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+            lease: Some(proto::Lease {
+                slot_id: children[0].slot_id,
+                token: children[0].token.to_vec(),
+            }),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.runtime_table().occupied_count(), 1);
+        assert_eq!(
+            svc.slot_manager().slot_info(parent.slot_id).unwrap().state,
+            dh_vmm::SlotState::Paused
+        );
     }
 
     #[tokio::test]
