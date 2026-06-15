@@ -9,6 +9,10 @@
 //! `DH_M6_ACCEPT_SLOT_CORES`, which must still resolve to exactly 64 cores.
 //!
 //!   cargo test -p dh-worker --test m6_full_api_uds --release -- --ignored --nocapture
+//!
+//! Developer smoke on under-provisioned hosts may set
+//! `DH_M6_ACCEPT_ALLOW_SKIP=1`; the acceptance command above must fail when
+//! prerequisites are not met.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -38,6 +42,7 @@ const INPUT_ICOUNT: u64 = 1;
 const CAPTURE_OFFSET: u64 = 8;
 const CAPTURE_LEN: u32 = 24;
 const SLOT_CORES_ENV: &str = "DH_M6_ACCEPT_SLOT_CORES";
+const ALLOW_SKIP_ENV: &str = "DH_M6_ACCEPT_ALLOW_SKIP";
 
 type TestResult<T> = Result<T, String>;
 type WorkerClient = HypervisorWorkerClient<Channel>;
@@ -169,10 +174,9 @@ fn available_cores() -> Option<BTreeSet<u32>> {
     Some(online.intersection(&allowed).copied().collect())
 }
 
-fn acceptance_slot_cores_or_skip() -> Option<Vec<u32>> {
+fn acceptance_slot_cores() -> TestResult<Vec<u32>> {
     if !common::kvm_available() {
-        eprintln!("skipping M6 UDS acceptance: /dev/kvm is unavailable");
-        return None;
+        return Err("/dev/kvm is unavailable".into());
     }
 
     let cores = configured_slot_cores();
@@ -182,22 +186,33 @@ fn acceptance_slot_cores_or_skip() -> Option<Vec<u32>> {
         "{SLOT_CORES_ENV} must list exactly {ACCEPT_SLOTS} dedicated slot cores"
     );
 
-    let Some(available) = available_cores() else {
-        eprintln!("skipping M6 UDS acceptance: could not read available CPU core set");
-        return None;
-    };
+    let available =
+        available_cores().ok_or_else(|| "could not read available CPU core set".to_owned())?;
     let missing: Vec<_> = cores
         .iter()
         .copied()
         .filter(|core| !available.contains(core))
         .collect();
     if !missing.is_empty() {
-        eprintln!(
-            "skipping M6 UDS acceptance: slot cores unavailable in this process affinity: {missing:?}"
-        );
-        return None;
+        return Err(format!(
+            "slot cores unavailable in this process affinity: {missing:?}"
+        ));
     }
-    Some(cores)
+    Ok(cores)
+}
+
+fn acceptance_slot_cores_or_skip() -> Option<Vec<u32>> {
+    match acceptance_slot_cores() {
+        Ok(cores) => Some(cores),
+        Err(e) if std::env::var(ALLOW_SKIP_ENV).as_deref() == Ok("1") => {
+            eprintln!("skipping M6 UDS acceptance because {ALLOW_SKIP_ENV}=1: {e}");
+            None
+        }
+        Err(e) => panic!(
+            "M6 acceptance prerequisites failed: {e}. \
+             Set {ALLOW_SKIP_ENV}=1 only for non-acceptance local smoke."
+        ),
+    }
 }
 
 async fn start_worker_uds(config: WorkerConfig) -> WorkerUdsServer {
@@ -235,35 +250,115 @@ async fn connect_worker_uds(uds_path: PathBuf) -> WorkerClient {
         .expect("connect worker UDS")
 }
 
+fn slot_label(index: usize) -> String {
+    if index == usize::MAX {
+        "baseline slot".into()
+    } else {
+        format!("slot {index}")
+    }
+}
+
+async fn destroy_with_client(
+    client: &mut WorkerClient,
+    label: &str,
+    lease: proto::Lease,
+) -> TestResult<()> {
+    client
+        .destroy_vm(proto::DestroyVmRequest { lease: Some(lease) })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{label} DestroyVm: {e}"))
+}
+
+async fn error_after_destroy(
+    client: &mut WorkerClient,
+    label: &str,
+    lease: proto::Lease,
+    original: String,
+) -> String {
+    match destroy_with_client(client, label, lease).await {
+        Ok(()) => original,
+        Err(cleanup) => format!("{original}; cleanup failed: {cleanup}"),
+    }
+}
+
+async fn destroy_slots_best_effort(
+    uds_path: &Path,
+    phase: &str,
+    slots: &[RestoredSlot],
+) -> Vec<String> {
+    let mut tasks = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let uds_path = uds_path.to_path_buf();
+        let lease = slot.lease.clone();
+        let label = slot_label(slot.index);
+        tasks.push(tokio::spawn(async move {
+            let mut client = connect_worker_uds(uds_path).await;
+            destroy_with_client(&mut client, &label, lease).await.err()
+        }));
+    }
+
+    let mut errors = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(Some(e)) => errors.push(format!("{phase} cleanup: {e}")),
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{phase} cleanup task: {e}")),
+        }
+    }
+    errors
+}
+
+fn merge_phase_errors(phase: &str, mut errors: Vec<String>, cleanup_errors: Vec<String>) -> String {
+    errors.extend(cleanup_errors);
+    format!("{phase} failed: {}", errors.join("; "))
+}
+
 async fn create_base_snapshot(
     client: &mut WorkerClient,
     config: proto::MachineConfig,
-) -> proto::SnapshotRef {
+) -> TestResult<proto::SnapshotRef> {
     let created = client
         .create_vm(proto::CreateVmRequest {
             config: Some(config),
             entropy_seed: vec![0x4D; 32],
         })
         .await
-        .expect("CreateVm base")
+        .map_err(|e| format!("CreateVm base: {e}"))?
         .into_inner();
-    let lease = created.lease.expect("base lease");
-    let snapshot = client
+    let lease = created
+        .lease
+        .ok_or_else(|| "CreateVm base returned no lease".to_owned())?;
+    let snapshot = match client
         .take_snapshot(proto::TakeSnapshotRequest {
             lease: Some(lease.clone()),
             seal_input_log: Some(true),
             capture: None,
         })
         .await
-        .expect("TakeSnapshot base")
-        .into_inner()
-        .snapshot
-        .expect("base snapshot ref");
-    client
-        .destroy_vm(proto::DestroyVmRequest { lease: Some(lease) })
-        .await
-        .expect("DestroyVm base");
-    snapshot
+    {
+        Ok(response) => response
+            .into_inner()
+            .snapshot
+            .ok_or_else(|| "TakeSnapshot base returned no snapshot ref".to_owned()),
+        Err(e) => {
+            return Err(error_after_destroy(
+                client,
+                "baseline slot",
+                lease,
+                format!("TakeSnapshot base: {e}"),
+            )
+            .await);
+        }
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            return Err(error_after_destroy(client, "baseline slot", lease, e).await);
+        }
+    };
+    destroy_with_client(client, "baseline slot", lease).await?;
+    Ok(snapshot)
 }
 
 async fn restore_slot(
@@ -291,7 +386,9 @@ async fn restore_slot(
 }
 
 async fn inject_slot(mut client: WorkerClient, slot: RestoredSlot) -> TestResult<RestoredSlot> {
-    let scheduled = client
+    let label = slot_label(slot.index);
+    let lease = slot.lease.clone();
+    let scheduled = match client
         .inject_inputs(proto::InjectInputsRequest {
             lease: Some(slot.lease.clone()),
             events: vec![proto::ScheduledEvent {
@@ -303,14 +400,26 @@ async fn inject_slot(mut client: WorkerClient, slot: RestoredSlot) -> TestResult
             }],
         })
         .await
-        .map_err(|e| format!("slot {} InjectInputs: {e}", slot.index))?
-        .into_inner()
-        .scheduled;
+    {
+        Ok(response) => response.into_inner().scheduled,
+        Err(e) => {
+            return Err(error_after_destroy(
+                &mut client,
+                &label,
+                lease,
+                format!("{label} InjectInputs: {e}"),
+            )
+            .await);
+        }
+    };
     if scheduled != 1 {
-        return Err(format!(
-            "slot {} InjectInputs scheduled {scheduled}, expected 1",
-            slot.index
-        ));
+        return Err(error_after_destroy(
+            &mut client,
+            &label,
+            lease,
+            format!("{label} InjectInputs scheduled {scheduled}, expected 1"),
+        )
+        .await);
     }
     Ok(slot)
 }
@@ -319,7 +428,9 @@ async fn run_snapshot_destroy(
     mut client: WorkerClient,
     slot: RestoredSlot,
 ) -> TestResult<LegDigest> {
-    let run = client
+    let label = slot_label(slot.index);
+    let lease = slot.lease.clone();
+    let run = match client
         .run(proto::RunRequest {
             lease: Some(slot.lease.clone()),
             until: Some(proto::run_request::Until::IcountBudget(RUN_BUDGET)),
@@ -327,43 +438,82 @@ async fn run_snapshot_destroy(
             capture: None,
         })
         .await
-        .map_err(|e| format!("slot {} Run: {e}", slot.index))?
-        .into_inner();
+    {
+        Ok(response) => response.into_inner(),
+        Err(e) => {
+            return Err(error_after_destroy(
+                &mut client,
+                &label,
+                lease,
+                format!("{label} Run: {e}"),
+            )
+            .await);
+        }
+    };
     if run.reason != i32::from(proto::StopReason::GuestHalted) {
-        return Err(format!(
-            "slot {} Run stopped with {}, expected GUEST_HALTED",
-            slot.index, run.reason
-        ));
+        return Err(error_after_destroy(
+            &mut client,
+            &label,
+            lease,
+            format!(
+                "{label} Run stopped with {}, expected GUEST_HALTED",
+                run.reason
+            ),
+        )
+        .await);
     }
     if run.icount < INPUT_ICOUNT {
-        return Err(format!(
-            "slot {} Run stopped before the injected input boundary: {}",
-            slot.index, run.icount
-        ));
+        return Err(error_after_destroy(
+            &mut client,
+            &label,
+            lease,
+            format!(
+                "{label} Run stopped before the injected input boundary: {}",
+                run.icount
+            ),
+        )
+        .await);
     }
 
-    let snapshot = client
+    let snapshot = match client
         .take_snapshot(proto::TakeSnapshotRequest {
             lease: Some(slot.lease.clone()),
             seal_input_log: Some(true),
             capture: Some(capture_spec()),
         })
         .await
-        .map_err(|e| format!("slot {} TakeSnapshot: {e}", slot.index))?
-        .into_inner();
+    {
+        Ok(response) => response.into_inner(),
+        Err(e) => {
+            return Err(error_after_destroy(
+                &mut client,
+                &label,
+                lease,
+                format!("{label} TakeSnapshot: {e}"),
+            )
+            .await);
+        }
+    };
     if snapshot.feature_bytes != expected_capture_bytes() {
-        return Err(format!(
-            "slot {} CaptureSpec feature bytes changed",
-            slot.index
-        ));
+        return Err(error_after_destroy(
+            &mut client,
+            &label,
+            lease,
+            format!("{label} CaptureSpec feature bytes changed"),
+        )
+        .await);
+    }
+    if !snapshot.fb_lz4.is_empty() || snapshot.fb_info.is_some() {
+        return Err(error_after_destroy(
+            &mut client,
+            &label,
+            lease,
+            format!("{label} CaptureSpec framebuffer output should be empty"),
+        )
+        .await);
     }
 
-    client
-        .destroy_vm(proto::DestroyVmRequest {
-            lease: Some(slot.lease.clone()),
-        })
-        .await
-        .map_err(|e| format!("slot {} DestroyVm: {e}", slot.index))?;
+    destroy_with_client(&mut client, &label, slot.lease.clone()).await?;
 
     Ok(digest_leg(&slot.restore, &run, &snapshot))
 }
@@ -444,11 +594,17 @@ async fn restore_all(
     }
 
     let mut slots = Vec::with_capacity(ACCEPT_SLOTS);
+    let mut errors = Vec::new();
     for task in tasks {
-        slots.push(
-            task.await
-                .map_err(|e| format!("RestoreSnapshot task: {e}"))??,
-        );
+        match task.await {
+            Ok(Ok(slot)) => slots.push(slot),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("RestoreSnapshot task: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        let cleanup = destroy_slots_best_effort(uds_path, "RestoreSnapshot", &slots).await;
+        return Err(merge_phase_errors("RestoreSnapshot", errors, cleanup));
     }
     slots.sort_by_key(|slot| slot.index);
     Ok(slots)
@@ -465,11 +621,17 @@ async fn inject_all(uds_path: &Path, slots: Vec<RestoredSlot>) -> TestResult<Vec
     }
 
     let mut injected = Vec::with_capacity(ACCEPT_SLOTS);
+    let mut errors = Vec::new();
     for task in tasks {
-        injected.push(
-            task.await
-                .map_err(|e| format!("InjectInputs task: {e}"))??,
-        );
+        match task.await {
+            Ok(Ok(slot)) => injected.push(slot),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("InjectInputs task: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        let cleanup = destroy_slots_best_effort(uds_path, "InjectInputs", &injected).await;
+        return Err(merge_phase_errors("InjectInputs", errors, cleanup));
     }
     injected.sort_by_key(|slot| slot.index);
     Ok(injected)
@@ -489,11 +651,16 @@ async fn run_snapshot_destroy_all(
     }
 
     let mut digests = Vec::with_capacity(ACCEPT_SLOTS);
+    let mut errors = Vec::new();
     for task in tasks {
-        digests.push(
-            task.await
-                .map_err(|e| format!("Run/Snapshot task: {e}"))??,
-        );
+        match task.await {
+            Ok(Ok(digest)) => digests.push(digest),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("Run/Snapshot task: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(merge_phase_errors("Run/Snapshot", errors, Vec::new()));
     }
     Ok(digests)
 }
@@ -531,7 +698,9 @@ async fn m6_full_api_uds_64_concurrent_slots_match_single_slot_baseline() {
     assert_eq!(info.slots_total as usize, ACCEPT_SLOTS);
     assert_eq!(info.slots_free as usize, ACCEPT_SLOTS);
 
-    let base_snapshot = create_base_snapshot(&mut control, config).await;
+    let base_snapshot = create_base_snapshot(&mut control, config)
+        .await
+        .expect("base snapshot");
 
     let baseline_restore = restore_slot(control.clone(), usize::MAX, base_snapshot.clone())
         .await
@@ -556,6 +725,17 @@ async fn m6_full_api_uds_64_concurrent_slots_match_single_slot_baseline() {
     assert!(listed
         .iter()
         .all(|slot| slot.state == i32::from(proto::SlotState::PausedS)));
+    let slot_ids: BTreeSet<_> = listed.iter().map(|slot| slot.slot_id).collect();
+    assert_eq!(slot_ids.len(), ACCEPT_SLOTS);
+    assert!(listed.iter().all(|slot| {
+        slot.base.as_ref().map(|base| base.hash.as_slice()) == Some(base_snapshot.hash.as_slice())
+    }));
+    let info = control
+        .get_worker_info(proto::GetWorkerInfoRequest {})
+        .await
+        .expect("GetWorkerInfo after restore")
+        .into_inner();
+    assert_eq!(info.slots_free, 0);
 
     let slots = inject_all(&worker.uds_path, slots)
         .await
