@@ -7,6 +7,7 @@
 //! `SlotManager`, then enter this table from a blocking worker thread before
 //! driving KVM or snapshot-store work.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -79,15 +80,14 @@ impl<T> RuntimeTable<T> {
 
     pub fn insert_many(&self, runtimes: Vec<(u64, T)>) -> Result<(), RuntimeError> {
         let mut slots = self.slots.lock().expect("runtime table poisoned");
-        let mut seen = Vec::with_capacity(runtimes.len());
+        let mut seen = HashSet::with_capacity(runtimes.len());
         for (slot_id, _) in &runtimes {
             let entry = slots
                 .get(*slot_id as usize)
                 .ok_or(RuntimeError::NoSuchSlot(*slot_id))?;
-            if entry.is_some() || seen.contains(slot_id) {
+            if entry.is_some() || !seen.insert(*slot_id) {
                 return Err(RuntimeError::Occupied { slot_id: *slot_id });
             }
-            seen.push(*slot_id);
         }
         for (slot_id, runtime) in runtimes {
             slots[slot_id as usize] = Some(runtime);
