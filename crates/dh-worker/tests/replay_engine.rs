@@ -20,7 +20,7 @@ use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
 use dh_devices::MmioBus;
-use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
+use dh_inputlog::dhilog::{LogWriter, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER};
 use dh_verify::verify::VerifyProgress;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
@@ -176,6 +176,18 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
     rail.borrow_mut()
         .apply_pad_set(o1.boundary.icount, o1.boundary.rip, 0, 0xA1B2, 0)
         .unwrap();
+    let mut pio = [0u8; 8];
+    pio[..2].copy_from_slice(&0xD370u16.to_le_bytes());
+    pio[4..].copy_from_slice(&0x1234u32.to_le_bytes());
+    rail.borrow_mut()
+        .apply_dev_event(
+            o1.boundary.icount,
+            o1.boundary.rip,
+            DEVICE_ID_DETCHANNEL,
+            EVENT_PIO_ANSWER,
+            &pio,
+        )
+        .unwrap();
     let o2 = run_one(&mut slot, &mut chain);
     rail.borrow_mut()
         .apply_pad_set(o2.boundary.icount, o2.boundary.rip, 0, 0xC3D4, 1)
@@ -236,7 +248,10 @@ fn replay_reproduces_the_recording_bit_identically() {
     )
     .expect("replay");
 
-    assert_eq!(outcome.records_applied, 2, "both PAD_SETs replayed");
+    assert_eq!(
+        outcome.records_applied, 3,
+        "both PAD_SETs and the DEV_EVENT replayed"
+    );
     // 3 quanta x (100k/30k grid) = epochs 1..=10 minus none: 300k/30k=10.
     assert_eq!(outcome.epoch_hashes_verified, 10);
     assert_eq!(outcome.end_icount, 3 * QUANTUM);

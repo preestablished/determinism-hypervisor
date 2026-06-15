@@ -23,12 +23,11 @@
 //! state, subsuming the per-record checks (which exist for granular
 //! divergence reporting, not extra strength).
 //!
-//! Phase-1 scope, loud where cut: DEV_EVENT replay needs the detchannel
-//! composition (slot manager, ol1); vectored inputs (a PAD_SET/NET_RX
-//! whose device queued an edge interrupt) need run control's injection
-//! scheduling contract — both error as `NotYetWired`, never silently
-//! skip. The M5 demo path (polling pad-echo, loopback net) needs
-//! neither.
+//! Phase-1 scope, loud where cut: DEV_EVENT records replay through the
+//! generic device-event rail; vectored inputs (a PAD_SET/NET_RX whose
+//! device queued an edge interrupt) still need run control's injection
+//! scheduling contract and error as `NotYetWired`, never silently skip.
+//! The M5 demo path (polling pad-echo, loopback net) needs no vectors.
 
 use dh_detclock::counter::InstRetired;
 use dh_devices::ctx::GuestMem;
@@ -284,10 +283,16 @@ pub fn replay_segment<M: GuestMem>(
                     .apply_net_rx(icount, rip, frame)
                     .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
             }
-            RecordBody::DevEvent { .. } => {
-                return Err(ReplayError::NotYetWired(
-                    "DEV_EVENT replay needs the detchannel composition (ol1)",
-                ));
+            RecordBody::DevEvent {
+                device_id,
+                event_type,
+                data,
+            } => {
+                let o = run_to(slot, &mut chain, icount)?;
+                require_landed(&o, icount)?;
+                rail.borrow_mut()
+                    .apply_dev_event(icount, rip, device_id, event_type, data)
+                    .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
             }
             other => {
                 return Err(ReplayError::Apply(format!(

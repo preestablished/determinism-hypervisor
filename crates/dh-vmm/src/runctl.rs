@@ -283,6 +283,7 @@ pub fn run_segment_with_scheduled_inputs(
         until,
         scheduled_inputs,
         &[],
+        0,
         goal,
         on_exit,
         input_sink,
@@ -297,6 +298,7 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
     until: Until,
     scheduled_inputs: &[u64],
     frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
@@ -307,6 +309,7 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
         RunOptions::default(),
         scheduled_inputs,
         frame_inputs,
+        start_frame_counter,
         goal,
         on_exit,
         input_sink,
@@ -329,6 +332,7 @@ pub fn run_segment_with_epoch_options(
         options,
         &[],
         &[],
+        0,
         goal,
         on_exit,
         &mut |_, _| Ok(Vec::new()),
@@ -343,6 +347,7 @@ fn run_segment_inner(
     options: RunOptions,
     scheduled_inputs: &[u64],
     frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
@@ -454,6 +459,7 @@ fn run_segment_inner(
     let mut halted = false;
     let mut event_stop = false;
     let mut frames_seen = 0u64;
+    let mut last_frame_counter = start_frame_counter;
     let mut frame_inputs_applied = vec![false; frame_inputs.len()];
     macro_rules! exits {
         () => {
@@ -477,6 +483,12 @@ fn run_segment_inner(
                 };
                 on_exit(exit)?;
                 if let Some(frame) = frame_mark {
+                    if frame <= last_frame_counter {
+                        return Err(BoundaryError::Exit(format!(
+                            "FRAME_COUNTER must increase monotonically: previous {last_frame_counter}, got {frame}"
+                        )));
+                    }
+                    last_frame_counter = frame;
                     frames_seen += 1;
                     let icount = seg
                         .counter
@@ -1737,6 +1749,7 @@ mod event_until_tests {
             },
             &[0],
             &frame_inputs,
+            0,
             &mut || false,
             &mut pad_serial_exits,
             &mut |idx, boundary| {

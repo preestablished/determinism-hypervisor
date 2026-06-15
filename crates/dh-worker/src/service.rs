@@ -564,6 +564,16 @@ fn queued_input_from_proto(
             dh_inputlog::dhilog::FRAME_HINT_NONE,
         ),
         WireAt::AtFrame(frame) => {
+            if *frame == dh_inputlog::dhilog::FRAME_HINT_NONE {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].at_frame value {frame} is reserved"
+                )));
+            }
+            if !machine_has_pv_pad(config) {
+                return Err(Status::failed_precondition(format!(
+                    "events[{index}].at_frame requires pv-pad in machine_config.device_set"
+                )));
+            }
             if *frame <= current_frame_counter {
                 return Err(Status::invalid_argument(format!(
                     "events[{index}].at_frame must be greater than current frame_counter {current_frame_counter}, got {frame}"
@@ -645,6 +655,57 @@ fn queued_input_from_proto(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn machine_has_pv_pad(config: &dh_vmm::config::MachineConfig) -> bool {
+    config
+        .device_set
+        .contains(&dh_devices::pad::DEVICE_ID_PV_PAD)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn frame_scheduled_irq_precondition(
+    bus: &mut dh_devices::MmioBus,
+    kind: &QueuedInputKind,
+) -> Option<&'static str> {
+    match kind {
+        QueuedInputKind::PadSet { .. } => {
+            for (_base, dev) in bus.devices_mut() {
+                if dev.device_id() != dh_devices::pad::DEVICE_ID_PV_PAD {
+                    continue;
+                }
+                let pad = dev
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<dh_devices::pad::PvPad>())?;
+                if pad.irq_vector() != 0 {
+                    return Some(
+                        "pv-pad IRQ vector is enabled; frame-scheduled PAD_SET IRQ delivery is not wired",
+                    );
+                }
+                return None;
+            }
+            None
+        }
+        QueuedInputKind::NetRx { .. } => {
+            for (_base, dev) in bus.devices_mut() {
+                if dev.device_id() != dh_devices::net::DEVICE_ID_PV_NET {
+                    continue;
+                }
+                let net = dev
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<dh_devices::net::PvNet>())?;
+                if net.rx_vector() != 0 {
+                    return Some(
+                        "pv-net RX vector is enabled; frame-scheduled NET_RX IRQ delivery is not wired",
+                    );
+                }
+                return None;
+            }
+            None
+        }
+        QueuedInputKind::DevEvent { .. } => None,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn queue_inputs_from_proto(
     runtime: &mut SlotRuntime,
     events: Vec<proto::ScheduledEvent>,
@@ -662,6 +723,13 @@ fn queue_inputs_from_proto(
             current_frame_counter,
             &runtime.machine_config,
         )?;
+        if matches!(input.at, QueuedInputAt::Frame(_)) {
+            if let Some(reason) = frame_scheduled_irq_precondition(&mut runtime.bus, &input.kind) {
+                return Err(Status::failed_precondition(format!(
+                    "events[{index}].at_frame cannot queue an IRQ: {reason}"
+                )));
+            }
+        }
         input.order = runtime.next_input_order;
         runtime.next_input_order = runtime
             .next_input_order
@@ -1768,6 +1836,7 @@ impl HypervisorWorker for WorkerService {
                                 until,
                                 &scheduled_input_icounts,
                                 &scheduled_frame_inputs,
+                                runtime.position.frame_counter,
                                 &mut goal,
                                 &mut on_exit,
                                 &mut input_sink,
@@ -2219,14 +2288,16 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     fn mapper_config() -> dh_vmm::config::MachineConfig {
-        dh_vmm::config::MachineConfig::new(
+        let mut config = dh_vmm::config::MachineConfig::new(
             2 * 1024 * 1024,
             [0xAA; 32],
             dh_vmm::config::BootSpec::Elf {
                 kernel_hash: [0xBB; 32],
                 cmdline: Vec::new(),
             },
-        )
+        );
+        config.device_set = vec![dh_devices::pad::DEVICE_ID_PV_PAD];
+        config
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2327,6 +2398,111 @@ mod tests {
         .unwrap_err();
         assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
         assert!(oversized.message().contains("dev_event.payload exceeds"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inject_mapper_rejects_reserved_frame_and_missing_pv_pad() {
+        let reserved = queued_input_from_proto(
+            0,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(
+                    dh_inputlog::dhilog::FRAME_HINT_NONE,
+                )),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 1,
+                })),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap_err();
+        assert_eq!(reserved.code(), tonic::Code::InvalidArgument);
+        assert!(reserved.message().contains("reserved"));
+
+        let mut no_pad = mapper_config();
+        no_pad.device_set.clear();
+        let missing = queued_input_from_proto(
+            1,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(11)),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 1,
+                })),
+            },
+            100,
+            10,
+            &no_pad,
+        )
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::FailedPrecondition);
+        assert!(missing.message().contains("requires pv-pad"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_pad_irq_vector(pad: &mut dh_devices::pad::PvPad, vector: u32) {
+        let mut log = dh_inputlog::dhilog::LogWriter::new(dh_inputlog::dhilog::SegmentHeader {
+            base_snapshot_id: [0; 32],
+            entropy_seed: [0; 32],
+            machine_config_hash: [0; 32],
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        });
+        let mut mem = dh_devices::ctx::VecGuestMem(vec![0; 8]);
+        let mut entropy = dh_devices::entropy::DetEntropy::from_seed([0; 32]);
+        let mut irqs = Vec::new();
+        let mut ctx =
+            dh_devices::ctx::DevCtx::new(0, 0, &mut log, &mut mem, &mut entropy, &mut irqs);
+        dh_devices::DetDevice::mmio_write(
+            pad,
+            dh_devices::pad::REG_IRQ_VECTOR,
+            &vector.to_le_bytes(),
+            &mut ctx,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn frame_scheduled_inputs_reject_current_irq_delivery_gap() {
+        let mut bus = dh_devices::MmioBus::new();
+        let mut pad = dh_devices::pad::PvPad::new();
+        set_pad_irq_vector(&mut pad, 0x45);
+        bus.register(dh_devices::pad::PV_PAD_BASE, Box::new(pad))
+            .unwrap();
+
+        let reason = frame_scheduled_irq_precondition(
+            &mut bus,
+            &QueuedInputKind::PadSet {
+                port: 0,
+                buttons: 1,
+                frame_hint: 12,
+            },
+        )
+        .unwrap();
+        assert!(reason.contains("pv-pad IRQ vector is enabled"));
+
+        let mut polling_bus = dh_devices::MmioBus::new();
+        polling_bus
+            .register(
+                dh_devices::pad::PV_PAD_BASE,
+                Box::new(dh_devices::pad::PvPad::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            frame_scheduled_irq_precondition(
+                &mut polling_bus,
+                &QueuedInputKind::PadSet {
+                    port: 0,
+                    buttons: 1,
+                    frame_hint: 12,
+                },
+            ),
+            None
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

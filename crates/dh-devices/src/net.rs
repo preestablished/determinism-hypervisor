@@ -133,6 +133,11 @@ impl PvNet {
         (self.tx_buf_gpa, self.tx_len, self.tx_status)
     }
 
+    /// Current RX edge IRQ vector; zero means disabled.
+    pub fn rx_vector(&self) -> u8 {
+        self.rx_vector as u8
+    }
+
     /// Run-control entry point: a canonical NET_RX record landed at its
     /// icount. Copies the frame into the guest-published RX buffer, sets
     /// RX_LEN, and returns the edge vector to inject (per §3.4) if the
