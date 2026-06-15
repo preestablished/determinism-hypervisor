@@ -7,6 +7,7 @@
 //! `SlotManager`, then enter this table from a blocking worker thread before
 //! driving KVM or snapshot-store work.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +75,23 @@ impl<T> RuntimeTable<T> {
             return Err(RuntimeError::Occupied { slot_id });
         }
         *entry = Some(runtime);
+        Ok(())
+    }
+
+    pub fn insert_many(&self, runtimes: Vec<(u64, T)>) -> Result<(), RuntimeError> {
+        let mut slots = self.slots.lock().expect("runtime table poisoned");
+        let mut seen = HashSet::with_capacity(runtimes.len());
+        for (slot_id, _) in &runtimes {
+            let entry = slots
+                .get(*slot_id as usize)
+                .ok_or(RuntimeError::NoSuchSlot(*slot_id))?;
+            if entry.is_some() || !seen.insert(*slot_id) {
+                return Err(RuntimeError::Occupied { slot_id: *slot_id });
+            }
+        }
+        for (slot_id, runtime) in runtimes {
+            slots[slot_id as usize] = Some(runtime);
+        }
         Ok(())
     }
 
@@ -297,5 +315,37 @@ mod tests {
         assert_eq!(table.take(0).unwrap().value, 11);
         assert_eq!(table.occupied_count(), 0);
         assert_eq!(table.take(0), Err(RuntimeError::Empty { slot_id: 0 }));
+    }
+
+    #[test]
+    fn insert_many_is_all_or_nothing() {
+        let table = RuntimeTable::new(3);
+        table.insert(1, Stub { value: 10 }).unwrap();
+        assert_eq!(
+            table.insert_many(vec![(0, Stub { value: 20 }), (1, Stub { value: 30 })]),
+            Err(RuntimeError::Occupied { slot_id: 1 })
+        );
+        assert_eq!(table.occupied_count(), 1);
+        assert_eq!(
+            table.ensure_occupied(0),
+            Err(RuntimeError::Empty { slot_id: 0 })
+        );
+
+        table
+            .insert_many(vec![(0, Stub { value: 20 }), (2, Stub { value: 30 })])
+            .unwrap();
+        assert_eq!(table.occupied_count(), 3);
+        assert_eq!(table.with(0, |s| s.value).unwrap(), 20);
+        assert_eq!(table.with(2, |s| s.value).unwrap(), 30);
+    }
+
+    #[test]
+    fn insert_many_rejects_duplicate_slot_ids() {
+        let table = RuntimeTable::new(2);
+        assert_eq!(
+            table.insert_many(vec![(0, Stub { value: 1 }), (0, Stub { value: 2 })]),
+            Err(RuntimeError::Occupied { slot_id: 0 })
+        );
+        assert_eq!(table.occupied_count(), 0);
     }
 }

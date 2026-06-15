@@ -377,6 +377,54 @@ impl SlotManager {
         now_ms: u64,
     ) -> Result<Vec<Lease>, SlotError> {
         let mut slots = self.slots.lock().expect("slot table poisoned");
+        let (parent_idx, frozen, free) =
+            Self::check_fork_entries(&slots, parent, children, now_ms)?;
+        slots[parent_idx].state = frozen;
+        let parent_position = (slots[parent_idx].icount, slots[parent_idx].base_snapshot_id);
+        let mut leases = Vec::with_capacity(children);
+        for idx in free {
+            let entry = &mut slots[idx];
+            entry.state = entry
+                .state
+                .transition(SlotState::Paused)
+                .expect("Empty → Paused is always legal");
+            entry.parent = Some(parent.slot_id);
+            entry.ram_is_cow = true;
+            // Children resume at the parent's position (fork_engine's
+            // cumulative_icount contract).
+            entry.icount = parent_position.0;
+            entry.base_snapshot_id = parent_position.1;
+            let lease = self.lease_into(entry, idx as u64, now_ms);
+            leases.push(lease);
+        }
+        // Bounded by the free-slot count (≤ slot table length), so the
+        // narrowing is total; try_from keeps it honest.
+        slots[parent_idx].live_children = slots[parent_idx]
+            .live_children
+            .saturating_add(u32::try_from(children).expect("children ≤ slot count"));
+        Ok(leases)
+    }
+
+    /// Validate that `fork` would be accepted without freezing the
+    /// parent or claiming child slots. The daemon uses this before
+    /// consulting runtime resources so lease/state errors come from the
+    /// slot-manager authority first.
+    pub fn check_fork(
+        &self,
+        parent: &Lease,
+        children: usize,
+        now_ms: u64,
+    ) -> Result<(), SlotError> {
+        let slots = self.slots.lock().expect("slot table poisoned");
+        Self::check_fork_entries(&slots, parent, children, now_ms).map(|_| ())
+    }
+
+    fn check_fork_entries(
+        slots: &[SlotEntry],
+        parent: &Lease,
+        children: usize,
+        now_ms: u64,
+    ) -> Result<(usize, SlotState, Vec<usize>), SlotError> {
         let parent_idx = parent.slot_id as usize;
         if parent_idx >= slots.len() {
             return Err(SlotError::NoSuchSlot(parent.slot_id));
@@ -404,30 +452,7 @@ impl SlotManager {
         if free.len() < children {
             return Err(SlotError::NoFreeSlot);
         }
-        slots[parent_idx].state = frozen;
-        let parent_position = (slots[parent_idx].icount, slots[parent_idx].base_snapshot_id);
-        let mut leases = Vec::with_capacity(children);
-        for idx in free {
-            let entry = &mut slots[idx];
-            entry.state = entry
-                .state
-                .transition(SlotState::Paused)
-                .expect("Empty → Paused is always legal");
-            entry.parent = Some(parent.slot_id);
-            entry.ram_is_cow = true;
-            // Children resume at the parent's position (fork_engine's
-            // cumulative_icount contract).
-            entry.icount = parent_position.0;
-            entry.base_snapshot_id = parent_position.1;
-            let lease = self.lease_into(entry, idx as u64, now_ms);
-            leases.push(lease);
-        }
-        // Bounded by the free-slot count (≤ slot table length), so the
-        // narrowing is total; try_from keeps it honest.
-        slots[parent_idx].live_children = slots[parent_idx]
-            .live_children
-            .saturating_add(u32::try_from(children).expect("children ≤ slot count"));
-        Ok(leases)
+        Ok((parent_idx, frozen, free))
     }
 
     /// Run / Pause crossings (lease-gated; the run side is write-path
@@ -785,6 +810,10 @@ mod tests {
             Err(SlotError::StaleLease { .. })
         ));
         assert!(matches!(
+            m.check_fork(&stale, 1, 0),
+            Err(SlotError::StaleLease { .. })
+        ));
+        assert!(matches!(
             m.fork(&stale, 0, 0),
             Err(SlotError::StaleLease { .. })
         ));
@@ -814,6 +843,12 @@ mod tests {
     fn fork_freezes_parent_accounts_children_and_autothaws() {
         let m = manager(4, LeasePolicy::default());
         let parent = m.allocate(0).unwrap();
+        m.check_fork(&parent, 2, 0).unwrap();
+        assert_eq!(
+            m.slot_info(parent.slot_id).unwrap().state,
+            SlotState::Paused
+        );
+        assert_eq!(m.slot_info(parent.slot_id).unwrap().live_children, 0);
         let children = m.fork(&parent, 2, 0).unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(
