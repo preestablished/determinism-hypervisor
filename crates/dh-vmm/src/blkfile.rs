@@ -23,6 +23,13 @@ impl FileBase {
     /// every read goes through positional `pread` (no shared cursor).
     pub fn open(path: &Path) -> std::io::Result<FileBase> {
         let file = File::open(path)?; // read-only by definition
+        Self::from_file(file)
+    }
+
+    /// Build from an already-open read-only file. Used by dh-workerd's image
+    /// resolver so the descriptor handed to pv-blk is the descriptor whose
+    /// content hash was verified.
+    pub fn from_file(file: File) -> std::io::Result<FileBase> {
         let len = file.metadata()?.len();
         Ok(FileBase { file, len })
     }

@@ -102,8 +102,8 @@ message BootSpec {
     BzImageBoot bzimage = 2;     // minimal Linux
   }
 }
-message ElfBoot     { bytes kernel_hash = 1; bytes cmdline = 2; }
-message BzImageBoot { bytes kernel_hash = 1; bytes initramfs_hash = 2;
+message ElfBoot     { bytes kernel_hash = 1; bytes cmdline = 2; } // kernel_hash is a 32-byte BLAKE3 cache key
+message BzImageBoot { bytes kernel_hash = 1; bytes initramfs_hash = 2; // both are 32-byte BLAKE3 cache keys
                       bytes cmdline = 3; }  // APPEND-ONLY extras; the worker forces the
                                             //   canonical deterministic baseline and accepts
                                             //   only whitelisted extra flags (ARCH §2.3)
