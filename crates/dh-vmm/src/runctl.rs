@@ -142,6 +142,14 @@ pub struct ScheduledInjection {
     pub vector: u8,
 }
 
+/// One frame-scheduled canonical input: apply `index` when the guest writes
+/// absolute FRAME_COUNTER value `frame`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledFrameInput {
+    pub frame: u32,
+    pub index: usize,
+}
+
 /// A guest-armed one-shot pv-clock timer (ARCH §4): the caller reads it
 /// from the device (`PvClock::armed()`) before compiling the segment.
 /// `deadline_vns` is COUNTER-SPACE vns — the same origin as
@@ -270,11 +278,38 @@ pub fn run_segment_with_scheduled_inputs(
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
+    run_segment_with_scheduled_inputs_and_frames(
+        seg,
+        until,
+        scheduled_inputs,
+        &[],
+        0,
+        goal,
+        on_exit,
+        input_sink,
+    )
+}
+
+/// [`run_segment_with_scheduled_inputs`] plus dynamic frame-triggered
+/// inputs. Frame inputs land immediately after the frame-boundary MMIO exit
+/// is serviced, using the just-recorded absolute FRAME_COUNTER value.
+pub fn run_segment_with_scheduled_inputs_and_frames(
+    seg: &mut Segment<'_>,
+    until: Until,
+    scheduled_inputs: &[u64],
+    frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
+    goal: &mut dyn FnMut() -> bool,
+    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
+) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
         until,
         RunOptions::default(),
         scheduled_inputs,
+        frame_inputs,
+        start_frame_counter,
         goal,
         on_exit,
         input_sink,
@@ -296,6 +331,8 @@ pub fn run_segment_with_epoch_options(
         until,
         options,
         &[],
+        &[],
+        0,
         goal,
         on_exit,
         &mut |_, _| Ok(Vec::new()),
@@ -309,6 +346,8 @@ fn run_segment_inner(
     until: Until,
     options: RunOptions,
     scheduled_inputs: &[u64],
+    frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
@@ -420,6 +459,8 @@ fn run_segment_inner(
     let mut halted = false;
     let mut event_stop = false;
     let mut frames_seen = 0u64;
+    let mut last_frame_counter = start_frame_counter;
+    let mut frame_inputs_applied = vec![false; frame_inputs.len()];
     macro_rules! exits {
         () => {
             &mut |exit: VcpuExit| {
@@ -427,11 +468,49 @@ fn run_segment_inner(
                     halted = true;
                     return Err(BoundaryError::Exit("guest halted".into()));
                 }
-                let frame_mark =
-                    matches!(exit, VcpuExit::MmioWrite(gpa, _) if gpa == frame_mark_gpa);
+                let frame_mark = match &exit {
+                    VcpuExit::MmioWrite(gpa, data)
+                        if *gpa == frame_mark_gpa && data.len() == 4 =>
+                    {
+                        Some(u32::from_le_bytes((*data).try_into().unwrap()))
+                    }
+                    VcpuExit::MmioWrite(gpa, _) if *gpa == frame_mark_gpa => {
+                        return Err(BoundaryError::Exit(
+                            "FRAME_COUNTER write with non-u32 payload".into(),
+                        ));
+                    }
+                    _ => None,
+                };
                 on_exit(exit)?;
-                if frame_mark {
+                if let Some(frame) = frame_mark {
+                    if frame <= last_frame_counter {
+                        return Err(BoundaryError::Exit(format!(
+                            "FRAME_COUNTER must increase monotonically: previous {last_frame_counter}, got {frame}"
+                        )));
+                    }
+                    last_frame_counter = frame;
                     frames_seen += 1;
+                    let icount = seg
+                        .counter
+                        .read()
+                        .map_err(|e| BoundaryError::Exit(format!("counter read: {e:?}")))?;
+                    for (slot, scheduled) in frame_inputs.iter().enumerate() {
+                        if frame_inputs_applied[slot] || scheduled.frame != frame {
+                            continue;
+                        }
+                        let boundary = Boundary {
+                            icount,
+                            rip: 0,
+                            rcx: 0,
+                        };
+                        let vectors = input_sink(scheduled.index, boundary)?;
+                        if !vectors.is_empty() {
+                            return Err(BoundaryError::Exit(format!(
+                                "frame-scheduled input for FRAME_COUNTER {frame} queued IRQ vectors; frame IRQ delivery is not wired"
+                            )));
+                        }
+                        frame_inputs_applied[slot] = true;
+                    }
                     if frame_target == Some(frames_seen) {
                         event_stop = true;
                         return Err(BoundaryError::Exit("frame budget reached".into()));
@@ -1639,6 +1718,56 @@ mod event_until_tests {
             return;
         };
         assert_eq!(a, b, "frame-budget stop must replay identically");
+    }
+
+    #[test]
+    fn frame_scheduled_input_lands_on_matching_frame_mark_live() {
+        let Some((mut slot, counter)) = rig(nanokernel::pad_echo_elf(), b"") else {
+            return;
+        };
+        let config = cfg();
+        let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+        let pause = AtomicBool::new(false);
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &config,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let frame_inputs = [ScheduledFrameInput { frame: 2, index: 0 }];
+        let mut landed = Vec::new();
+        let out = run_segment_with_scheduled_inputs_and_frames(
+            &mut seg,
+            Until::FrameBudget {
+                frames: 3,
+                hard_cap: 50_000_000,
+            },
+            &[0],
+            &frame_inputs,
+            0,
+            &mut || false,
+            &mut pad_serial_exits,
+            &mut |idx, boundary| {
+                landed.push((idx, boundary.icount, boundary.rip));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.reason, StopReason::BudgetReached);
+        assert_eq!(out.frames_elapsed, 3);
+        assert_eq!(landed.len(), 1);
+        assert_eq!(landed[0].0, 0);
+        assert!(landed[0].1 > 0);
+        assert_eq!(landed[0].2, 0, "exit-time rail boundary_rip convention");
+        assert!(
+            landed[0].1 <= out.boundary.icount,
+            "input must land no later than the frame-budget stop"
+        );
     }
 
     /// FrameBudget(0) — zero MORE frames — is satisfied at the start

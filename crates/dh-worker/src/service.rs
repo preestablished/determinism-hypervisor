@@ -15,8 +15,8 @@ use crate::proto_map::{
 };
 #[cfg(target_arch = "x86_64")]
 use crate::runtime::{
-    QueuedInput, QueuedInputKind, RuntimeActorError, RuntimeError, RuntimeThreadState, SlotActor,
-    SlotRuntime, WorkerRuntimeTable,
+    QueuedInput, QueuedInputAt, QueuedInputKind, RuntimeActorError, RuntimeError,
+    RuntimeThreadState, SlotActor, SlotRuntime, WorkerRuntimeTable,
 };
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
@@ -543,26 +543,51 @@ fn queued_input_from_proto(
     index: usize,
     event: &proto::ScheduledEvent,
     current_icount: u64,
+    current_frame_counter: u32,
     config: &dh_vmm::config::MachineConfig,
 ) -> Result<QueuedInput, Status> {
     use proto::scheduled_event::{At as WireAt, Event as WireEvent};
 
-    let icount = match event
+    let (at, frame_hint) = match event
         .at
         .as_ref()
         .ok_or_else(|| Status::invalid_argument(format!("events[{index}].at is required")))?
     {
-        WireAt::AtIcount(icount) => *icount,
-        WireAt::AtVns(vns) => config
-            .clock
-            .icount_for_vns_target(*vns)
-            .ok_or_else(|| Status::invalid_argument(format!("events[{index}].at_vns overflows")))?,
-        WireAt::AtFrame(_) => return Err(unimplemented_status("InjectInputs at_frame")),
+        WireAt::AtIcount(icount) => (
+            QueuedInputAt::Icount(*icount),
+            dh_inputlog::dhilog::FRAME_HINT_NONE,
+        ),
+        WireAt::AtVns(vns) => (
+            QueuedInputAt::Icount(config.clock.icount_for_vns_target(*vns).ok_or_else(|| {
+                Status::invalid_argument(format!("events[{index}].at_vns overflows"))
+            })?),
+            dh_inputlog::dhilog::FRAME_HINT_NONE,
+        ),
+        WireAt::AtFrame(frame) => {
+            if *frame == dh_inputlog::dhilog::FRAME_HINT_NONE {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].at_frame value {frame} is reserved"
+                )));
+            }
+            if !machine_has_pv_pad(config) {
+                return Err(Status::failed_precondition(format!(
+                    "events[{index}].at_frame requires pv-pad in machine_config.device_set"
+                )));
+            }
+            if *frame <= current_frame_counter {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].at_frame must be greater than current frame_counter {current_frame_counter}, got {frame}"
+                )));
+            }
+            (QueuedInputAt::Frame(*frame), *frame)
+        }
     };
-    if icount <= current_icount {
-        return Err(Status::invalid_argument(format!(
-            "events[{index}] must land after current segment icount {current_icount}, got {icount}"
-        )));
+    if let QueuedInputAt::Icount(icount) = at {
+        if icount <= current_icount {
+            return Err(Status::invalid_argument(format!(
+                "events[{index}] must land after current segment icount {current_icount}, got {icount}"
+            )));
+        }
     }
 
     let kind = match event
@@ -582,7 +607,7 @@ fn queued_input_from_proto(
             QueuedInputKind::PadSet {
                 port,
                 buttons: pad.buttons,
-                frame_hint: dh_inputlog::dhilog::FRAME_HINT_NONE,
+                frame_hint,
             }
         }
         WireEvent::NetRx(net) => {
@@ -601,14 +626,83 @@ fn queued_input_from_proto(
                 frame: net.frame.clone(),
             }
         }
-        WireEvent::DevEvent(_) => return Err(unimplemented_status("InjectInputs dev_event")),
+        WireEvent::DevEvent(dev) => {
+            let device_id = u16::try_from(dev.device_id).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "events[{index}].dev_event.device_id must fit u16"
+                ))
+            })?;
+            let event_type = u16::try_from(dev.event_type).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "events[{index}].dev_event.event_type must fit u16"
+                ))
+            })?;
+            if dev.payload.len() > dh_inputlog::dhilog::MAX_DEV_EVENT_DATA {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].dev_event.payload exceeds {} bytes",
+                    dh_inputlog::dhilog::MAX_DEV_EVENT_DATA
+                )));
+            }
+            QueuedInputKind::DevEvent {
+                device_id,
+                event_type,
+                payload: dev.payload.clone(),
+            }
+        }
     };
 
-    Ok(QueuedInput {
-        icount,
-        order: 0,
-        kind,
-    })
+    Ok(QueuedInput { at, order: 0, kind })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn machine_has_pv_pad(config: &dh_vmm::config::MachineConfig) -> bool {
+    config
+        .device_set
+        .contains(&dh_devices::pad::DEVICE_ID_PV_PAD)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn frame_scheduled_irq_precondition(
+    bus: &mut dh_devices::MmioBus,
+    kind: &QueuedInputKind,
+) -> Option<&'static str> {
+    match kind {
+        QueuedInputKind::PadSet { .. } => {
+            for (_base, dev) in bus.devices_mut() {
+                if dev.device_id() != dh_devices::pad::DEVICE_ID_PV_PAD {
+                    continue;
+                }
+                let pad = dev
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<dh_devices::pad::PvPad>())?;
+                if pad.irq_vector() != 0 {
+                    return Some(
+                        "pv-pad IRQ vector is enabled; frame-scheduled PAD_SET IRQ delivery is not wired",
+                    );
+                }
+                return None;
+            }
+            None
+        }
+        QueuedInputKind::NetRx { .. } => {
+            for (_base, dev) in bus.devices_mut() {
+                if dev.device_id() != dh_devices::net::DEVICE_ID_PV_NET {
+                    continue;
+                }
+                let net = dev
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<dh_devices::net::PvNet>())?;
+                if net.rx_vector() != 0 {
+                    return Some(
+                        "pv-net RX vector is enabled; frame-scheduled NET_RX IRQ delivery is not wired",
+                    );
+                }
+                return None;
+            }
+            None
+        }
+        QueuedInputKind::DevEvent { .. } => None,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -619,10 +713,23 @@ fn queue_inputs_from_proto(
     let scheduled = u32::try_from(events.len())
         .map_err(|_| Status::invalid_argument("too many scheduled events"))?;
     let current_icount = runtime.position.segment_icount;
+    let current_frame_counter = runtime.position.frame_counter;
     let mut queued = Vec::with_capacity(events.len());
     for (index, event) in events.iter().enumerate() {
-        let mut input =
-            queued_input_from_proto(index, event, current_icount, &runtime.machine_config)?;
+        let mut input = queued_input_from_proto(
+            index,
+            event,
+            current_icount,
+            current_frame_counter,
+            &runtime.machine_config,
+        )?;
+        if matches!(input.at, QueuedInputAt::Frame(_)) {
+            if let Some(reason) = frame_scheduled_irq_precondition(&mut runtime.bus, &input.kind) {
+                return Err(Status::failed_precondition(format!(
+                    "events[{index}].at_frame cannot queue an IRQ: {reason}"
+                )));
+            }
+        }
         input.order = runtime.next_input_order;
         runtime.next_input_order = runtime
             .next_input_order
@@ -631,9 +738,13 @@ fn queue_inputs_from_proto(
         queued.push(input);
     }
     runtime.queued_inputs.extend(queued);
-    runtime
-        .queued_inputs
-        .sort_by_key(|input| (input.icount, input.order));
+    runtime.queued_inputs.sort_by_key(|input| {
+        let (kind, value) = match input.at {
+            QueuedInputAt::Icount(icount) => (0u8, icount),
+            QueuedInputAt::Frame(frame) => (1u8, u64::from(frame)),
+        };
+        (kind, value, input.order)
+    });
     Ok(scheduled)
 }
 
@@ -658,6 +769,19 @@ fn apply_queued_input<M: dh_devices::ctx::GuestMem>(
             .map_err(record_error_to_boundary)?,
         QueuedInputKind::NetRx { frame } => rail
             .apply_net_rx(boundary.icount, boundary.rip, frame)
+            .map_err(record_error_to_boundary)?,
+        QueuedInputKind::DevEvent {
+            device_id,
+            event_type,
+            payload,
+        } => rail
+            .apply_dev_event(
+                boundary.icount,
+                boundary.rip,
+                *device_id,
+                *event_type,
+                payload,
+            )
             .map_err(record_error_to_boundary)?,
     };
     Ok(vector.into_iter().collect())
@@ -1650,8 +1774,23 @@ impl HypervisorWorker for WorkerService {
                         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
                     );
                     let pending_inputs = runtime.queued_inputs.clone();
-                    let scheduled_input_icounts: Vec<u64> =
-                        pending_inputs.iter().map(|input| input.icount).collect();
+                    let scheduled_input_icounts: Vec<u64> = pending_inputs
+                        .iter()
+                        .map(|input| match input.at {
+                            QueuedInputAt::Icount(icount) => icount,
+                            QueuedInputAt::Frame(_) => start_segment_icount,
+                        })
+                        .collect();
+                    let scheduled_frame_inputs: Vec<_> = pending_inputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, input)| match input.at {
+                            QueuedInputAt::Frame(frame) => {
+                                Some(dh_vmm::runctl::ScheduledFrameInput { frame, index })
+                            }
+                            QueuedInputAt::Icount(_) => None,
+                        })
+                        .collect();
                     let (run_result, consumed_input_orders, rail) = {
                         let rail = std::cell::RefCell::new(dh_vmm::recording::DeviceRail::new(
                             bus,
@@ -1692,10 +1831,12 @@ impl HypervisorWorker for WorkerService {
                                 pause: pause.as_ref(),
                                 sdk_events: None,
                             };
-                            dh_vmm::runctl::run_segment_with_scheduled_inputs(
+                            dh_vmm::runctl::run_segment_with_scheduled_inputs_and_frames(
                                 &mut segment,
                                 until,
                                 &scheduled_input_icounts,
+                                &scheduled_frame_inputs,
+                                runtime.position.frame_counter,
                                 &mut goal,
                                 &mut on_exit,
                                 &mut input_sink,
@@ -1729,9 +1870,7 @@ impl HypervisorWorker for WorkerService {
                                 runtime.chain.clone(),
                             );
                             runtime.position.frame_counter =
-                                runtime.position.frame_counter.saturating_add(
-                                    u32::try_from(outcome.frames_elapsed).unwrap_or(u32::MAX),
-                                );
+                                frame_counter_from_bus(&mut runtime.bus);
                             if !consumed_input_orders.is_empty() {
                                 runtime
                                     .queued_inputs
@@ -2145,6 +2284,225 @@ mod tests {
             dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
         ];
         machine_config_to_proto(&config)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn mapper_config() -> dh_vmm::config::MachineConfig {
+        let mut config = dh_vmm::config::MachineConfig::new(
+            2 * 1024 * 1024,
+            [0xAA; 32],
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash: [0xBB; 32],
+                cmdline: Vec::new(),
+            },
+        );
+        config.device_set = vec![dh_devices::pad::DEVICE_ID_PV_PAD];
+        config
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inject_mapper_accepts_at_frame_pad_set_with_frame_hint() {
+        let input = queued_input_from_proto(
+            0,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(12)),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 0xA5A5,
+                })),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap();
+        assert_eq!(input.at, QueuedInputAt::Frame(12));
+        assert_eq!(
+            input.kind,
+            QueuedInputKind::PadSet {
+                port: 0,
+                buttons: 0xA5A5,
+                frame_hint: 12
+            }
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inject_mapper_accepts_generic_device_event() {
+        let input = queued_input_from_proto(
+            1,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtIcount(150)),
+                event: Some(proto::scheduled_event::Event::DevEvent(
+                    proto::DeviceEvent {
+                        device_id: u32::from(dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL),
+                        event_type: u32::from(dh_inputlog::dhilog::EVENT_RING_PUSH),
+                        payload: vec![1, 2, 3, 4],
+                    },
+                )),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap();
+        assert_eq!(input.at, QueuedInputAt::Icount(150));
+        assert_eq!(
+            input.kind,
+            QueuedInputKind::DevEvent {
+                device_id: dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL,
+                event_type: dh_inputlog::dhilog::EVENT_RING_PUSH,
+                payload: vec![1, 2, 3, 4]
+            }
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inject_mapper_rejects_stale_frame_and_oversized_device_event() {
+        let stale = queued_input_from_proto(
+            0,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(10)),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 1,
+                })),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::InvalidArgument);
+        assert!(stale.message().contains("current frame_counter 10"));
+
+        let oversized = queued_input_from_proto(
+            1,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtIcount(150)),
+                event: Some(proto::scheduled_event::Event::DevEvent(
+                    proto::DeviceEvent {
+                        device_id: 1,
+                        event_type: 1,
+                        payload: vec![0; dh_inputlog::dhilog::MAX_DEV_EVENT_DATA + 1],
+                    },
+                )),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap_err();
+        assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
+        assert!(oversized.message().contains("dev_event.payload exceeds"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn inject_mapper_rejects_reserved_frame_and_missing_pv_pad() {
+        let reserved = queued_input_from_proto(
+            0,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(
+                    dh_inputlog::dhilog::FRAME_HINT_NONE,
+                )),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 1,
+                })),
+            },
+            100,
+            10,
+            &mapper_config(),
+        )
+        .unwrap_err();
+        assert_eq!(reserved.code(), tonic::Code::InvalidArgument);
+        assert!(reserved.message().contains("reserved"));
+
+        let mut no_pad = mapper_config();
+        no_pad.device_set.clear();
+        let missing = queued_input_from_proto(
+            1,
+            &proto::ScheduledEvent {
+                at: Some(proto::scheduled_event::At::AtFrame(11)),
+                event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                    port: 0,
+                    buttons: 1,
+                })),
+            },
+            100,
+            10,
+            &no_pad,
+        )
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::FailedPrecondition);
+        assert!(missing.message().contains("requires pv-pad"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_pad_irq_vector(pad: &mut dh_devices::pad::PvPad, vector: u32) {
+        let mut log = dh_inputlog::dhilog::LogWriter::new(dh_inputlog::dhilog::SegmentHeader {
+            base_snapshot_id: [0; 32],
+            entropy_seed: [0; 32],
+            machine_config_hash: [0; 32],
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        });
+        let mut mem = dh_devices::ctx::VecGuestMem(vec![0; 8]);
+        let mut entropy = dh_devices::entropy::DetEntropy::from_seed([0; 32]);
+        let mut irqs = Vec::new();
+        let mut ctx =
+            dh_devices::ctx::DevCtx::new(0, 0, &mut log, &mut mem, &mut entropy, &mut irqs);
+        dh_devices::DetDevice::mmio_write(
+            pad,
+            dh_devices::pad::REG_IRQ_VECTOR,
+            &vector.to_le_bytes(),
+            &mut ctx,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn frame_scheduled_inputs_reject_current_irq_delivery_gap() {
+        let mut bus = dh_devices::MmioBus::new();
+        let mut pad = dh_devices::pad::PvPad::new();
+        set_pad_irq_vector(&mut pad, 0x45);
+        bus.register(dh_devices::pad::PV_PAD_BASE, Box::new(pad))
+            .unwrap();
+
+        let reason = frame_scheduled_irq_precondition(
+            &mut bus,
+            &QueuedInputKind::PadSet {
+                port: 0,
+                buttons: 1,
+                frame_hint: 12,
+            },
+        )
+        .unwrap();
+        assert!(reason.contains("pv-pad IRQ vector is enabled"));
+
+        let mut polling_bus = dh_devices::MmioBus::new();
+        polling_bus
+            .register(
+                dh_devices::pad::PV_PAD_BASE,
+                Box::new(dh_devices::pad::PvPad::new()),
+            )
+            .unwrap();
+        assert_eq!(
+            frame_scheduled_irq_precondition(
+                &mut polling_bus,
+                &QueuedInputKind::PadSet {
+                    port: 0,
+                    buttons: 1,
+                    frame_hint: 12,
+                },
+            ),
+            None
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

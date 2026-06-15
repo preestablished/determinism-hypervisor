@@ -84,6 +84,11 @@ impl PvPad {
     pub fn frame_counter(&self) -> u32 {
         self.frame_counter
     }
+
+    /// Current edge IRQ vector; zero means disabled.
+    pub fn irq_vector(&self) -> u8 {
+        self.irq_vector as u8
+    }
 }
 
 impl DetDevice for PvPad {
