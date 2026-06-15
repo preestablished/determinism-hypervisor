@@ -38,11 +38,13 @@ vm-memory.workspace = true
 # importing the engines.
 detguest-host.workspace = true
 detguest-wire.workspace = true
+hyper-util.workspace = true
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }
 snapstore-server.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tower.workspace = true
 
 # Criterion perf benches (bead 9sb): fork / incremental snapshot /
 # restore latency distributions for the nightly perf-gate job (bead
