@@ -103,6 +103,8 @@ const MAX_CAPTURE_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_READ_GUEST_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const FRAMEBUFFER_DESCRIPTOR_BYTES: usize = 16;
+#[cfg(target_arch = "x86_64")]
+const MAX_RETAINED_GUEST_EVENTS_PER_SLOT: usize = 1024;
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:7401";
@@ -1851,6 +1853,54 @@ fn drained_guest_events_to_runtime(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn append_guest_events_with_retention_cap(
+    retained: &mut Vec<DrainedGuestEvent>,
+    events: Vec<DrainedGuestEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    retained.extend(events);
+    trim_guest_events_to_retention_cap(retained);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn trim_guest_events_to_retention_cap(events: &mut Vec<DrainedGuestEvent>) {
+    let overflow = events
+        .len()
+        .saturating_sub(MAX_RETAINED_GUEST_EVENTS_PER_SLOT);
+    if overflow != 0 {
+        events.drain(..overflow);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn select_stream_guest_events(
+    guest_events: &mut Vec<DrainedGuestEvent>,
+    streams: &[u32],
+) -> Vec<proto::GuestEvent> {
+    let stream_filter: std::collections::HashSet<u32> = streams.iter().copied().collect();
+    let want_all = stream_filter.is_empty();
+    let mut selected = Vec::new();
+    let mut retained = Vec::new();
+    for event in guest_events.drain(..) {
+        if want_all || stream_filter.contains(&event.stream) {
+            selected.push(proto::GuestEvent {
+                stream: event.stream,
+                icount: event.icount,
+                vns: event.vns,
+                payload: event.payload,
+            });
+        } else {
+            retained.push(event);
+        }
+    }
+    trim_guest_events_to_retention_cap(&mut retained);
+    *guest_events = retained;
+    selected
+}
+
+#[cfg(target_arch = "x86_64")]
 fn service_exit_with_detchannel(
     rail: &mut dh_vmm::recording::DeviceRail<RuntimeVmMem>,
     log_icount: u64,
@@ -2075,7 +2125,7 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
     runtime.bus = rail.bus;
     runtime.entropy = rail.entropy;
     runtime.log = Some(rail.log);
-    runtime.guest_events.extend(result?);
+    append_guest_events_with_retention_cap(&mut runtime.guest_events, result?);
     Ok(())
 }
 
@@ -3324,7 +3374,10 @@ impl HypervisorWorker for WorkerService {
                     runtime.bus = rail.bus;
                     runtime.entropy = rail.entropy;
                     runtime.log = Some(rail.log);
-                    runtime.guest_events.extend(drained_guest_events);
+                    append_guest_events_with_retention_cap(
+                        &mut runtime.guest_events,
+                        drained_guest_events,
+                    );
 
                     match run_result {
                         Ok(outcome) => {
@@ -3842,25 +3895,10 @@ impl HypervisorWorker for WorkerService {
                                 e,
                             ));
                         }
-                        let stream_filter: std::collections::HashSet<u32> =
-                            streams.into_iter().collect();
-                        let want_all = stream_filter.is_empty();
-                        let mut selected = Vec::new();
-                        let mut retained = Vec::new();
-                        for event in runtime.guest_events.drain(..) {
-                            if want_all || stream_filter.contains(&event.stream) {
-                                selected.push(proto::GuestEvent {
-                                    stream: event.stream,
-                                    icount: event.icount,
-                                    vns: event.vns,
-                                    payload: event.payload,
-                                });
-                            } else {
-                                retained.push(event);
-                            }
-                        }
-                        runtime.guest_events = retained;
-                        Ok(selected)
+                        Ok(select_stream_guest_events(
+                            &mut runtime.guest_events,
+                            &streams,
+                        ))
                     },
                 )
             })
@@ -4548,6 +4586,79 @@ mod tests {
         let err = descriptor_framebuffer_capture(truncated, 7).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("truncated"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn retained_test_event(stream: u32, sequence: u64) -> DrainedGuestEvent {
+        DrainedGuestEvent {
+            stream,
+            icount: sequence,
+            vns: sequence * 10,
+            payload: sequence.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn guest_event_retention_cap_keeps_newest_events() {
+        let mut retained = Vec::new();
+        append_guest_events_with_retention_cap(
+            &mut retained,
+            (0..MAX_RETAINED_GUEST_EVENTS_PER_SLOT + 3)
+                .map(|sequence| retained_test_event(sequence as u32, sequence as u64))
+                .collect(),
+        );
+
+        assert_eq!(retained.len(), MAX_RETAINED_GUEST_EVENTS_PER_SLOT);
+        assert_eq!(retained.first().unwrap().icount, 3);
+        assert_eq!(
+            retained.last().unwrap().icount,
+            (MAX_RETAINED_GUEST_EVENTS_PER_SLOT + 2) as u64
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stream_guest_events_filter_retains_unselected_and_consumes_selected() {
+        let beacon = detguest_wire::record::EventKind::Beacon as u32;
+        let frame_mark = detguest_wire::record::EventKind::FrameMark as u32;
+        let mut retained = vec![
+            retained_test_event(beacon, 1),
+            retained_test_event(frame_mark, 2),
+            retained_test_event(beacon, 3),
+        ];
+
+        let selected = select_stream_guest_events(&mut retained, &[beacon]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|event| event.icount)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(retained, vec![retained_test_event(frame_mark, 2)]);
+
+        let selected = select_stream_guest_events(&mut retained, &[beacon]);
+        assert!(selected.is_empty());
+        assert_eq!(retained, vec![retained_test_event(frame_mark, 2)]);
+
+        let selected = select_stream_guest_events(&mut retained, &[frame_mark]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].icount, 2);
+        assert!(retained.is_empty());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn filtered_guest_events_stay_capped() {
+        let mut retained: Vec<_> = (0..MAX_RETAINED_GUEST_EVENTS_PER_SLOT + 2)
+            .map(|sequence| retained_test_event(1, sequence as u64))
+            .collect();
+
+        let selected = select_stream_guest_events(&mut retained, &[2]);
+        assert!(selected.is_empty());
+        assert_eq!(retained.len(), MAX_RETAINED_GUEST_EVENTS_PER_SLOT);
+        assert_eq!(retained.first().unwrap().icount, 2);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5533,6 +5644,104 @@ mod tests {
                 saw_beacon = true;
             }
             assert!(saw_beacon, "device exercise should emit one Beacon event");
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stream_guest_events_retains_filtered_events_and_consumes_on_cancel() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::device_exercise_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use tokio_stream::StreamExt;
+
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(device_exercise_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xA7; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+            );
+
+            let mut filtered = svc
+                .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+                    lease: Some(lease.clone()),
+                    streams: vec![detguest_wire::record::EventKind::FrameMark as u32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(filtered.as_mut().next().await.is_none());
+            let retained_after_filter = svc
+                .inner
+                .runtimes
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime(|runtime| runtime.guest_events.len())
+                        .unwrap()
+                })
+                .unwrap();
+            assert_eq!(retained_after_filter, 1);
+
+            let response = svc
+                .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+                    lease: Some(lease.clone()),
+                    streams: vec![detguest_wire::record::EventKind::Beacon as u32],
+                }))
+                .await
+                .unwrap();
+            drop(response);
+            let retained_after_cancel = svc
+                .inner
+                .runtimes
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime(|runtime| runtime.guest_events.len())
+                        .unwrap()
+                })
+                .unwrap();
+            assert_eq!(retained_after_cancel, 0);
+
+            let mut after_cancel = svc
+                .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+                    lease: Some(lease.clone()),
+                    streams: vec![detguest_wire::record::EventKind::Beacon as u32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(after_cancel.as_mut().next().await.is_none());
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
         });
     }
 
