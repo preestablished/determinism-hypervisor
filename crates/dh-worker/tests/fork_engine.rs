@@ -121,6 +121,7 @@ fn fork_inherits_the_exact_machine_and_cow_isolates_host_writes() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c,
         None,
     )
@@ -161,6 +162,63 @@ fn fork_inherits_the_exact_machine_and_cow_isolates_host_writes() {
 }
 
 #[test]
+fn fork_can_start_child_segment_with_explicit_entropy_seed() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let sys = KvmSystem::open().unwrap();
+    let (parent, bus_p, entropy_p, config) = frozen_parent(&sys);
+    let child_seed = [0xA7; 32];
+
+    let mut bus_c = test_bus();
+    let outcome = fork_slot(
+        &sys,
+        &parent,
+        SlotState::Frozen,
+        &bus_p,
+        &entropy_p,
+        &config,
+        boundary(),
+        Some(child_seed),
+        &mut bus_c,
+        None,
+    )
+    .expect("fork with child seed");
+
+    assert_ne!(outcome.entropy.state(), entropy_p.state());
+    assert_eq!(outcome.entropy.state().seed, child_seed);
+    assert_eq!(outcome.entropy.state().stream, 0);
+    assert_eq!(outcome.entropy.state().word_pos, 0);
+    assert_eq!(
+        vcpu_state::capture(&outcome.child).unwrap(),
+        vcpu_state::capture(&parent).unwrap()
+    );
+    assert_eq!(bus_state(&bus_c), bus_state(&bus_p));
+
+    let mut bus_zero = test_bus();
+    let zero_seed_outcome = fork_slot(
+        &sys,
+        &parent,
+        SlotState::Frozen,
+        &bus_p,
+        &entropy_p,
+        &config,
+        boundary(),
+        Some([0; 32]),
+        &mut bus_zero,
+        None,
+    )
+    .expect("fork with explicit zero child seed");
+    assert_eq!(zero_seed_outcome.entropy.state(), entropy_p.state());
+    assert_eq!(
+        vcpu_state::capture(&zero_seed_outcome.child).unwrap(),
+        vcpu_state::capture(&parent).unwrap()
+    );
+    assert_eq!(bus_state(&bus_zero), bus_state(&bus_p));
+}
+
+#[test]
 fn guest_writes_in_the_child_cow_and_never_reach_the_parent() {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not usable");
@@ -196,6 +254,7 @@ fn guest_writes_in_the_child_cow_and_never_reach_the_parent() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c,
         None,
     )
@@ -250,6 +309,7 @@ fn second_child_sees_the_pristine_parent_after_first_child_diverged() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c1,
         None,
     )
@@ -273,6 +333,7 @@ fn second_child_sees_the_pristine_parent_after_first_child_diverged() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c2,
         None,
     )
@@ -312,6 +373,7 @@ fn fork_preconditions_fail_loudly() {
                 &entropy_p,
                 &config,
                 boundary(),
+                None,
                 &mut bus_c,
                 None,
             ),
@@ -332,6 +394,7 @@ fn fork_preconditions_fail_loudly() {
             &entropy_p,
             &config,
             b,
+            None,
             &mut bus_c,
             None,
         ),
@@ -350,6 +413,7 @@ fn fork_preconditions_fail_loudly() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut empty_bus,
         None,
     ) {
@@ -371,6 +435,7 @@ fn fork_preconditions_fail_loudly() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c,
         None,
     ) {
@@ -403,6 +468,7 @@ fn cow_children_cannot_be_frozen_or_re_forked() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c,
         None,
     )
@@ -423,6 +489,7 @@ fn cow_children_cannot_be_frozen_or_re_forked() {
         &outcome.entropy,
         &config,
         boundary(),
+        None,
         &mut bus_g,
         None,
     ) {
@@ -479,6 +546,7 @@ fn forked_child_snapshots_to_the_parents_exact_ref() {
         &entropy_p,
         &config,
         boundary(),
+        None,
         &mut bus_c,
         None,
     )

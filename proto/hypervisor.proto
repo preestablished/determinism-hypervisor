@@ -138,8 +138,9 @@ message RestoreSnapshotResponse {
 message ForkRequest {
   Lease parent           = 1;        // parent must be Paused; becomes Frozen
   uint32 count           = 2;        // 1..=remaining free slots
-  repeated bytes entropy_seeds = 3;  // count × 32 bytes (one per child; required —
-                                     //   forks exist to diversify, seeds make it explicit)
+  repeated bytes entropy_seeds = 3;  // empty ⇒ every child continues the fork-point PRNG;
+                                     //   otherwise count × 32 bytes. An all-zero child seed
+                                     //   continues; a non-zero seed starts that child segment.
 }
 message ForkResponse {
   repeated Lease children = 1;       // tier-A CoW forks (ARCHITECTURE §8.4)

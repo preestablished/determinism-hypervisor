@@ -228,6 +228,23 @@ mod tests {
         assert_eq!(restored_cfg.cpuid_table.len(), 1);
         assert_eq!(restored_cfg.device_set, vec![1, 4, 7]);
 
+        // §2.2 ForkRequest: per-child segment seeds are explicit wire bytes.
+        // The all-zero entry means "continue fork-point PRNG"; non-zero starts
+        // a fresh deterministic stream for that child.
+        let fork = v1::ForkRequest {
+            parent: Some(sample_lease()),
+            count: 2,
+            entropy_seeds: vec![vec![0; 32], vec![0xA7; 32]],
+        };
+        let fork_bytes = fork.encode_to_vec();
+        assert_eq!(
+            v1::ForkRequest::decode(fork_bytes.as_slice()).unwrap(),
+            fork
+        );
+        assert!(fork_bytes
+            .windows([0x1A, 0x20].len())
+            .any(|w| w == [0x1A, 0x20]));
+
         // frame_budget rides wire tag 8 (varint key 0x40) — pinned at the
         // byte level since the non-contiguous number is easy to "tidy".
         let only_frame_budget = v1::RunRequest {
