@@ -47,6 +47,7 @@ use dh_detclock::counter::InstRetired;
 use dh_devices::clock::{PvClock, DEVICE_ID_PV_CLOCK};
 use dh_devices::entropy::{DetEntropy, EntropyState, DEVICE_ID_PV_ENTROPY};
 use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, TimeSection};
+use dh_vmm::config::MachineConfig;
 use dh_vmm::dirty::{DirtyPageSet, PAGE_SIZE};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
@@ -97,6 +98,22 @@ pub struct RestoreOutcome {
     pub entropy: DetEntropy,
 }
 
+/// Recover the `MachineConfig` embedded in a snapshot's DHSNAP `MCFG`
+/// section. `dh-workerd` uses this before restore so
+/// `RestoreSnapshotResponse.config` comes from the snapshot itself, not
+/// caller-supplied memory.
+pub fn recover_machine_config(
+    snapshot_ref: SnapshotRef,
+    store: &SnapstoreClient,
+) -> Result<MachineConfig, RestoreError> {
+    let container_bytes = store
+        .get_snapshot(snapshot_ref)
+        .map_err(|e| RestoreError::Store(format!("get_snapshot: {e}")))?;
+    let manifest = snapstore_manifest::Manifest::decode(&container_bytes)
+        .map_err(|e| RestoreError::Codec(format!("manifest: {e}")))?;
+    recover_machine_config_from_blob(&manifest.device_blob)
+}
+
 /// One RestoreSnapshot, end to end. On success the slot holds exactly the
 /// snapshot's state, Paused at a boundary with segment-relative icount 0.
 /// On error the slot's contents are UNDEFINED (RAM, devices, or vCPU may
@@ -136,17 +153,7 @@ pub fn restore_snapshot(
         )));
     }
     let blob = &manifest.device_blob;
-    if blob.format != DEVICE_BLOB_FORMAT_DHSNAP {
-        return Err(RestoreError::Codec(format!(
-            "device blob format {:#010x} is not DHSNAP ({DEVICE_BLOB_FORMAT_DHSNAP:#010x})",
-            blob.format
-        )));
-    }
-    if blob.zstd || blob.raw_len != blob.bytes.len() as u64 {
-        return Err(RestoreError::Codec(
-            "device blob is compressed or length-inconsistent (engine writes plain)".into(),
-        ));
-    }
+    validate_dhsnap_blob(blob)?;
 
     // ── 2. RAM (§8.3 step 2): flattened pages → the live mapping ─────────
     // mem_bytes is page-multiple by SlotVm construction; keep the
@@ -208,6 +215,50 @@ pub(crate) struct AppliedMachine {
     pub entropy: DetEntropy,
 }
 
+fn validate_dhsnap_blob(blob: &snapstore_manifest::DeviceBlob) -> Result<(), RestoreError> {
+    if blob.format != DEVICE_BLOB_FORMAT_DHSNAP {
+        return Err(RestoreError::Codec(format!(
+            "device blob format {:#010x} is not DHSNAP ({DEVICE_BLOB_FORMAT_DHSNAP:#010x})",
+            blob.format
+        )));
+    }
+    if blob.zstd || blob.raw_len != blob.bytes.len() as u64 {
+        return Err(RestoreError::Codec(
+            "device blob is compressed or length-inconsistent (engine writes plain)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_machine_config_from_blob(
+    blob: &snapstore_manifest::DeviceBlob,
+) -> Result<MachineConfig, RestoreError> {
+    validate_dhsnap_blob(blob)?;
+    recover_machine_config_from_dhsnap(&blob.bytes)
+}
+
+fn recover_machine_config_from_dhsnap(dhsnap_bytes: &[u8]) -> Result<MachineConfig, RestoreError> {
+    let dhsnap = Container::parse(dhsnap_bytes)
+        .map_err(|e| RestoreError::Codec(format!("DHSNAP: {e:?}")))?;
+    let mcfg = dhsnap
+        .get(tag::MCFG)
+        .ok_or_else(|| RestoreError::Codec("missing MCFG section".into()))?;
+    decode_machine_config_section(mcfg)
+}
+
+fn decode_machine_config_section(
+    section: &dh_snapshot::dhsnap::Section<'_>,
+) -> Result<MachineConfig, RestoreError> {
+    if section.sec_version != 1 {
+        return Err(RestoreError::Codec(format!(
+            "MCFG v{} is not supported",
+            section.sec_version
+        )));
+    }
+    MachineConfig::canonical_decode(section.contents)
+        .map_err(|e| RestoreError::Codec(format!("MCFG decode: {e:?}")))
+}
+
 /// Steps 3–6 of §8.3 — decode the DHSNAP and stuff devices + vCPU into a
 /// slot whose RAM is ALREADY the snapshot's bytes (materialized from the
 /// store on the tier-B path, or CoW-shared with a frozen parent on the
@@ -237,6 +288,7 @@ pub(crate) fn apply_dhsnap(
     // from. The engine refuses to guess: a mismatch means this snapshot
     // belongs to a different machine.
     let mcfg = section(tag::MCFG)?;
+    decode_machine_config_section(mcfg)?;
     let expected = machine_config
         .canonical_encode()
         .map_err(|e| RestoreError::Codec(format!("MCFG encode: {e:?}")))?;

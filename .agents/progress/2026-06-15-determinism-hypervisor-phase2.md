@@ -189,3 +189,56 @@ Remaining:
   real `CreateVm`/`RestoreSnapshot`/`Fork` construction paths.
 - `rfv` remains blocked by `p8g` image/kernel resolution, `797` MCFG decode, and
   `3pk` fork entropy semantics before full API success can be claimed.
+
+## Iteration 105: `determinism-hypervisor-797` MCFG decode
+
+Branch: `ralph/iteration-105-dhsnap-mcfg-decode`, stacked on
+`ralph/iteration-104-dh-workerd-runtime-table`.
+
+Beads:
+
+- Checked `bd list` before starting this resumed session.
+- Claimed `determinism-hypervisor-797`, the RestoreSnapshotResponse MCFG
+  recovery blocker for `determinism-hypervisor-rfv`.
+
+Two subagent reviews were completed for the current plan:
+
+- Dependency-order review confirmed that `8kb` remains the correct runtime-table
+  track, but the new `iteration-105` branch should stay scoped to `797`.
+- Implementation review recommended `RestoreSnapshot` runtime-table population
+  as the next larger service slice, with `797` MCFG decode as a mandatory
+  prerequisite and `p8g`/`3pk` left explicit for CreateVm/Fork.
+
+Implementation progress:
+
+- Added `MachineConfig::canonical_decode` in `dh-vmm`, the exact inverse of the
+  frozen v1 canonical MCFG encoding. It validates the reconstructed config,
+  rejects trailing/non-canonical bytes, supports ELF and BzImage boot variants,
+  and recovers landing-only knobs to defaults because they are intentionally
+  excluded from the preimage.
+- Added `dh_worker::restore_engine::recover_machine_config`, which fetches the
+  snapshot manifest from the real snapshot-store, validates the DHSNAP device
+  blob, parses the `MCFG` section, checks `sec_version == 1`, and returns the
+  decoded domain `MachineConfig`.
+- Tightened `apply_dhsnap` so restore now decodes and validates the `MCFG`
+  section before comparing it with the caller-built slot config.
+- Added a snapshot-store-backed recovery test using a crafted DHSNAP `MCFG`
+  container, plus pure `dh-vmm` decoder round-trip and rejection tests.
+
+Verification:
+
+- `cargo test -p dh-vmm canonical_decode -- --nocapture`
+- `cargo test -p dh-worker recovers_machine_config_from_snapshot_mcfg -- --nocapture`
+- `cargo test -p dh-worker --test restore_engine -- --nocapture`
+- `cargo fmt --check -p dh-vmm -p dh-worker`
+- `cargo check -p dh-worker`
+- `cargo test -p dh-vmm config -- --nocapture`
+
+Remaining surfaced by this slice:
+
+- The domain `MachineConfig` canonical MCFG includes `cpuid_table` and
+  `device_set`, but the current public proto `MachineConfig` does not expose
+  those fields. Do not add a lossy mapper silently when wiring
+  `RestoreSnapshotResponse.config`; track and resolve the wire-shape decision
+  before claiming full `rfv` lifecycle success. Filed as
+  `determinism-hypervisor-ysm`, now an `rfv` dependency.
