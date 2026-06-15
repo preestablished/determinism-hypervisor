@@ -59,6 +59,8 @@ pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
 #[cfg(target_arch = "x86_64")]
 pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
+#[cfg(target_arch = "x86_64")]
+const VERIFY_REPLAY_INLINE_LOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 type ResponseStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -171,6 +173,8 @@ struct WorkerInner {
     image_resolver: ImageResolver,
     #[cfg(target_arch = "x86_64")]
     store: Option<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>>,
+    #[cfg(target_arch = "x86_64")]
+    snapstore_transport: Option<snapstore_client::Transport>,
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
@@ -187,6 +191,7 @@ impl WorkerService {
         #[cfg(target_arch = "x86_64")]
         let store = config
             .snapstore
+            .clone()
             .map(snapstore_client::blocking::SnapstoreClient::connect)
             .transpose()
             .map_err(|e| ConfigError::Store(e.to_string()))?
@@ -200,6 +205,8 @@ impl WorkerService {
                 image_resolver: ImageResolver::new(config.image_cache_dir),
                 #[cfg(target_arch = "x86_64")]
                 store,
+                #[cfg(target_arch = "x86_64")]
+                snapstore_transport: config.snapstore,
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -220,6 +227,14 @@ impl WorkerService {
     fn store(&self) -> Result<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>, Status> {
         self.inner
             .store
+            .clone()
+            .ok_or_else(|| unavailable_status("snapshot-store"))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn snapstore_transport(&self) -> Result<snapstore_client::Transport, Status> {
+        self.inner
+            .snapstore_transport
             .clone()
             .ok_or_else(|| unavailable_status("snapshot-store"))
     }
@@ -507,6 +522,31 @@ fn log_id_from_bytes(bytes: Vec<u8>) -> Result<snapstore_types::LogId, Status> {
 }
 
 #[cfg(target_arch = "x86_64")]
+enum VerifyReplayLogInput {
+    Inline(Vec<u8>),
+    Stored(snapstore_types::LogId),
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_replay_log_input(
+    log: Option<proto::verify_replay_request::Log>,
+) -> Result<VerifyReplayLogInput, Status> {
+    use proto::verify_replay_request::Log as WireLog;
+    match log.ok_or_else(|| Status::invalid_argument("VerifyReplay.log is required"))? {
+        WireLog::InputLog(bytes) => {
+            if bytes.len() > VERIFY_REPLAY_INLINE_LOG_MAX_BYTES {
+                return Err(Status::invalid_argument(format!(
+                    "VerifyReplay.input_log exceeds {} bytes",
+                    VERIFY_REPLAY_INLINE_LOG_MAX_BYTES
+                )));
+            }
+            Ok(VerifyReplayLogInput::Inline(bytes))
+        }
+        WireLog::InputLogId(id) => log_id_from_bytes(id).map(VerifyReplayLogInput::Stored),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn input_log_payload_from_container(container: &[u8]) -> Result<Vec<u8>, Status> {
     let container = snapstore_manifest::input_log::InputLogContainer::decode(container)
         .map_err(|e| Status::data_loss(format!("input log container decode failed: {e}")))?;
@@ -518,6 +558,22 @@ fn input_log_payload_from_container(container: &[u8]) -> Result<Vec<u8>, Status>
         )));
     }
     Ok(container.payload().to_vec())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_replay_log_bytes(
+    input: VerifyReplayLogInput,
+    store: &snapstore_client::blocking::SnapstoreClient,
+) -> Result<Vec<u8>, Status> {
+    match input {
+        VerifyReplayLogInput::Inline(bytes) => Ok(bytes),
+        VerifyReplayLogInput::Stored(log_id) => {
+            let container = store
+                .get_input_log(log_id)
+                .map_err(|e| store_error_to_status("get_input_log", e))?;
+            input_log_payload_from_container(&container)
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -594,7 +650,48 @@ fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn verify_progress_to_proto(progress: VerifyProgress) -> proto::VerifyReplayProgress {
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_log_header_matches_request(
+    header: &dh_inputlog::reader::Header,
+    base_snapshot: &snapstore_types::SnapshotRef,
+    config: &dh_vmm::config::MachineConfig,
+) -> Result<(), Status> {
+    if header.base_snapshot_id != base_snapshot.to_bytes() {
+        return Err(Status::failed_precondition(
+            "DHILOG header base_snapshot_id does not match VerifyReplay.base",
+        ));
+    }
+    let config_hash = config
+        .config_hash()
+        .map_err(|e| Status::invalid_argument(format!("MachineConfig hash: {e:?}")))?;
+    if header.machine_config_hash != config_hash {
+        return Err(Status::failed_precondition(
+            "DHILOG header machine_config_hash does not match base snapshot config",
+        ));
+    }
+    if header.clock_num != config.clock.num() || header.clock_den != config.clock.den() {
+        return Err(Status::failed_precondition(
+            "DHILOG header clock ratio does not match base snapshot config",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_progress_to_proto(
+    progress: VerifyProgress,
+    bisect_on_divergence: bool,
+) -> Result<proto::VerifyReplayProgress, Status> {
     use proto::verify_replay_progress::Msg;
     let msg = match progress {
         VerifyProgress::EpochOk {
@@ -620,22 +717,108 @@ fn verify_progress_to_proto(progress: VerifyProgress) -> proto::VerifyReplayProg
             expected,
             got,
         } => {
-            let mut reg_diff = Vec::with_capacity(64);
-            reg_diff.extend_from_slice(&expected);
-            reg_diff.extend_from_slice(&got);
+            if bisect_on_divergence {
+                return Err(Status::unimplemented(
+                    "VerifyReplay divergence bisection is M8 and is not implemented yet; retry without bisection",
+                ));
+            }
+            let first_bad_epoch_value = first_bad_epoch.unwrap_or(0);
+            let first_bad_epoch_note = first_bad_epoch
+                .map(|epoch| epoch.to_string())
+                .unwrap_or_else(|| "none".into());
             Msg::Divergence(proto::Divergence {
-                first_bad_epoch: first_bad_epoch.unwrap_or(u64::MAX),
+                first_bad_epoch: first_bad_epoch_value,
                 icount_lo: at_icount,
                 icount_hi: at_icount,
                 rip_expected: 0,
                 rip_actual: 0,
-                reg_diff,
+                reg_diff: Vec::new(),
                 diff_page_idx: Vec::new(),
-                suspected_cause: what.into(),
+                suspected_cause: format!(
+                    "coarse:{what}; first_bad_epoch={first_bad_epoch_note}; expected_hash={}; got_hash={}",
+                    hex32(&expected),
+                    hex32(&got)
+                ),
             })
         }
     };
-    proto::VerifyReplayProgress { msg: Some(msg) }
+    Ok(proto::VerifyReplayProgress { msg: Some(msg) })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_verify_replay_on_current_thread(
+    core: u32,
+    base_snapshot: snapstore_types::SnapshotRef,
+    log_input: VerifyReplayLogInput,
+    transport: snapstore_client::Transport,
+    image_resolver: ImageResolver,
+    bisect_on_divergence: bool,
+) -> Result<Vec<proto::VerifyReplayProgress>, Status> {
+    let store = snapstore_client::blocking::SnapstoreClient::connect(transport)
+        .map_err(|e| store_error_to_status("connect snapstore", e))?;
+    let log_bytes = verify_replay_log_bytes(log_input, &store)?;
+    let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
+        .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
+    let header = reader.header().clone();
+    let log_writer = log_writer_from_reader_header(&header);
+    drop(reader);
+
+    let config = crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
+        .map_err(restore_engine_error_to_status)?;
+    verify_log_header_matches_request(&header, &base_snapshot, &config)?;
+    let assets = image_resolver
+        .resolve_create_vm(&config)
+        .map_err(image_error_to_status)?;
+    let sys = dh_vmm::kvm::KvmSystem::open().map_err(|e| kvm_error_to_status("open KVM", e))?;
+    if !sys.dirty_ring {
+        return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+    }
+    dh_vmm::run::install_kick_handler()
+        .map_err(|e| Status::failed_precondition(format!("install kick handler: {e}")))?;
+    dh_vmm::run::pin_current_thread(core).map_err(|e| {
+        Status::failed_precondition(format!("pin VerifyReplay to core {core}: {e:?}"))
+    })?;
+    let _ = dh_vmm::run::set_current_thread_fifo();
+    let mut slot = sys
+        .create_slot_vm(config.mem_bytes)
+        .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+    let bus = build_bus(&config, assets.base_image)?;
+    let rail = dh_vmm::recording::DeviceRail::new(
+        bus,
+        dh_devices::entropy::DetEntropy::from_seed([0; 32]),
+        log_writer,
+        RuntimeVmMem(slot.guest_mem.clone()),
+    );
+    let counter = dh_detclock::counter::InstRetired::open_for_current_thread()
+        .map_err(|e| Status::failed_precondition(format!("open InstRetired: {e:?}")))?;
+    counter
+        .route_overflow_to_thread(dh_vmm::run::current_tid(), dh_vmm::run::kick_signal())
+        .map_err(|e| Status::failed_precondition(format!("route InstRetired overflow: {e:?}")))?;
+    counter
+        .reset()
+        .map_err(|e| Status::failed_precondition(format!("reset InstRetired: {e:?}")))?;
+    counter
+        .arm_period(dh_detclock::counter::NEVER_FIRES_PERIOD)
+        .map_err(|e| Status::failed_precondition(format!("arm InstRetired: {e:?}")))?;
+    counter
+        .enable()
+        .map_err(|e| Status::failed_precondition(format!("enable InstRetired: {e:?}")))?;
+
+    let report = crate::verify_replay::verify_replay(
+        &mut slot,
+        rail,
+        &config,
+        base_snapshot,
+        &counter,
+        &store,
+        &log_bytes,
+    )
+    .map_err(replay_error_to_status)?;
+    report
+        .events
+        .into_iter()
+        .map(|event| verify_progress_to_proto(event, bisect_on_divergence))
+        .collect()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2276,98 +2459,76 @@ impl HypervisorWorker for WorkerService {
     ) -> Result<Response<Self::VerifyReplayStream>, Status> {
         #[cfg(target_arch = "x86_64")]
         {
-            use proto::verify_replay_request::Log as WireLog;
-
             let request = request.into_inner();
             let base_snapshot = snapshot_ref_from_proto(request.base)?;
-            let wire_log = request
-                .log
-                .ok_or_else(|| Status::invalid_argument("VerifyReplay.log is required"))?;
-            let store = self.store()?;
+            let log_input = verify_replay_log_input(request.log)?;
+            let bisect_on_divergence = request.bisect_on_divergence;
+            let transport = self.snapstore_transport()?;
             let image_resolver = self.inner.image_resolver.clone();
-            let events = blocking_lifecycle("VerifyReplay", move || {
-                let log_bytes = match wire_log {
-                    WireLog::InputLog(bytes) => bytes,
-                    WireLog::InputLogId(id) => {
-                        let log_id = log_id_from_bytes(id)?;
-                        let store = store.lock().map_err(|_| {
-                            Status::internal("snapshot-store client mutex poisoned")
-                        })?;
-                        let container = store
-                            .get_input_log(log_id)
-                            .map_err(|e| store_error_to_status("get_input_log", e))?;
-                        input_log_payload_from_container(&container)?
-                    }
-                };
-                let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
-                    .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
-                let log_writer = log_writer_from_reader_header(reader.header());
-                drop(reader);
-
-                let store = store
-                    .lock()
-                    .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
-                let config =
-                    crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
-                        .map_err(restore_engine_error_to_status)?;
-                let assets = image_resolver
-                    .resolve_create_vm(&config)
-                    .map_err(image_error_to_status)?;
-                let sys = dh_vmm::kvm::KvmSystem::open()
-                    .map_err(|e| kvm_error_to_status("open KVM", e))?;
-                if !sys.dirty_ring {
-                    return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+            let manager = self.inner.manager.clone();
+            let reserved_at_ms = lease_now_ms();
+            let verify_lease = manager
+                .allocate(reserved_at_ms)
+                .map_err(slot_error_to_status)?;
+            let core = match runtime_core(manager.as_ref(), verify_lease.slot_id) {
+                Ok(core) => core,
+                Err(e) => {
+                    let cleanup = manager
+                        .destroy(&verify_lease, lease_now_ms())
+                        .map_err(slot_error_to_status);
+                    return Err(original_or_rollback("VerifyReplay", e, cleanup));
                 }
-                dh_vmm::run::install_kick_handler().map_err(|e| {
-                    Status::failed_precondition(format!("install kick handler: {e}"))
-                })?;
-                let mut slot = sys
-                    .create_slot_vm(config.mem_bytes)
-                    .map_err(|e| kvm_error_to_status("create slot VM", e))?;
-                let bus = build_bus(&config, assets.base_image)?;
-                let rail = dh_vmm::recording::DeviceRail::new(
-                    bus,
-                    dh_devices::entropy::DetEntropy::from_seed([0; 32]),
-                    log_writer,
-                    RuntimeVmMem(slot.guest_mem.clone()),
-                );
-                let counter = dh_detclock::counter::InstRetired::open_for_current_thread()
-                    .map_err(|e| Status::failed_precondition(format!("open InstRetired: {e:?}")))?;
-                counter
-                    .route_overflow_to_thread(
-                        dh_vmm::run::current_tid(),
-                        dh_vmm::run::kick_signal(),
-                    )
-                    .map_err(|e| {
-                        Status::failed_precondition(format!("route InstRetired overflow: {e:?}"))
-                    })?;
-                counter.reset().map_err(|e| {
-                    Status::failed_precondition(format!("reset InstRetired: {e:?}"))
-                })?;
-                counter
-                    .arm_period(dh_detclock::counter::NEVER_FIRES_PERIOD)
-                    .map_err(|e| Status::failed_precondition(format!("arm InstRetired: {e:?}")))?;
-                counter.enable().map_err(|e| {
-                    Status::failed_precondition(format!("enable InstRetired: {e:?}"))
-                })?;
+            };
 
-                let report = crate::verify_replay::verify_replay(
-                    &mut slot,
-                    rail,
-                    &config,
-                    base_snapshot,
-                    &counter,
-                    &store,
-                    &log_bytes,
-                )
-                .map_err(replay_error_to_status)?;
-                Ok(report
-                    .events
-                    .into_iter()
-                    .map(verify_progress_to_proto)
-                    .collect::<Vec<_>>())
-            })
-            .await?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let thread_manager = manager.clone();
+            let thread_lease = verify_lease.clone();
+            let cleanup_manager = manager.clone();
+            let cleanup_lease = verify_lease.clone();
+            let spawn = std::thread::Builder::new()
+                .name(format!("dh-verify-{}", verify_lease.slot_id))
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_verify_replay_on_current_thread(
+                            core,
+                            base_snapshot,
+                            log_input,
+                            transport,
+                            image_resolver,
+                            bisect_on_divergence,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err(Status::internal("VerifyReplay thread panicked")));
+                    let cleanup = thread_manager
+                        .destroy(&thread_lease, lease_now_ms())
+                        .map_err(slot_error_to_status);
+                    let result = match result {
+                        Ok(events) => match cleanup {
+                            Ok(()) => Ok(events),
+                            Err(cleanup) => Err(Status::internal(format!(
+                                "VerifyReplay succeeded but slot cleanup failed with {}: {}",
+                                cleanup.code(),
+                                cleanup.message()
+                            ))),
+                        },
+                        Err(e) => Err(original_or_rollback("VerifyReplay", e, cleanup)),
+                    };
+                    let _ = tx.send(result);
+                });
+            if let Err(e) = spawn {
+                let cleanup = cleanup_manager
+                    .destroy(&cleanup_lease, lease_now_ms())
+                    .map_err(slot_error_to_status);
+                return Err(original_or_rollback(
+                    "VerifyReplay",
+                    Status::internal(format!("start VerifyReplay thread: {e}")),
+                    cleanup,
+                ));
+            }
+
+            let events = rx
+                .await
+                .map_err(|_| Status::internal("VerifyReplay thread ended without response"))??;
             let stream = tokio_stream::iter(events.into_iter().map(Ok));
             Ok(Response::new(Box::pin(stream) as Self::VerifyReplayStream))
         }
@@ -3123,9 +3284,10 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
+            let base_lease = created.lease.unwrap();
             let base_snapshot = svc
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: created.lease,
+                    lease: Some(base_lease.clone()),
                     seal_input_log: Some(true),
                     capture: None,
                 }))
@@ -3134,6 +3296,11 @@ mod tests {
                 .into_inner()
                 .snapshot
                 .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(base_lease),
+            }))
+            .await
+            .unwrap();
 
             let restored = svc
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
@@ -3188,6 +3355,90 @@ mod tests {
             assert_eq!(done.total_icount, 50_000);
             assert_eq!(done.end_state_hash.unwrap().hash.len(), 32);
         });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn verify_replay_rejects_oversized_inline_log_before_resources() {
+        let svc = WorkerService::new(test_config(1)).unwrap();
+        let err = match svc
+            .verify_replay(Request::new(proto::VerifyReplayRequest {
+                base: Some(proto::SnapshotRef { hash: vec![0; 32] }),
+                log: Some(proto::verify_replay_request::Log::InputLog(vec![
+                    0;
+                    VERIFY_REPLAY_INLINE_LOG_MAX_BYTES
+                        + 1
+                ])),
+                bisect_on_divergence: false,
+            }))
+            .await
+        {
+            Ok(_) => panic!("oversized inline log must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("VerifyReplay.input_log exceeds"));
+        assert_eq!(svc.slots_free(), 1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_requires_worker_slot_capacity() {
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+        let _held = svc.slot_manager().allocate(0).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let err = match svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(proto::SnapshotRef { hash: vec![0; 32] }),
+                    log: Some(proto::verify_replay_request::Log::InputLog(vec![0; 256])),
+                    bisect_on_divergence: false,
+                }))
+                .await
+            {
+                Ok(_) => panic!("VerifyReplay must require a free worker slot"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_divergence_mapping_is_honest_about_bisection() {
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+
+        let divergence = VerifyProgress::Divergence {
+            first_bad_epoch: None,
+            at_icount: 123,
+            what: "end_state_hash",
+            expected: [0x11; 32],
+            got: [0x22; 32],
+        };
+        let err = verify_progress_to_proto(divergence.clone(), true).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("bisection"));
+
+        let progress = verify_progress_to_proto(divergence, false).unwrap();
+        let div = match progress.msg.unwrap() {
+            VerifyMsg::Divergence(div) => div,
+            other => panic!("expected Divergence, got {other:?}"),
+        };
+        assert_eq!(div.first_bad_epoch, 0);
+        assert_eq!(div.icount_lo, 123);
+        assert_eq!(div.icount_hi, 123);
+        assert!(div.reg_diff.is_empty());
+        assert!(div.diff_page_idx.is_empty());
+        assert!(div.suspected_cause.contains("first_bad_epoch=none"));
+        assert!(div.suspected_cause.contains("expected_hash="));
+        assert!(div.suspected_cause.contains("got_hash="));
     }
 
     #[cfg(target_arch = "x86_64")]
