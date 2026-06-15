@@ -512,6 +512,31 @@ impl SlotManager {
         Ok(())
     }
 
+    /// Run completion crossing: publish Paused together with the final
+    /// deterministic position so WatchSlots observers do not see a stale
+    /// boundary for the transition that matters most.
+    pub fn mark_paused_at_position(
+        &self,
+        lease: &Lease,
+        icount: u64,
+        base_snapshot_id: Option<[u8; 32]>,
+        now_ms: u64,
+    ) -> Result<(), SlotError> {
+        let event = {
+            let mut slots = self.slots.lock().expect("slot table poisoned");
+            let entry = slots
+                .get_mut(lease.slot_id as usize)
+                .ok_or(SlotError::NoSuchSlot(lease.slot_id))?;
+            Self::validate_entry(entry, lease, now_ms)?;
+            entry.icount = icount;
+            entry.base_snapshot_id = base_snapshot_id;
+            entry.state = entry.state.transition(SlotState::Paused)?;
+            Self::info_of(entry, lease.slot_id)
+        };
+        self.publish([event]);
+        Ok(())
+    }
+
     /// Record the slot's deterministic position (boundary icount + the
     /// segment's base snapshot) for §2.8 introspection.
     pub fn set_position(

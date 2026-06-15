@@ -29,8 +29,22 @@
 use dh_detclock::counter::{CounterError, InstRetired, NEVER_FIRES_PERIOD};
 use kvm_bindings::kvm_guest_debug;
 use kvm_ioctls::{VcpuExit, VcpuFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::run::{clear_immediate_exit, KickGuard};
+
+static LANDING_SINGLE_STEPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of KVM entries made with guest single-step enabled
+/// by the boundary/injection machinery. `dh-workerd` exports this as the
+/// ARCH §9 landing single-step telemetry.
+pub fn landing_single_steps_total() -> u64 {
+    LANDING_SINGLE_STEPS_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_single_step_entry() {
+    LANDING_SINGLE_STEPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 /// §3.2 margins (MachineConfig fields; defaults are the doc's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +173,7 @@ pub fn land_at(
                 set_singlestep(&mut guard, true)?;
                 stepping = true;
             }
+            record_single_step_entry();
             match guard.run() {
                 // One step. The counter re-read at loop top is the ONLY
                 // progress signal (never assume +1; REP rule).
@@ -241,6 +256,7 @@ pub fn step_one_entry(
     let mut guard = KickGuard::register(vcpu);
     set_singlestep(&mut guard, true)?;
     let result = loop {
+        record_single_step_entry();
         match guard.run() {
             Ok(VcpuExit::Debug(_)) => break Ok(()),
             Ok(exit) => {
@@ -378,6 +394,7 @@ mod tests {
         )
         .unwrap();
         // Near target: under skid+slack, never arms a real period.
+        let steps_before = landing_single_steps_total();
         let b = land_at(
             &mut slot.vcpu,
             &counter,
@@ -387,6 +404,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b.icount, 100_123);
+        assert!(
+            landing_single_steps_total() > steps_before,
+            "near landing must publish single-step telemetry"
+        );
     }
 
     #[test]

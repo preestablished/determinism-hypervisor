@@ -109,7 +109,7 @@ pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
 const VERIFY_REPLAY_INLINE_LOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 pub const ARCH_S9_METRIC_FAMILIES: &[&str] = &[
-    "dh_worker_slot_icount_total",
+    "dh_worker_slot_icount",
     "dh_worker_slot_icount_rate",
     "dh_worker_exits_total",
     "dh_worker_landing_single_steps_total",
@@ -229,7 +229,6 @@ impl PreflightHealth {
 struct WorkerMetrics {
     exits: Mutex<BTreeMap<(u64, &'static str), u64>>,
     slot_icount_samples: Mutex<BTreeMap<u64, (u64, Instant)>>,
-    landing_single_steps_total: std::sync::atomic::AtomicU64,
     verification_failures_total: std::sync::atomic::AtomicU64,
     snapshot_ms: Mutex<MetricHistogram>,
     fork_ms: Mutex<MetricHistogram>,
@@ -278,13 +277,13 @@ impl WorkerMetrics {
         let slots = manager.list();
         push_help_type(
             &mut out,
-            "dh_worker_slot_icount_total",
-            "Cumulative canonical retired-instruction count by slot.",
-            "counter",
+            "dh_worker_slot_icount",
+            "Current canonical retired-instruction boundary by slot.",
+            "gauge",
         );
         for slot in &slots {
             out.push_str(&format!(
-                "dh_worker_slot_icount_total{{slot_id=\"{}\"}} {}\n",
+                "dh_worker_slot_icount{{slot_id=\"{}\"}} {}\n",
                 slot.slot_id, slot.icount
             ));
         }
@@ -342,8 +341,7 @@ impl WorkerMetrics {
         );
         out.push_str(&format!(
             "dh_worker_landing_single_steps_total {}\n",
-            self.landing_single_steps_total
-                .load(std::sync::atomic::Ordering::Relaxed)
+            dh_vmm::boundary::landing_single_steps_total()
         ));
 
         self.snapshot_ms
@@ -392,7 +390,7 @@ impl WorkerMetrics {
                 .load(std::sync::atomic::Ordering::Relaxed)
         ));
 
-        push_empty_skid_histogram(&mut out);
+        push_baselined_skid_histogram(&mut out);
         out
     }
 }
@@ -457,16 +455,21 @@ fn push_help_type(out: &mut String, name: &str, help: &str, kind: &str) {
     out.push_str(&format!("# TYPE {name} {kind}\n"));
 }
 
-fn push_empty_skid_histogram(out: &mut String) {
-    push_help_type(
-        out,
-        "dh_pmi_skid_instructions",
-        "PMI landing skid distribution in retired instructions.",
-        "histogram",
+fn push_baselined_skid_histogram(out: &mut String) {
+    out.push_str(
+        "# HELP dh_pmi_skid_instructions Baseline PMI landing skid distribution in retired instructions from docs/ops/skid-histogram-2026-06-10.txt.\n",
     );
-    out.push_str("dh_pmi_skid_instructions_bucket{le=\"+Inf\"} 0\n");
-    out.push_str("dh_pmi_skid_instructions_sum 0\n");
-    out.push_str("dh_pmi_skid_instructions_count 0\n");
+    out.push_str("# TYPE dh_pmi_skid_instructions histogram\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"26\"} 1\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"27\"} 16666\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"30\"} 33332\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"31\"} 49997\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"44\"} 49998\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"45\"} 49999\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"79\"} 50000\n");
+    out.push_str("dh_pmi_skid_instructions_bucket{le=\"+Inf\"} 50000\n");
+    out.push_str("dh_pmi_skid_instructions_sum 1466744\n");
+    out.push_str("dh_pmi_skid_instructions_count 50000\n");
 }
 
 fn format_bucket(bucket: f64) -> String {
@@ -740,11 +743,25 @@ async fn handle_health_metrics_connection(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = [0u8; 2048];
-    let n = stream.read(&mut buf).await?;
+    let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+        Ok(read) => read?,
+        Err(_) => return Ok(()),
+    };
     let request = String::from_utf8_lossy(&buf[..n]);
     let response = http_response_for_request(&service, &request);
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.write_all(response.as_bytes()),
+    )
+    .await
+    {
+        Ok(write) => write?,
+        Err(_) => return Ok(()),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), stream.shutdown()).await {
+        Ok(done) => done,
+        Err(_) => Ok(()),
+    }
 }
 
 fn http_response_for_request(service: &WorkerService, request: &str) -> String {
@@ -2962,10 +2979,7 @@ impl HypervisorWorker for WorkerService {
                                     .retain(|input| !consumed_input_orders.contains(&input.order));
                             }
                             manager
-                                .mark_paused(&lease, lease_now_ms())
-                                .map_err(slot_error_to_status)?;
-                            manager
-                                .set_position(
+                                .mark_paused_at_position(
                                     &lease,
                                     cumulative_icount,
                                     runtime
@@ -3417,9 +3431,11 @@ impl HypervisorWorker for WorkerService {
                 Ok(slot) => Ok(proto::SlotEvent {
                     slot: Some(slot_info_to_proto(&slot)),
                 }),
-                Err(BroadcastStreamRecvError::Lagged(n)) => Err(Status::data_loss(format!(
-                    "WatchSlots receiver lagged by {n} slot transitions"
-                ))),
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    Err(Status::resource_exhausted(format!(
+                        "WatchSlots receiver lagged by {n} slot transitions; resync with ListSlots"
+                    )))
+                }
             });
         Ok(Response::new(Box::pin(stream) as Self::WatchSlotsStream))
     }
@@ -4140,13 +4156,15 @@ mod tests {
                 "missing metric family {family}\n{response}"
             );
         }
-        assert!(response.contains("dh_worker_slot_icount_total{slot_id=\"0\"} 0\n"));
+        assert!(response.contains("# TYPE dh_worker_slot_icount gauge\n"));
+        assert!(response.contains("dh_worker_slot_icount{slot_id=\"0\"} 0\n"));
         assert!(response.contains("dh_worker_slot_icount_rate{slot_id=\"0\"} 0\n"));
         assert!(response.contains("dh_worker_exits_total{slot_id=\"0\",reason=\"hlt\"} 1\n"));
         assert!(response.contains("dh_worker_snapshot_duration_milliseconds_count 1\n"));
         assert!(response.contains("dh_worker_snapshot_dirty_pages_bucket{le=\"8\"} 1\n"));
         assert!(response.contains("dh_worker_verification_failures_total 1\n"));
-        assert!(response.contains("dh_pmi_skid_instructions_bucket{le=\"+Inf\"} 0\n"));
+        assert!(response.contains("dh_pmi_skid_instructions_bucket{le=\"79\"} 50000\n"));
+        assert!(response.contains("dh_pmi_skid_instructions_count 50000\n"));
     }
 
     #[tokio::test]
@@ -4179,6 +4197,20 @@ mod tests {
         let slot = event.slot.unwrap();
         assert_eq!(slot.slot_id, lease.slot_id);
         assert_eq!(slot.state, i32::from(proto::SlotState::Running));
+
+        svc.slot_manager()
+            .mark_paused_at_position(&lease, 42, Some([0xAB; 32]), 0)
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.as_mut().next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let slot = event.slot.unwrap();
+        assert_eq!(slot.slot_id, lease.slot_id);
+        assert_eq!(slot.state, i32::from(proto::SlotState::PausedS));
+        assert_eq!(slot.icount, 42);
+        assert_eq!(slot.base.unwrap().hash, vec![0xAB; 32]);
     }
 
     #[test]
