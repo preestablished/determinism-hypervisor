@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 dh-detclock.workspace = true
 dh-devices.workspace = true
+dh-proto.workspace = true
 dh-verify.workspace = true
 dh-vmm.workspace = true
 
@@ -16,8 +17,13 @@ dh-vmm.workspace = true
 kvm-bindings = "0.14.0"
 libc.workspace = true
 kvm-ioctls.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 vm-memory.workspace = true
 # The embedded test guests: the debug CLI ships them for boot/run/skid.
 nanokernel = { path = "../../tests/nanokernel" }
 
 [dev-dependencies]
+
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
