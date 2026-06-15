@@ -175,6 +175,59 @@ mod tests {
         assert_eq!(v1::mem_predicate::Op::Ge as i32, 3);
         assert_eq!(v1::mem_predicate::Op::Le as i32, 4);
 
+        // §2.1 MachineConfig: append-only canonical MCFG fields. The
+        // message must carry the cpuid_table/device_set bytes needed to
+        // reconstruct the exact domain MachineConfig recovered from DHSNAP.
+        let cfg = v1::MachineConfig {
+            version: 1,
+            mem_bytes: 64 * 1024 * 1024,
+            vcpus: 1,
+            clock_num: 1,
+            clock_den: 1,
+            base_image_hash: vec![0x11; 32],
+            boot: Some(v1::BootSpec {
+                kind: Some(v1::boot_spec::Kind::Elf(v1::ElfBoot {
+                    kernel_hash: vec![0x22; 32],
+                    cmdline: b"console=none".to_vec(),
+                })),
+            }),
+            epoch_len: 50_000_000,
+            hash_epochs: v1::HashEpochs::EpochsOn as i32,
+            skid_margin: 8192,
+            cpuid_table: vec![v1::CpuidLeaf {
+                function: 1,
+                index: 0,
+                flags: 0,
+                eax: 1,
+                ebx: 2,
+                ecx: 3,
+                edx: 4,
+            }],
+            device_set: vec![1, 4, 7],
+        };
+        let cfg_bytes = cfg.encode_to_vec();
+        let cfg_back = v1::MachineConfig::decode(cfg_bytes.as_slice()).unwrap();
+        assert_eq!(cfg_back, cfg);
+        assert!(cfg_bytes
+            .windows([0x5A, 0x0A].len())
+            .any(|w| w == [0x5A, 0x0A]));
+        assert!(cfg_bytes
+            .windows([0x62, 0x03, 0x01, 0x04, 0x07].len())
+            .any(|w| w == [0x62, 0x03, 0x01, 0x04, 0x07]));
+        let restore = v1::RestoreSnapshotResponse {
+            lease: Some(sample_lease()),
+            config: Some(cfg),
+            state_hash: Some(v1::StateHash {
+                hash: vec![0xAA; 32],
+            }),
+            frame_counter: 9,
+        };
+        let restore_back =
+            v1::RestoreSnapshotResponse::decode(restore.encode_to_vec().as_slice()).unwrap();
+        let restored_cfg = restore_back.config.unwrap();
+        assert_eq!(restored_cfg.cpuid_table.len(), 1);
+        assert_eq!(restored_cfg.device_set, vec![1, 4, 7]);
+
         // frame_budget rides wire tag 8 (varint key 0x40) — pinned at the
         // byte level since the non-contiguous number is easy to "tidy".
         let only_frame_budget = v1::RunRequest {

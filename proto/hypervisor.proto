@@ -63,6 +63,17 @@ message MachineConfig {
   uint64 epoch_len        = 8;   // instructions per epoch (default 50_000_000)
   HashEpochs hash_epochs  = 9;   // EPOCHS_ON (default) | FINAL_ONLY
   uint32 skid_margin      = 10;  // default 8192 (landing only; does not affect results)
+  repeated CpuidLeaf cpuid_table = 11;  // sorted by (function,index), unique; canonical MCFG preimage
+  repeated uint32 device_set     = 12;  // u16 device ids, sorted unique; canonical MCFG preimage
+}
+message CpuidLeaf {
+  uint32 function = 1;
+  uint32 index    = 2;
+  uint32 flags    = 3;
+  uint32 eax      = 4;
+  uint32 ebx      = 5;
+  uint32 ecx      = 6;
+  uint32 edx      = 7;
 }
 message BootSpec {
   oneof kind {

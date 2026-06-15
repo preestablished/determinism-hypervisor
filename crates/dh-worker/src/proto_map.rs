@@ -15,7 +15,8 @@
 //! with bead 4qo.)
 
 use dh_proto::v1 as proto;
-use dh_vmm::SlotState;
+use dh_vmm::config::{BootSpec, ConfigError, CpuidLeaf, HashEpochs, MachineConfig};
+use dh_vmm::{vt::ClockRatio, SlotState};
 
 /// Slot lifecycle → API.md §2.8 `SlotState` (the `_S` suffixes are the
 /// proto package's enum-value collision convention, not semantics).
@@ -35,6 +36,180 @@ pub fn lease_to_proto(l: &crate::slot_manager::Lease) -> proto::Lease {
         slot_id: l.slot_id,
         token: l.token.to_vec(),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachineConfigWireError {
+    MissingBoot,
+    BadHash { field: &'static str, len: usize },
+    BadHashEpochs(i32),
+    BadDeviceId(u32),
+    ZeroClockTerm,
+    InvalidConfig(ConfigError),
+}
+
+impl std::fmt::Display for MachineConfigWireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MachineConfigWireError::MissingBoot => write!(f, "missing boot spec"),
+            MachineConfigWireError::BadHash { field, len } => {
+                write!(f, "{field} must be 32 bytes, got {len}")
+            }
+            MachineConfigWireError::BadHashEpochs(value) => {
+                write!(f, "unknown hash_epochs value {value}")
+            }
+            MachineConfigWireError::BadDeviceId(id) => {
+                write!(f, "device id {id:#x} does not fit u16")
+            }
+            MachineConfigWireError::ZeroClockTerm => {
+                write!(f, "clock numerator/denominator must be nonzero")
+            }
+            MachineConfigWireError::InvalidConfig(e) => write!(f, "invalid MachineConfig: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for MachineConfigWireError {}
+
+impl From<ConfigError> for MachineConfigWireError {
+    fn from(e: ConfigError) -> Self {
+        MachineConfigWireError::InvalidConfig(e)
+    }
+}
+
+pub fn machine_config_to_proto(config: &MachineConfig) -> proto::MachineConfig {
+    proto::MachineConfig {
+        version: config.version,
+        mem_bytes: config.mem_bytes,
+        vcpus: config.vcpus,
+        clock_num: config.clock.num(),
+        clock_den: config.clock.den(),
+        base_image_hash: config.base_image_hash.to_vec(),
+        boot: Some(boot_spec_to_proto(&config.boot)),
+        epoch_len: config.epoch_len,
+        hash_epochs: i32::from(match config.hash_epochs {
+            HashEpochs::EpochsOn => proto::HashEpochs::EpochsOn,
+            HashEpochs::FinalOnly => proto::HashEpochs::FinalOnly,
+        }),
+        skid_margin: config.skid_margin,
+        cpuid_table: config.cpuid_table.iter().map(cpuid_leaf_to_proto).collect(),
+        device_set: config.device_set.iter().map(|id| u32::from(*id)).collect(),
+    }
+}
+
+pub fn machine_config_from_proto(
+    config: &proto::MachineConfig,
+) -> Result<MachineConfig, MachineConfigWireError> {
+    let clock = ClockRatio::new(config.clock_num, config.clock_den)
+        .ok_or(MachineConfigWireError::ZeroClockTerm)?;
+    let boot = match config
+        .boot
+        .as_ref()
+        .and_then(|boot| boot.kind.as_ref())
+        .ok_or(MachineConfigWireError::MissingBoot)?
+    {
+        proto::boot_spec::Kind::Elf(elf) => BootSpec::Elf {
+            kernel_hash: hash32("boot.elf.kernel_hash", &elf.kernel_hash)?,
+            cmdline: elf.cmdline.clone(),
+        },
+        proto::boot_spec::Kind::Bzimage(bzimage) => BootSpec::BzImage {
+            kernel_hash: hash32("boot.bzimage.kernel_hash", &bzimage.kernel_hash)?,
+            initramfs_hash: hash32("boot.bzimage.initramfs_hash", &bzimage.initramfs_hash)?,
+            cmdline: bzimage.cmdline.clone(),
+        },
+    };
+    let hash_epochs = match proto::HashEpochs::try_from(config.hash_epochs)
+        .map_err(|_| MachineConfigWireError::BadHashEpochs(config.hash_epochs))?
+    {
+        proto::HashEpochs::EpochsOn => HashEpochs::EpochsOn,
+        proto::HashEpochs::FinalOnly => HashEpochs::FinalOnly,
+        proto::HashEpochs::Unspecified => {
+            return Err(MachineConfigWireError::BadHashEpochs(config.hash_epochs));
+        }
+    };
+    let cpuid_table = config
+        .cpuid_table
+        .iter()
+        .map(cpuid_leaf_from_proto)
+        .collect();
+    let device_set = config
+        .device_set
+        .iter()
+        .copied()
+        .map(|id| u16::try_from(id).map_err(|_| MachineConfigWireError::BadDeviceId(id)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let out = MachineConfig {
+        version: config.version,
+        mem_bytes: config.mem_bytes,
+        vcpus: config.vcpus,
+        clock,
+        base_image_hash: hash32("base_image_hash", &config.base_image_hash)?,
+        boot,
+        epoch_len: config.epoch_len,
+        hash_epochs,
+        skid_margin: config.skid_margin,
+        resync_slack: dh_vmm::config::DEFAULT_RESYNC_SLACK,
+        cpuid_table,
+        device_set,
+    };
+    out.validate()?;
+    Ok(out)
+}
+
+fn boot_spec_to_proto(boot: &BootSpec) -> proto::BootSpec {
+    proto::BootSpec {
+        kind: Some(match boot {
+            BootSpec::Elf {
+                kernel_hash,
+                cmdline,
+            } => proto::boot_spec::Kind::Elf(proto::ElfBoot {
+                kernel_hash: kernel_hash.to_vec(),
+                cmdline: cmdline.clone(),
+            }),
+            BootSpec::BzImage {
+                kernel_hash,
+                initramfs_hash,
+                cmdline,
+            } => proto::boot_spec::Kind::Bzimage(proto::BzImageBoot {
+                kernel_hash: kernel_hash.to_vec(),
+                initramfs_hash: initramfs_hash.to_vec(),
+                cmdline: cmdline.clone(),
+            }),
+        }),
+    }
+}
+
+fn cpuid_leaf_to_proto(leaf: &CpuidLeaf) -> proto::CpuidLeaf {
+    proto::CpuidLeaf {
+        function: leaf.function,
+        index: leaf.index,
+        flags: leaf.flags,
+        eax: leaf.eax,
+        ebx: leaf.ebx,
+        ecx: leaf.ecx,
+        edx: leaf.edx,
+    }
+}
+
+fn cpuid_leaf_from_proto(leaf: &proto::CpuidLeaf) -> CpuidLeaf {
+    CpuidLeaf {
+        function: leaf.function,
+        index: leaf.index,
+        flags: leaf.flags,
+        eax: leaf.eax,
+        ebx: leaf.ebx,
+        ecx: leaf.ecx,
+        edx: leaf.edx,
+    }
+}
+
+fn hash32(field: &'static str, bytes: &[u8]) -> Result<[u8; 32], MachineConfigWireError> {
+    bytes
+        .try_into()
+        .map_err(|_| MachineConfigWireError::BadHash {
+            field,
+            len: bytes.len(),
+        })
 }
 
 /// Slot-manager introspection row → wire `SlotInfo` (API.md §2.8). The
@@ -173,6 +348,135 @@ mod tests {
             ..info
         };
         assert_eq!(slot_info_to_proto(&bare).base, None, "no segment yet");
+    }
+
+    #[test]
+    fn machine_config_wire_shape_is_lossless_for_canonical_fields() {
+        let config = full_machine_config();
+        let wire = machine_config_to_proto(&config);
+        assert_eq!(wire.cpuid_table.len(), 2);
+        assert_eq!(wire.device_set, vec![1, 4, 7]);
+        assert_eq!(wire.skid_margin, 16_384);
+        let back = machine_config_from_proto(&wire).unwrap();
+
+        assert_eq!(
+            back.canonical_encode().unwrap(),
+            config.canonical_encode().unwrap()
+        );
+        assert_eq!(back.cpuid_table, config.cpuid_table);
+        assert_eq!(back.device_set, config.device_set);
+        assert_eq!(back.resync_slack, dh_vmm::config::DEFAULT_RESYNC_SLACK);
+    }
+
+    #[test]
+    fn machine_config_wire_rejects_lossy_or_invalid_shapes() {
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.base_image_hash.pop();
+        assert!(matches!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::BadHash {
+                field: "base_image_hash",
+                len: 31
+            })
+        ));
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        if let Some(proto::boot_spec::Kind::Bzimage(bzimage)) =
+            wire.boot.as_mut().and_then(|boot| boot.kind.as_mut())
+        {
+            bzimage.kernel_hash.pop();
+        }
+        assert!(matches!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::BadHash {
+                field: "boot.bzimage.kernel_hash",
+                len: 31
+            })
+        ));
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.hash_epochs = proto::HashEpochs::Unspecified as i32;
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::BadHashEpochs(0))
+        );
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.hash_epochs = 99;
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::BadHashEpochs(99))
+        );
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.cpuid_table.swap(0, 1);
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::InvalidConfig(
+                ConfigError::CpuidTableUnsorted
+            ))
+        );
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.device_set.swap(0, 1);
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::InvalidConfig(
+                ConfigError::DeviceSetUnsorted
+            ))
+        );
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.device_set = vec![u32::from(u16::MAX) + 1];
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::BadDeviceId(u32::from(u16::MAX) + 1))
+        );
+
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        wire.boot = None;
+        assert_eq!(
+            machine_config_from_proto(&wire),
+            Err(MachineConfigWireError::MissingBoot)
+        );
+    }
+
+    fn full_machine_config() -> MachineConfig {
+        let mut config = MachineConfig::new(
+            64 * 1024 * 1024,
+            [0x11; 32],
+            BootSpec::BzImage {
+                kernel_hash: [0x22; 32],
+                initramfs_hash: [0x33; 32],
+                cmdline: b"console=ttyS0".to_vec(),
+            },
+        );
+        config.clock = ClockRatio::new(1000, 1).unwrap();
+        config.hash_epochs = HashEpochs::FinalOnly;
+        config.skid_margin = 16_384;
+        config.resync_slack = 4_096;
+        config.cpuid_table = vec![
+            CpuidLeaf {
+                function: 0,
+                index: 0,
+                flags: 0,
+                eax: 0xD,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+            CpuidLeaf {
+                function: 1,
+                index: 0,
+                flags: 0,
+                eax: 1,
+                ebx: 2,
+                ecx: 3,
+                edx: 4,
+            },
+        ];
+        config.device_set = vec![1, 4, 7];
+        config
     }
 
     /// The iteration-80 deny gate (sr5 review, armed by ol1's SlotInfo
