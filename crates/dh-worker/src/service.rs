@@ -101,6 +101,8 @@ const MAX_CAPTURE_FEATURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAPTURE_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const MAX_READ_GUEST_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_arch = "x86_64")]
+const FRAMEBUFFER_DESCRIPTOR_BYTES: usize = 16;
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:7401";
@@ -1829,26 +1831,36 @@ fn drained_guest_event_to_runtime(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn cumulative_event_icount(
+    start_segment_icount: u64,
+    start_cumulative_icount: u64,
+    segment_icount: u64,
+) -> u64 {
+    start_cumulative_icount.saturating_add(segment_icount.saturating_sub(start_segment_icount))
+}
+
+#[cfg(target_arch = "x86_64")]
 fn drained_guest_events_to_runtime(
     events: Vec<detguest_host::GuestEvent>,
-    icount: u64,
+    event_icount: u64,
 ) -> Result<Vec<DrainedGuestEvent>, dh_vmm::boundary::BoundaryError> {
     events
         .into_iter()
-        .map(|ev| drained_guest_event_to_runtime(ev, icount))
+        .map(|ev| drained_guest_event_to_runtime(ev, event_icount))
         .collect()
 }
 
 #[cfg(target_arch = "x86_64")]
 fn service_exit_with_detchannel(
     rail: &mut dh_vmm::recording::DeviceRail<RuntimeVmMem>,
-    icount: u64,
+    log_icount: u64,
+    event_icount: u64,
     exit: kvm_ioctls::VcpuExit<'_>,
 ) -> Result<Vec<DrainedGuestEvent>, dh_vmm::boundary::BoundaryError> {
     let serial_end = dh_vmm::kvm::PIO_SERIAL_BASE + dh_vmm::kvm::PIO_SERIAL_LEN;
     let detcall_end = dh_vmm::kvm::PIO_DETCALL_BASE + dh_vmm::kvm::PIO_DETCALL_LEN;
     let mut ctx = dh_devices::DevCtx::new(
-        icount,
+        log_icount,
         0,
         &mut rail.log,
         &mut rail.mem,
@@ -1888,7 +1900,7 @@ fn service_exit_with_detchannel(
                     "detchannel drain anomaly".into(),
                 ));
             }
-            drained_guest_events_to_runtime(events, icount)?
+            drained_guest_events_to_runtime(events, event_icount)?
         }
         kvm_ioctls::VcpuExit::IoIn(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
@@ -1995,21 +2007,25 @@ fn checked_introspection_total(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn ensure_paused_slot(manager: &SlotManager, lease: &Lease, method: &str) -> Result<(), Status> {
+fn ensure_paused_slot(
+    manager: &SlotManager,
+    lease: &Lease,
+    method: &str,
+) -> Result<crate::slot_manager::SlotInfo, Status> {
     let now_ms = lease_now_ms();
     manager
         .validate(lease, now_ms)
         .map_err(slot_error_to_status)?;
-    let state = manager
+    let info = manager
         .slot_info(lease.slot_id)
-        .map_err(slot_error_to_status)?
-        .state;
-    if state != dh_vmm::SlotState::Paused {
+        .map_err(slot_error_to_status)?;
+    if info.state != dh_vmm::SlotState::Paused {
         return Err(Status::failed_precondition(format!(
-            "{method} requires Paused slot, got {state:?}"
+            "{method} requires Paused slot, got {:?}",
+            info.state
         )));
     }
-    Ok(())
+    Ok(info)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2030,13 +2046,14 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
         log,
         RuntimeVmMem(runtime.slot.guest_mem.clone()),
     );
-    let icount = runtime.position.cumulative_icount;
+    let log_icount = runtime.position.segment_icount;
+    let event_icount = runtime.position.cumulative_icount;
     let result = (|| {
         let Some(host) = runtime_detchannel_mut(&mut rail.bus) else {
             return Ok(Vec::new());
         };
         let mut ctx = dh_devices::DevCtx::new(
-            icount,
+            log_icount,
             0,
             &mut rail.log,
             &mut rail.mem,
@@ -2052,7 +2069,7 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
                 "detchannel pause drain log fault: {e:?}"
             )));
         }
-        drained_guest_events_to_runtime(events, icount)
+        drained_guest_events_to_runtime(events, event_icount)
             .map_err(|e| Status::data_loss(e.to_string()))
     })();
     runtime.bus = rail.bus;
@@ -2060,6 +2077,28 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
     runtime.log = Some(rail.log);
     runtime.guest_events.extend(result?);
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fault_runtime_after_pause_drain_error(
+    manager: &SlotManager,
+    runtime: &mut SlotRuntime,
+    slot_id: u64,
+    status: Status,
+) -> Status {
+    runtime.thread = RuntimeThreadState::Faulted(format!(
+        "detchannel pause drain: {}: {}",
+        status.code(),
+        status.message()
+    ));
+    if let Err(fault) = manager.mark_faulted(slot_id) {
+        return Status::internal(format!(
+            "detchannel pause drain failed with {}: {}; also failed to mark slot faulted: {fault:?}",
+            status.code(),
+            status.message()
+        ));
+    }
+    status
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2100,13 +2139,59 @@ fn read_framebuffer_from_bus(
     channel
         .read_region(name, 0, &mut pixels)
         .map_err(|e| capture_region_error(name, e))?;
-    Ok((
-        0,
-        0,
-        0,
-        proto_pixel_format(proto::PixelFormat::PfUnspecified),
-        pixels,
-    ))
+    framebuffer_response_from_region_bytes(&pixels)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn framebuffer_response_from_region_bytes(
+    region: &[u8],
+) -> Result<(u32, u32, u32, i32, Vec<u8>), Status> {
+    let descriptor = region.get(..FRAMEBUFFER_DESCRIPTOR_BYTES).ok_or_else(|| {
+        Status::failed_precondition(
+            "GetFramebuffer requires a descriptor-bearing framebuffer region",
+        )
+    })?;
+    let width = u32::from_le_bytes(descriptor[0..4].try_into().unwrap());
+    let height = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+    let stride = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+    let format = u32::from_le_bytes(descriptor[12..16].try_into().unwrap());
+    if width == 0 || height == 0 || stride == 0 {
+        return Err(Status::failed_precondition(
+            "GetFramebuffer framebuffer descriptor has zero dimensions",
+        ));
+    }
+    let format_i32 = i32::try_from(format).map_err(|_| {
+        Status::failed_precondition(format!("GetFramebuffer unsupported pixel_format {format}"))
+    })?;
+    let (format, bytes_per_pixel) = match proto::PixelFormat::try_from(format_i32) {
+        Ok(proto::PixelFormat::Xrgb8888) => (proto::PixelFormat::Xrgb8888, 4u64),
+        Ok(proto::PixelFormat::Rgb565) => (proto::PixelFormat::Rgb565, 2u64),
+        _ => {
+            return Err(Status::failed_precondition(format!(
+                "GetFramebuffer unsupported pixel_format {format}"
+            )));
+        }
+    };
+    let min_stride = u64::from(width)
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| Status::failed_precondition("framebuffer stride overflows"))?;
+    if u64::from(stride) < min_stride {
+        return Err(Status::failed_precondition(format!(
+            "GetFramebuffer stride {stride} is smaller than width {width} * bytes_per_pixel {bytes_per_pixel}"
+        )));
+    }
+    let pixel_len = u64::from(stride)
+        .checked_mul(u64::from(height))
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Status::failed_precondition("framebuffer pixel length overflows"))?;
+    let pixel_end = FRAMEBUFFER_DESCRIPTOR_BYTES
+        .checked_add(pixel_len)
+        .ok_or_else(|| Status::failed_precondition("framebuffer pixel length overflows"))?;
+    let pixels = region
+        .get(FRAMEBUFFER_DESCRIPTOR_BYTES..pixel_end)
+        .ok_or_else(|| Status::failed_precondition("framebuffer pixels are truncated"))?
+        .to_vec();
+    Ok((width, height, stride, proto_pixel_format(format), pixels))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2310,6 +2395,31 @@ where
     actor
         .with_runtime_mut(f)
         .map_err(runtime_actor_error_to_status)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn with_paused_runtime_mut<R>(
+    manager: Arc<SlotManager>,
+    runtimes: Arc<WorkerRuntimeTable>,
+    lease: Lease,
+    method: &'static str,
+    f: impl FnOnce(&mut SlotRuntime) -> Result<R, Status> + Send + 'static,
+) -> Result<R, Status>
+where
+    R: Send + 'static,
+{
+    let expected = ensure_paused_slot(&manager, &lease, method)?;
+    with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+        let current = ensure_paused_slot(&manager, &lease, method)?;
+        if current.icount != expected.icount || runtime.position.cumulative_icount != current.icount
+        {
+            return Err(Status::aborted(format!(
+                "{method} boundary changed before introspection: manager {} -> {}, runtime {}",
+                expected.icount, current.icount, runtime.position.cumulative_icount
+            )));
+        }
+        f(runtime)
+    })?
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3081,8 +3191,17 @@ impl HypervisorWorker for WorkerService {
                                     "counter read: {e:?}"
                                 ))
                             })?;
-                            let events =
-                                service_exit_with_detchannel(&mut rail.borrow_mut(), icount, exit)?;
+                            let event_icount = cumulative_event_icount(
+                                start_segment_icount,
+                                start_cumulative_icount,
+                                icount,
+                            );
+                            let events = service_exit_with_detchannel(
+                                &mut rail.borrow_mut(),
+                                icount,
+                                event_icount,
+                                exit,
+                            )?;
                             drained_guest_events.extend(events);
                             Ok(())
                         };
@@ -3171,7 +3290,14 @@ impl HypervisorWorker for WorkerService {
                                     lease_now_ms(),
                                 )
                                 .map_err(slot_error_to_status)?;
-                            drain_runtime_detchannel_at_pause(runtime)?;
+                            if let Err(e) = drain_runtime_detchannel_at_pause(runtime) {
+                                return Err(fault_runtime_after_pause_drain_error(
+                                    manager.as_ref(),
+                                    runtime,
+                                    lease.slot_id,
+                                    e,
+                                ));
+                            }
                             let capture = capture_at_boundary(
                                 &mut runtime.bus,
                                 capture.as_ref(),
@@ -3455,8 +3581,7 @@ impl HypervisorWorker for WorkerService {
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let response = blocking_lifecycle("ReadGuestMemory", move || {
-                ensure_paused_slot(&manager, &lease, "ReadGuestMemory")?;
-                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+                with_paused_runtime_mut(manager, runtimes, lease, "ReadGuestMemory", move |runtime| {
                     use vm_memory::Bytes;
 
                     let mut chunks =
@@ -3549,7 +3674,7 @@ impl HypervisorWorker for WorkerService {
                         chunks,
                         icount: runtime.position.cumulative_icount,
                     })
-                })?
+                })
             })
             .await?;
             Ok(Response::new(response))
@@ -3572,23 +3697,37 @@ impl HypervisorWorker for WorkerService {
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let response = blocking_lifecycle("GetFramebuffer", move || {
-                ensure_paused_slot(&manager, &lease, "GetFramebuffer")?;
-                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
-                    drain_runtime_detchannel_at_pause(runtime)?;
-                    let frame_counter = frame_counter_from_bus(&mut runtime.bus);
-                    runtime.position.frame_counter = frame_counter;
-                    let (width, height, stride, format, pixels) =
-                        read_framebuffer_from_bus(&mut runtime.bus)?;
-                    Ok(proto::GetFramebufferResponse {
-                        width,
-                        height,
-                        stride,
-                        format,
-                        frame_counter,
-                        icount: runtime.position.cumulative_icount,
-                        pixels,
-                    })
-                })?
+                let slot_id = lease.slot_id;
+                let manager_for_fault = manager.clone();
+                with_paused_runtime_mut(
+                    manager,
+                    runtimes,
+                    lease,
+                    "GetFramebuffer",
+                    move |runtime| {
+                        if let Err(e) = drain_runtime_detchannel_at_pause(runtime) {
+                            return Err(fault_runtime_after_pause_drain_error(
+                                manager_for_fault.as_ref(),
+                                runtime,
+                                slot_id,
+                                e,
+                            ));
+                        }
+                        let frame_counter = frame_counter_from_bus(&mut runtime.bus);
+                        runtime.position.frame_counter = frame_counter;
+                        let (width, height, stride, format, pixels) =
+                            read_framebuffer_from_bus(&mut runtime.bus)?;
+                        Ok(proto::GetFramebufferResponse {
+                            width,
+                            height,
+                            stride,
+                            format,
+                            frame_counter,
+                            icount: runtime.position.cumulative_icount,
+                            pixels,
+                        })
+                    },
+                )
             })
             .await?;
             Ok(Response::new(response))
@@ -3612,27 +3751,43 @@ impl HypervisorWorker for WorkerService {
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let events = blocking_lifecycle("StreamGuestEvents", move || {
-                ensure_paused_slot(&manager, &lease, "StreamGuestEvents")?;
-                with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
-                    drain_runtime_detchannel_at_pause(runtime)?;
-                    let want_all = streams.is_empty();
-                    let mut selected = Vec::new();
-                    let mut retained = Vec::new();
-                    for event in runtime.guest_events.drain(..) {
-                        if want_all || streams.contains(&event.stream) {
-                            selected.push(proto::GuestEvent {
-                                stream: event.stream,
-                                icount: event.icount,
-                                vns: event.vns,
-                                payload: event.payload,
-                            });
-                        } else {
-                            retained.push(event);
+                let slot_id = lease.slot_id;
+                let manager_for_fault = manager.clone();
+                with_paused_runtime_mut(
+                    manager,
+                    runtimes,
+                    lease,
+                    "StreamGuestEvents",
+                    move |runtime| {
+                        if let Err(e) = drain_runtime_detchannel_at_pause(runtime) {
+                            return Err(fault_runtime_after_pause_drain_error(
+                                manager_for_fault.as_ref(),
+                                runtime,
+                                slot_id,
+                                e,
+                            ));
                         }
-                    }
-                    runtime.guest_events = retained;
-                    Ok(selected)
-                })?
+                        let stream_filter: std::collections::HashSet<u32> =
+                            streams.into_iter().collect();
+                        let want_all = stream_filter.is_empty();
+                        let mut selected = Vec::new();
+                        let mut retained = Vec::new();
+                        for event in runtime.guest_events.drain(..) {
+                            if want_all || stream_filter.contains(&event.stream) {
+                                selected.push(proto::GuestEvent {
+                                    stream: event.stream,
+                                    icount: event.icount,
+                                    vns: event.vns,
+                                    payload: event.payload,
+                                });
+                            } else {
+                                retained.push(event);
+                            }
+                        }
+                        runtime.guest_events = retained;
+                        Ok(selected)
+                    },
+                )
             })
             .await?;
             let stream = tokio_stream::iter(events.into_iter().map(Ok));
@@ -4074,7 +4229,8 @@ mod tests {
                     let icount = counter.read().map_err(|e| {
                         dh_vmm::boundary::BoundaryError::Exit(format!("counter read: {e:?}"))
                     })?;
-                    service_exit_with_detchannel(&mut rail.borrow_mut(), icount, exit).map(|_| ())
+                    service_exit_with_detchannel(&mut rail.borrow_mut(), icount, icount, exit)
+                        .map(|_| ())
                 },
                 &mut |epoch_index, icount, chain_value| {
                     epochs.push((epoch_index, icount, chain_value));
@@ -4239,6 +4395,38 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(over.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn framebuffer_descriptor_shape_is_enforced() {
+        let mut region = Vec::new();
+        region.extend_from_slice(&4u32.to_le_bytes());
+        region.extend_from_slice(&2u32.to_le_bytes());
+        region.extend_from_slice(&16u32.to_le_bytes());
+        region.extend_from_slice(&(proto::PixelFormat::Xrgb8888 as u32).to_le_bytes());
+        region.extend_from_slice(&(0u8..32).collect::<Vec<_>>());
+
+        let (width, height, stride, format, pixels) =
+            framebuffer_response_from_region_bytes(&region).unwrap();
+        assert_eq!(width, 4);
+        assert_eq!(height, 2);
+        assert_eq!(stride, 16);
+        assert_eq!(format, proto_pixel_format(proto::PixelFormat::Xrgb8888));
+        assert_eq!(pixels, (0u8..32).collect::<Vec<_>>());
+
+        let raw = capture_fixture_bytes(0, FRAMEBUFFER_DESCRIPTOR_BYTES + 32);
+        let err = framebuffer_response_from_region_bytes(&raw).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("framebuffer descriptor"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn event_icount_conversion_keeps_segment_log_and_cumulative_stream_domains() {
+        assert_eq!(cumulative_event_icount(0, 0, 42), 42);
+        assert_eq!(cumulative_event_icount(10, 1_000, 25), 1_015);
+        assert_eq!(cumulative_event_icount(50, 1_000, 49), 1_000);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5066,24 +5254,14 @@ mod tests {
             assert_eq!(memory.chunks[0].len(), 16);
             assert_eq!(memory.chunks[1], capture_fixture_bytes(8, 24));
 
-            let fb = svc
+            let fb_err = svc
                 .get_framebuffer(Request::new(proto::GetFramebufferRequest {
                     lease: Some(lease.clone()),
                 }))
                 .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(fb.icount, run.icount);
-            assert_eq!(fb.frame_counter, 0);
-            assert_eq!(
-                fb.format,
-                proto_pixel_format(proto::PixelFormat::PfUnspecified)
-            );
-            assert_eq!(
-                fb.pixels.len(),
-                nanokernel::CAPTURE_FIXTURE_FB_BYTES as usize
-            );
-            assert_eq!(&fb.pixels[..32], &capture_fixture_bytes(0, 32));
+                .unwrap_err();
+            assert_eq!(fb_err.code(), tonic::Code::FailedPrecondition);
+            assert!(fb_err.message().contains("framebuffer descriptor"));
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
