@@ -75,6 +75,38 @@ jobs:
         run: cargo test -p determinism-tests --test regression --test counting_semantics --test counting_smoke
         working-directory: repo
 
+  record-replay-corpus:
+    # Replays checked-in corpus bytes against the locked determinism class:
+    # root RAM image + DHSNAP + DHILOG + expected epoch hashes. This is the
+    # nightly tripwire that catches behavioral drift without regenerating the
+    # recording. A deliberate ci/determinism-class.lock bump must re-baseline
+    # the corpus in the same reviewed commit.
+    needs: determinism-class
+    runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
+      - name: re-verify checked-in record/replay corpus
+        run: cargo test -p dh-worker --test m5_record_replay record_replay_corpus_pad_echo_6s_reverifies -- --nocapture
+        working-directory: repo
+
   # 1h libFuzzer run over the DHILOG read path (bead 1j4): arbitrary
   # bytes -> LogReader::parse -> full record walk; the invariant is no
   # panics / no unbounded allocation on hostile input. Hosted by
@@ -120,7 +152,7 @@ jobs:
   # A silent-red nightly is the worst outcome for a determinism product:
   # route failures to a visible issue (updated, not duplicated).
   alert-on-failure:
-    needs: [determinism-class, determinism-canary, dhilog-fuzz]
+    needs: [determinism-class, determinism-canary, record-replay-corpus, dhilog-fuzz]
     if: failure()
     runs-on: ubuntu-latest
     permissions:
@@ -131,8 +163,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
-          TITLE="nightly-drift FAILED: determinism class, canary, or DHILOG fuzz"
-          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a canary failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
+          TITLE="nightly-drift FAILED: determinism class, corpus, canary, or DHILOG fuzz"
+          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
