@@ -21,6 +21,8 @@ use crate::runtime::{
 use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
+#[cfg(target_arch = "x86_64")]
+use dh_verify::verify::VerifyProgress;
 use prost::Message;
 use std::convert::TryFrom;
 use std::os::unix::fs::FileTypeExt;
@@ -456,6 +458,23 @@ fn restore_engine_error_to_status(e: crate::restore_engine::RestoreError) -> Sta
 }
 
 #[cfg(target_arch = "x86_64")]
+fn replay_error_to_status(e: crate::replay_engine::ReplayError) -> Status {
+    use crate::replay_engine::ReplayError;
+    match e {
+        ReplayError::Restore(e) => restore_engine_error_to_status(e),
+        ReplayError::Log(e) => Status::data_loss(format!("DHILOG parse: {e:?}")),
+        ReplayError::HeaderMismatch(what) => {
+            Status::failed_precondition(format!("DHILOG header mismatch: {what}"))
+        }
+        ReplayError::Divergence { .. } => {
+            Status::internal("VerifyReplay divergence escaped report translation")
+        }
+        ReplayError::NotYetWired(what) => Status::unimplemented(what),
+        ReplayError::Apply(m) | ReplayError::Run(m) => Status::data_loss(m),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn fork_engine_error_to_status(e: crate::fork_engine::ForkError) -> Status {
     use crate::fork_engine::ForkError;
     match e {
@@ -477,6 +496,42 @@ fn snapshot_ref_from_proto(
         .try_into()
         .map_err(|_| Status::invalid_argument("snapshot hash must be 32 bytes"))?;
     Ok(snapstore_types::SnapshotRef::from_bytes(hash))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_id_from_bytes(bytes: Vec<u8>) -> Result<snapstore_types::LogId, Status> {
+    let id: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Status::invalid_argument("input_log_id must be 32 bytes"))?;
+    Ok(snapstore_types::LogId::from_bytes(id))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn input_log_payload_from_container(container: &[u8]) -> Result<Vec<u8>, Status> {
+    let container = snapstore_manifest::input_log::InputLogContainer::decode(container)
+        .map_err(|e| Status::data_loss(format!("input log container decode failed: {e}")))?;
+    if container.inner_version() != dh_inputlog::DHILOG_FORMAT_VERSION {
+        return Err(Status::failed_precondition(format!(
+            "input log inner format version {} != DHILOG {}",
+            container.inner_version(),
+            dh_inputlog::DHILOG_FORMAT_VERSION
+        )));
+    }
+    Ok(container.payload().to_vec())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_writer_from_reader_header(
+    header: &dh_inputlog::reader::Header,
+) -> dh_inputlog::dhilog::LogWriter {
+    dh_inputlog::dhilog::LogWriter::new(dh_inputlog::dhilog::SegmentHeader {
+        base_snapshot_id: header.base_snapshot_id,
+        entropy_seed: header.entropy_seed,
+        machine_config_hash: header.machine_config_hash,
+        clock_num: header.clock_num,
+        clock_den: header.clock_den,
+        encoder_fingerprint: header.encoder_fingerprint,
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -536,6 +591,51 @@ fn until_from_run_request(req: &proto::RunRequest) -> Result<dh_vmm::runctl::Unt
 #[cfg(target_arch = "x86_64")]
 fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
     i32::from(stop_reason_to_proto(reason))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_progress_to_proto(progress: VerifyProgress) -> proto::VerifyReplayProgress {
+    use proto::verify_replay_progress::Msg;
+    let msg = match progress {
+        VerifyProgress::EpochOk {
+            epoch_index,
+            icount,
+        } => Msg::EpochOk(proto::EpochOk {
+            epoch_index,
+            icount,
+        }),
+        VerifyProgress::Done {
+            total_icount,
+            end_state_hash,
+        } => Msg::Done(proto::VerifyDone {
+            total_icount,
+            end_state_hash: Some(proto::StateHash {
+                hash: end_state_hash.to_vec(),
+            }),
+        }),
+        VerifyProgress::Divergence {
+            first_bad_epoch,
+            at_icount,
+            what,
+            expected,
+            got,
+        } => {
+            let mut reg_diff = Vec::with_capacity(64);
+            reg_diff.extend_from_slice(&expected);
+            reg_diff.extend_from_slice(&got);
+            Msg::Divergence(proto::Divergence {
+                first_bad_epoch: first_bad_epoch.unwrap_or(u64::MAX),
+                icount_lo: at_icount,
+                icount_hi: at_icount,
+                rip_expected: 0,
+                rip_actual: 0,
+                reg_diff,
+                diff_page_idx: Vec::new(),
+                suspected_cause: what.into(),
+            })
+        }
+    };
+    proto::VerifyReplayProgress { msg: Some(msg) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2172,9 +2272,110 @@ impl HypervisorWorker for WorkerService {
 
     async fn verify_replay(
         &self,
-        _request: Request<proto::VerifyReplayRequest>,
+        request: Request<proto::VerifyReplayRequest>,
     ) -> Result<Response<Self::VerifyReplayStream>, Status> {
-        Err(unimplemented_status("VerifyReplay"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            use proto::verify_replay_request::Log as WireLog;
+
+            let request = request.into_inner();
+            let base_snapshot = snapshot_ref_from_proto(request.base)?;
+            let wire_log = request
+                .log
+                .ok_or_else(|| Status::invalid_argument("VerifyReplay.log is required"))?;
+            let store = self.store()?;
+            let image_resolver = self.inner.image_resolver.clone();
+            let events = blocking_lifecycle("VerifyReplay", move || {
+                let log_bytes = match wire_log {
+                    WireLog::InputLog(bytes) => bytes,
+                    WireLog::InputLogId(id) => {
+                        let log_id = log_id_from_bytes(id)?;
+                        let store = store.lock().map_err(|_| {
+                            Status::internal("snapshot-store client mutex poisoned")
+                        })?;
+                        let container = store
+                            .get_input_log(log_id)
+                            .map_err(|e| store_error_to_status("get_input_log", e))?;
+                        input_log_payload_from_container(&container)?
+                    }
+                };
+                let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
+                    .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
+                let log_writer = log_writer_from_reader_header(reader.header());
+                drop(reader);
+
+                let store = store
+                    .lock()
+                    .map_err(|_| Status::internal("snapshot-store client mutex poisoned"))?;
+                let config =
+                    crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
+                        .map_err(restore_engine_error_to_status)?;
+                let assets = image_resolver
+                    .resolve_create_vm(&config)
+                    .map_err(image_error_to_status)?;
+                let sys = dh_vmm::kvm::KvmSystem::open()
+                    .map_err(|e| kvm_error_to_status("open KVM", e))?;
+                if !sys.dirty_ring {
+                    return Err(Status::failed_precondition("KVM dirty ring unavailable"));
+                }
+                dh_vmm::run::install_kick_handler().map_err(|e| {
+                    Status::failed_precondition(format!("install kick handler: {e}"))
+                })?;
+                let mut slot = sys
+                    .create_slot_vm(config.mem_bytes)
+                    .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+                let bus = build_bus(&config, assets.base_image)?;
+                let rail = dh_vmm::recording::DeviceRail::new(
+                    bus,
+                    dh_devices::entropy::DetEntropy::from_seed([0; 32]),
+                    log_writer,
+                    RuntimeVmMem(slot.guest_mem.clone()),
+                );
+                let counter = dh_detclock::counter::InstRetired::open_for_current_thread()
+                    .map_err(|e| Status::failed_precondition(format!("open InstRetired: {e:?}")))?;
+                counter
+                    .route_overflow_to_thread(
+                        dh_vmm::run::current_tid(),
+                        dh_vmm::run::kick_signal(),
+                    )
+                    .map_err(|e| {
+                        Status::failed_precondition(format!("route InstRetired overflow: {e:?}"))
+                    })?;
+                counter.reset().map_err(|e| {
+                    Status::failed_precondition(format!("reset InstRetired: {e:?}"))
+                })?;
+                counter
+                    .arm_period(dh_detclock::counter::NEVER_FIRES_PERIOD)
+                    .map_err(|e| Status::failed_precondition(format!("arm InstRetired: {e:?}")))?;
+                counter.enable().map_err(|e| {
+                    Status::failed_precondition(format!("enable InstRetired: {e:?}"))
+                })?;
+
+                let report = crate::verify_replay::verify_replay(
+                    &mut slot,
+                    rail,
+                    &config,
+                    base_snapshot,
+                    &counter,
+                    &store,
+                    &log_bytes,
+                )
+                .map_err(replay_error_to_status)?;
+                Ok(report
+                    .events
+                    .into_iter()
+                    .map(verify_progress_to_proto)
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+            let stream = tokio_stream::iter(events.into_iter().map(Ok));
+            Ok(Response::new(Box::pin(stream) as Self::VerifyReplayStream))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("VerifyReplay"))
+        }
     }
 
     async fn run_with_frame_capture(
@@ -2888,6 +3089,104 @@ mod tests {
                 .unwrap()
                 .into_inner();
             assert_eq!(snap.input_log_id.len(), 32);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_streams_done_for_stored_input_log() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            2,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xA5; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: created.lease,
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(base_snapshot.clone()),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = restored.lease.unwrap();
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(50_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(run.icount, 50_000);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(snap.input_log_id.len(), 32);
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLogId(snap.input_log_id)),
+                    bisect_on_divergence: true,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut done = None;
+            while let Some(item) = stream.next().await {
+                match item.unwrap().msg.unwrap() {
+                    VerifyMsg::EpochOk(_) => {}
+                    VerifyMsg::Done(msg) => done = Some(msg),
+                    VerifyMsg::Divergence(div) => panic!("unexpected divergence: {div:?}"),
+                }
+            }
+            let done = done.expect("VerifyReplay must stream Done");
+            assert_eq!(done.total_icount, 50_000);
+            assert_eq!(done.end_state_hash.unwrap().hash.len(), 32);
         });
     }
 
