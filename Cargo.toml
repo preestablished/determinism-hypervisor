@@ -50,6 +50,7 @@ snapstore-server = { path = "../snapshot-store/crates/snapstore-server" }
 criterion = "0.5"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
 # KVM-facing FFI surface, one pinned closure for every member (iteration-75
 # review hygiene: these literals were drifting toward five copies).
 kvm-ioctls = "0.24.0"

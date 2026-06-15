@@ -55,3 +55,82 @@ Note: workspace-wide `cargo fmt --check` currently reports formatting diffs in
 `tests/nanokernel/tests/capture_manifest_interop.rs` and
 `tests/nanokernel/tests/elf_shape.rs`. Those files are outside this
 determinism-hypervisor slot-manager change and were not modified.
+
+## Iteration 103: `determinism-hypervisor-rfv` start
+
+Branch: `ralph/iteration-103-dh-workerd-grpc-service`
+
+Beads:
+
+- Checked `bd list` before starting, then `bd ready`.
+- Claimed `determinism-hypervisor-rfv`, the P0 worker-daemon service bead.
+
+Reviewed inputs:
+
+- `/home/infra-admin/.agents/plans/preestablished-phase-2/dependency-order.md`
+- `/home/infra-admin/.agents/projects/determinism-hypervisor/docs/phase2/gaps.md`
+- Bead `determinism-hypervisor-rfv`
+
+Plan after review:
+
+1. Build the real `dh-workerd` service shell on the `ol1` slot-manager base.
+2. Land transport and host-runnable worker/slot visibility first:
+   `GetWorkerInfo`, `ListSlots`, status mapping, generated-client test.
+3. Keep lifecycle/execution RPCs `UNIMPLEMENTED` until the service owns real
+   KVM/store runtime state; do not fake M6 acceptance.
+4. Wire mutating RPCs through a per-slot runtime table next, then add UDS M6
+   acceptance and M7 harness evidence.
+
+Two subagent reviews were completed for this plan:
+
+- Phase/critical-path review agreed that branching from the slot-manager branch
+  and working `rfv` is correct, but warned that M4/M5 evidence still precedes
+  M6 sign-off and that `WatchSlots` belongs to later transition/event wiring.
+- Code-feasibility review confirmed the generated trait requires all 17 methods
+  and concrete stream associated types, and called out dependencies, no fixed
+  `:7400` tests, no preflight in host-runnable tests, and preserving the
+  existing enum-cast guard.
+
+Implementation progress:
+
+- Added `crates/dh-worker/src/service.rs` with `WorkerService`, `WorkerConfig`,
+  tonic `HypervisorWorker` implementation, TCP+UDS serving helper, lease wire
+  validation, and `SlotError -> tonic::Status` mapping with `ErrorDetail`
+  details.
+- Implemented real `GetWorkerInfo` and `ListSlots` over `SlotManager`.
+- Implemented explicit `UNIMPLEMENTED` responses for mutating, introspection,
+  replay, frame-capture, and `WatchSlots` RPCs until their real runtime/event
+  ownership lands.
+- Updated `dh-workerd` to preserve `--preflight` and add serving mode with
+  defaults `0.0.0.0:7400` and `/run/dh/grpc.sock`, plus `--skip-preflight` and
+  ephemeral-address-friendly CLI flags for development/testing.
+- Added direct service tests and a generated tonic client test on
+  `127.0.0.1:0`; tests do not bind production ports or require `/dev/kvm`.
+
+Remaining blockers surfaced by review:
+
+- The service still needs a real per-slot runtime table before lifecycle RPCs
+  can succeed: `SlotVm`, bus, entropy, config, dirty ring/set, hash chain,
+  counter/thread state, base snapshot, and pause/fault state. Filed as
+  `determinism-hypervisor-8kb`, now a dependency of `rfv`.
+- `CreateVm` needs a production image/kernel resolver; current boot paths use
+  raw test ELF bytes. Filed as `determinism-hypervisor-p8g`, now a dependency
+  of `rfv`.
+- `RestoreSnapshotResponse.config` needs a decode/recover path for the MCFG
+  section; the current restore engine receives a caller-provided config and
+  compares canonical bytes. Filed as `determinism-hypervisor-797`, now a
+  dependency of `rfv`.
+- `ForkRequest.entropy_seeds` conflicts with the current fork engine contract
+  that preserves the parent PRNG stream; this needs a design decision before
+  wiring the public RPC. Filed as `determinism-hypervisor-3pk`, now a
+  dependency of `rfv`.
+- Blocking KVM/PMU engine work must not run on the Tokio reactor; later slices
+  should use per-slot blocking workers or `spawn_blocking` with vCPU core
+  pinning via `SlotManager::core_for`.
+
+Verification for this slice:
+
+- `cargo check -p dh-worker`
+- `cargo fmt --check -p dh-worker`
+- `cargo test -p dh-worker service -- --nocapture`
+- `cargo test -p dh-worker proto_map -- --nocapture`
