@@ -26,7 +26,7 @@ use crate::replay_engine::{replay_segment, ReplayError};
 /// `Divergence` event; infrastructure failures (store, log parse, KVM)
 /// stay errors — they are not verdicts about the recording.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_replay<M: GuestMem>(
+pub fn verify_replay<M>(
     slot: &mut SlotVm,
     rail: DeviceRail<M>,
     machine_config: &MachineConfig,
@@ -34,7 +34,10 @@ pub fn verify_replay<M: GuestMem>(
     counter: &InstRetired,
     store: &SnapstoreClient,
     log_bytes: &[u8],
-) -> Result<VerifyReport, ReplayError> {
+) -> Result<VerifyReport, ReplayError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
     let mut report = VerifyReport::default();
     match replay_segment(
         slot,

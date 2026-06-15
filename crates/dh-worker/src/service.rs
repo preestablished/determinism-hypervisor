@@ -93,6 +93,10 @@ type RuntimeDetChannel = dh_devices::detchannel::DetChannelDevice<
 
 #[cfg(target_arch = "x86_64")]
 const DETCHANNEL_MMIO_BASE: u64 = 0xD000_3000;
+#[cfg(target_arch = "x86_64")]
+const MAX_CAPTURE_FEATURE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_arch = "x86_64")]
+const MAX_CAPTURE_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 pub const DEFAULT_TCP_ADDR: &str = "0.0.0.0:7400";
 pub const DEFAULT_UDS_PATH: &str = "/run/dh/grpc.sock";
@@ -1441,6 +1445,18 @@ fn capture_region_error(region: &str, e: detguest_host::RegionReadError) -> Stat
 }
 
 #[cfg(target_arch = "x86_64")]
+fn checked_capture_len(what: &str, len: u64, max: usize) -> Result<usize, Status> {
+    let len = usize::try_from(len)
+        .map_err(|_| Status::invalid_argument(format!("{what} is too large")))?;
+    if len > max {
+        return Err(Status::invalid_argument(format!(
+            "{what} is {len} bytes, max {max}"
+        )));
+    }
+    Ok(len)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn capture_at_boundary(
     bus: &mut dh_devices::MmioBus,
     capture: Option<&proto::CaptureSpec>,
@@ -1465,8 +1481,11 @@ fn capture_at_boundary(
     let feature_len = capture
         .ranges
         .iter()
-        .try_fold(0usize, |acc, range| acc.checked_add(range.len as usize))
-        .ok_or_else(|| Status::invalid_argument("CaptureSpec ranges are too large"))?;
+        .try_fold(0u64, |acc, range| acc.checked_add(u64::from(range.len)))
+        .ok_or_else(|| Status::invalid_argument("CaptureSpec ranges are too large"))
+        .and_then(|len| {
+            checked_capture_len("CaptureSpec feature_bytes", len, MAX_CAPTURE_FEATURE_BYTES)
+        })?;
     let mut out = CaptureOutput {
         feature_bytes: Vec::with_capacity(feature_len),
         fb_lz4: Vec::new(),
@@ -1529,8 +1548,11 @@ fn capture_at_boundary(
         let region = manifest.resolve(name).ok_or_else(|| {
             Status::failed_precondition("framebuffer region could not be resolved")
         })?;
-        let fb_len = usize::try_from(region.len)
-            .map_err(|_| Status::invalid_argument("framebuffer region is too large"))?;
+        let fb_len = checked_capture_len(
+            "framebuffer region",
+            region.len,
+            MAX_CAPTURE_FRAMEBUFFER_BYTES,
+        )?;
         let mut pixels = vec![0u8; fb_len];
         channel
             .read_region(name, 0, &mut pixels)
@@ -3000,6 +3022,36 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn capture_size_limits_reject_oversized_lengths() {
+        assert_eq!(
+            checked_capture_len(
+                "CaptureSpec feature_bytes",
+                MAX_CAPTURE_FEATURE_BYTES as u64,
+                MAX_CAPTURE_FEATURE_BYTES
+            )
+            .unwrap(),
+            MAX_CAPTURE_FEATURE_BYTES
+        );
+        let over = checked_capture_len(
+            "CaptureSpec feature_bytes",
+            MAX_CAPTURE_FEATURE_BYTES as u64 + 1,
+            MAX_CAPTURE_FEATURE_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(over.code(), tonic::Code::InvalidArgument);
+        assert!(over.message().contains("max"));
+
+        let huge = checked_capture_len(
+            "framebuffer region",
+            u64::MAX,
+            MAX_CAPTURE_FRAMEBUFFER_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(huge.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn mapper_config() -> dh_vmm::config::MachineConfig {
         let mut config = dh_vmm::config::MachineConfig::new(
             2 * 1024 * 1024,
@@ -3659,6 +3711,72 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn run_capture_layout_mismatch_commits_successful_run_boundary() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::capture_fixture_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xC9; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+
+            let err = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION + 1,
+                            offset: 0,
+                            len: 8,
+                        }],
+                        framebuffer: false,
+                    }),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(err.message().contains("layout_version"));
+
+            let info = svc.slot_manager().slot_info(lease.slot_id).unwrap();
+            assert_eq!(info.state, dh_vmm::SlotState::Paused);
+            assert!(
+                info.icount > 0,
+                "Run capture errors are post-run validation errors; the slot position is committed"
+            );
+            let runtime_icount = svc
+                .runtime_table()
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime(|runtime| runtime.position.cumulative_icount)
+                        .unwrap()
+                })
+                .unwrap();
+            assert_eq!(runtime_icount, info.icount);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn take_snapshot_capture_checks_layout_version_and_returns_features() {
         if !runtime_tests_available() {
             return;
@@ -3749,6 +3867,124 @@ mod tests {
             assert!(snap.fb_lz4.is_empty());
             assert!(snap.fb_info.is_none());
             assert_eq!(snap.input_log_id.len(), 32);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_handles_detchannel_capture_fixture_log() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::capture_fixture_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            2,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xC8; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let root_lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(root_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(root_lease),
+            }))
+            .await
+            .unwrap();
+
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(base_snapshot.clone()),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = restored.lease.unwrap();
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                            offset: 0,
+                            len: 8,
+                        }],
+                        framebuffer: false,
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+            );
+            assert_eq!(run.feature_bytes, capture_fixture_bytes(0, 8));
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(snap.input_log_id.len(), 32);
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLogId(snap.input_log_id)),
+                    bisect_on_divergence: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut saw_done = false;
+            let mut progress = Vec::new();
+            while let Some(event) = stream.next().await {
+                let msg = event.unwrap().msg;
+                progress.push(format!("{msg:?}"));
+                if matches!(msg, Some(VerifyMsg::Done(_))) {
+                    saw_done = true;
+                }
+            }
+            assert!(
+                saw_done,
+                "VerifyReplay should finish the detchannel log, got {progress:?}"
+            );
         });
     }
 
