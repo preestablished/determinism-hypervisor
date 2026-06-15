@@ -17,6 +17,7 @@ const PROGRAMS: &[&str] = &[
     "landing_loop",
     "device_exercise",
     "capture_fixture",
+    "framebuffer_fixture",
     "net_loopback",
     "fake_frames",
     "hello",

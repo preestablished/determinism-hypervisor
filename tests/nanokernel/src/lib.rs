@@ -181,10 +181,20 @@ pub fn capture_fixture_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/capture_fixture.elf"))
 }
 
+/// Descriptor-backed framebuffer fixture (bead 02r; see
+/// asm/framebuffer_fixture.asm). Publishes the same single
+/// FRAMEBUFFER-flagged region shape as capture_fixture, but the region
+/// starts with the v1 host descriptor {width,height,stride,pixel_format}
+/// followed by exactly stride*height bytes of known XRGB8888 pixels.
+pub fn framebuffer_fixture_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/framebuffer_fixture.elf"))
+}
+
 /// Full-success serial output of the capture fixture ('F' manifest
 /// published, 'D' CHANNEL_INIT ok, 'X' done); a lowercase letter means
 /// that stage failed and the guest parked.
 pub const CAPTURE_FIXTURE_OK_SEQUENCE: &[u8] = b"FDX";
+pub const FRAMEBUFFER_FIXTURE_OK_SEQUENCE: &[u8] = b"FDX";
 
 /// Channel page GPA the capture fixture donates (2 MiB-aligned, same
 /// canonical header/ring layout as device_exercise — see
@@ -205,6 +215,18 @@ pub const CAPTURE_FIXTURE_FB_QWORD_BASE: u64 = 0xFB00_0000_0000_0000;
 /// the layout_version used when the cmdline carries no digits.
 pub const CAPTURE_FIXTURE_REGION_NAME: &[u8] = b"framebuffer";
 pub const CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION: u32 = 1;
+
+pub const FRAMEBUFFER_FIXTURE_CHANNEL_GPA: u64 = 0x40_0000;
+pub const FRAMEBUFFER_FIXTURE_FB_GPA: u64 = 0x60_0000;
+pub const FRAMEBUFFER_FIXTURE_WIDTH: u32 = 8;
+pub const FRAMEBUFFER_FIXTURE_HEIGHT: u32 = 4;
+pub const FRAMEBUFFER_FIXTURE_STRIDE: u32 = 32;
+pub const FRAMEBUFFER_FIXTURE_PIXEL_FORMAT: u32 = 1; // PixelFormat::XRGB8888.
+pub const FRAMEBUFFER_FIXTURE_PIXEL_BYTES: u64 = 128;
+pub const FRAMEBUFFER_FIXTURE_FB_BYTES: u64 = 144;
+pub const FRAMEBUFFER_FIXTURE_FB_QWORD_BASE: u64 = 0xFD00_0000_0000_0000;
+pub const FRAMEBUFFER_FIXTURE_REGION_NAME: &[u8] = b"framebuffer";
+pub const FRAMEBUFFER_FIXTURE_DEFAULT_LAYOUT_VERSION: u32 = 1;
 
 /// The M5 NET_RX landing guest (bead fbr; see asm/net_loopback.asm):
 /// publishes an RX buffer, TXes one known frame through the pv-net
@@ -350,6 +372,7 @@ mod tests {
         assert!(!landing_loop_elf().is_empty());
         assert!(!device_exercise_elf().is_empty());
         assert!(!capture_fixture_elf().is_empty());
+        assert!(!framebuffer_fixture_elf().is_empty());
         assert!(!net_loopback_elf().is_empty());
         assert!(!fake_frames_elf().is_empty());
         assert!(!hello_elf().is_empty());

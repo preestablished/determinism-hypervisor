@@ -58,6 +58,7 @@ fn every_guest_is_a_static_x86_64_exec_at_the_load_addr() {
     assert_guest_shape("landing_loop", landing_loop_elf());
     assert_guest_shape("device_exercise", device_exercise_elf());
     assert_guest_shape("capture_fixture", capture_fixture_elf());
+    assert_guest_shape("framebuffer_fixture", framebuffer_fixture_elf());
     assert_guest_shape("net_loopback", net_loopback_elf());
     assert_guest_shape("fake_frames", fake_frames_elf());
     assert_guest_shape("hello", hello_elf());
@@ -354,9 +355,11 @@ fn entropy_draw_asm_matches_rust_constants() {
 /// (manifest magic and the two area-relative offsets it stores at).
 #[test]
 fn capture_fixture_asm_matches_rust_constants() {
-    let asm =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/asm/capture_fixture.asm"))
-            .unwrap();
+    let asm = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/asm/capture_fixture.asm"
+    ))
+    .unwrap();
     let define = |name: &str| -> u64 {
         asm.lines()
             .find_map(|l| {
@@ -411,9 +414,87 @@ fn capture_fixture_asm_matches_rust_constants() {
     // The framebuffer must start at or after the channel page's end —
     // a manifest extent overlapping the channel would let capture reads
     // see ring traffic (const-evaluated for the clippy lane).
-    const _FB_CLEAR_OF_CHANNEL: () = assert!(
-        CAPTURE_FIXTURE_FB_GPA >= CAPTURE_FIXTURE_CHANNEL_GPA + 0x20_0000
+    const _FB_CLEAR_OF_CHANNEL: () =
+        assert!(CAPTURE_FIXTURE_FB_GPA >= CAPTURE_FIXTURE_CHANNEL_GPA + 0x20_0000);
+}
+
+/// Drift pin for the descriptor-backed framebuffer fixture: the region
+/// descriptor and pixel payload dimensions are the contract shared by
+/// CaptureSpec.framebuffer and GetFramebuffer tests.
+#[test]
+fn framebuffer_fixture_asm_matches_rust_constants() {
+    let asm = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/asm/framebuffer_fixture.asm"
+    ))
+    .unwrap();
+    let define = |name: &str| -> u64 {
+        asm.lines()
+            .find_map(|l| {
+                let mut t = l.split_whitespace();
+                (t.next() == Some("%define") && t.next() == Some(name)).then(|| {
+                    let v = t.next().unwrap();
+                    if let Some(hex) = v.strip_prefix("0x") {
+                        u64::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        v.parse().unwrap()
+                    }
+                })
+            })
+            .unwrap_or_else(|| panic!("missing %define {name}"))
+    };
+    assert_eq!(define("CHANNEL_GPA"), FRAMEBUFFER_FIXTURE_CHANNEL_GPA);
+    assert_eq!(define("FB_GPA"), FRAMEBUFFER_FIXTURE_FB_GPA);
+    assert_eq!(define("FB_WIDTH"), u64::from(FRAMEBUFFER_FIXTURE_WIDTH));
+    assert_eq!(define("FB_HEIGHT"), u64::from(FRAMEBUFFER_FIXTURE_HEIGHT));
+    assert_eq!(define("FB_STRIDE"), u64::from(FRAMEBUFFER_FIXTURE_STRIDE));
+    assert_eq!(
+        define("FB_FORMAT"),
+        u64::from(FRAMEBUFFER_FIXTURE_PIXEL_FORMAT)
     );
+    assert_eq!(define("FB_PIXEL_BYTES"), FRAMEBUFFER_FIXTURE_PIXEL_BYTES);
+    assert_eq!(define("FB_BYTES"), FRAMEBUFFER_FIXTURE_FB_BYTES);
+    assert_eq!(define("FB_QWORDS"), FRAMEBUFFER_FIXTURE_PIXEL_BYTES / 8);
+    assert_eq!(define("FB_QWORD_BASE"), FRAMEBUFFER_FIXTURE_FB_QWORD_BASE);
+    assert_eq!(
+        u32::try_from(define("DEFAULT_LAYOUT_VERSION")).unwrap(),
+        FRAMEBUFFER_FIXTURE_DEFAULT_LAYOUT_VERSION
+    );
+    assert_eq!(
+        define("REGION_NAME_LEN"),
+        FRAMEBUFFER_FIXTURE_REGION_NAME.len() as u64
+    );
+    assert_eq!(
+        u32::try_from(define("MANIFEST_MAGIC")).unwrap(),
+        detguest_wire::manifest::MANIFEST_MAGIC
+    );
+    assert_eq!(
+        define("MANIFEST_OFF"),
+        detguest_wire::header::OFF_MANIFEST as u64
+    );
+    assert_eq!(
+        define("OFF_ENTRY0"),
+        detguest_wire::manifest::RegionEntry::offset(0) as u64
+    );
+    assert_eq!(
+        define("OFF_EXTENT0"),
+        detguest_wire::manifest::Extent::offset(0) as u64
+    );
+    assert_eq!(
+        u32::try_from(define("REGION_FLAG_FRAMEBUFFER")).unwrap(),
+        detguest_wire::manifest::REGION_FLAG_FRAMEBUFFER
+    );
+    assert_eq!(
+        u64::from(FRAMEBUFFER_FIXTURE_STRIDE) * u64::from(FRAMEBUFFER_FIXTURE_HEIGHT),
+        FRAMEBUFFER_FIXTURE_PIXEL_BYTES
+    );
+    assert_eq!(
+        FRAMEBUFFER_FIXTURE_FB_BYTES,
+        16 + FRAMEBUFFER_FIXTURE_PIXEL_BYTES
+    );
+
+    const _FB_CLEAR_OF_CHANNEL: () =
+        assert!(FRAMEBUFFER_FIXTURE_FB_GPA >= FRAMEBUFFER_FIXTURE_CHANNEL_GPA + 0x20_0000);
 }
 
 /// Both channel-publishing guests hardcode the eight ring-desc dwords in
@@ -424,7 +505,11 @@ fn capture_fixture_asm_matches_rust_constants() {
 /// slots against the constant.
 #[test]
 fn channel_guest_asm_ring_descs_match_the_constant() {
-    for file in ["device_exercise.asm", "capture_fixture.asm"] {
+    for file in [
+        "device_exercise.asm",
+        "capture_fixture.asm",
+        "framebuffer_fixture.asm",
+    ] {
         let asm = std::fs::read_to_string(
             std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/asm")).join(file),
         )
@@ -543,9 +628,8 @@ fn net_loopback_asm_matches_rust_constants() {
     // TX frame end must not reach into the RX buffer (this asserts
     // TX-end <= RX-start only; nothing is mapped above RX to collide
     // with its capacity).
-    const _BUFFERS_DISJOINT: () = assert!(
-        NET_LOOPBACK_TX_GPA + NET_LOOPBACK_FRAME_LEN as u64 <= NET_LOOPBACK_RX_GPA
-    );
+    const _BUFFERS_DISJOINT: () =
+        assert!(NET_LOOPBACK_TX_GPA + NET_LOOPBACK_FRAME_LEN as u64 <= NET_LOOPBACK_RX_GPA);
 
     // The serial protocol: the asm's uppercase putc bytes, in program
     // order, must spell the lib.rs OK sequence (lowercase = failures).
@@ -595,7 +679,10 @@ fn fake_frames_asm_matches_rust_constants() {
     assert_eq!(define("PAD_BASE"), dh_devices::pad::PV_PAD_BASE);
     assert_eq!(define("REG_FRAME"), dh_devices::pad::REG_FRAME_COUNTER);
     assert_eq!(define("PACE_ITERS"), FAKE_FRAMES_PACE_ITERS);
-    assert_eq!(FAKE_FRAMES_PACE_ITERS, PAD_ECHO_PACE_ITERS, "shared cadence");
+    assert_eq!(
+        FAKE_FRAMES_PACE_ITERS, PAD_ECHO_PACE_ITERS,
+        "shared cadence"
+    );
     assert!(
         asm.contains(&format!("'{}'", FAKE_FRAMES_BOOT_MARKER as char)),
         "boot marker drifted from FAKE_FRAMES_BOOT_MARKER"
@@ -620,11 +707,13 @@ fn fake_frames_asm_matches_rust_constants() {
     // The work_buf ring bound must match the pace loop's mask: a
     // PACE_ITERS retune past the mask would otherwise write past it.
     assert!(
-        code.iter().any(|t| t.contains("and") && t.contains("ebx, 511")),
+        code.iter()
+            .any(|t| t.contains("and") && t.contains("ebx, 511")),
         "pace mask drifted"
     );
     assert!(
-        code.iter().any(|t| t.contains("work_buf:") && t.contains("resq 512")),
+        code.iter()
+            .any(|t| t.contains("work_buf:") && t.contains("resq 512")),
         "work_buf size drifted from the 511 pace mask"
     );
 

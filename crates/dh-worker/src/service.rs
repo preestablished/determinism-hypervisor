@@ -2102,29 +2102,72 @@ fn fault_runtime_after_pause_drain_error(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn read_framebuffer_from_bus(
+#[derive(Clone, Copy)]
+enum FramebufferCaller {
+    GetFramebuffer,
+    CaptureSpec,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FramebufferCaller {
+    fn missing_device(self) -> &'static str {
+        match self {
+            FramebufferCaller::GetFramebuffer => {
+                "GetFramebuffer requires DetChannelDevice in machine_config"
+            }
+            FramebufferCaller::CaptureSpec => {
+                "CaptureSpec requires DetChannelDevice in machine_config"
+            }
+        }
+    }
+
+    fn missing_channel(self) -> &'static str {
+        match self {
+            FramebufferCaller::GetFramebuffer => "GetFramebuffer requires an attached detchannel",
+            FramebufferCaller::CaptureSpec => "CaptureSpec requires an attached detchannel",
+        }
+    }
+
+    fn read_manifest_context(self) -> &'static str {
+        match self {
+            FramebufferCaller::GetFramebuffer => "read framebuffer manifest",
+            FramebufferCaller::CaptureSpec => "read capture manifest",
+        }
+    }
+
+    fn missing_region(self) -> &'static str {
+        match self {
+            FramebufferCaller::GetFramebuffer => {
+                "GetFramebuffer requested but no framebuffer region is published"
+            }
+            FramebufferCaller::CaptureSpec => {
+                "CaptureSpec.framebuffer requested but no framebuffer region is published"
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_framebuffer_region_from_bus(
     bus: &mut dh_devices::MmioBus,
-) -> Result<(u32, u32, u32, i32, Vec<u8>), Status> {
-    let detchannel = runtime_detchannel_mut(bus).ok_or_else(|| {
-        Status::failed_precondition("GetFramebuffer requires DetChannelDevice in machine_config")
+    caller: FramebufferCaller,
+) -> Result<Vec<u8>, Status> {
+    let detchannel = runtime_detchannel_mut(bus)
+        .ok_or_else(|| Status::failed_precondition(caller.missing_device()))?;
+    let channel = detchannel
+        .host()
+        .channel()
+        .ok_or_else(|| Status::failed_precondition(caller.missing_channel()))?;
+    let manifest = channel.read_manifest().map_err(|e| {
+        Status::failed_precondition(format!("{}: {e:?}", caller.read_manifest_context()))
     })?;
-    let channel = detchannel.host().channel().ok_or_else(|| {
-        Status::failed_precondition("GetFramebuffer requires an attached detchannel")
-    })?;
-    let manifest = channel
-        .read_manifest()
-        .map_err(|e| Status::failed_precondition(format!("read framebuffer manifest: {e:?}")))?;
     let entry = manifest
         .entries
         .iter()
         .find(|entry| {
             entry.is_live() && entry.flags & detguest_wire::manifest::REGION_FLAG_FRAMEBUFFER != 0
         })
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                "GetFramebuffer requested but no framebuffer region is published",
-            )
-        })?;
+        .ok_or_else(|| Status::failed_precondition(caller.missing_region()))?;
     let name = std::str::from_utf8(entry.name_bytes())
         .map_err(|_| Status::failed_precondition("framebuffer region name is not valid UTF-8"))?;
     let region = manifest
@@ -2139,7 +2182,15 @@ fn read_framebuffer_from_bus(
     channel
         .read_region(name, 0, &mut pixels)
         .map_err(|e| capture_region_error(name, e))?;
-    framebuffer_response_from_region_bytes(&pixels)
+    Ok(pixels)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_framebuffer_from_bus(
+    bus: &mut dh_devices::MmioBus,
+) -> Result<(u32, u32, u32, i32, Vec<u8>), Status> {
+    let region = read_framebuffer_region_from_bus(bus, FramebufferCaller::GetFramebuffer)?;
+    framebuffer_response_from_region_bytes(&region)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2192,6 +2243,48 @@ fn framebuffer_response_from_region_bytes(
         .ok_or_else(|| Status::failed_precondition("framebuffer pixels are truncated"))?
         .to_vec();
     Ok((width, height, stride, proto_pixel_format(format), pixels))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn descriptor_framebuffer_capture(
+    region: &[u8],
+    frame_counter: u32,
+) -> Result<Option<(Vec<u8>, proto::FbInfo)>, Status> {
+    if !framebuffer_region_advertises_descriptor(region) {
+        return Ok(None);
+    }
+    let (width, height, stride, format, pixels) = framebuffer_response_from_region_bytes(region)?;
+    Ok(Some((
+        pixels,
+        proto::FbInfo {
+            width,
+            height,
+            stride,
+            format,
+            frame_counter,
+        },
+    )))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn framebuffer_region_advertises_descriptor(region: &[u8]) -> bool {
+    let Some(descriptor) = region.get(..FRAMEBUFFER_DESCRIPTOR_BYTES) else {
+        return false;
+    };
+    let width = u32::from_le_bytes(descriptor[0..4].try_into().unwrap());
+    let height = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+    let stride = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+    let format = u32::from_le_bytes(descriptor[12..16].try_into().unwrap());
+    let known_format = matches!(
+        i32::try_from(format)
+            .ok()
+            .and_then(|format| proto::PixelFormat::try_from(format).ok()),
+        Some(proto::PixelFormat::PfUnspecified)
+            | Some(proto::PixelFormat::Xrgb8888)
+            | Some(proto::PixelFormat::Rgb565)
+    );
+    let plausible_dimensions = width != 0 && height != 0 && stride >= width;
+    known_format || plausible_dimensions
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2268,41 +2361,23 @@ fn capture_at_boundary(
     }
 
     if capture.framebuffer {
-        let entry = manifest
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.is_live()
-                    && entry.flags & detguest_wire::manifest::REGION_FLAG_FRAMEBUFFER != 0
-            })
-            .ok_or_else(|| {
-                Status::failed_precondition(
-                    "CaptureSpec.framebuffer requested but no framebuffer region is published",
-                )
-            })?;
-        let name = std::str::from_utf8(entry.name_bytes()).map_err(|_| {
-            Status::failed_precondition("framebuffer region name is not valid UTF-8")
-        })?;
-        let region = manifest.resolve(name).ok_or_else(|| {
-            Status::failed_precondition("framebuffer region could not be resolved")
-        })?;
-        let fb_len = checked_capture_len(
-            "framebuffer region",
-            region.len,
-            MAX_CAPTURE_FRAMEBUFFER_BYTES,
-        )?;
-        let mut pixels = vec![0u8; fb_len];
-        channel
-            .read_region(name, 0, &mut pixels)
-            .map_err(|e| capture_region_error(name, e))?;
-        out.fb_lz4 = lz4_flex::compress_prepend_size(&pixels);
-        out.fb_info = Some(proto::FbInfo {
-            width: 0,
-            height: 0,
-            stride: 0,
-            format: proto_pixel_format(proto::PixelFormat::PfUnspecified),
-            frame_counter,
-        });
+        let region = read_framebuffer_region_from_bus(bus, FramebufferCaller::CaptureSpec)?;
+        match descriptor_framebuffer_capture(&region, frame_counter)? {
+            Some((pixels, fb_info)) => {
+                out.fb_lz4 = lz4_flex::compress_prepend_size(&pixels);
+                out.fb_info = Some(fb_info);
+            }
+            None => {
+                out.fb_lz4 = lz4_flex::compress_prepend_size(&region);
+                out.fb_info = Some(proto::FbInfo {
+                    width: 0,
+                    height: 0,
+                    stride: 0,
+                    format: proto_pixel_format(proto::PixelFormat::PfUnspecified),
+                    frame_counter,
+                });
+            }
+        }
     }
 
     Ok(out)
@@ -4065,6 +4140,14 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn framebuffer_fixture_machine_config(
+        base_hash: [u8; 32],
+        kernel_hash: [u8; 32],
+    ) -> proto::MachineConfig {
+        capture_fixture_machine_config(base_hash, kernel_hash)
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn capture_fixture_machine_config_with_epoch_len(
         base_hash: [u8; 32],
         kernel_hash: [u8; 32],
@@ -4096,6 +4179,17 @@ mod tests {
             fb.extend_from_slice(&(nanokernel::CAPTURE_FIXTURE_FB_QWORD_BASE + j).to_le_bytes());
         }
         fb[offset..offset + len].to_vec()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn framebuffer_fixture_pixels() -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(nanokernel::FRAMEBUFFER_FIXTURE_PIXEL_BYTES as usize);
+        for j in 0..nanokernel::FRAMEBUFFER_FIXTURE_PIXEL_BYTES / 8 {
+            pixels.extend_from_slice(
+                &(nanokernel::FRAMEBUFFER_FIXTURE_FB_QWORD_BASE + j).to_le_bytes(),
+            );
+        }
+        pixels
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4414,11 +4508,46 @@ mod tests {
         assert_eq!(stride, 16);
         assert_eq!(format, proto_pixel_format(proto::PixelFormat::Xrgb8888));
         assert_eq!(pixels, (0u8..32).collect::<Vec<_>>());
+        let (capture_pixels, capture_info) =
+            descriptor_framebuffer_capture(&region, 7).unwrap().unwrap();
+        assert_eq!(capture_pixels, pixels);
+        assert_eq!(capture_info.width, 4);
+        assert_eq!(capture_info.height, 2);
+        assert_eq!(capture_info.stride, 16);
+        assert_eq!(
+            capture_info.format,
+            proto_pixel_format(proto::PixelFormat::Xrgb8888)
+        );
+        assert_eq!(capture_info.frame_counter, 7);
 
         let raw = capture_fixture_bytes(0, FRAMEBUFFER_DESCRIPTOR_BYTES + 32);
         let err = framebuffer_response_from_region_bytes(&raw).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("framebuffer descriptor"));
+        assert!(descriptor_framebuffer_capture(&raw, 7).unwrap().is_none());
+
+        let mut zero_width = region.clone();
+        zero_width[0..4].copy_from_slice(&0u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&zero_width, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("zero dimensions"));
+
+        let mut bad_stride = region.clone();
+        bad_stride[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&bad_stride, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("stride"));
+
+        let mut bad_format = region.clone();
+        bad_format[12..16].copy_from_slice(&99u32.to_le_bytes());
+        let err = descriptor_framebuffer_capture(&bad_format, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("unsupported pixel_format"));
+
+        let truncated = &region[..region.len() - 1];
+        let err = descriptor_framebuffer_capture(truncated, 7).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("truncated"));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5182,6 +5311,91 @@ mod tests {
                 proto_pixel_format(proto::PixelFormat::PfUnspecified)
             );
             assert_eq!(fb_info.frame_counter, 0);
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn descriptor_framebuffer_fixture_feeds_capture_and_get_framebuffer() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash =
+            write_cache_blob(image_cache.path(), nanokernel::framebuffer_fixture_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(framebuffer_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xF0; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let expected_pixels = framebuffer_fixture_pixels();
+
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
+                    hard_icount_cap: 0,
+                    capture: Some(proto::CaptureSpec {
+                        ranges: Vec::new(),
+                        framebuffer: true,
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+            );
+            let capture_pixels = lz4_flex::decompress_size_prepended(&run.fb_lz4).unwrap();
+            assert_eq!(capture_pixels, expected_pixels);
+            assert_eq!(
+                capture_pixels.len(),
+                (nanokernel::FRAMEBUFFER_FIXTURE_STRIDE * nanokernel::FRAMEBUFFER_FIXTURE_HEIGHT)
+                    as usize
+            );
+            let capture_info = run.fb_info.unwrap();
+            assert_eq!(capture_info.width, nanokernel::FRAMEBUFFER_FIXTURE_WIDTH);
+            assert_eq!(capture_info.height, nanokernel::FRAMEBUFFER_FIXTURE_HEIGHT);
+            assert_eq!(capture_info.stride, nanokernel::FRAMEBUFFER_FIXTURE_STRIDE);
+            assert_eq!(
+                capture_info.format,
+                proto_pixel_format(proto::PixelFormat::Xrgb8888)
+            );
+            assert_eq!(capture_info.frame_counter, 0);
+
+            let fb = svc
+                .get_framebuffer(Request::new(proto::GetFramebufferRequest {
+                    lease: Some(lease),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(fb.icount, run.icount);
+            assert_eq!(fb.width, nanokernel::FRAMEBUFFER_FIXTURE_WIDTH);
+            assert_eq!(fb.height, nanokernel::FRAMEBUFFER_FIXTURE_HEIGHT);
+            assert_eq!(fb.stride, nanokernel::FRAMEBUFFER_FIXTURE_STRIDE);
+            assert_eq!(fb.format, proto_pixel_format(proto::PixelFormat::Xrgb8888));
+            assert_eq!(fb.frame_counter, capture_info.frame_counter);
+            assert_eq!(fb.pixels, expected_pixels);
+            assert_eq!(
+                fb.pixels.len(),
+                (u64::from(fb.stride) * u64::from(fb.height)) as usize
+            );
         });
     }
 
