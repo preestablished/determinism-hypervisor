@@ -127,6 +127,24 @@ mod tests {
             req
         );
 
+        // §2.5 TakeSnapshotRequest: seal_input_log has presence because the
+        // API default is true but explicit false is meaningful.
+        let default_seal = v1::TakeSnapshotRequest {
+            lease: Some(sample_lease()),
+            seal_input_log: None,
+            capture: None,
+        };
+        let explicit_false = v1::TakeSnapshotRequest {
+            lease: Some(sample_lease()),
+            seal_input_log: Some(false),
+            capture: None,
+        };
+        assert_ne!(default_seal.encode_to_vec(), explicit_false.encode_to_vec());
+        assert_eq!(
+            v1::TakeSnapshotRequest::decode(explicit_false.encode_to_vec().as_slice()).unwrap(),
+            explicit_false
+        );
+
         // §2.4 GoalCondition with the nested MemPredicate::Op enum.
         let goal = v1::GoalCondition {
             all_of: vec![v1::MemPredicate {

@@ -255,8 +255,8 @@ message PauseResponse { uint64 icount = 1; uint64 vns = 2; StateHash state_hash 
 
 message TakeSnapshotRequest {
   Lease lease = 1;
-  bool seal_input_log = 2;     // true (default): close + store the segment's DHILOG in
-                               // snapshot-store, reference it in the response
+  optional bool seal_input_log = 2; // true (default): close + store the segment's DHILOG in
+                                    // snapshot-store, reference it in the response
   CaptureSpec capture = 3;     // optional: extract features/framebuffer at the same
                                //   boundary (capture engine, ARCHITECTURE §6.10)
 }
