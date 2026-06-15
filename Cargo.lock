@@ -520,6 +520,7 @@ dependencies = [
  "dh-snapshot",
  "dh-verify",
  "dh-vmm",
+ "hyper-util",
  "kvm-ioctls",
  "libc",
  "lz4_flex",
@@ -533,6 +534,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower 0.5.3",
  "vm-memory",
 ]
 
