@@ -1538,7 +1538,9 @@ mod event_until_tests {
             };
             let out = run_segment(
                 &mut seg,
-                Until::NextSdkEvent { hard_cap: 1_000_000 },
+                Until::NextSdkEvent {
+                    hard_cap: 1_000_000,
+                },
                 &mut || false,
                 &mut |exit| match exit {
                     VcpuExit::IoOut(port, _) if (0x3F8..0x400).contains(&port) => {

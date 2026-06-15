@@ -9,6 +9,10 @@ pub mod replay_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod restore_engine;
 #[cfg(target_arch = "x86_64")]
+pub mod runtime;
+pub mod service;
+pub mod slot_manager;
+#[cfg(target_arch = "x86_64")]
 pub mod snapshot_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod verify_replay;

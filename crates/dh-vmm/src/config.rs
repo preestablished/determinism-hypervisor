@@ -233,9 +233,160 @@ impl MachineConfig {
         Ok(out)
     }
 
+    /// Decode the frozen v1 canonical representation written into DHSNAP
+    /// `MCFG` sections. Landing-only knobs are not in the preimage, so they
+    /// recover to their defaults while preserving the exact canonical bytes.
+    pub fn canonical_decode(bytes: &[u8]) -> Result<Self, ConfigDecodeError> {
+        let mut r = ConfigReader::new(bytes);
+        if r.read_exact(8)? != b"DHMCFG\0\0" {
+            return Err(ConfigDecodeError::BadMagic);
+        }
+        let version = r.read_u32()?;
+        let mem_bytes = r.read_u64()?;
+        let vcpus = r.read_u32()?;
+        let clock_num = r.read_u32()?;
+        let clock_den = r.read_u32()?;
+        let clock =
+            ClockRatio::new(clock_num, clock_den).ok_or(ConfigDecodeError::ZeroClockTerm)?;
+        let base_image_hash = r.read_hash()?;
+        let boot = match r.read_u8()? {
+            1 => BootSpec::Elf {
+                kernel_hash: r.read_hash()?,
+                cmdline: r.read_vec_u32("cmdline", MAX_CMDLINE)?,
+            },
+            2 => BootSpec::BzImage {
+                kernel_hash: r.read_hash()?,
+                initramfs_hash: r.read_hash()?,
+                cmdline: r.read_vec_u32("cmdline", MAX_CMDLINE)?,
+            },
+            found => return Err(ConfigDecodeError::BadBootTag { found }),
+        };
+        let epoch_len = r.read_u64()?;
+        let hash_epochs = match r.read_u8()? {
+            1 => HashEpochs::EpochsOn,
+            2 => HashEpochs::FinalOnly,
+            found => return Err(ConfigDecodeError::BadHashEpochs { found }),
+        };
+        let cpuid_count = r.read_u32()? as usize;
+        if cpuid_count > MAX_CPUID_LEAVES {
+            return Err(ConfigDecodeError::InvalidConfig(
+                ConfigError::CpuidTableTooLarge,
+            ));
+        }
+        let mut cpuid_table = Vec::with_capacity(cpuid_count);
+        for _ in 0..cpuid_count {
+            cpuid_table.push(CpuidLeaf {
+                function: r.read_u32()?,
+                index: r.read_u32()?,
+                flags: r.read_u32()?,
+                eax: r.read_u32()?,
+                ebx: r.read_u32()?,
+                ecx: r.read_u32()?,
+                edx: r.read_u32()?,
+            });
+        }
+        let device_count = r.read_u32()? as usize;
+        if device_count > MAX_DEVICES {
+            return Err(ConfigDecodeError::InvalidConfig(
+                ConfigError::DeviceSetTooLarge,
+            ));
+        }
+        let mut device_set = Vec::with_capacity(device_count);
+        for _ in 0..device_count {
+            device_set.push(r.read_u16()?);
+        }
+        if !r.is_finished() {
+            return Err(ConfigDecodeError::TrailingBytes {
+                trailing: r.remaining(),
+            });
+        }
+        let config = Self {
+            version,
+            mem_bytes,
+            vcpus,
+            clock,
+            base_image_hash,
+            boot,
+            epoch_len,
+            hash_epochs,
+            skid_margin: DEFAULT_SKID_MARGIN,
+            resync_slack: DEFAULT_RESYNC_SLACK,
+            cpuid_table,
+            device_set,
+        };
+        config
+            .validate()
+            .map_err(ConfigDecodeError::InvalidConfig)?;
+        Ok(config)
+    }
+
     /// BLAKE3 of the canonical encoding (32 bytes) — `machine_config_hash`.
     pub fn config_hash(&self) -> Result<[u8; 32], ConfigError> {
         Ok(dh_inputlog::payload_digest(&self.canonical_encode()?))
+    }
+}
+
+struct ConfigReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ConfigReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ConfigDecodeError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or(ConfigDecodeError::Truncated)?;
+        let out = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(ConfigDecodeError::Truncated)?;
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ConfigDecodeError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ConfigDecodeError> {
+        Ok(u16::from_le_bytes(self.read_exact(2)?.try_into().unwrap()))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ConfigDecodeError> {
+        Ok(u32::from_le_bytes(self.read_exact(4)?.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ConfigDecodeError> {
+        Ok(u64::from_le_bytes(self.read_exact(8)?.try_into().unwrap()))
+    }
+
+    fn read_hash(&mut self) -> Result<[u8; 32], ConfigDecodeError> {
+        Ok(self.read_exact(32)?.try_into().unwrap())
+    }
+
+    fn read_vec_u32(
+        &mut self,
+        field: &'static str,
+        max: usize,
+    ) -> Result<Vec<u8>, ConfigDecodeError> {
+        let len = self.read_u32()? as usize;
+        if len > max {
+            return Err(ConfigDecodeError::LengthTooLarge { field, len, max });
+        }
+        Ok(self.read_exact(len)?.to_vec())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
     }
 }
 
@@ -250,6 +401,28 @@ pub enum ConfigError {
     DeviceSetTooLarge,
     CpuidTableUnsorted,
     DeviceSetUnsorted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigDecodeError {
+    BadMagic,
+    Truncated,
+    TrailingBytes {
+        trailing: usize,
+    },
+    BadBootTag {
+        found: u8,
+    },
+    BadHashEpochs {
+        found: u8,
+    },
+    ZeroClockTerm,
+    LengthTooLarge {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+    InvalidConfig(ConfigError),
 }
 
 #[cfg(test)]
@@ -401,6 +574,89 @@ mod tests {
             "boot variant must be domain-separated"
         );
         assert!(bytes.windows(32).any(|w| w == [0x44; 32]));
+    }
+
+    #[test]
+    fn canonical_decode_round_trips_the_frozen_preimage() {
+        let mut c = config();
+        c.skid_margin = 16_384;
+        c.resync_slack = 4_096;
+        let bytes = c.canonical_encode().unwrap();
+        let decoded = MachineConfig::canonical_decode(&bytes).unwrap();
+
+        assert_eq!(decoded.canonical_encode().unwrap(), bytes);
+        assert_eq!(decoded.version, c.version);
+        assert_eq!(decoded.mem_bytes, c.mem_bytes);
+        assert_eq!(decoded.vcpus, c.vcpus);
+        assert_eq!(decoded.clock, c.clock);
+        assert_eq!(decoded.base_image_hash, c.base_image_hash);
+        assert_eq!(decoded.boot, c.boot);
+        assert_eq!(decoded.epoch_len, c.epoch_len);
+        assert_eq!(decoded.hash_epochs, c.hash_epochs);
+        assert_eq!(decoded.cpuid_table, c.cpuid_table);
+        assert_eq!(decoded.device_set, c.device_set);
+        assert_eq!(decoded.skid_margin, DEFAULT_SKID_MARGIN);
+        assert_eq!(decoded.resync_slack, DEFAULT_RESYNC_SLACK);
+    }
+
+    #[test]
+    fn canonical_decode_round_trips_bzimage() {
+        let mut c = config();
+        c.boot = BootSpec::BzImage {
+            kernel_hash: [0x33; 32],
+            initramfs_hash: [0x44; 32],
+            cmdline: b"quiet".to_vec(),
+        };
+        c.hash_epochs = HashEpochs::FinalOnly;
+        let bytes = c.canonical_encode().unwrap();
+        let decoded = MachineConfig::canonical_decode(&bytes).unwrap();
+        assert_eq!(decoded.canonical_encode().unwrap(), bytes);
+        assert_eq!(decoded.boot, c.boot);
+        assert_eq!(decoded.hash_epochs, HashEpochs::FinalOnly);
+    }
+
+    #[test]
+    fn canonical_decode_rejects_non_canonical_bytes() {
+        assert_eq!(
+            MachineConfig::canonical_decode(b"not-mcfg"),
+            Err(ConfigDecodeError::BadMagic)
+        );
+
+        let mut bytes = config().canonical_encode().unwrap();
+        bytes.push(0);
+        assert_eq!(
+            MachineConfig::canonical_decode(&bytes),
+            Err(ConfigDecodeError::TrailingBytes { trailing: 1 })
+        );
+
+        let mut bytes = config().canonical_encode().unwrap();
+        let boot_tag = 8 + 4 + 8 + 4 + 4 + 4 + 32;
+        bytes[boot_tag] = 9;
+        assert_eq!(
+            MachineConfig::canonical_decode(&bytes),
+            Err(ConfigDecodeError::BadBootTag { found: 9 })
+        );
+
+        let mut bytes = config().canonical_encode().unwrap();
+        let hash_epochs = bytes
+            .windows(DEFAULT_EPOCH_LEN.to_le_bytes().len())
+            .position(|w| w == DEFAULT_EPOCH_LEN.to_le_bytes())
+            .unwrap()
+            + DEFAULT_EPOCH_LEN.to_le_bytes().len();
+        bytes[hash_epochs] = 7;
+        assert_eq!(
+            MachineConfig::canonical_decode(&bytes),
+            Err(ConfigDecodeError::BadHashEpochs { found: 7 })
+        );
+
+        let mut bytes = config().canonical_encode().unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            MachineConfig::canonical_decode(&bytes),
+            Err(ConfigDecodeError::InvalidConfig(
+                ConfigError::UnsupportedVersion
+            ))
+        );
     }
 
     #[test]
