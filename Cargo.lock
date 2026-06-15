@@ -415,12 +415,16 @@ version = "0.1.0"
 dependencies = [
  "dh-detclock",
  "dh-devices",
+ "dh-proto",
  "dh-verify",
  "dh-vmm",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "nanokernel",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "vm-memory",
 ]
 

@@ -21,7 +21,7 @@ fn json_escape(bytes: &[u8]) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli skid [--samples N]\n  dh-cli gate [--runs N]"
+        "usage:\n  dh-cli caps\n  dh-cli cpuid-diff\n  dh-cli boot <guest.elf> [--mem-mib N] [--cmdline S] [--json]\n  dh-cli run <guest.elf> (--icount-budget N | --vns-budget N) [--mem-mib N] [--cmdline S]\n  dh-cli snapshot --lease SLOT:TOKEN_HEX [--endpoint URL] [--no-seal-input-log] [--json]\n  dh-cli restore --snapshot SNAPSHOT_HEX [--endpoint URL] [--entropy-seed HEX] [--json]\n  dh-cli fork --parent SLOT:TOKEN_HEX --count N [--endpoint URL] [--entropy-seed HEX]... [--json]\n  dh-cli replay --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--json]\n  dh-cli verify --snapshot SNAPSHOT_HEX (--input-log PATH | --input-log-id HEX) [--endpoint URL] [--bisect|--no-bisect] [--json]\n  dh-cli skid [--samples N]\n  dh-cli gate [--runs N]"
     );
     std::process::exit(2);
 }
@@ -32,6 +32,11 @@ pub fn main() {
         Some("caps") | None => println!("{}", dh_vmm::m0_missing_caps_summary()),
         Some("boot") => boot_cmd(&args[1..]),
         Some("run") => run_cmd(&args[1..]),
+        Some("snapshot") => crate::ops::dispatch("snapshot", &args[1..]),
+        Some("restore") => crate::ops::dispatch("restore", &args[1..]),
+        Some("fork") => crate::ops::dispatch("fork", &args[1..]),
+        Some("replay") => crate::ops::dispatch("replay", &args[1..]),
+        Some("verify") => crate::ops::dispatch("verify", &args[1..]),
         Some("gate") => {
             let runs = args
                 .get(1)
