@@ -18,6 +18,14 @@
 //!
 //!   DH_M7_ACCEPT_JOBS=2 DH_M7_ACCEPT_SLOT_CORES=0-1 \
 //!     cargo test -p dh-worker --test m7_fork_verify -- --ignored --nocapture
+//!
+//! The cross-slot acceptance gate re-runs a deterministic sample of the same
+//! 1000-job universe by forking same-seed child twins onto two different slots:
+//!
+//!   DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker \
+//!     --test m7_fork_verify --release \
+//!     m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs \
+//!     -- --ignored --nocapture
 
 #![cfg(target_arch = "x86_64")]
 
@@ -52,12 +60,14 @@ const BURST_EVENTS: usize = 8;
 const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
 const SLOT_CORES_ENV: &str = "DH_M7_ACCEPT_SLOT_CORES";
 const ALLOW_SKIP_ENV: &str = "DH_M7_ACCEPT_ALLOW_SKIP";
+const CROSS_CHECKS_ENV: &str = "DH_M7_CROSS_CHECKS";
 
 type TestResult<T> = Result<T, String>;
 
 #[derive(Clone, Debug)]
 struct ChildRecord {
     index: usize,
+    slot_id: u64,
     snapshot: proto::SnapshotRef,
     state_hash: [u8; 32],
     input_log_id: Vec<u8>,
@@ -185,6 +195,29 @@ fn configured_jobs() -> usize {
         .max(1)
 }
 
+fn configured_cross_checks(jobs: usize) -> usize {
+    std::env::var(CROSS_CHECKS_ENV)
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().unwrap_or_else(|_| {
+                panic!("{CROSS_CHECKS_ENV} must be a positive integer, got {value:?}")
+            })
+        })
+        .unwrap_or(10)
+        .clamp(1, jobs)
+}
+
+fn cross_check_indices(total_jobs: usize, checks: usize) -> Vec<usize> {
+    assert!(total_jobs > 0);
+    let checks = checks.clamp(1, total_jobs);
+    if checks == 1 {
+        return vec![0];
+    }
+    (0..checks)
+        .map(|index| index * (total_jobs - 1) / (checks - 1))
+        .collect()
+}
+
 fn default_slot_cores() -> Vec<u32> {
     (BASE_SLOT_CORE..BASE_SLOT_CORE + DEFAULT_SLOT_COUNT as u32).collect()
 }
@@ -242,7 +275,7 @@ fn acceptance_slot_cores() -> TestResult<Vec<u32>> {
 fn acceptance_slot_cores_or_skip() -> Option<Vec<u32>> {
     match acceptance_slot_cores() {
         Ok(cores) => Some(cores),
-        Err(e) if std::env::var(ALLOW_SKIP_ENV).as_deref() == Ok("1") => {
+        Err(e) if allow_skip() => {
             eprintln!("skipping M7 fork/verify acceptance because {ALLOW_SKIP_ENV}=1: {e}");
             None
         }
@@ -251,6 +284,10 @@ fn acceptance_slot_cores_or_skip() -> Option<Vec<u32>> {
              Set {ALLOW_SKIP_ENV}=1 only for non-acceptance local smoke."
         ),
     }
+}
+
+fn allow_skip() -> bool {
+    std::env::var(ALLOW_SKIP_ENV).as_deref() == Ok("1")
 }
 
 async fn create_root(
@@ -295,6 +332,7 @@ async fn run_child(
     index: usize,
     lease: proto::Lease,
 ) -> TestResult<ChildRecord> {
+    let slot_id = lease.slot_id;
     let scheduled = match svc
         .inject_inputs(Request::new(proto::InjectInputsRequest {
             lease: Some(lease.clone()),
@@ -377,6 +415,7 @@ async fn run_child(
     destroy_best_effort(&svc, Some(lease)).await;
     Ok(ChildRecord {
         index,
+        slot_id,
         snapshot: snapshot_ref,
         state_hash,
         input_log_id: snapshot.input_log_id,
@@ -409,6 +448,35 @@ async fn run_child_batch(
         return Err(errors.join("; "));
     }
     records.sort_by_key(|record| record.index);
+    Ok(records)
+}
+
+async fn run_child_twins(
+    svc: &WorkerService,
+    index: usize,
+    leases: Vec<proto::Lease>,
+) -> TestResult<Vec<ChildRecord>> {
+    let mut tasks = Vec::with_capacity(leases.len());
+    for lease in leases {
+        let svc = svc.clone();
+        tasks.push(tokio::spawn(
+            async move { run_child(svc, index, lease).await },
+        ));
+    }
+
+    let mut records = Vec::with_capacity(tasks.len());
+    let mut errors = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(Ok(record)) => records.push(record),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("cross-slot child task join: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    records.sort_by_key(|record| record.slot_id);
     Ok(records)
 }
 
@@ -545,6 +613,84 @@ async fn verify_batch(
     Ok(verified)
 }
 
+async fn cross_check_child_on_distinct_slots(
+    svc: &WorkerService,
+    root_lease: &proto::Lease,
+    root_snapshot: &proto::SnapshotRef,
+    store: &snapstore_client::blocking::SnapstoreClient,
+    index: usize,
+) -> TestResult<()> {
+    let seed = child_seed(index);
+    let forked = svc
+        .fork(Request::new(proto::ForkRequest {
+            parent: Some(root_lease.clone()),
+            count: 2,
+            entropy_seeds: vec![seed.clone(), seed],
+        }))
+        .await
+        .map_err(|e| format!("cross-slot child {index} Fork twins: {e}"))?
+        .into_inner()
+        .children;
+    if forked.len() != 2 {
+        return Err(format!(
+            "cross-slot child {index} Fork returned {} children, expected 2",
+            forked.len()
+        ));
+    }
+    if forked[0].slot_id == forked[1].slot_id {
+        return Err(format!(
+            "cross-slot child {index} twins landed on the same slot {}",
+            forked[0].slot_id
+        ));
+    }
+
+    let children = run_child_twins(svc, index, forked).await?;
+    for child in &children {
+        let log = tokio::task::block_in_place(|| fetch_log_payload(store, &child.input_log_id));
+        validate_single_edge_lineage(root_snapshot, child, &log);
+    }
+
+    let mut verified = verify_batch(svc, root_snapshot, children).await?;
+    verified.sort_by_key(|record| record.slot_id);
+    let first = &verified[0];
+    let second = &verified[1];
+    if first.slot_id == second.slot_id {
+        return Err(format!(
+            "cross-slot child {index} verified records used the same slot {}",
+            first.slot_id
+        ));
+    }
+    if first.snapshot.hash != second.snapshot.hash {
+        return Err(format!(
+            "cross-slot child {index} snapshot refs diverged between slots {} and {}",
+            first.slot_id, second.slot_id
+        ));
+    }
+    if first.state_hash != second.state_hash {
+        return Err(format!(
+            "cross-slot child {index} state hashes diverged between slots {} and {}",
+            first.slot_id, second.slot_id
+        ));
+    }
+    if first.input_log_id != second.input_log_id {
+        return Err(format!(
+            "cross-slot child {index} input log ids diverged between slots {} and {}",
+            first.slot_id, second.slot_id
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn cross_check_indices_cover_the_1000_job_universe() {
+    assert_eq!(
+        cross_check_indices(1000, 10),
+        vec![0, 111, 222, 333, 444, 555, 666, 777, 888, 999]
+    );
+    assert_eq!(cross_check_indices(2, 10), vec![0, 1]);
+    assert_eq!(cross_check_indices(1, 10), vec![0]);
+}
+
 #[test]
 #[ignore = "M7 acceptance gate: 1000 forked children; run with --release -- --ignored --nocapture"]
 fn m7_accept_1000_seeded_forks_verify_replay_all() {
@@ -634,5 +780,73 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
             .expect("GetWorkerInfo after cleanup")
             .into_inner();
         assert_eq!(info.slots_free as usize, child_capacity + 1);
+    });
+}
+
+#[test]
+#[ignore = "M7 acceptance gate: cross-slot same-seed reruns; run with --release -- --ignored --nocapture"]
+fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
+    let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
+        return;
+    };
+    if slot_cores.len() < 3 {
+        let message = format!(
+            "{SLOT_CORES_ENV} must provide at least three slots for cross-slot rerun: \
+             one root parent and two same-seed children"
+        );
+        if allow_skip() {
+            eprintln!("skipping M7 cross-slot acceptance because {ALLOW_SKIP_ENV}=1: {message}");
+            return;
+        }
+        panic!("{message}");
+    }
+
+    let jobs = configured_jobs();
+    let checks = configured_cross_checks(jobs);
+    let indices = cross_check_indices(jobs, checks);
+
+    let image_cache = tempfile::TempDir::new().expect("image cache");
+    let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+    let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::pad_echo_elf());
+    let config = pad_echo_config(base_hash, kernel_hash);
+
+    let store_dir = tempfile::TempDir::new().expect("snapstore data root");
+    let store_sock = "snapstore.sock";
+    let (_store_rt, _store_handle, store) =
+        common::spawn_store_at(store_dir.path().to_path_buf(), store_sock);
+    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
+
+    let svc = WorkerService::new(worker_config(
+        slot_cores.clone(),
+        image_cache.path().to_path_buf(),
+        snapstore,
+    ))
+    .expect("worker service");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async {
+        let (root_lease, root_snapshot) = create_root(&svc, config).await.expect("root snapshot");
+        for (offset, index) in indices.iter().copied().enumerate() {
+            cross_check_child_on_distinct_slots(&svc, &root_lease, &root_snapshot, &store, index)
+                .await
+                .unwrap_or_else(|e| panic!("cross-slot check for child {index}: {e}"));
+            eprintln!(
+                "M7 cross-slot progress: {}/{} (job index {index})",
+                offset + 1,
+                indices.len()
+            );
+        }
+
+        destroy_best_effort(&svc, Some(root_lease)).await;
+        let info = svc
+            .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
+            .await
+            .expect("GetWorkerInfo after cleanup")
+            .into_inner();
+        assert_eq!(info.slots_free as usize, slot_cores.len());
     });
 }
