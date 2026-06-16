@@ -95,5 +95,7 @@ counting-semantics failure on a future kernel/microcode bump.
 ## More docs
 
 - Test partitioning + Intel-box runbook: `docs/ops/test-partitioning.md`
+- Phase exit-gate records: `docs/phase-1-exit-gate.md`,
+  `docs/phase-2-exit-gate.md`
 - Merge policy / required checks: `CONTRIBUTING.md`
 - Host config + determinism-class re-baseline: `docs/ops/host-config-intel-box.md`

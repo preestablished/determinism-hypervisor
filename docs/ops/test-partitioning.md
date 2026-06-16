@@ -18,6 +18,7 @@ such as `stress-ng`.
 | ELF shape + asm constant pins | `cargo test -p nanokernel` | needs `nasm` (build.rs assembles the guests; cross-assembles fine on arm) |
 | Drift-check script logic | `bash ci/check-determinism-class.sh` | compares against the LIVE host — only meaningful on the lab box, but parses anywhere |
 | R12 joint tests vs the REAL snapshot-store | `cargo test -p determinism-tests --test store_joint` | spawns `snapstore-server` in-process on a TempDir over UDS (decision: docs/decisions/snapstore-server-for-tests.md) — needs only the `../snapshot-store` checkout, no provisioning, no KVM |
+| Phase-2 exit-gate record | [`docs/phase-2-exit-gate.md`](../phase-2-exit-gate.md) | as-built snapshot/fork/replay notes, frozen-format anchors, measured perf numbers, and ownership split vs sibling repos |
 | aarch64 build/clippy | `cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings` | KVM modules are `cfg(target_arch = "x86_64")`-gated. On an arm host this just works (CI's arm lane runs natively). On an x86 Linux box you need `rustup target add aarch64-unknown-linux-gnu` plus a cross C toolchain — see "aarch64 cross C toolchain on x86" below |
 
 ### aarch64 cross C toolchain on x86
@@ -77,6 +78,9 @@ past it to finish the in-flight batch before checking aggregate throughput.
 4. **Run the gates**: `cargo test --workspace` for non-ignored workspace
    tests, plus the hardware-gated/ignored rows above with their explicit
    commands (for example the M7 `-- --ignored` acceptance command).
+   For phase close-out context, keep
+   [`docs/phase-2-exit-gate.md`](../phase-2-exit-gate.md) in sync with
+   the fresh command evidence and any ownership split vs sibling repos.
 5. CI wiring: pushes run `.github/workflows/ci.yaml` (hosted matrix +
    kvm-intel lane); nightly drift, canary, record/replay corpus, and
    scaled-down M7 100-fork VerifyReplay run via
