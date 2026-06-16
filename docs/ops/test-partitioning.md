@@ -56,6 +56,7 @@ These self-skip elsewhere; on the box they run for real:
 | M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
 | M7 nightly fork/VerifyReplay canary | `DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | scheduled in `nightly-drift.yaml` |
 | M7 fork/VerifyReplay acceptance | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | long |
+| M7 throughput soak under housekeeping load | `DH_M7_SOAK_SECONDS=1800 ci/m7-throughput-soak.sh` | 30 min |
 
 ## Intel-box runbook (condensed)
 
