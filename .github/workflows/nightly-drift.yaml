@@ -27,6 +27,14 @@ on:
         description: "Fuzz job runner label: ubuntu-latest or kvm-intel (exactly these — a typo'd label strands the run queued until the 25h timeout while holding the concurrency group)"
         required: false
         default: "ubuntu-latest"
+      m7_fork_jobs:
+        description: "M7 nightly fork/VerifyReplay child count"
+        required: false
+        default: "100"
+      m7_slot_cores:
+        description: "M7 nightly slot cores on the kvm-intel runner"
+        required: false
+        default: "2-5"
 
 # Queue hygiene on the single kvm-intel runner; never cancel in flight —
 # this is the measurement workflow (docs/ops/github-runner.md caveat).
@@ -107,6 +115,42 @@ jobs:
         run: cargo test -p dh-worker --test m5_record_replay record_replay_corpus_pad_echo_6s_reverifies -- --nocapture
         working-directory: repo
 
+  m7-fork-verify-100:
+    # Scaled-down M7 canary: fork 100 seeded children from one root snapshot,
+    # then VerifyReplay every child log. The full acceptance remains the
+    # ignored 1000-child command in docs/ops/test-partitioning.md.
+    needs: determinism-class
+    runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 60
+    env:
+      DH_M7_ACCEPT_JOBS: ${{ inputs.m7_fork_jobs || '100' }}
+      DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m7_slot_cores || '2-5' }}
+      DH_M7_ACCEPT_ALLOW_SKIP: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
+      - name: nightly 100-fork M7 VerifyReplay canary
+        run: |
+          echo "M7 fork/VerifyReplay canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES allow_skip=$DH_M7_ACCEPT_ALLOW_SKIP"
+          cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
+        working-directory: repo
+
   # 1h libFuzzer budget over the DHILOG read and splice paths (beads
   # 1j4, 6zm): arbitrary bytes -> LogReader::parse / Lineage
   # composition; the invariant is no panics / no unbounded allocation on
@@ -176,7 +220,7 @@ jobs:
   # A silent-red nightly is the worst outcome for a determinism product:
   # route failures to a visible issue (updated, not duplicated).
   alert-on-failure:
-    needs: [determinism-class, determinism-canary, record-replay-corpus, dhilog-fuzz]
+    needs: [determinism-class, determinism-canary, record-replay-corpus, m7-fork-verify-100, dhilog-fuzz]
     if: failure()
     runs-on: ubuntu-latest
     permissions:
@@ -187,8 +231,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
-          TITLE="nightly-drift FAILED: determinism class, corpus, canary, or DHILOG fuzz"
-          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
+          TITLE="nightly-drift FAILED: determinism class, corpus, canary, M7 fork verify, or DHILOG fuzz"
+          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary/M7 fork-verify failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
