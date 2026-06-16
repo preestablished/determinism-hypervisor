@@ -10,6 +10,7 @@ housekeeping_cores="${DH_M7_SOAK_HOUSEKEEPING_CORES:-0-1}"
 duration_seconds="${DH_M7_SOAK_SECONDS:-1800}"
 target_millijobs_per_second="${DH_M7_SOAK_TARGET_MILLIJOBS_PER_SECOND:-}"
 batch_jobs="${DH_M7_SOAK_BATCH_JOBS:-}"
+allow_core_overlap="${DH_M7_SOAK_ALLOW_CORE_OVERLAP:-0}"
 
 usage() {
   cat <<'EOF'
@@ -21,6 +22,7 @@ Environment:
   DH_M7_SOAK_SECONDS                     default: 1800
   DH_M7_SOAK_BATCH_JOBS                  default: slot_count * 10
   DH_M7_SOAK_TARGET_MILLIJOBS_PER_SECOND default: slot_count * 1000
+  DH_M7_SOAK_ALLOW_CORE_OVERLAP          default: 0
 
 The acceptance target is N_slots x 1 job/s for at least 30 minutes on the
 kvm-intel host:
@@ -31,7 +33,8 @@ Developer smoke on this constrained shell can lower the target explicitly, e.g.:
 
   DH_M7_SOAK_SECONDS=1 DH_M7_SOAK_SLOT_CORES=0-1 \
   DH_M7_SOAK_HOUSEKEEPING_CORES=0-1 DH_M7_SOAK_BATCH_JOBS=2 \
-  DH_M7_SOAK_TARGET_MILLIJOBS_PER_SECOND=1 ci/m7-throughput-soak.sh
+  DH_M7_SOAK_TARGET_MILLIJOBS_PER_SECOND=1 \
+  DH_M7_SOAK_ALLOW_CORE_OVERLAP=1 ci/m7-throughput-soak.sh
 EOF
 }
 
@@ -49,11 +52,10 @@ require_positive_int() {
   fi
 }
 
-count_core_list() {
+expand_core_list() {
   local spec="$1"
   SPEC="$spec" python3 - <<'PY'
 import os
-import sys
 
 spec = os.environ["SPEC"]
 seen = set()
@@ -63,30 +65,54 @@ for part in spec.split(","):
         raise SystemExit("empty core-list component")
     if "-" in part:
         lo_s, hi_s = part.split("-", 1)
+        if not lo_s.isdigit() or not hi_s.isdigit():
+            raise SystemExit("non-integer core range")
         lo, hi = int(lo_s), int(hi_s)
         if lo > hi:
             raise SystemExit("descending core range")
         values = range(lo, hi + 1)
     else:
+        if not part.isdigit():
+            raise SystemExit("non-integer core")
         values = [int(part)]
     for value in values:
         if value in seen:
             raise SystemExit("duplicate core")
         seen.add(value)
-print(len(seen))
+for value in sorted(seen):
+    print(value)
+PY
+}
+
+count_expanded_cores() {
+  local cores="$1"
+  printf '%s\n' "$cores" | awk 'NF {count++} END {print count + 0}'
+}
+
+core_list_overlap() {
+  local left="$1"
+  local right="$2"
+  LEFT_CORES="$left" RIGHT_CORES="$right" python3 - <<'PY'
+import os
+
+left = {int(line) for line in os.environ["LEFT_CORES"].splitlines() if line}
+right = {int(line) for line in os.environ["RIGHT_CORES"].splitlines() if line}
+print(",".join(str(value) for value in sorted(left & right)))
 PY
 }
 
 require_positive_int DH_M7_SOAK_SECONDS "$duration_seconds"
 
-slot_count="$(count_core_list "$slot_cores")" || {
+slot_core_list="$(expand_core_list "$slot_cores")" || {
   echo "::error::DH_M7_SOAK_SLOT_CORES must be a kernel-style core list, got '$slot_cores'" >&2
   exit 2
 }
-housekeeping_count="$(count_core_list "$housekeeping_cores")" || {
+housekeeping_core_list="$(expand_core_list "$housekeeping_cores")" || {
   echo "::error::DH_M7_SOAK_HOUSEKEEPING_CORES must be a kernel-style core list, got '$housekeeping_cores'" >&2
   exit 2
 }
+slot_count="$(count_expanded_cores "$slot_core_list")"
+housekeeping_count="$(count_expanded_cores "$housekeeping_core_list")"
 
 if [[ "$slot_count" -lt 2 ]]; then
   echo "::error::DH_M7_SOAK_SLOT_CORES must provide at least two slots" >&2
@@ -94,6 +120,17 @@ if [[ "$slot_count" -lt 2 ]]; then
 fi
 if [[ "$housekeeping_count" -lt 1 ]]; then
   echo "::error::DH_M7_SOAK_HOUSEKEEPING_CORES must provide at least one core" >&2
+  exit 2
+fi
+if [[ "$allow_core_overlap" != "0" && "$allow_core_overlap" != "1" ]]; then
+  echo "::error::DH_M7_SOAK_ALLOW_CORE_OVERLAP must be 0 or 1, got '$allow_core_overlap'" >&2
+  exit 2
+fi
+
+overlap="$(core_list_overlap "$slot_core_list" "$housekeeping_core_list")"
+if [[ -n "$overlap" && "$allow_core_overlap" != "1" ]]; then
+  echo "::error::slot and housekeeping cores must be disjoint for acceptance; overlap: $overlap" >&2
+  echo "::error::set DH_M7_SOAK_ALLOW_CORE_OVERLAP=1 only for constrained local smoke runs" >&2
   exit 2
 fi
 
@@ -115,28 +152,75 @@ command -v taskset >/dev/null || {
   echo "::error::taskset missing; util-linux is required for housekeeping pinning" >&2
   exit 2
 }
+taskset -c "$housekeeping_cores" true || {
+  echo "::error::DH_M7_SOAK_HOUSEKEEPING_CORES is not valid in this process cpuset: $housekeeping_cores" >&2
+  exit 2
+}
+if [[ "$(uname -m)" != "x86_64" ]]; then
+  echo "::error::M7 throughput soak must run on the x86_64 kvm-intel host" >&2
+  exit 2
+fi
 
 echo "M7 throughput soak config:"
 echo "  slot_cores=$slot_cores slot_count=$slot_count"
 echo "  housekeeping_cores=$housekeeping_cores housekeeping_count=$housekeeping_count"
 echo "  duration_seconds=$duration_seconds batch_jobs=$batch_jobs"
 echo "  target_millijobs_per_second=$target_millijobs_per_second"
+echo "  allow_core_overlap=$allow_core_overlap"
 
-cargo test -p dh-worker --test m7_fork_verify --release --no-run
+test_list="$(cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --list)"
+if ! grep -q '^m7_accept_1000_seeded_forks_verify_replay_all: test$' <<<"$test_list"; then
+  echo "::error::M7 ignored acceptance test was not discovered" >&2
+  exit 2
+fi
 
-stress_timeout=$(( duration_seconds + 120 ))
-taskset -c "$housekeeping_cores" \
-  stress-ng --cpu "$housekeeping_count" --io 1 --vm 1 --vm-bytes 25% \
-    --timeout "${stress_timeout}s" --metrics-brief &
-stress_pid=$!
+stress_pid=""
+stress_reaped=0
 
 cleanup() {
+  if [[ -z "${stress_pid:-}" || "$stress_reaped" == "1" ]]; then
+    return
+  fi
   if kill -0 "$stress_pid" 2>/dev/null; then
     kill "$stress_pid" 2>/dev/null || true
-    wait "$stress_pid" 2>/dev/null || true
+  fi
+  wait "$stress_pid" 2>/dev/null || true
+  stress_reaped=1
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+fail_if_stress_exited() {
+  local phase="$1"
+  local rc=0
+  set +e
+  wait "$stress_pid"
+  rc=$?
+  set -e
+  stress_reaped=1
+  echo "::error::stress-ng exited during $phase before the soak completed (exit $rc)" >&2
+  exit 1
+}
+
+require_stress_alive() {
+  local phase="$1"
+  if [[ "$stress_reaped" == "1" ]]; then
+    echo "::error::stress-ng was already reaped during $phase before the soak completed" >&2
+    exit 1
+  fi
+  if ! kill -0 "$stress_pid" 2>/dev/null; then
+    fail_if_stress_exited "$phase"
   fi
 }
-trap cleanup EXIT INT TERM
+
+taskset -c "$housekeeping_cores" \
+  stress-ng --cpu "$housekeeping_count" --io 1 --vm 1 --vm-bytes 25% \
+    --metrics-brief &
+stress_pid=$!
+
+sleep 1
+require_stress_alive "startup"
 
 start_ns="$(date +%s%N)"
 deadline_ns=$(( start_ns + duration_seconds * 1000000000 ))
@@ -146,14 +230,17 @@ iteration=0
 while :; do
   now_ns="$(date +%s%N)"
   if [[ "$now_ns" -ge "$deadline_ns" && "$jobs_done" -gt 0 ]]; then
+    require_stress_alive "completion"
     break
   fi
   iteration=$(( iteration + 1 ))
+  require_stress_alive "batch $iteration startup"
   echo "M7 throughput soak batch $iteration: running $batch_jobs jobs"
   DH_M7_ACCEPT_JOBS="$batch_jobs" \
   DH_M7_ACCEPT_SLOT_CORES="$slot_cores" \
   DH_M7_ACCEPT_ALLOW_SKIP=0 \
     cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
+  require_stress_alive "batch $iteration completion"
   jobs_done=$(( jobs_done + batch_jobs ))
   elapsed_ns=$(( $(date +%s%N) - start_ns ))
   echo "M7 throughput soak progress: jobs_done=$jobs_done elapsed_seconds=$(( elapsed_ns / 1000000000 ))"

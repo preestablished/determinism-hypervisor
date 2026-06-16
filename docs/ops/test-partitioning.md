@@ -1,8 +1,10 @@
 # Test partitioning: what runs where (bead b0h)
 
-Two hardware classes run this repo's gates. Everything is part of
-`cargo test --workspace`; the live legs self-skip when `/dev/kvm` is
-not usable (open rw probe), so the same command is correct everywhere.
+Two hardware classes run this repo's gates. Most Rust test entries are part
+of `cargo test --workspace`; the live Rust legs self-skip when `/dev/kvm` is
+not usable (open rw probe), so that command is correct everywhere. Rows
+marked operator-run are explicit commands and may require lab-host-only tools
+such as `stress-ng`.
 
 ## Host-runnable (any machine — Linux/aarch64/CI hosted runners; macOS
 ## is EXPECTED to work via the rust-lld linker fallback in
@@ -56,7 +58,10 @@ These self-skip elsewhere; on the box they run for real:
 | M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
 | M7 nightly fork/VerifyReplay canary | `DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | scheduled in `nightly-drift.yaml` |
 | M7 fork/VerifyReplay acceptance | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | long |
-| M7 throughput soak under housekeeping load | `DH_M7_SOAK_SECONDS=1800 ci/m7-throughput-soak.sh` | 30 min |
+| M7 throughput soak under housekeeping load | `DH_M7_SOAK_SLOT_CORES=2-5 DH_M7_SOAK_HOUSEKEEPING_CORES=0-1 DH_M7_SOAK_SECONDS=1800 ci/m7-throughput-soak.sh` | minimum 30 min |
+
+`DH_M7_SOAK_SECONDS` is a minimum measured wall-clock window; the soak can run
+past it to finish the in-flight batch before checking aggregate throughput.
 
 ## Intel-box runbook (condensed)
 
