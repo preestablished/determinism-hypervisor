@@ -106,6 +106,12 @@ Notes:
   dispatch: `gh workflow run nightly-drift.yaml -f fuzz_seconds=86400
   -f fuzz_runner=kvm-intel` — which occupies the single kvm-intel runner
   for the duration; schedule deliberately).
+- **M7 fork/VerifyReplay nightly coverage is live**:
+  `nightly-drift.yaml` runs the scaled-down 100-child M7 canary on the
+  `kvm-intel` runner with `DH_M7_ACCEPT_SLOT_CORES=2-5`, matching this
+  box's isolated slot-core set. The full 1000-child acceptance command
+  remains operator-run because it is the phase exit gate rather than the
+  nightly tripwire.
 - **`grpcurl --version` prints `dev build <no version set>`** when installed
   via `go install` (release binaries get the version stamped via ldflags;
   go install does not). Verify the real version with

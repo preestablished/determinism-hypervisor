@@ -23,7 +23,10 @@ use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
-use dh_vmm::runctl::{run_segment_with_epochs, Segment, SegmentOutcome, StopReason, Until};
+use dh_vmm::runctl::{
+    run_segment_with_epoch_options, run_segment_with_epochs, RunOptions, Segment, SegmentOutcome,
+    StopReason, Until,
+};
 use dh_vmm::SlotState;
 use dh_worker::replay_engine::{replay_segment, ReplayOutcome};
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
@@ -144,11 +147,15 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
             sdk_events: None,
         };
         let counter_ref = &counter;
-        run_segment_with_epochs(
+        run_segment_with_epoch_options(
             &mut seg,
             Until::Goal {
                 poll_period: 1,
                 hard_cap: HARD_CAP,
+            },
+            RunOptions {
+                hash_final_stop: false,
+                ..RunOptions::default()
             },
             &mut || pending_rx.borrow().is_some(),
             &mut |exit: VcpuExit| {
