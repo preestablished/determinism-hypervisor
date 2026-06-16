@@ -43,8 +43,11 @@ boundaries are out of scope here by ownership, not omission.
   on this box.
 - **Fork:** tier-A fork starts from a frozen parent and creates children
   through CoW memory plus in-memory DHSNAP restore. A parent cannot run
-  while children live; a child is not a new fork parent. Each child gets
-  an explicit entropy seed and a fresh DHILOG segment.
+  while children live; a child is not a new fork parent. The service
+  opens a fresh DHILOG segment for each child. Child entropy continues
+  from the fork-point ENTR state unless the caller supplies an explicit
+  nonzero segment seed; the M7 harness supplies explicit per-child
+  seeds.
 - **Replay and VerifyReplay:** DHILOG v1 records the segment between
   snapshots, including injected inputs, entropy draws, SDK events, epoch
   hashes, and stop reason. VerifyReplay consumes a base snapshot plus
@@ -64,7 +67,7 @@ boundaries are out of scope here by ownership, not omission.
 | Format | Freeze anchor | As-built notes |
 |---|---|---|
 | DHSNAP v1.0 | `crates/dh-snapshot/tests/golden.rs`; `crates/dh-snapshot/tests/fixtures/v1_minimal.dhsnap`, `v1_kitchen_sink.dhsnap`, `v1_entr_v2.dhsnap` | Header and section layout are BLAKE3-pinned. Layout changes require a format bump and new fixture names. ENTR v2 is 72 bytes: the v1 ChaCha20 state plus pv-entropy guest-visible registers. |
-| DHILOG v1.0 | `crates/dh-inputlog/tests/golden.rs`; `crates/dh-inputlog/tests/fixtures/v1_minimal.dhilog`, `v1_kitchen_sink.dhilog` | Header, record kinds, encoder fingerprint field, END stop-reason byte, NET_RX lower bound, and lineage assumptions are pinned by checked-in bytes. |
+| DHILOG v1.0 | `crates/dh-inputlog/tests/golden.rs`; `crates/dh-inputlog/tests/fixtures/v1_minimal.dhilog`, `v1_kitchen_sink.dhilog`; `crates/dh-inputlog/tests/reader_validation.rs`; `crates/dh-inputlog/src/splice.rs` | Header, writer-emitted record kinds, encoder fingerprint field, and END stop-reason byte are pinned by checked-in bytes. NET_RX lower-bound validation is covered by reader validation, and lineage splicing is covered by splice tests without changing the frozen DHILOG v1 record format. |
 | Record/replay corpus | `crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s` | Nightly drift replays the corpus so behavioral drift in code, kernel, or microcode has a named failure surface. |
 | Device snapshots | `crates/dh-devices` and `crates/dh-snapshot` tests; [`docs/upstream-divergences.md`](upstream-divergences.md) | EVTC v1 is 39 bytes, NETL is 36 bytes of registers with no pending-RX state to serialize, and ENTR v2 is the snapshot-engine layout. |
 
@@ -72,7 +75,10 @@ boundaries are out of scope here by ownership, not omission.
 
 The accepted M4 perf gates are regression gates, not the original
 aspirational storage numbers. The authority is
-`crates/dh-worker/tests/perf_gates.rs` and divergence ledger #20:
+`crates/dh-worker/tests/perf_gates.rs` and
+[`docs/upstream-divergences.md`](upstream-divergences.md) ledger #20.
+The measured p50s below are the 2026-06-12 accepted baselines, not a
+fresh perf re-run in this docs-only sign-off:
 
 | Operation | Measured p50 | Gate |
 |---|---:|---:|
@@ -95,13 +101,13 @@ non-overlapping slot and housekeeping CPU masks by default.
 
 | # | Gate | Evidence |
 |---|---|---|
-| 1 | Workspace non-ignored suite remains green | `cargo test --workspace` on 2026-06-16, after the Phase-2 docs update |
-| 2 | Workspace build remains green | `cargo build --workspace` on 2026-06-16, after the Phase-2 docs update |
+| 1 | Workspace non-ignored suite remains green | `cargo test --workspace`: PASS on 2026-06-16 after checkpoint commit `089d9eb` |
+| 2 | Workspace build remains green | `cargo build --workspace`: PASS on 2026-06-16 after checkpoint commit `089d9eb` |
 | 3 | M4/M5 format freezes are present | DHSNAP and DHILOG golden tests are part of the workspace suite; fixture bytes are checked in and BLAKE3-pinned |
 | 4 | Real store fixture is documented and exercised | `cargo test -p determinism-tests --test store_joint` runs through `snapstore-server` over UDS and is part of the workspace suite |
 | 5 | M6 daemon/ops surface is documented | [`docs/ops/m6-grpcurl-metrics-smoke.md`](ops/m6-grpcurl-metrics-smoke.md) covers grpcurl calls, health, metrics, snapshot, restore, fork, VerifyReplay, and framebuffer read probes |
-| 6 | M7 fork/VerifyReplay harness remains runnable | `cargo test -p dh-worker --test m7_fork_verify -- --nocapture` and `cargo test -p dh-worker --test m7_fork_verify --release --no-run` on 2026-06-16 |
-| 7 | M7 full slot-core gates are preserved as operator commands | Full acceptance, 100-child nightly canary, cross-slot rerun determinism, and throughput soak commands are listed in [`docs/ops/test-partitioning.md`](ops/test-partitioning.md). This shell only exposes CPUs 0-1, so a local skip-mode cross-slot run confirms the guard path but does not replace the 2-5 slot-core operator run. |
+| 6 | M7 fork/VerifyReplay harness remains buildable and discoverable in this constrained shell | `cargo test -p dh-worker --test m7_fork_verify -- --nocapture` covers non-ignored helper tests, and `cargo test -p dh-worker --test m7_fork_verify --release --no-run` compiles the ignored acceptance target on 2026-06-16 |
+| 7 | M7 full slot-core gates are preserved as operator commands | Full acceptance, 100-child nightly canary, cross-slot rerun determinism, and throughput soak commands are listed in [`docs/ops/test-partitioning.md`](ops/test-partitioning.md). This shell only exposes CPUs 0-1, so `DH_M7_ACCEPT_SLOT_CORES=0-1 DH_M7_ACCEPT_ALLOW_SKIP=1 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` confirms the guard path but does not replace the 2-5 slot-core operator run. |
 | 8 | Runner/tooling state recorded | [`docs/ops/github-runner.md`](ops/github-runner.md) records runner identity, fork-PR security policy, slot-core isolation, and pinned tool versions for M6/M7 |
 
 ## Known refinements baked into the gate
