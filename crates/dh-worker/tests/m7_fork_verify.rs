@@ -19,13 +19,18 @@
 //!   DH_M7_ACCEPT_JOBS=2 DH_M7_ACCEPT_SLOT_CORES=0-1 \
 //!     cargo test -p dh-worker --test m7_fork_verify -- --ignored --nocapture
 //!
-//! The cross-slot acceptance gate re-runs a deterministic sample of the same
-//! 1000-job universe by forking same-seed child twins onto two different slots:
+//! The cross-slot acceptance gate samples the same 1000-job universe, forking
+//! same-seed children across every available child slot and requiring identical
+//! refs:
 //!
 //!   DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker \
 //!     --test m7_fork_verify --release \
 //!     m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs \
 //!     -- --ignored --nocapture
+//!
+//! By default it samples 10 indices from the 1000-job universe. Override
+//! `DH_M7_ACCEPT_JOBS` to change the universe size and `DH_M7_CROSS_CHECKS`
+//! to change the number of sampled indices.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -451,7 +456,7 @@ async fn run_child_batch(
     Ok(records)
 }
 
-async fn run_child_twins(
+async fn run_same_seed_children(
     svc: &WorkerService,
     index: usize,
     leases: Vec<proto::Lease>,
@@ -619,66 +624,96 @@ async fn cross_check_child_on_distinct_slots(
     root_snapshot: &proto::SnapshotRef,
     store: &snapstore_client::blocking::SnapstoreClient,
     index: usize,
+    child_count: usize,
 ) -> TestResult<()> {
+    if child_count < 2 {
+        return Err(format!(
+            "cross-slot child {index} requires at least two child slots, got {child_count}"
+        ));
+    }
     let seed = child_seed(index);
     let forked = svc
         .fork(Request::new(proto::ForkRequest {
             parent: Some(root_lease.clone()),
-            count: 2,
-            entropy_seeds: vec![seed.clone(), seed],
+            count: child_count as u32,
+            entropy_seeds: std::iter::repeat_n(seed, child_count).collect(),
         }))
         .await
-        .map_err(|e| format!("cross-slot child {index} Fork twins: {e}"))?
+        .map_err(|e| format!("cross-slot child {index} Fork same-seed children: {e}"))?
         .into_inner()
         .children;
-    if forked.len() != 2 {
-        return Err(format!(
-            "cross-slot child {index} Fork returned {} children, expected 2",
-            forked.len()
-        ));
-    }
-    if forked[0].slot_id == forked[1].slot_id {
-        return Err(format!(
-            "cross-slot child {index} twins landed on the same slot {}",
-            forked[0].slot_id
-        ));
-    }
 
-    let children = run_child_twins(svc, index, forked).await?;
-    for child in &children {
-        let log = tokio::task::block_in_place(|| fetch_log_payload(store, &child.input_log_id));
-        validate_single_edge_lineage(root_snapshot, child, &log);
-    }
+    let result = async {
+        if forked.len() != child_count {
+            return Err(format!(
+                "cross-slot child {index} Fork returned {}, expected {child_count}",
+                forked.len()
+            ));
+        }
+        let mut slot_ids: Vec<_> = forked.iter().map(|lease| lease.slot_id).collect();
+        slot_ids.sort_unstable();
+        slot_ids.dedup();
+        if slot_ids.len() != child_count {
+            return Err(format!(
+                "cross-slot child {index} same-seed children did not land on distinct slots: \
+                 {slot_ids:?}"
+            ));
+        }
 
-    let mut verified = verify_batch(svc, root_snapshot, children).await?;
-    verified.sort_by_key(|record| record.slot_id);
-    let first = &verified[0];
-    let second = &verified[1];
-    if first.slot_id == second.slot_id {
-        return Err(format!(
-            "cross-slot child {index} verified records used the same slot {}",
-            first.slot_id
-        ));
+        let children = run_same_seed_children(svc, index, forked.clone()).await?;
+        let mut logs = Vec::with_capacity(children.len());
+        for child in &children {
+            let log = tokio::task::block_in_place(|| fetch_log_payload(store, &child.input_log_id));
+            validate_single_edge_lineage(root_snapshot, child, &log);
+            logs.push((child.slot_id, log));
+        }
+
+        let mut verified = verify_batch(svc, root_snapshot, children).await?;
+        verified.sort_by_key(|record| record.slot_id);
+        let first = verified
+            .first()
+            .ok_or_else(|| format!("cross-slot child {index} produced no child records"))?;
+        for other in verified.iter().skip(1) {
+            if first.snapshot.hash != other.snapshot.hash {
+                return Err(format!(
+                    "cross-slot child {index} snapshot refs diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.state_hash != other.state_hash {
+                return Err(format!(
+                    "cross-slot child {index} state hashes diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.input_log_id != other.input_log_id {
+                return Err(format!(
+                    "cross-slot child {index} input log ids diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+        }
+        let first_log = logs
+            .first()
+            .ok_or_else(|| format!("cross-slot child {index} produced no input logs"))?;
+        for (slot_id, log) in logs.iter().skip(1) {
+            if first_log.1 != *log {
+                return Err(format!(
+                    "cross-slot child {index} input log payloads diverged between slots {} and {}",
+                    first_log.0, slot_id
+                ));
+            }
+        }
+        Ok(())
     }
-    if first.snapshot.hash != second.snapshot.hash {
-        return Err(format!(
-            "cross-slot child {index} snapshot refs diverged between slots {} and {}",
-            first.slot_id, second.slot_id
-        ));
+    .await;
+
+    if result.is_err() {
+        for lease in forked {
+            destroy_best_effort(svc, Some(lease)).await;
+        }
     }
-    if first.state_hash != second.state_hash {
-        return Err(format!(
-            "cross-slot child {index} state hashes diverged between slots {} and {}",
-            first.slot_id, second.slot_id
-        ));
-    }
-    if first.input_log_id != second.input_log_id {
-        return Err(format!(
-            "cross-slot child {index} input log ids diverged between slots {} and {}",
-            first.slot_id, second.slot_id
-        ));
-    }
-    Ok(())
+    result
 }
 
 #[test]
@@ -789,10 +824,11 @@ fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
     let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
         return;
     };
-    if slot_cores.len() < 3 {
+    let child_capacity = slot_cores.len().saturating_sub(1);
+    if child_capacity < 2 {
         let message = format!(
             "{SLOT_CORES_ENV} must provide at least three slots for cross-slot rerun: \
-             one root parent and two same-seed children"
+             one root parent and at least two same-seed children"
         );
         if allow_skip() {
             eprintln!("skipping M7 cross-slot acceptance because {ALLOW_SKIP_ENV}=1: {message}");
@@ -830,10 +866,21 @@ fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
         .expect("test runtime");
     rt.block_on(async {
         let (root_lease, root_snapshot) = create_root(&svc, config).await.expect("root snapshot");
+        let mut first_error = None;
         for (offset, index) in indices.iter().copied().enumerate() {
-            cross_check_child_on_distinct_slots(&svc, &root_lease, &root_snapshot, &store, index)
-                .await
-                .unwrap_or_else(|e| panic!("cross-slot check for child {index}: {e}"));
+            if let Err(e) = cross_check_child_on_distinct_slots(
+                &svc,
+                &root_lease,
+                &root_snapshot,
+                &store,
+                index,
+                child_capacity,
+            )
+            .await
+            {
+                first_error = Some(format!("cross-slot check for child {index}: {e}"));
+                break;
+            }
             eprintln!(
                 "M7 cross-slot progress: {}/{} (job index {index})",
                 offset + 1,
@@ -848,5 +895,8 @@ fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
             .expect("GetWorkerInfo after cleanup")
             .into_inner();
         assert_eq!(info.slots_free as usize, slot_cores.len());
+        if let Some(error) = first_error {
+            panic!("{error}");
+        }
     });
 }
