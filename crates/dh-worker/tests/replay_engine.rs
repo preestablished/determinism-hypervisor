@@ -27,7 +27,10 @@ use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
-use dh_vmm::runctl::{run_segment_with_epochs, Segment, SegmentOutcome, StopReason, Until};
+use dh_vmm::runctl::{
+    run_segment_with_epochs, run_segment_with_scheduled_inputs_frames_and_epochs, Segment,
+    SegmentOutcome, StopReason, Until,
+};
 use dh_vmm::SlotState;
 use dh_worker::replay_engine::{replay_segment, ReplayError};
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
@@ -47,7 +50,7 @@ fn config() -> MachineConfig {
             cmdline: Vec::new(),
         },
     );
-    c.epoch_len = 30_000; // several epochs per quantum
+    c.epoch_len = 50_000; // several epochs per quantum; quanta stop on the grid
     c
 }
 
@@ -252,8 +255,8 @@ fn replay_reproduces_the_recording_bit_identically() {
         outcome.records_applied, 3,
         "both PAD_SETs and the DEV_EVENT replayed"
     );
-    // 3 quanta x (100k/30k grid) = epochs 1..=10 minus none: 300k/30k=10.
-    assert_eq!(outcome.epoch_hashes_verified, 10);
+    // 3 quanta x (100k/50k grid) = epochs 1..=6.
+    assert_eq!(outcome.epoch_hashes_verified, 6);
     assert_eq!(outcome.end_icount, 3 * QUANTUM);
     assert_eq!(outcome.resealed, rec.log, "the reseal hammer");
 
@@ -263,6 +266,157 @@ fn replay_reproduces_the_recording_bit_identically() {
         .read_slice(&mut head, GuestAddress(nanokernel::PAD_ECHO_TABLE_GPA))
         .unwrap();
     assert!(u64::from_le_bytes(head) > 0);
+}
+
+#[test]
+fn replay_does_not_hash_intermediate_canonical_record_landings() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+
+    dh_vmm::run::install_kick_handler().unwrap();
+    let sys = KvmSystem::open().unwrap();
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    dh_vmm::boot::load_and_enter(&slot, nanokernel::pad_echo_elf(), b"").unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+
+    let mut cfg = config();
+    cfg.epoch_len = 60_000;
+    let cfg_hash = cfg.config_hash().unwrap();
+    let mut chain = StateHashChain::new(&cfg_hash, &[0; 32]);
+    let bus = record_bus();
+    let entropy = DetEntropy::from_seed([0x43; 32]);
+    let snap = take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &cfg,
+        BoundaryState {
+            icount: 0,
+            vns: 0,
+            epoch_index: 0,
+            hash_chain: chain.value(),
+            agenda_empty: true,
+        },
+        PageSource::Full,
+        &store,
+    )
+    .expect("base snapshot")
+    .snapshot_ref;
+
+    let rail = std::cell::RefCell::new(DeviceRail::new(
+        bus,
+        entropy,
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: snap.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: cfg_hash,
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    ));
+    let pause = AtomicBool::new(false);
+    let scheduled_inputs = [40_000, cfg.epoch_len, QUANTUM];
+    let out = {
+        let mut seg = Segment {
+            slot: &mut slot,
+            counter: &counter,
+            chain: &mut chain,
+            config: &cfg,
+            start_icount: 0,
+            injections: &[],
+            timer: None,
+            pause: &pause,
+            sdk_events: None,
+        };
+        let counter_ref = &counter;
+        run_segment_with_scheduled_inputs_frames_and_epochs(
+            &mut seg,
+            Until::IcountBudget(QUANTUM),
+            &scheduled_inputs,
+            &[],
+            0,
+            &mut || false,
+            &mut |exit: VcpuExit| {
+                let icount = counter_ref
+                    .read()
+                    .map_err(|e| BoundaryError::Exit(format!("{e:?}")))?;
+                rail.borrow_mut().service_exit(icount, exit)
+            },
+            &mut |idx, boundary| {
+                rail.borrow_mut()
+                    .apply_pad_set(boundary.icount, boundary.rip, 0, 0xFACE ^ (idx as u32), 0)
+                    .map(|vector| vector.into_iter().collect())
+                    .map_err(|e| BoundaryError::Exit(format!("input: {e:?}")))
+            },
+            &mut |idx, icount, value| {
+                rail.borrow_mut()
+                    .log_epoch_hash(idx, icount, value)
+                    .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(out.reason, StopReason::BudgetReached);
+
+    let log = rail.into_inner().seal(&out, [0; 32]).expect("seal");
+    let reader = dh_inputlog::reader::LogReader::parse(&log).unwrap();
+    assert_eq!(
+        reader.canonical().count(),
+        scheduled_inputs.len(),
+        "the recording has the expected canonical split points"
+    );
+    assert_eq!(
+        reader
+            .aux()
+            .filter(|rec| matches!(
+                rec.body(),
+                dh_inputlog::reader::RecordBody::EpochHash { .. }
+            ))
+            .count(),
+        1,
+        "only the real epoch boundary should add an epoch/hash record"
+    );
+
+    let mut replay_slot = sys.create_slot_vm(MEM).unwrap();
+    counter.reset().unwrap();
+    let replay_rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: snap.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: cfg_hash,
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(replay_slot.guest_mem.clone()),
+    );
+    let outcome = replay_segment(
+        &mut replay_slot,
+        replay_rail,
+        &cfg,
+        snap,
+        &counter,
+        &store,
+        &log,
+    )
+    .expect("replay with non-epoch canonical split");
+    assert_eq!(outcome.records_applied, scheduled_inputs.len() as u64);
+    assert_eq!(outcome.epoch_hashes_verified, 1);
+    assert_eq!(outcome.resealed, log);
 }
 
 #[test]
@@ -396,7 +550,7 @@ fn verify_replay_reports_done_and_divergence() {
     )
     .expect("verification ran");
     assert!(report.verified());
-    assert_eq!(report.epochs_ok(), 10);
+    assert_eq!(report.epochs_ok(), 6);
     let (total, end_hash) = report.done().unwrap();
     assert_eq!(total, 3 * QUANTUM);
     assert_ne!(end_hash, [0u8; 32]);

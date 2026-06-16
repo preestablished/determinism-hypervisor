@@ -86,7 +86,10 @@ pub fn run(
         run_segment_with_options(
             &mut seg,
             until,
-            RunOptions { paranoid_hash },
+            RunOptions {
+                paranoid_hash,
+                ..RunOptions::default()
+            },
             &mut || false,
             &mut on_exit,
         )
