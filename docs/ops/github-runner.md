@@ -94,12 +94,15 @@ Notes:
   after any incident (or surprising tool behavior), treat the Status column
   as a fingerprint and re-verify the binaries rather than trusting what is
   in place.
-- **grpcurl and stress-ng are pre-staged, not yet exercised by workflow**:
+- **grpcurl is pre-staged, not yet exercised by workflow; stress-ng is
+  operator-exercised by the M7 throughput soak**:
   the M6 grpcurl/manual metrics smoke has a runbook
   ([m6-grpcurl-metrics-smoke.md](./m6-grpcurl-metrics-smoke.md)), but no
-  workflow invokes it yet. M7 stress-ng jobs also land later, so "✅
-  installed" does not mean "proven in a runner job" — unlike the `protoc`
-  row, which every build exercises via the vendored binary. cargo-fuzz +
+  workflow invokes it yet. The M7 throughput soak script
+  (`ci/m7-throughput-soak.sh`) pins `stress-ng` to housekeeping cores for
+  the operator-run acceptance; it is intentionally not a scheduled nightly.
+  Unlike the `protoc` row, which every build exercises via the vendored
+  binary, grpcurl remains runbook-only. cargo-fuzz +
   nightly ARE exercised:
   `nightly-drift.yaml`'s `dhilog-fuzz` job runs 1h nightly on a HOSTED
   runner (this box's install serves local runs and the 24h operator
