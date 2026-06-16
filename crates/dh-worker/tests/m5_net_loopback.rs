@@ -153,6 +153,8 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
                 poll_period: 1,
                 hard_cap: HARD_CAP,
             },
+            // This quantum stops at the next canonical NET_RX landing, not
+            // a segment END; replay must not inherit a hidden final-stop link.
             RunOptions {
                 hash_final_stop: false,
                 ..RunOptions::default()

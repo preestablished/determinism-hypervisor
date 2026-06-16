@@ -125,6 +125,7 @@ jobs:
     env:
       DH_M7_ACCEPT_JOBS: ${{ inputs.m7_fork_jobs || '100' }}
       DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m7_slot_cores || '2-5' }}
+      DH_M7_ACCEPT_ALLOW_SKIP: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,7 +146,9 @@ jobs:
       - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
       - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
       - name: nightly 100-fork M7 VerifyReplay canary
-        run: cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
+        run: |
+          echo "M7 fork/VerifyReplay canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES allow_skip=$DH_M7_ACCEPT_ALLOW_SKIP"
+          cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
         working-directory: repo
 
   # 1h libFuzzer budget over the DHILOG read and splice paths (beads
