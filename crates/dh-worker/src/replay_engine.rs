@@ -373,7 +373,8 @@ where
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
                     replay_service_exit(&mut rail.borrow_mut(), icount, exit)
                 },
-                &mut |idx, icount, value| {
+                &mut |idx, boundary, value, _slot| {
+                    let icount = boundary.icount;
                     let i = verified.get();
                     match expected_epochs.get(i) {
                         Some((e_idx, e_icount, e_value))
