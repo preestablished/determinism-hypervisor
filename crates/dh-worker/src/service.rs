@@ -5292,6 +5292,83 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn bisection_checkpoint_capture_preserves_runtime_lineage_and_log_surfaces() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            std::env::temp_dir(),
+            Some(transport),
+        ))
+        .unwrap();
+        let position = SlotPosition {
+            cumulative_icount: 12_345,
+            segment_icount: 4_321,
+            vns: 987_654,
+            epoch_index: 7,
+            frame_counter: 3,
+        };
+        let base_snapshot = snapstore_types::SnapshotRef::from_bytes([0x55; 32]);
+        let mut runtime = make_runtime(0x61, position, Some(base_snapshot.clone())).unwrap();
+        runtime.log = Some(
+            new_segment_log(
+                &runtime.machine_config,
+                runtime.base_snapshot.as_ref(),
+                [0x11; 32],
+            )
+            .unwrap(),
+        );
+        runtime.dirty.insert(7).unwrap();
+
+        let before = (
+            runtime.base_snapshot.clone(),
+            runtime.position,
+            runtime.chain.value(),
+            runtime.entropy.state(),
+            runtime.dirty.len(),
+            runtime.log.as_ref().map(|log| log.record_count()),
+        );
+        let store = svc.store().unwrap();
+        let checkpoint = {
+            let store = store.lock().unwrap();
+            crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+                &runtime.slot,
+                dh_vmm::SlotState::Paused,
+                &runtime.bus,
+                &runtime.entropy,
+                &runtime.machine_config,
+                runtime.boundary_state(runtime.queued_inputs.is_empty()),
+                &store,
+            )
+            .unwrap()
+        };
+        let after = (
+            runtime.base_snapshot.clone(),
+            runtime.position,
+            runtime.chain.value(),
+            runtime.entropy.state(),
+            runtime.dirty.len(),
+            runtime.log.as_ref().map(|log| log.record_count()),
+        );
+        assert_eq!(after, before);
+        assert_eq!(
+            checkpoint.pages_shipped,
+            runtime.slot.mem_bytes / dh_vmm::dirty::PAGE_SIZE
+        );
+        assert_eq!(checkpoint.hash_chain, before.2);
+
+        let container = {
+            let store = store.lock().unwrap();
+            store.get_snapshot(checkpoint.snapshot_ref).unwrap()
+        };
+        let manifest = snapstore_manifest::Manifest::decode(&container).unwrap();
+        assert_eq!(manifest.parent, None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn run_rpc_reuses_actor_counter_across_sequential_runs() {
         if !runtime_tests_available() {
             return;

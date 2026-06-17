@@ -12,11 +12,14 @@ use dh_devices::pad::PvPad;
 use dh_devices::MmioBus;
 use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, TimeSection};
 use dh_vmm::config::{BootSpec, MachineConfig};
-use dh_vmm::dirty::{enable_dirty_logging, DirtyPageSet, DirtyRing};
+use dh_vmm::dirty::{
+    enable_dirty_logging, harvest_at_boundary, DirtyPageSet, DirtyRing, PAGE_SIZE,
+};
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem, SlotVm};
 use dh_vmm::{vcpu_state, SlotState};
 use dh_worker::snapshot_engine::{
-    take_snapshot, BoundaryState, EngineError, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
+    capture_bisection_checkpoint_snapshot, take_snapshot, BoundaryState, EngineError, PageSource,
+    DEVICE_BLOB_FORMAT_DHSNAP,
 };
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
@@ -44,6 +47,32 @@ fn boundary() -> BoundaryState {
 
 fn make_slot(sys: &KvmSystem) -> SlotVm {
     sys.create_slot_vm(MEM).unwrap()
+}
+
+fn run_guest_byte_writes(slot: &mut SlotVm, writes: &[(u16, u8)]) {
+    let mut code = Vec::with_capacity(writes.len() * 5 + 1);
+    for (addr, value) in writes {
+        let [lo, hi] = addr.to_le_bytes();
+        code.extend_from_slice(&[0xC6, 0x06, lo, hi, *value]);
+    }
+    code.push(0xF4); // hlt
+
+    use vm_memory::{Bytes, GuestAddress};
+    slot.guest_mem.write_slice(&code, GuestAddress(0)).unwrap();
+    let mut sregs = slot.vcpu.get_sregs().unwrap();
+    sregs.cs.base = 0;
+    sregs.cs.selector = 0;
+    slot.vcpu.set_sregs(&sregs).unwrap();
+    let mut regs = slot.vcpu.get_regs().unwrap();
+    regs.rip = 0;
+    regs.rflags = 2;
+    slot.vcpu.set_regs(&regs).unwrap();
+    loop {
+        match classify_exit(slot.vcpu.run().unwrap()) {
+            ExitEvent::Hlt => break,
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -158,35 +187,7 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
     let mut ring = DirtyRing::map(&slot).expect("ring");
     let mut dirty = DirtyPageSet::new(slot.mem_bytes);
     enable_dirty_logging(&slot).expect("logging on");
-    use vm_memory::{Bytes, GuestAddress};
-    slot.guest_mem
-        .write_slice(
-            &[
-                0xC6, 0x06, 0x00, 0x20, 0x42, // mov byte [0x2000], 0x42
-                0xC6, 0x06, 0x00, 0x50, 0x43, // mov byte [0x5000], 0x43
-                0xC6, 0x06, 0x00, 0x90, 0x44, // mov byte [0x9000], 0x44
-                0xF4, // hlt
-            ],
-            GuestAddress(0),
-        )
-        .unwrap();
-    let mut sregs = slot.vcpu.get_sregs().unwrap();
-    sregs.cs.base = 0;
-    sregs.cs.selector = 0;
-    slot.vcpu.set_sregs(&sregs).unwrap();
-    let mut regs = slot.vcpu.get_regs().unwrap();
-    regs.rip = 0;
-    regs.rflags = 2;
-    slot.vcpu.set_regs(&regs).unwrap();
-    loop {
-        match classify_exit(slot.vcpu.run().unwrap()) {
-            ExitEvent::Hlt => break,
-            ExitEvent::DirtyRingFull => {
-                dh_vmm::dirty::harvest_at_boundary(&mut ring, &slot.vm, &mut dirty).unwrap();
-            }
-            other => panic!("unexpected exit: {other:?}"),
-        }
-    }
+    run_guest_byte_writes(&mut slot, &[(0x2000, 0x42), (0x5000, 0x43), (0x9000, 0x44)]);
 
     let outcome = take_snapshot(
         &slot,
@@ -225,6 +226,114 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
 }
 
 #[test]
+fn bisection_checkpoint_capture_is_full_and_preserves_dirty_tracking() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let sys = KvmSystem::open().unwrap();
+    let mut slot = make_slot(&sys);
+    let bus = test_bus();
+    let entropy = DetEntropy::from_seed([0x47; 32]);
+    let config = test_config();
+
+    let root = take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        PageSource::Full,
+        &store,
+    )
+    .expect("root snapshot");
+
+    let mut ring = DirtyRing::map(&slot).expect("ring");
+    let mut dirty = DirtyPageSet::new(slot.mem_bytes);
+    enable_dirty_logging(&slot).expect("logging on");
+    run_guest_byte_writes(&mut slot, &[(0x2000, 0x42), (0x5000, 0x43), (0x9000, 0x44)]);
+
+    let entropy_before = entropy.state();
+    let checkpoint = capture_bisection_checkpoint_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        &store,
+    )
+    .expect("bisection checkpoint capture");
+    assert_eq!(checkpoint.pages_shipped, MEM / PAGE_SIZE);
+    assert_eq!(checkpoint.hash_chain, [0xCA; 32]);
+    assert_eq!(
+        entropy.state(),
+        entropy_before,
+        "checkpoint capture must not reseed or advance entropy"
+    );
+
+    let container = store
+        .get_snapshot(checkpoint.snapshot_ref.clone())
+        .expect("get checkpoint");
+    let manifest = snapstore_manifest::Manifest::decode(&container).expect("manifest");
+    assert_eq!(manifest.parent, None);
+    assert_eq!(manifest.device_blob.format, DEVICE_BLOB_FORMAT_DHSNAP);
+    let resolved = store
+        .resolve_pages(checkpoint.snapshot_ref.clone(), None, false)
+        .expect("resolve checkpoint pages");
+    assert_eq!(resolved.len(), (MEM / PAGE_SIZE) as usize);
+    for (page, expected) in [(0x2, 0x42), (0x5, 0x43), (0x9, 0x44)] {
+        let payload = resolved
+            .iter()
+            .find(|(idx, _, _)| *idx == page)
+            .and_then(|(_, _, payload)| payload.as_ref())
+            .unwrap_or_else(|| panic!("missing resolved page {page:#x}"));
+        assert_eq!(payload[0], expected, "page {page:#x}");
+    }
+
+    assert!(
+        dirty.is_empty(),
+        "checkpoint capture must not harvest into the dirty page set"
+    );
+    let stats = harvest_at_boundary(&mut ring, &slot.vm, &mut dirty).expect("post-capture harvest");
+    assert!(stats.harvested >= 3, "stats: {stats:?}");
+    for page in [0x2u64, 0x5, 0x9] {
+        assert!(dirty.contains(page), "page {page:#x} missing: {dirty:?}");
+    }
+
+    let incremental = take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        PageSource::Incremental {
+            parent: root.snapshot_ref,
+            ring: &mut ring,
+            dirty: &mut dirty,
+        },
+        &store,
+    )
+    .expect("post-checkpoint incremental snapshot");
+    assert!(
+        incremental.pages_shipped >= 3,
+        "{}",
+        incremental.pages_shipped
+    );
+    assert!(
+        incremental.pages_shipped < MEM / PAGE_SIZE,
+        "incremental lineage snapshot should remain a delta"
+    );
+    assert!(
+        dirty.is_empty(),
+        "ordinary TakeSnapshot still clears dirty tracking after store ack"
+    );
+}
+
+#[test]
 fn preconditions_fail_loudly_without_touching_the_store() {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not usable");
@@ -252,6 +361,18 @@ fn preconditions_fail_loudly_without_touching_the_store() {
         ),
         Err(EngineError::AgendaNotEmpty)
     ));
+    assert!(matches!(
+        capture_bisection_checkpoint_snapshot(
+            &slot,
+            SlotState::Paused,
+            &bus,
+            &entropy,
+            &config,
+            b,
+            &store
+        ),
+        Err(EngineError::AgendaNotEmpty)
+    ));
 
     for state in [SlotState::Running, SlotState::Frozen, SlotState::Empty] {
         assert!(matches!(
@@ -263,6 +384,18 @@ fn preconditions_fail_loudly_without_touching_the_store() {
                 &config,
                 boundary(),
                 PageSource::Full,
+                &store
+            ),
+            Err(EngineError::NotPaused { .. })
+        ));
+        assert!(matches!(
+            capture_bisection_checkpoint_snapshot(
+                &slot,
+                state,
+                &bus,
+                &entropy,
+                &config,
+                boundary(),
                 &store
             ),
             Err(EngineError::NotPaused { .. })
