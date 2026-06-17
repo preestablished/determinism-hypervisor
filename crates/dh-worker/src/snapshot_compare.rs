@@ -39,6 +39,8 @@ pub struct RegDiff {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotComparison {
+    pub rip_expected: u64,
+    pub rip_actual: u64,
     pub reg_diffs: Vec<RegDiff>,
     pub reg_diff: Vec<u8>,
     pub diff_page_idx: Vec<u64>,
@@ -190,6 +192,8 @@ where
             })?;
 
     Ok(SnapshotComparison {
+        rip_expected: expected_vcpu.regs.rip,
+        rip_actual: actual_vcpu.regs.rip,
         reg_diffs,
         reg_diff,
         diff_page_idx: first_diff_page_indices(expected_pages, actual_pages),
@@ -477,6 +481,8 @@ mod tests {
             compare_snapshots(&store, fixture.snapshot_ref.clone(), fixture.snapshot_ref).unwrap();
 
         assert!(comparison.reg_diffs.is_empty());
+        assert_eq!(comparison.rip_expected, 0x1000);
+        assert_eq!(comparison.rip_actual, 0x1000);
         assert!(decode_reg_diff(&comparison.reg_diff).is_empty());
         assert!(comparison.diff_page_idx.is_empty());
     }
@@ -505,6 +511,8 @@ mod tests {
         assert_eq!(decoded[0].name, "rip");
         assert_eq!(decoded[0].expected, 0x1000u64.to_le_bytes());
         assert_eq!(decoded[0].actual, 0x2000u64.to_le_bytes());
+        assert_eq!(comparison.rip_expected, 0x1000);
+        assert_eq!(comparison.rip_actual, 0x2000);
         assert!(comparison.diff_page_idx.is_empty());
     }
 

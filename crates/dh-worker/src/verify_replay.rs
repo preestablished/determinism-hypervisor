@@ -18,7 +18,8 @@ use dh_vmm::recording::DeviceRail;
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 
-use crate::replay_engine::{replay_segment_with_epoch_progress, ReplayError};
+use crate::bisection_index::BisectionCheckpointIndex;
+use crate::replay_engine::{replay_segment_with_epoch_progress_and_bisection, ReplayError};
 
 /// Execute and verify. `Ok(report)` always carries either a `Done` or a
 /// `Divergence` event; infrastructure failures (store, log parse, KVM)
@@ -66,13 +67,13 @@ pub fn verify_replay_with_progress<M, F>(
     counter: &InstRetired,
     store: &SnapstoreClient,
     log_bytes: &[u8],
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<VerifyProgress, ReplayError>
 where
     M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
     F: FnMut(VerifyProgress) -> Result<(), ReplayError>,
 {
-    match replay_segment_with_epoch_progress(
+    verify_replay_with_bisection_progress(
         slot,
         rail,
         machine_config,
@@ -80,6 +81,37 @@ where
         counter,
         store,
         log_bytes,
+        None,
+        on_progress,
+    )
+}
+
+/// Streaming verifier entry point with optional M8 bisection refinement.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_replay_with_bisection_progress<M, F>(
+    slot: &mut SlotVm,
+    rail: DeviceRail<M>,
+    machine_config: &MachineConfig,
+    base_snapshot: SnapshotRef,
+    counter: &InstRetired,
+    store: &SnapstoreClient,
+    log_bytes: &[u8],
+    bisection_index: Option<&BisectionCheckpointIndex>,
+    mut on_progress: F,
+) -> Result<VerifyProgress, ReplayError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+    F: FnMut(VerifyProgress) -> Result<(), ReplayError>,
+{
+    match replay_segment_with_epoch_progress_and_bisection(
+        slot,
+        rail,
+        machine_config,
+        base_snapshot,
+        counter,
+        store,
+        log_bytes,
+        bisection_index,
         |epoch_index, icount, _chain_value| {
             on_progress(VerifyProgress::EpochOk {
                 epoch_index,
@@ -103,6 +135,9 @@ where
             expected,
             got,
         }),
+        Err(ReplayError::BisectionDivergence(divergence)) => {
+            Ok(VerifyProgress::BisectionDivergence(divergence))
+        }
         Err(other) => Err(other),
     }
 }
