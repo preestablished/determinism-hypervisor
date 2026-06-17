@@ -4,11 +4,11 @@
 //! re-execution`. This module writes the versioned 256-byte header, the
 //! canonical records (PAD_SET, DEV_EVENT incl. the PIO_ANSWER detchannel
 //! encoding, NET_RX) and AUX records (ENTROPY, TIMER_FIRE, SDK_EVENT,
-//! FRAME_MARK), and seals the log (END record, body_hash). The validating
-//! reader lives in [`crate::reader`]; the v1.0 layout is FROZEN by the
-//! golden-bytes fixtures (tests/golden.rs, bead bp9). NET_TX/EPOCH_HASH
-//! emission is M5; the format version field is how M5 extends without
-//! breaking us.
+//! FRAME_MARK, BISECTION_CHECKPOINT), and seals the log (END record,
+//! body_hash). The validating reader lives in [`crate::reader`]; the v1.0
+//! layout is FROZEN by the golden-bytes fixtures (tests/golden.rs, bead bp9).
+//! NET_TX/EPOCH_HASH emission is M5; the format version field is how M5
+//! extends without breaking us.
 //!
 //! Code is no_std-compatible by construction (core + alloc idioms only);
 //! flipping the crate to `#![no_std]` later only needs blake3's `std`
@@ -38,8 +38,9 @@ pub const FLAG_SEALED: u32 = 1 << 0;
 pub const FLAG_HAS_AUX: u32 = 1 << 1;
 pub const FLAG_EPOCH_HASHES: u32 = 1 << 2;
 
-// Record kinds (§3.3). The writer emits the Phase-1 subset; NET_RX,
-// EPOCH_HASH and NET_TX are spec-defined v1 kinds the reader must accept.
+// Record kinds (§3.3). The writer emits the Phase-1 subset plus the later
+// bisection checkpoint AUX record; EPOCH_HASH and NET_TX are spec-defined
+// v1 kinds the reader must accept.
 pub const KIND_PAD_SET: u8 = 0x01;
 pub const KIND_DEV_EVENT: u8 = 0x02;
 pub const KIND_NET_RX: u8 = 0x03;
@@ -49,10 +50,15 @@ pub const KIND_EPOCH_HASH: u8 = 0x42;
 pub const KIND_SDK_EVENT: u8 = 0x43;
 pub const KIND_NET_TX: u8 = 0x44;
 pub const KIND_FRAME_MARK: u8 = 0x45;
+pub const KIND_BISECTION_CHECKPOINT: u8 = 0x46;
 pub const KIND_END: u8 = 0x7F;
 
 /// NET_RX payload IS the raw frame, capped at 2048 (§3.3).
 pub const MAX_NET_RX_FRAME: usize = 2048;
+
+pub const BISECTION_CHECKPOINT_FORMAT_VERSION: u16 = 1;
+pub const BISECTION_CHECKPOINT_FLAGS: u16 = 0;
+pub const BISECTION_CHECKPOINT_PAYLOAD_LEN: usize = 56;
 
 pub const RFLAG_AUX: u8 = 1 << 0;
 
@@ -328,6 +334,34 @@ impl LogWriter {
         self.record(KIND_FRAME_MARK, RFLAG_AUX, icount, boundary_rip, &payload)
     }
 
+    /// BISECTION_CHECKPOINT (§3.3): full checkpoint snapshot evidence
+    /// captured at `icount`. The record `seq` remains in the DHILOG record
+    /// header; verifiers combine it with this payload for sequence-aware
+    /// bisection windows when several records share an icount.
+    pub fn bisection_checkpoint(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        max_covered_gap: u32,
+        checkpoint_snapshot_ref: [u8; 32],
+        checkpoint_vns: u64,
+    ) -> Result<(), WriteError> {
+        let mut payload = [0u8; BISECTION_CHECKPOINT_PAYLOAD_LEN];
+        payload[0..2].copy_from_slice(&BISECTION_CHECKPOINT_FORMAT_VERSION.to_le_bytes());
+        payload[2..4].copy_from_slice(&BISECTION_CHECKPOINT_FLAGS.to_le_bytes());
+        payload[4..8].copy_from_slice(&max_covered_gap.to_le_bytes());
+        payload[8..40].copy_from_slice(&checkpoint_snapshot_ref);
+        payload[40..48].copy_from_slice(&icount.to_le_bytes());
+        payload[48..56].copy_from_slice(&checkpoint_vns.to_le_bytes());
+        self.record(
+            KIND_BISECTION_CHECKPOINT,
+            RFLAG_AUX,
+            icount,
+            boundary_rip,
+            &payload,
+        )
+    }
+
     // ---- sealing ------------------------------------------------------------
 
     /// Write the END record, back-fill the header, compute `body_hash`, and
@@ -529,6 +563,8 @@ mod tests {
         w.entropy(10, 0, 64, 0x0102_0304_0506_0708).unwrap();
         w.timer_fire(20, 0, 0x30, 19_000, 20).unwrap();
         w.sdk_event(30, 0, 5, 100, 0x1111_2222_3333_4444).unwrap();
+        w.bisection_checkpoint(35, 0x3500, 1024, [0xBC; 32], 35_000)
+            .unwrap();
         w.frame_mark(40, 0, 7).unwrap();
         let log = w.seal(seal_params()).unwrap();
 
@@ -543,6 +579,7 @@ mod tests {
             KIND_ENTROPY,
             KIND_TIMER_FIRE,
             KIND_SDK_EVENT,
+            KIND_BISECTION_CHECKPOINT,
             KIND_FRAME_MARK,
             KIND_END,
         ] {
@@ -552,6 +589,45 @@ mod tests {
             off += sz;
         }
         assert_eq!(off, log.len());
+    }
+
+    #[test]
+    fn bisection_checkpoint_layout_and_flags() {
+        let mut w = LogWriter::new(header());
+        w.bisection_checkpoint(42, 0xFFFF_8000_0000_4242, 1024, [0x46; 32], 84_000)
+            .unwrap();
+        let log = w.seal(seal_params()).unwrap();
+
+        let flags = u32::from_le_bytes(log[12..16].try_into().unwrap());
+        assert_eq!(flags, FLAG_SEALED | FLAG_HAS_AUX);
+
+        let r = &log[256..];
+        assert_eq!(r[0], KIND_BISECTION_CHECKPOINT);
+        assert_eq!(r[1], RFLAG_AUX);
+        assert_eq!(
+            u16::from_le_bytes(r[2..4].try_into().unwrap()),
+            BISECTION_CHECKPOINT_PAYLOAD_LEN as u16
+        );
+        assert_eq!(u32::from_le_bytes(r[4..8].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(r[8..16].try_into().unwrap()), 42);
+        assert_eq!(
+            u64::from_le_bytes(r[16..24].try_into().unwrap()),
+            0xFFFF_8000_0000_4242
+        );
+        let p = &r[24..24 + BISECTION_CHECKPOINT_PAYLOAD_LEN];
+        assert_eq!(
+            u16::from_le_bytes(p[0..2].try_into().unwrap()),
+            BISECTION_CHECKPOINT_FORMAT_VERSION
+        );
+        assert_eq!(
+            u16::from_le_bytes(p[2..4].try_into().unwrap()),
+            BISECTION_CHECKPOINT_FLAGS
+        );
+        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 1024);
+        assert_eq!(&p[8..40], &[0x46; 32]);
+        assert_eq!(u64::from_le_bytes(p[40..48].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(p[48..56].try_into().unwrap()), 84_000);
+        assert_eq!(r[24 + BISECTION_CHECKPOINT_PAYLOAD_LEN], KIND_END);
     }
 
     #[test]

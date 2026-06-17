@@ -21,9 +21,11 @@
 //! corruption without exposing a replay-capable `LogReader`.
 
 use crate::dhilog::{
-    FLAG_EPOCH_HASHES, FLAG_HAS_AUX, FLAG_SEALED, HEADER_LEN, KIND_DEV_EVENT, KIND_END,
-    KIND_ENTROPY, KIND_EPOCH_HASH, KIND_FRAME_MARK, KIND_NET_RX, KIND_NET_TX, KIND_PAD_SET,
-    KIND_SDK_EVENT, KIND_TIMER_FIRE, MAX_NET_RX_FRAME, MAX_PAYLOAD, RFLAG_AUX,
+    BISECTION_CHECKPOINT_FLAGS, BISECTION_CHECKPOINT_FORMAT_VERSION,
+    BISECTION_CHECKPOINT_PAYLOAD_LEN, FLAG_EPOCH_HASHES, FLAG_HAS_AUX, FLAG_SEALED, HEADER_LEN,
+    KIND_BISECTION_CHECKPOINT, KIND_DEV_EVENT, KIND_END, KIND_ENTROPY, KIND_EPOCH_HASH,
+    KIND_FRAME_MARK, KIND_NET_RX, KIND_NET_TX, KIND_PAD_SET, KIND_SDK_EVENT, KIND_TIMER_FIRE,
+    MAX_NET_RX_FRAME, MAX_PAYLOAD, RFLAG_AUX,
 };
 
 /// Validation failure. Variants carry the record `seq` where applicable —
@@ -63,6 +65,10 @@ pub enum ReadError {
     KindAuxMismatch { kind: u8, seq: u32 },
     /// A known kind with the wrong payload size/shape for its §3.3 layout.
     BadPayloadLayout { kind: u8, seq: u32 },
+    /// A BISECTION_CHECKPOINT payload uses an unsupported nested format.
+    UnsupportedBisectionCheckpointVersion { found: u16, seq: u32 },
+    /// Reserved BISECTION_CHECKPOINT flags are nonzero.
+    InvalidBisectionCheckpointFlags { flags: u16, seq: u32 },
     /// Inter-record zero-padding is nonzero (writer zero-pads, §3.2).
     NonzeroPadding { seq: u32 },
     /// `header.record_count` does not match the records actually present.
@@ -200,6 +206,14 @@ impl<'a> Record<'a> {
             KIND_FRAME_MARK => RecordBody::FrameMark {
                 frame_index: u32at(0),
             },
+            KIND_BISECTION_CHECKPOINT => RecordBody::BisectionCheckpoint {
+                format_version: u16at(0),
+                flags: u16at(2),
+                max_covered_gap: u32at(4),
+                checkpoint_snapshot_ref: p[8..40].try_into().unwrap(),
+                checkpoint_icount: u64at(40),
+                checkpoint_vns: u64at(48),
+            },
             KIND_END => RecordBody::End {
                 stop_reason: p[0],
                 end_state_hash: p[8..40].try_into().unwrap(),
@@ -252,6 +266,14 @@ pub enum RecordBody<'a> {
     },
     FrameMark {
         frame_index: u32,
+    },
+    BisectionCheckpoint {
+        format_version: u16,
+        flags: u16,
+        max_covered_gap: u32,
+        checkpoint_snapshot_ref: [u8; 32],
+        checkpoint_icount: u64,
+        checkpoint_vns: u64,
     },
     End {
         stop_reason: u8,
@@ -613,8 +635,14 @@ fn scan_next_record<'a>(
 fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), ReadError> {
     let class_aux = match kind {
         KIND_PAD_SET | KIND_DEV_EVENT | KIND_NET_RX => false,
-        KIND_ENTROPY | KIND_TIMER_FIRE | KIND_EPOCH_HASH | KIND_SDK_EVENT | KIND_NET_TX
-        | KIND_FRAME_MARK | KIND_END => true,
+        KIND_ENTROPY
+        | KIND_TIMER_FIRE
+        | KIND_EPOCH_HASH
+        | KIND_SDK_EVENT
+        | KIND_NET_TX
+        | KIND_FRAME_MARK
+        | KIND_BISECTION_CHECKPOINT
+        | KIND_END => true,
         _ if aux => return Ok(()), // unknown AUX: skippable, accepted (§3.4)
         _ => return Err(ReadError::UnknownCanonicalKind { kind, seq }),
     };
@@ -636,6 +664,24 @@ fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), Re
         KIND_TIMER_FIRE => payload.len() == 20,
         KIND_EPOCH_HASH | KIND_END => payload.len() == 40,
         KIND_FRAME_MARK => payload.len() == 8,
+        KIND_BISECTION_CHECKPOINT => {
+            if payload.len() != BISECTION_CHECKPOINT_PAYLOAD_LEN {
+                false
+            } else {
+                let format_version = u16::from_le_bytes(payload[0..2].try_into().unwrap());
+                if format_version != BISECTION_CHECKPOINT_FORMAT_VERSION {
+                    return Err(ReadError::UnsupportedBisectionCheckpointVersion {
+                        found: format_version,
+                        seq,
+                    });
+                }
+                let flags = u16::from_le_bytes(payload[2..4].try_into().unwrap());
+                if flags != BISECTION_CHECKPOINT_FLAGS {
+                    return Err(ReadError::InvalidBisectionCheckpointFlags { flags, seq });
+                }
+                true
+            }
+        }
         // Unreachable: unknown kinds returned above (Ok for AUX, Err for
         // canonical), so `kind` is a known kind here. Kept total anyway.
         _ => true,
