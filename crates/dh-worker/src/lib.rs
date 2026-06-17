@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_arch = "x86_64")]
+pub mod bisection_index;
+#[cfg(target_arch = "x86_64")]
 pub mod fork_engine;
 pub mod image_resolver;
 pub mod preflight;

@@ -1387,13 +1387,39 @@ fn run_verify_replay_on_current_thread(
     let log_bytes = verify_replay_log_bytes(log_input, &store)?;
     let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
         .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
+    let checkpoint_index = if bisect_on_divergence {
+        Some(
+            crate::bisection_index::BisectionCheckpointIndex::from_reader(&reader).map_err(
+                |e| {
+                    Status::failed_precondition(format!(
+                        "VerifyReplay bisection checkpoint index invalid: {e}"
+                    ))
+                },
+            )?,
+        )
+    } else {
+        None
+    };
     let header = reader.header().clone();
     let log_writer = log_writer_from_reader_header(&header);
     drop(reader);
 
     let config = crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
         .map_err(restore_engine_error_to_status)?;
-    verify_log_header_matches_request(&header, &base_snapshot, &config)?;
+    validate_verify_replay_header_and_bisection_refs(
+        &header,
+        &base_snapshot,
+        &config,
+        checkpoint_index.as_ref(),
+        |snapshot_ref| {
+            let container = store
+                .get_snapshot(snapstore_types::SnapshotRef::from_bytes(snapshot_ref))
+                .map_err(|e| format!("get_snapshot: {e}"))?;
+            snapstore_manifest::Manifest::decode(&container)
+                .map_err(|e| format!("manifest: {e}"))?;
+            Ok::<(), String>(())
+        },
+    )?;
     let assets = image_resolver
         .resolve_create_vm(&config)
         .map_err(image_error_to_status)?;
@@ -1459,6 +1485,29 @@ fn run_verify_replay_on_current_thread(
     )
     .map_err(replay_error_to_status)?;
     verify_progress_to_proto(terminal, bisect_on_divergence)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn validate_verify_replay_header_and_bisection_refs<F, E>(
+    header: &dh_inputlog::reader::Header,
+    base_snapshot: &snapstore_types::SnapshotRef,
+    config: &dh_vmm::config::MachineConfig,
+    checkpoint_index: Option<&crate::bisection_index::BisectionCheckpointIndex>,
+    validate_ref: F,
+) -> Result<(), Status>
+where
+    F: FnMut([u8; 32]) -> Result<(), E>,
+    E: std::fmt::Display,
+{
+    verify_log_header_matches_request(header, base_snapshot, config)?;
+    if let Some(index) = checkpoint_index {
+        index.validate_snapshot_refs(validate_ref).map_err(|e| {
+            Status::failed_precondition(format!(
+                "VerifyReplay bisection checkpoint ref unusable: {e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -7305,6 +7354,53 @@ mod tests {
             };
             assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_header_mismatch_precedes_bisection_ref_validation() {
+        let config =
+            machine_config_from_proto(&service_machine_config([0x01; 32], [0x02; 32])).unwrap();
+        let recorded_base = snapstore_types::SnapshotRef::from_bytes([0x10; 32]);
+        let requested_base = snapstore_types::SnapshotRef::from_bytes([0x20; 32]);
+        let mut writer = new_segment_log(&config, Some(&recorded_base), [0x30; 32]).unwrap();
+        writer.epoch_hash(20, 0x2000, 1, [0x01; 32]).unwrap();
+        writer
+            .bisection_checkpoint(20, 0x2000, 20, [0xEE; 32], 20)
+            .unwrap();
+        let log = writer
+            .seal(dh_inputlog::dhilog::SealParams {
+                end_snapshot_id: [0; 32],
+                end_icount: 20,
+                end_vns: 20,
+                end_state_hash: [0x44; 32],
+                stop_reason: 0,
+            })
+            .unwrap();
+        let reader = dh_inputlog::reader::LogReader::parse(&log).unwrap();
+        let header = reader.header().clone();
+        let index = crate::bisection_index::BisectionCheckpointIndex::from_reader(&reader)
+            .expect("test log has valid checkpoint index");
+
+        let mut ref_validator_called = false;
+        let err = validate_verify_replay_header_and_bisection_refs(
+            &header,
+            &requested_base,
+            &config,
+            Some(&index),
+            |_snapshot_ref| {
+                ref_validator_called = true;
+                Err::<(), &str>("checkpoint ref should not be validated after header mismatch")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("base_snapshot_id"));
+        assert!(
+            !ref_validator_called,
+            "checkpoint refs must not be dereferenced before header identity is validated"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
