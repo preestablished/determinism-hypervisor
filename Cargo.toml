@@ -64,5 +64,7 @@ vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 # tonic/prost closure. protoc is vendored — no runner provisioning needed.
 prost = "0.13"
 protoc-bin-vendored = "3"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
 tonic = "0.12"
 tonic-build = "0.12"

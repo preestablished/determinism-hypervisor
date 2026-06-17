@@ -26,6 +26,8 @@ detguest-host.workspace = true
 detguest-wire.workspace = true
 kvm-ioctls.workspace = true
 lz4_flex.workspace = true
+postcard.workspace = true
+serde.workspace = true
 snapstore-client.workspace = true
 snapstore-manifest.workspace = true
 snapstore-types.workspace = true
@@ -39,6 +41,7 @@ vm-memory.workspace = true
 detguest-host.workspace = true
 detguest-wire.workspace = true
 hyper-util.workspace = true
+kvm-bindings = "0.14.0"
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }
 snapstore-server.workspace = true
