@@ -55,8 +55,11 @@ pub struct BoundaryState {
     /// Current StateHashChain value — recorded in TIME; the child segment
     /// resumes the chain from it (`StateHashChain::from_value`).
     pub hash_chain: [u8; 32],
-    /// MUST be true: snapshots only happen at quiescent boundaries with no
-    /// unconsumed scheduled events (§8.1).
+    /// MUST be true for public TakeSnapshot lineage boundaries: those
+    /// snapshots rotate the segment and therefore require no unconsumed
+    /// scheduled events (§8.1). Non-mutating bisection checkpoint captures
+    /// may be taken at a paused deterministic boundary while future inputs
+    /// remain queued.
     pub agenda_empty: bool,
 }
 
@@ -80,6 +83,15 @@ pub struct TakeSnapshotOutcome {
     /// Pages shipped (== dirty count for incremental, total for full).
     pub pages_shipped: u64,
     /// The chain value to seed the child segment with.
+    pub hash_chain: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct BisectionCheckpointSnapshotOutcome {
+    pub snapshot_ref: SnapshotRef,
+    /// Always the full guest page count. Checkpoint snapshots are complete,
+    /// parentless evidence artifacts, not lineage deltas.
+    pub pages_shipped: u64,
     pub hash_chain: [u8; 32],
 }
 
@@ -110,12 +122,7 @@ pub fn take_snapshot(
     source: PageSource<'_>,
     store: &SnapstoreClient,
 ) -> Result<TakeSnapshotOutcome, EngineError> {
-    if !boundary.agenda_empty {
-        return Err(EngineError::AgendaNotEmpty);
-    }
-    if slot_state != SlotState::Paused {
-        return Err(EngineError::NotPaused { state: slot_state });
-    }
+    validate_take_snapshot_preconditions(slot_state, &boundary)?;
 
     // ── 1. Page set (§8.2: drain ring at the pause) ───────────────────────
     let total_pages = slot.mem_bytes / PAGE_SIZE;
@@ -138,14 +145,7 @@ pub fn take_snapshot(
     };
 
     // ── 2. Read pages from the live mapping (paused: no shadow copy) ──────
-    let mut pages: Vec<(u64, Vec<u8>)> = Vec::with_capacity(page_indices.len());
-    for idx in &page_indices {
-        let mut buf = vec![0u8; PAGE_SIZE as usize];
-        slot.guest_mem
-            .read_slice(&mut buf, GuestAddress(idx * PAGE_SIZE))
-            .map_err(|e| EngineError::Kvm(format!("page {idx} read: {e}")))?;
-        pages.push((*idx, buf));
-    }
+    let pages = read_pages(slot, &page_indices)?;
     let pages_shipped = pages.len() as u64;
 
     // ── 3. Assemble DHSNAP ────────────────────────────────────────────────
@@ -158,19 +158,8 @@ pub fn take_snapshot(
     //       returned ref is the durability receipt (R12). An empty
     //       incremental (no guest writes since the parent) is a VALID
     //       zero-page DELTA, not an error — verified against the store. ──
-    let snapshot_ref = store
-        .put_snapshot_from_parts(
-            parent.as_ref(),
-            slot.mem_bytes,
-            pages,
-            DeviceBlob {
-                format: DEVICE_BLOB_FORMAT_DHSNAP,
-                zstd: false,
-                raw_len: dhsnap.len() as u64,
-                bytes: dhsnap,
-            },
-        )
-        .map_err(|e| EngineError::Store(format!("put_snapshot: {e}")))?;
+    let snapshot_ref =
+        put_snapshot_from_pages(store, parent.as_ref(), slot.mem_bytes, pages, dhsnap)?;
 
     // ── 5. Only now: clear the dirty set (§8.2's last step) ───────────────
     if let Some(dirty) = dirty_to_clear {
@@ -182,6 +171,90 @@ pub fn take_snapshot(
         pages_shipped,
         hash_chain: boundary.hash_chain,
     })
+}
+
+/// Capture a full bisection checkpoint snapshot without public
+/// TakeSnapshot lineage effects.
+///
+/// This stores a parentless FULL snapshot for later evidence comparison,
+/// but it does not harvest or clear dirty tracking, rotate DHILOG segments,
+/// reseed entropy, reset segment counters, or publish a new slot base. The
+/// caller owns any surrounding AUX record scheduling.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_bisection_checkpoint_snapshot(
+    slot: &SlotVm,
+    slot_state: SlotState,
+    bus: &dh_devices::MmioBus,
+    entropy: &dh_devices::entropy::DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    store: &SnapstoreClient,
+) -> Result<BisectionCheckpointSnapshotOutcome, EngineError> {
+    validate_paused(slot_state)?;
+
+    let total_pages = slot.mem_bytes / PAGE_SIZE;
+    let page_indices: Vec<u64> = (0..total_pages).collect();
+    let pages = read_pages(slot, &page_indices)?;
+    let pages_shipped = pages.len() as u64;
+    let dhsnap = build_dhsnap(slot, bus, entropy, machine_config, &boundary)?;
+    let snapshot_ref = put_snapshot_from_pages(store, None, slot.mem_bytes, pages, dhsnap)?;
+
+    Ok(BisectionCheckpointSnapshotOutcome {
+        snapshot_ref,
+        pages_shipped,
+        hash_chain: boundary.hash_chain,
+    })
+}
+
+fn validate_take_snapshot_preconditions(
+    slot_state: SlotState,
+    boundary: &BoundaryState,
+) -> Result<(), EngineError> {
+    if !boundary.agenda_empty {
+        return Err(EngineError::AgendaNotEmpty);
+    }
+    validate_paused(slot_state)
+}
+
+fn validate_paused(slot_state: SlotState) -> Result<(), EngineError> {
+    if slot_state != SlotState::Paused {
+        return Err(EngineError::NotPaused { state: slot_state });
+    }
+    Ok(())
+}
+
+fn read_pages(slot: &SlotVm, page_indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, EngineError> {
+    let mut pages = Vec::with_capacity(page_indices.len());
+    for idx in page_indices {
+        let mut buf = vec![0u8; PAGE_SIZE as usize];
+        slot.guest_mem
+            .read_slice(&mut buf, GuestAddress(idx * PAGE_SIZE))
+            .map_err(|e| EngineError::Kvm(format!("page {idx} read: {e}")))?;
+        pages.push((*idx, buf));
+    }
+    Ok(pages)
+}
+
+fn put_snapshot_from_pages(
+    store: &SnapstoreClient,
+    parent: Option<&SnapshotRef>,
+    mem_bytes: u64,
+    pages: Vec<(u64, Vec<u8>)>,
+    dhsnap: Vec<u8>,
+) -> Result<SnapshotRef, EngineError> {
+    store
+        .put_snapshot_from_parts(
+            parent,
+            mem_bytes,
+            pages,
+            DeviceBlob {
+                format: DEVICE_BLOB_FORMAT_DHSNAP,
+                zstd: false,
+                raw_len: dhsnap.len() as u64,
+                bytes: dhsnap,
+            },
+        )
+        .map_err(|e| EngineError::Store(format!("put_snapshot: {e}")))
 }
 
 /// DHSNAP assembly in the canonical §4 table order (byte-determinism: the

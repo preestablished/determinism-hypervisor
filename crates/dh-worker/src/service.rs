@@ -4499,6 +4499,17 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    struct BisectionCheckpointEquivalenceLeg {
+        first_run: proto::RunResponse,
+        final_run: proto::RunResponse,
+        snap: proto::TakeSnapshotResponse,
+        log_bytes: Vec<u8>,
+        slot_icount: u64,
+        slot_base_snapshot_id: Option<[u8; 32]>,
+        checkpoint_ref: Option<[u8; 32]>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
     async fn capture_neutrality_leg(
         svc: &WorkerService,
         base_snapshot: proto::SnapshotRef,
@@ -4561,6 +4572,198 @@ mod tests {
             run,
             snap,
             log_bytes,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn bisection_checkpoint_equivalence_leg(
+        svc: &WorkerService,
+        base_snapshot: proto::SnapshotRef,
+        capture_checkpoint: bool,
+    ) -> BisectionCheckpointEquivalenceLeg {
+        let restored = svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(base_snapshot),
+                entropy_seed: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let lease = restored.lease.unwrap();
+
+        let injected = svc
+            .inject_inputs(Request::new(proto::InjectInputsRequest {
+                lease: Some(lease.clone()),
+                events: vec![proto::ScheduledEvent {
+                    at: Some(proto::scheduled_event::At::AtIcount(25_000)),
+                    event: Some(proto::scheduled_event::Event::PadSet(proto::PadSet {
+                        port: 0,
+                        buttons: 0xA5A5,
+                    })),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(injected.scheduled, 1);
+
+        let first_run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(20_000)),
+                hard_icount_cap: 0,
+                capture: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            first_run.reason,
+            proto_stop_reason(dh_vmm::runctl::StopReason::BudgetReached)
+        );
+        assert_eq!(first_run.icount, 20_000);
+        assert_eq!(
+            svc.runtime_table()
+                .with(lease.slot_id, |actor| actor
+                    .with_runtime(|runtime| runtime.queued_inputs.len())
+                    .unwrap())
+                .unwrap(),
+            1,
+            "future input must still be queued at the checkpoint boundary"
+        );
+
+        let checkpoint_ref = if capture_checkpoint {
+            let svc_for_capture = svc.clone();
+            let lease_for_capture = lease.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    let store = svc_for_capture.store().unwrap();
+                    let actor = svc_for_capture
+                        .runtime_table()
+                        .with(lease_for_capture.slot_id, Arc::clone)
+                        .unwrap();
+                    actor
+                        .with_runtime_mut(move |runtime| {
+                            let before = (
+                                runtime.base_snapshot.clone(),
+                                runtime.position,
+                                runtime.chain.value(),
+                                runtime.entropy.state(),
+                                runtime.dirty.len(),
+                                runtime.log.as_ref().map(|log| log.record_count()),
+                                runtime.queued_inputs.len(),
+                                runtime.next_input_order,
+                            );
+                            assert_eq!(before.6, 1);
+                            let boundary = runtime.boundary_state(runtime.queued_inputs.is_empty());
+                            assert!(
+                                !boundary.agenda_empty,
+                                "checkpoint leg must exercise queued future input"
+                            );
+                            let checkpoint = {
+                                let store = store.lock().unwrap();
+                                crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+                                    &runtime.slot,
+                                    dh_vmm::SlotState::Paused,
+                                    &runtime.bus,
+                                    &runtime.entropy,
+                                    &runtime.machine_config,
+                                    boundary,
+                                    &store,
+                                )
+                                .unwrap()
+                            };
+                            let after = (
+                                runtime.base_snapshot.clone(),
+                                runtime.position,
+                                runtime.chain.value(),
+                                runtime.entropy.state(),
+                                runtime.dirty.len(),
+                                runtime.log.as_ref().map(|log| log.record_count()),
+                                runtime.queued_inputs.len(),
+                                runtime.next_input_order,
+                            );
+                            assert_eq!(after, before);
+                            checkpoint.snapshot_ref.to_bytes()
+                        })
+                        .unwrap()
+                })
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+
+        let final_run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(20_000)),
+                hard_icount_cap: 0,
+                capture: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            final_run.reason,
+            proto_stop_reason(dh_vmm::runctl::StopReason::BudgetReached)
+        );
+        assert_eq!(final_run.icount, 40_000);
+        assert_eq!(
+            svc.runtime_table()
+                .with(lease.slot_id, |actor| actor
+                    .with_runtime(|runtime| runtime.queued_inputs.len())
+                    .unwrap())
+                .unwrap(),
+            0,
+            "future input should drain after the post-checkpoint run"
+        );
+
+        let snap = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let svc_for_log = svc.clone();
+        let input_log_id = snap.input_log_id.clone();
+        let log_bytes = tokio::task::spawn_blocking(move || {
+            stored_input_log_payload(&svc_for_log, input_log_id)
+        })
+        .await
+        .unwrap();
+        let slot = svc.slot_manager().slot_info(lease.slot_id).unwrap();
+        let slot_icount = slot.icount;
+        let slot_base_snapshot_id = slot.base_snapshot_id;
+        assert_eq!(
+            slot_base_snapshot_id,
+            Some(
+                snap.snapshot
+                    .as_ref()
+                    .unwrap()
+                    .hash
+                    .clone()
+                    .try_into()
+                    .unwrap()
+            )
+        );
+
+        svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+            .await
+            .unwrap();
+
+        BisectionCheckpointEquivalenceLeg {
+            first_run,
+            final_run,
+            snap,
+            log_bytes,
+            slot_icount,
+            slot_base_snapshot_id,
+            checkpoint_ref,
         }
     }
 
@@ -5286,6 +5489,164 @@ mod tests {
                     .unwrap()
                     .base_snapshot_id,
                 Some(snapshot.hash.try_into().unwrap())
+            );
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bisection_checkpoint_capture_preserves_runtime_lineage_and_log_surfaces() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            std::env::temp_dir(),
+            Some(transport),
+        ))
+        .unwrap();
+        let position = SlotPosition {
+            cumulative_icount: 12_345,
+            segment_icount: 4_321,
+            vns: 987_654,
+            epoch_index: 7,
+            frame_counter: 3,
+        };
+        let base_snapshot = snapstore_types::SnapshotRef::from_bytes([0x55; 32]);
+        let mut runtime = make_runtime(0x61, position, Some(base_snapshot.clone())).unwrap();
+        runtime.log = Some(
+            new_segment_log(
+                &runtime.machine_config,
+                runtime.base_snapshot.as_ref(),
+                [0x11; 32],
+            )
+            .unwrap(),
+        );
+        runtime.dirty.insert(7).unwrap();
+
+        let before = (
+            runtime.base_snapshot.clone(),
+            runtime.position,
+            runtime.chain.value(),
+            runtime.entropy.state(),
+            runtime.dirty.len(),
+            runtime.log.as_ref().map(|log| log.record_count()),
+        );
+        let store = svc.store().unwrap();
+        let checkpoint = {
+            let store = store.lock().unwrap();
+            crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+                &runtime.slot,
+                dh_vmm::SlotState::Paused,
+                &runtime.bus,
+                &runtime.entropy,
+                &runtime.machine_config,
+                runtime.boundary_state(runtime.queued_inputs.is_empty()),
+                &store,
+            )
+            .unwrap()
+        };
+        let after = (
+            runtime.base_snapshot.clone(),
+            runtime.position,
+            runtime.chain.value(),
+            runtime.entropy.state(),
+            runtime.dirty.len(),
+            runtime.log.as_ref().map(|log| log.record_count()),
+        );
+        assert_eq!(after, before);
+        assert_eq!(
+            checkpoint.pages_shipped,
+            runtime.slot.mem_bytes / dh_vmm::dirty::PAGE_SIZE
+        );
+        assert_eq!(checkpoint.hash_chain, before.2);
+
+        let container = {
+            let store = store.lock().unwrap();
+            store.get_snapshot(checkpoint.snapshot_ref).unwrap()
+        };
+        let manifest = snapstore_manifest::Manifest::decode(&container).unwrap();
+        assert_eq!(manifest.parent, None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn bisection_checkpoint_capture_is_execution_equivalent_to_no_capture() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xB5; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let root_lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(root_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(root_lease),
+            }))
+            .await
+            .unwrap();
+
+            let control =
+                bisection_checkpoint_equivalence_leg(&svc, base_snapshot.clone(), false).await;
+            let captured = bisection_checkpoint_equivalence_leg(&svc, base_snapshot, true).await;
+            assert!(
+                captured.checkpoint_ref.is_some(),
+                "capture leg must store a checkpoint artifact"
+            );
+
+            assert_eq!(captured.first_run.icount, control.first_run.icount);
+            assert_eq!(captured.first_run.vns, control.first_run.vns);
+            assert_eq!(captured.first_run.state_hash, control.first_run.state_hash);
+            assert_eq!(captured.final_run.icount, control.final_run.icount);
+            assert_eq!(captured.final_run.vns, control.final_run.vns);
+            assert_eq!(captured.final_run.state_hash, control.final_run.state_hash);
+            assert_eq!(
+                captured.snap.snapshot.as_ref().unwrap().hash,
+                control.snap.snapshot.as_ref().unwrap().hash,
+                "checkpoint capture must not perturb the final snapshot ref"
+            );
+            assert_eq!(captured.snap.input_log_id, control.snap.input_log_id);
+            assert_eq!(captured.snap.icount, control.snap.icount);
+            assert_eq!(captured.snap.vns, control.snap.vns);
+            assert_eq!(captured.snap.state_hash, control.snap.state_hash);
+            assert_eq!(captured.snap.dirty_pages, control.snap.dirty_pages);
+            assert_eq!(
+                captured.log_bytes, control.log_bytes,
+                "checkpoint capture must not perturb the sealed DHILOG"
+            );
+            assert_eq!(captured.slot_icount, control.slot_icount);
+            assert_eq!(
+                captured.slot_base_snapshot_id,
+                control.slot_base_snapshot_id
             );
         });
     }
