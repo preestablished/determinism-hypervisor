@@ -1387,6 +1387,17 @@ fn run_verify_replay_on_current_thread(
     let log_bytes = verify_replay_log_bytes(log_input, &store)?;
     let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
         .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
+    if bisect_on_divergence {
+        let checkpoint_index = crate::bisection_index::BisectionCheckpointIndex::from_reader(
+            &reader,
+        )
+        .map_err(|e| {
+            Status::failed_precondition(format!(
+                "VerifyReplay bisection checkpoint index invalid: {e}"
+            ))
+        })?;
+        validate_bisection_checkpoint_refs_for_verify_replay(&checkpoint_index, &store)?;
+    }
     let header = reader.header().clone();
     let log_writer = log_writer_from_reader_header(&header);
     drop(reader);
@@ -1459,6 +1470,27 @@ fn run_verify_replay_on_current_thread(
     )
     .map_err(replay_error_to_status)?;
     verify_progress_to_proto(terminal, bisect_on_divergence)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn validate_bisection_checkpoint_refs_for_verify_replay(
+    index: &crate::bisection_index::BisectionCheckpointIndex,
+    store: &snapstore_client::blocking::SnapstoreClient,
+) -> Result<(), Status> {
+    index
+        .validate_snapshot_refs(|snapshot_ref| {
+            let container = store
+                .get_snapshot(snapstore_types::SnapshotRef::from_bytes(snapshot_ref))
+                .map_err(|e| format!("get_snapshot: {e}"))?;
+            snapstore_manifest::Manifest::decode(&container)
+                .map_err(|e| format!("manifest: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .map_err(|e| {
+            Status::failed_precondition(format!(
+                "VerifyReplay bisection checkpoint ref unusable: {e}"
+            ))
+        })
 }
 
 #[cfg(target_arch = "x86_64")]
