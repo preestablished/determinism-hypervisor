@@ -257,7 +257,7 @@ fn compare_vcpu(expected: &VcpuState, actual: &VcpuState) -> Vec<RegDiff> {
         diffs.push(RegDiff {
             name: "vcpu_non_gpr".into(),
             expected: vcpu_state::encode_section(expected),
-            actual: vcpu_state::encode_section(&actual_without_gpr_diffs),
+            actual: vcpu_state::encode_section(actual),
         });
     }
 
@@ -527,6 +527,34 @@ mod tests {
         assert_eq!(decoded[0].name, "vcpu_non_gpr");
         assert!(decoded[0].expected.len() > 4096);
         assert_eq!(decoded[0].expected.len(), decoded[0].actual.len());
+    }
+
+    #[test]
+    fn combined_gpr_and_non_gpr_mismatch_keeps_actual_vcpu_payload() {
+        let expected_state = synthetic_state();
+        let mut actual_state = expected_state.clone();
+        actual_state.regs.rip = 0x2000;
+        actual_state.sregs.cr3 = 0x5555_0000;
+        let expected_vcpu = vcpu_state::encode_section(&expected_state);
+        let actual_vcpu = vcpu_state::encode_section(&actual_state);
+        let expected = fixture_with_vcpu(&expected_state, vec![page(0)]);
+        let actual = fixture_with_vcpu(&actual_state, vec![page(0)]);
+        let mut store = FakeStore::default();
+        store.insert(expected.clone());
+        store.insert(actual.clone());
+
+        let comparison =
+            compare_snapshots(&store, expected.snapshot_ref, actual.snapshot_ref).unwrap();
+
+        let decoded = decode_reg_diff(&comparison.reg_diff);
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded.iter().any(|diff| diff.name == "rip"));
+        let non_gpr = decoded
+            .iter()
+            .find(|diff| diff.name == "vcpu_non_gpr")
+            .unwrap();
+        assert_eq!(non_gpr.expected, expected_vcpu);
+        assert_eq!(non_gpr.actual, actual_vcpu);
     }
 
     #[test]
