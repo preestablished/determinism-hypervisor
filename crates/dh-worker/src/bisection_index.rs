@@ -17,15 +17,6 @@ pub struct RecordPosition {
     pub seq: u32,
 }
 
-impl RecordPosition {
-    fn synthetic_terminal(icount: u64) -> Self {
-        Self {
-            icount,
-            seq: u32::MAX,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexedEpochHash {
     pub epoch_index: u64,
@@ -65,6 +56,12 @@ pub enum BisectionDivergenceSite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BisectionSelectionTarget {
+    EpochHash { epoch_index: u64, at_icount: u64 },
+    TerminalEndState { end_icount: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedBisectionCheckpoint {
     pub checkpoint: IndexedBisectionCheckpoint,
     pub divergence: BisectionDivergenceSite,
@@ -100,6 +97,11 @@ pub enum BisectionCheckpointIndexError {
     CheckpointDoesNotFollowEpochHash {
         checkpoint: RecordPosition,
         epoch_hash: RecordPosition,
+    },
+    CheckpointSeparatedFromEpochHashByCanonicalRecord {
+        checkpoint: RecordPosition,
+        epoch_hash: RecordPosition,
+        canonical: RecordPosition,
     },
     InconsistentSequenceOrdering {
         previous: RecordPosition,
@@ -161,6 +163,17 @@ impl fmt::Display for BisectionCheckpointIndexError {
                     checkpoint.seq, checkpoint.icount, epoch_hash.seq
                 )
             }
+            Self::CheckpointSeparatedFromEpochHashByCanonicalRecord {
+                checkpoint,
+                epoch_hash,
+                canonical,
+            } => {
+                write!(
+                    f,
+                    "BISECTION_CHECKPOINT seq {} at icount {} is separated from EPOCH_HASH seq {} by canonical record seq {}",
+                    checkpoint.seq, checkpoint.icount, epoch_hash.seq, canonical.seq
+                )
+            }
             Self::InconsistentSequenceOrdering { previous, current } => {
                 write!(
                     f,
@@ -202,7 +215,7 @@ impl std::error::Error for BisectionCheckpointIndexError {}
 
 impl BisectionCheckpointIndex {
     pub fn from_reader(reader: &LogReader<'_>) -> Result<Self, BisectionCheckpointIndexError> {
-        let mut epoch_hash_by_icount: BTreeMap<u64, IndexedEpochHash> = BTreeMap::new();
+        let mut epoch_hash_by_icount: BTreeMap<u64, EpochHashContext> = BTreeMap::new();
         let mut epoch_hashes = Vec::new();
         let mut candidates = Vec::new();
         let mut end_position = None;
@@ -218,7 +231,13 @@ impl BisectionCheckpointIndex {
                         epoch_index,
                         position,
                     };
-                    epoch_hash_by_icount.insert(position.icount, epoch_hash);
+                    epoch_hash_by_icount.insert(
+                        position.icount,
+                        EpochHashContext {
+                            epoch_hash,
+                            intervening_canonical: None,
+                        },
+                    );
                     epoch_hashes.push(epoch_hash);
                 }
                 RecordBody::BisectionCheckpoint {
@@ -228,17 +247,31 @@ impl BisectionCheckpointIndex {
                     checkpoint_snapshot_ref,
                     checkpoint_icount,
                     checkpoint_vns,
-                } => candidates.push(BisectionCheckpointCandidate {
-                    position,
-                    format_version,
-                    flags,
-                    max_covered_gap,
-                    checkpoint_snapshot_ref,
-                    checkpoint_icount,
-                    checkpoint_vns,
-                    preceding_epoch_hash: epoch_hash_by_icount.get(&position.icount).copied(),
-                }),
+                } => {
+                    let context = epoch_hash_by_icount.get(&position.icount).copied();
+                    candidates.push(BisectionCheckpointCandidate {
+                        position,
+                        format_version,
+                        flags,
+                        max_covered_gap,
+                        checkpoint_snapshot_ref,
+                        checkpoint_icount,
+                        checkpoint_vns,
+                        preceding_epoch_hash: context.map(|context| context.epoch_hash),
+                        intervening_canonical: context
+                            .and_then(|context| context.intervening_canonical),
+                    })
+                }
                 RecordBody::End { .. } => end_position = Some(position),
+                _ if !record.is_aux() => {
+                    if let Some(context) = epoch_hash_by_icount.get_mut(&position.icount) {
+                        if context.epoch_hash.position < position
+                            && context.intervening_canonical.is_none()
+                        {
+                            context.intervening_canonical = Some(position);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -280,12 +313,16 @@ impl BisectionCheckpointIndex {
 
     pub fn select_for_divergence(
         &self,
-        first_bad_epoch: Option<u64>,
-        at_icount: u64,
+        target: BisectionSelectionTarget,
     ) -> Option<SelectedBisectionCheckpoint> {
-        match first_bad_epoch {
-            Some(epoch_index) => self.select_epoch_hash_divergence(epoch_index, at_icount),
-            None => self.select_terminal_divergence(at_icount),
+        match target {
+            BisectionSelectionTarget::EpochHash {
+                epoch_index,
+                at_icount,
+            } => self.select_epoch_hash_divergence(epoch_index, at_icount),
+            BisectionSelectionTarget::TerminalEndState { end_icount } => {
+                self.select_terminal_divergence(end_icount)
+            }
         }
     }
 
@@ -318,10 +355,10 @@ impl BisectionCheckpointIndex {
         &self,
         end_icount: u64,
     ) -> Option<SelectedBisectionCheckpoint> {
-        let end_position = self
-            .end_position
-            .filter(|position| position.icount == end_icount)
-            .unwrap_or_else(|| RecordPosition::synthetic_terminal(end_icount));
+        let end_position = self.end_position?;
+        if end_position.icount != end_icount {
+            return None;
+        }
 
         self.checkpoints
             .iter()
@@ -394,6 +431,15 @@ impl BisectionCheckpointIndex {
                     },
                 );
             }
+            if let Some(canonical) = candidate.intervening_canonical {
+                return Err(
+                    BisectionCheckpointIndexError::CheckpointSeparatedFromEpochHashByCanonicalRecord {
+                        checkpoint: candidate.position,
+                        epoch_hash: preceding_epoch_hash.position,
+                        canonical,
+                    },
+                );
+            }
             let required_gap = if let Some(previous_icount) = previous_checkpoint_icount {
                 candidate
                     .checkpoint_icount
@@ -447,6 +493,12 @@ impl IndexedBisectionCheckpoint {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct EpochHashContext {
+    epoch_hash: IndexedEpochHash,
+    intervening_canonical: Option<RecordPosition>,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct BisectionCheckpointCandidate {
     position: RecordPosition,
     format_version: u16,
@@ -456,6 +508,7 @@ struct BisectionCheckpointCandidate {
     checkpoint_icount: u64,
     checkpoint_vns: u64,
     preceding_epoch_hash: Option<IndexedEpochHash>,
+    intervening_canonical: Option<RecordPosition>,
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -470,7 +523,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dh_inputlog::dhilog::{LogWriter, SealParams, SegmentHeader};
+    use dh_inputlog::dhilog::{LogWriter, SealParams, SegmentHeader, FRAME_HINT_NONE};
 
     fn pos(icount: u64, seq: u32) -> RecordPosition {
         RecordPosition { icount, seq }
@@ -500,6 +553,7 @@ mod tests {
             checkpoint_icount: icount,
             checkpoint_vns,
             preceding_epoch_hash: Some(preceding_epoch_hash),
+            intervening_canonical: None,
         }
     }
 
@@ -580,6 +634,15 @@ mod tests {
                 position: pos(30, 2),
             }
         );
+        assert_eq!(
+            index
+                .select_for_divergence(BisectionSelectionTarget::EpochHash {
+                    epoch_index: 2,
+                    at_icount: 30,
+                })
+                .unwrap(),
+            epoch_selection
+        );
 
         let terminal_selection = index.select_terminal_divergence(45).unwrap();
         assert_eq!(terminal_selection.checkpoint.position, pos(40, 5));
@@ -591,6 +654,21 @@ mod tests {
                 position: pos(45, 6),
             }
         );
+        assert_eq!(
+            index
+                .select_for_divergence(BisectionSelectionTarget::TerminalEndState {
+                    end_icount: 45,
+                })
+                .unwrap(),
+            terminal_selection
+        );
+        assert!(
+            index.select_terminal_divergence(44).is_none(),
+            "non-END icounts, including reseal-byte offsets, must not select terminal evidence"
+        );
+        assert!(index
+            .select_for_divergence(BisectionSelectionTarget::TerminalEndState { end_icount: 44 })
+            .is_none());
     }
 
     #[test]
@@ -716,6 +794,29 @@ mod tests {
         assert!(matches!(
             BisectionCheckpointIndex::from_reader(&reader).unwrap_err(),
             BisectionCheckpointIndexError::MissingPrecedingEpochHash { .. }
+        ));
+    }
+
+    #[test]
+    fn reader_index_rejects_canonical_record_between_epoch_hash_and_checkpoint() {
+        let mut writer = LogWriter::new(header());
+        writer.epoch_hash(20, 0x2000, 1, [0x01; 32]).unwrap();
+        writer
+            .pad_set(20, 0x2004, 0, 0x0000_0001, FRAME_HINT_NONE)
+            .unwrap();
+        writer
+            .bisection_checkpoint(20, 0x2008, 20, [0xA1; 32], 2_000)
+            .unwrap();
+        let log = writer.seal(seal_params(25)).unwrap();
+        let reader = LogReader::parse(&log).unwrap();
+
+        assert!(matches!(
+            BisectionCheckpointIndex::from_reader(&reader).unwrap_err(),
+            BisectionCheckpointIndexError::CheckpointSeparatedFromEpochHashByCanonicalRecord {
+                checkpoint: RecordPosition { icount: 20, seq: 2 },
+                epoch_hash: RecordPosition { icount: 20, seq: 0 },
+                canonical: RecordPosition { icount: 20, seq: 1 },
+            }
         ));
     }
 
