@@ -1054,6 +1054,14 @@ fn replay_error_to_status(e: crate::replay_engine::ReplayError) -> Status {
         ReplayError::Divergence { .. } => {
             Status::internal("VerifyReplay divergence escaped report translation")
         }
+        ReplayError::BisectionDivergence(_) => {
+            Status::internal("VerifyReplay bisection divergence escaped report translation")
+        }
+        ReplayError::BisectionPrecondition(m) => Status::failed_precondition(m),
+        ReplayError::BisectionCapture(e) => snapshot_engine_error_to_status(e),
+        ReplayError::BisectionCompare(e) => {
+            Status::data_loss(format!("VerifyReplay bisection snapshot comparison: {e}"))
+        }
         ReplayError::NotYetWired(what) => Status::unimplemented(what),
         ReplayError::Cancelled(what) => Status::cancelled(what),
         ReplayError::Apply(m) | ReplayError::Run(m) => Status::data_loss(m),
@@ -1462,7 +1470,7 @@ fn run_verify_replay_on_current_thread(
         .enable()
         .map_err(|e| Status::failed_precondition(format!("enable InstRetired: {e:?}")))?;
 
-    let terminal = crate::verify_replay::verify_replay_with_progress(
+    let terminal = crate::verify_replay::verify_replay_with_bisection_progress(
         &mut slot,
         rail,
         &config,
@@ -1470,6 +1478,11 @@ fn run_verify_replay_on_current_thread(
         &counter,
         &store,
         &log_bytes,
+        if bisect_on_divergence {
+            checkpoint_index.as_ref()
+        } else {
+            None
+        },
         |event| {
             let progress = verify_progress_to_proto(event, bisect_on_divergence).map_err(|e| {
                 ReplayError::Apply(format!(
@@ -7188,7 +7201,7 @@ mod tests {
                     }
                     Err(status) => {
                         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-                        assert!(status.message().contains("bisection checkpoints"));
+                        assert!(status.message().contains("checkpoint evidence"));
                         saw_checkpoint_error = true;
                     }
                 }
@@ -7197,6 +7210,138 @@ mod tests {
                 saw_checkpoint_error,
                 "default bisection must fail without checkpoint evidence"
             );
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_streams_bisection_divergence_with_checkpoint_evidence() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let mut config =
+            test_config_with_resources(2, image_cache.path().to_path_buf(), Some(transport));
+        config.bisection_checkpoints = BisectionCheckpointConfig::every_epoch();
+        let svc = WorkerService::new(config).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config_with_mem_epoch_len(
+                        base_hash,
+                        kernel_hash,
+                        8 * 1024 * 1024,
+                        10_000,
+                    )),
+                    entropy_seed: vec![0xB6; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+
+            svc.runtime_table()
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime_mut(|runtime| {
+                            use vm_memory::{Bytes, GuestAddress};
+                            runtime
+                                .slot
+                                .guest_mem
+                                .write_slice(&[0xDD; 64], GuestAddress(0x60_0000))
+                                .unwrap();
+                        })
+                        .unwrap()
+                })
+                .unwrap();
+
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(100_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(run.icount, 100_000);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let svc_for_log = svc.clone();
+            let input_log_id = snap.input_log_id;
+            let poisoned_log = tokio::task::spawn_blocking(move || {
+                stored_input_log_payload(&svc_for_log, input_log_id)
+            })
+            .await
+            .unwrap();
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLog(poisoned_log)),
+                    bisect_on_divergence: Some(true),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut divergence = None;
+            while let Some(item) = stream.next().await {
+                match item.unwrap().msg.unwrap() {
+                    VerifyMsg::EpochOk(_) => {}
+                    VerifyMsg::Done(done) => panic!("expected bisection divergence, got {done:?}"),
+                    VerifyMsg::Divergence(div) => divergence = Some(div),
+                }
+            }
+            let divergence = divergence.expect("VerifyReplay must stream a bisection divergence");
+            assert_eq!(divergence.first_bad_epoch, 1);
+            assert_eq!(divergence.icount_hi, 10_000);
+            assert!(divergence.icount_lo < divergence.icount_hi);
+            assert!(divergence
+                .diff_page_idx
+                .contains(&(0x60_0000u64 / snapstore_types::PAGE_SIZE as u64)));
+            assert!(divergence
+                .suspected_cause
+                .contains("replay-vs-recorded:EPOCH_HASH chain value"));
+            assert!(divergence
+                .suspected_cause
+                .contains("evidence_mode=replay-vs-recorded"));
+            assert!(divergence
+                .suspected_cause
+                .contains("expected_checkpoint_ref="));
+            assert!(divergence.suspected_cause.contains("actual_probe_ref="));
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
