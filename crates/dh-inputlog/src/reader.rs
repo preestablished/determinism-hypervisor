@@ -69,6 +69,12 @@ pub enum ReadError {
     UnsupportedBisectionCheckpointVersion { found: u16, seq: u32 },
     /// Reserved BISECTION_CHECKPOINT flags are nonzero.
     InvalidBisectionCheckpointFlags { flags: u16, seq: u32 },
+    /// BISECTION_CHECKPOINT payload icount must match the record header icount.
+    BisectionCheckpointIcountMismatch {
+        seq: u32,
+        record_icount: u64,
+        checkpoint_icount: u64,
+    },
     /// Inter-record zero-padding is nonzero (writer zero-pads, §3.2).
     NonzeroPadding { seq: u32 },
     /// `header.record_count` does not match the records actually present.
@@ -614,7 +620,7 @@ fn scan_next_record<'a>(
 
     let aux = rflags & RFLAG_AUX != 0;
     let payload = &b[24..24 + payload_len];
-    validate_kind(kind, aux, payload, seq)?;
+    validate_kind(kind, aux, payload, seq, icount)?;
 
     let record = Record {
         kind,
@@ -632,7 +638,13 @@ fn scan_next_record<'a>(
 
 /// Per-kind §3.3 layout validation. `payload` length is already ≤ 4096 and
 /// in-bounds.
-fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), ReadError> {
+fn validate_kind(
+    kind: u8,
+    aux: bool,
+    payload: &[u8],
+    seq: u32,
+    record_icount: u64,
+) -> Result<(), ReadError> {
     let class_aux = match kind {
         KIND_PAD_SET | KIND_DEV_EVENT | KIND_NET_RX => false,
         KIND_ENTROPY
@@ -679,6 +691,16 @@ fn validate_kind(kind: u8, aux: bool, payload: &[u8], seq: u32) -> Result<(), Re
                 if flags != BISECTION_CHECKPOINT_FLAGS {
                     return Err(ReadError::InvalidBisectionCheckpointFlags { flags, seq });
                 }
+                let checkpoint_icount = u64::from_le_bytes(payload[40..48].try_into().unwrap());
+                if checkpoint_icount != record_icount {
+                    return Err(ReadError::BisectionCheckpointIcountMismatch {
+                        seq,
+                        record_icount,
+                        checkpoint_icount,
+                    });
+                }
+                // `max_covered_gap` depends on neighboring checkpoint records
+                // and is validated by the VerifyReplay checkpoint indexer.
                 true
             }
         }

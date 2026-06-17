@@ -829,6 +829,34 @@ fn rejects_invalid_bisection_checkpoint_flags() {
 }
 
 #[test]
+fn rejects_bisection_checkpoint_icount_mismatch() {
+    let payload = bisection_checkpoint_payload(
+        BISECTION_CHECKPOINT_FORMAT_VERSION,
+        BISECTION_CHECKPOINT_FLAGS,
+        1024,
+        [0x46; 32],
+        11,
+        20,
+    );
+    let rec = make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        10,
+        0x1000,
+        &payload,
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX)).unwrap_err(),
+        ReadError::BisectionCheckpointIcountMismatch {
+            seq: 0,
+            record_icount: 10,
+            checkpoint_icount: 11
+        }
+    );
+}
+
+#[test]
 fn bisection_checkpoint_golden_bytes_decode_pinned() {
     // A minimal hand-pinned log: header + one BISECTION_CHECKPOINT + END.
     // This protects the nested payload offsets from writer/reader drift.
@@ -860,6 +888,13 @@ fn bisection_checkpoint_golden_bytes_decode_pinned() {
         42,
         1234,
     );
+    assert_eq!(
+        &checkpoint[0..8],
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00]
+    );
+    assert_eq!(&checkpoint[8..40], &[0x46; 32]);
+    assert_eq!(&checkpoint[40..48], &42u64.to_le_bytes());
+    assert_eq!(&checkpoint[48..56], &1234u64.to_le_bytes());
     log.extend_from_slice(&make_record(
         KIND_BISECTION_CHECKPOINT,
         RFLAG_AUX,

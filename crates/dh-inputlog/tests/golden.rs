@@ -46,8 +46,8 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The canonical kitchen-sink build: every writer-emittable kind, fixed
-/// inputs. This function's output is what v1.0 freezes.
+/// The original v1.0 kitchen-sink build, fixed inputs. This function's
+/// output is what v1.0 freezes.
 fn build_kitchen_sink() -> Vec<u8> {
     let mut w = LogWriter::new(SegmentHeader {
         base_snapshot_id: [0x11; 32],
