@@ -1,11 +1,10 @@
 //! DHILOG v1.0 golden-bytes freeze (bead bp9).
 //!
 //! `tests/fixtures/v1_kitchen_sink.dhilog` covers the header (incl. the
-//! encoder fingerprint) and every canonical + writer-emittable AUX record
-//! kind: PAD_SET, DEV_EVENT (RING_PUSH, CONS_BUMP and the PIO_ANSWER
-//! detchannel encodings), NET_RX, ENTROPY, TIMER_FIRE, SDK_EVENT,
-//! FRAME_MARK, END. `tests/fixtures/v1_minimal.dhilog` is the header+END
-//! degenerate case.
+//! encoder fingerprint) and the original v1.0 writer-emittable record set:
+//! PAD_SET, DEV_EVENT (RING_PUSH, CONS_BUMP and the PIO_ANSWER detchannel
+//! encodings), NET_RX, ENTROPY, TIMER_FIRE, SDK_EVENT, FRAME_MARK, END.
+//! `tests/fixtures/v1_minimal.dhilog` is the header+END degenerate case.
 //!
 //! THE V1.0 FORMAT FREEZES HERE: these tests assert (1) the checked-in
 //! fixture bytes are BLAKE3-pinned, (2) today's writer re-serializes the
@@ -16,14 +15,14 @@
 //! never regenerate + re-pin the hashes in the same change (that is exactly
 //! the laundering the pins exist to catch).
 //!
-//! Deliberately absent from the freeze: EPOCH_HASH / NET_TX records and the
-//! FLAG_EPOCH_HASHES header path (no writer emission until M5 — their READ
-//! side is already pinned by tests/reader_validation.rs), and unsealed logs
-//! (rejected wholesale by the reader; see bead lyu for inspection tooling).
-//! Zero-length NET_RX is likewise outside the freeze: never producible by
-//! a correct recording (the device faults empty TX/RX), and since bead 206
-//! the codec rejects it outright - a validation tightening, not a format
-//! change (the fixtures' NET_RX is 5 bytes; ledger #19).
+//! Deliberately absent from the freeze: EPOCH_HASH / NET_TX records, the
+//! BISECTION_CHECKPOINT additive AUX record, and the FLAG_EPOCH_HASHES header
+//! path (their READ side is pinned by tests/reader_validation.rs), and
+//! unsealed logs (rejected wholesale by the reader; see bead lyu for inspection
+//! tooling). Zero-length NET_RX is likewise outside the freeze: never
+//! producible by a correct recording (the device faults empty TX/RX), and
+//! since bead 206 the codec rejects it outright - a validation tightening, not
+//! a format change (the fixtures' NET_RX is 5 bytes; ledger #19).
 //!
 //! Regenerate (only for a NEW format version, into new file names):
 //! `DHILOG_REGEN_GOLDEN=1 cargo test -p dh-inputlog --test golden`
@@ -47,8 +46,8 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The canonical kitchen-sink build: every writer-emittable kind, fixed
-/// inputs. This function's output is what v1.0 freezes.
+/// The original v1.0 kitchen-sink build, fixed inputs. This function's
+/// output is what v1.0 freezes.
 fn build_kitchen_sink() -> Vec<u8> {
     let mut w = LogWriter::new(SegmentHeader {
         base_snapshot_id: [0x11; 32],

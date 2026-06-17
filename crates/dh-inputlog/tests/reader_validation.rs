@@ -45,6 +45,8 @@ fn full_log() -> Vec<u8> {
     w.timer_fire(500, 0x5000, 0x30, 450, 500).unwrap();
     w.sdk_event(600, 0x6000, 5, 100, 0x1111_2222_3333_4444)
         .unwrap();
+    w.bisection_checkpoint(650, 0x6500, 1024, [0x46; 32], 1950)
+        .unwrap();
     w.frame_mark(700, 0x7000, 9).unwrap();
     w.seal(seal_params()).unwrap()
 }
@@ -69,7 +71,7 @@ fn parses_writer_output_and_exposes_header() {
     assert_eq!(h.entropy_seed, [0xBB; 32]);
     assert_eq!(h.machine_config_hash, [0xCC; 32]);
     assert_eq!((h.clock_num, h.clock_den), (3, 1));
-    assert_eq!(h.record_count, 8); // 7 + END
+    assert_eq!(h.record_count, 9); // 8 + END
     assert_eq!(h.end_icount, 5000);
     assert_eq!(h.end_vns, 15000);
     assert_eq!(h.end_state_hash, [0xEE; 32]);
@@ -81,10 +83,10 @@ fn iterates_all_records_in_order_with_typed_bodies() {
     let log = full_log();
     let r = LogReader::parse(&log).unwrap();
     let records: Vec<_> = r.records().collect();
-    assert_eq!(records.len(), 8);
+    assert_eq!(records.len(), 9);
     assert_eq!(
         records.iter().map(|r| r.seq()).collect::<Vec<_>>(),
-        (0..8).collect::<Vec<_>>()
+        (0..9).collect::<Vec<_>>()
     );
     assert!(records.windows(2).all(|w| w[0].icount() <= w[1].icount()));
 
@@ -124,6 +126,25 @@ fn iterates_all_records_in_order_with_typed_bodies() {
         }
         other => panic!("expected TimerFire, got {other:?}"),
     }
+    match records[6].body() {
+        RecordBody::BisectionCheckpoint {
+            format_version,
+            flags,
+            max_covered_gap,
+            checkpoint_snapshot_ref,
+            checkpoint_icount,
+            checkpoint_vns,
+        } => {
+            assert_eq!(format_version, BISECTION_CHECKPOINT_FORMAT_VERSION);
+            assert_eq!(flags, BISECTION_CHECKPOINT_FLAGS);
+            assert_eq!(max_covered_gap, 1024);
+            assert_eq!(checkpoint_snapshot_ref, [0x46; 32]);
+            assert_eq!(checkpoint_icount, 650);
+            assert_eq!(checkpoint_vns, 1950);
+            assert_eq!(records[6].seq(), 6);
+        }
+        other => panic!("expected BisectionCheckpoint, got {other:?}"),
+    }
 }
 
 #[test]
@@ -131,8 +152,7 @@ fn canonical_iterator_implements_aux_skipping_contract() {
     let log = full_log();
     let r = LogReader::parse(&log).unwrap();
     let kinds: Vec<u8> = r.canonical().map(|r| r.kind()).collect();
-    // Canonical = the three inputs; ENTROPY/TIMER_FIRE/SDK_EVENT/FRAME_MARK
-    // and END (AUX-flagged) are all skipped.
+    // Canonical = the three inputs; all AUX records and END are skipped.
     assert_eq!(kinds, vec![KIND_PAD_SET, KIND_DEV_EVENT, KIND_DEV_EVENT]);
     let aux_kinds: Vec<u8> = r.aux().map(|r| r.kind()).collect();
     assert_eq!(
@@ -141,6 +161,7 @@ fn canonical_iterator_implements_aux_skipping_contract() {
             KIND_ENTROPY,
             KIND_TIMER_FIRE,
             KIND_SDK_EVENT,
+            KIND_BISECTION_CHECKPOINT,
             KIND_FRAME_MARK,
             KIND_END
         ]
@@ -176,7 +197,7 @@ fn inspection_walks_unsealed_artifacts_without_creating_a_reader() {
     let inspection = LogInspection::parse_unsealed(&log).unwrap();
     assert_eq!(inspection.header().flags & FLAG_SEALED, 0);
     assert_eq!(inspection.stop(), InspectionStop::Eof);
-    assert_eq!(inspection.records().count(), 8);
+    assert_eq!(inspection.records().count(), 9);
     let first = inspection.records().next().unwrap();
     assert_eq!(first.kind(), KIND_PAD_SET);
     assert!(matches!(first.body(), RecordBody::PadSet { .. }));
@@ -192,13 +213,13 @@ fn inspection_ignores_replay_only_hash_and_end_gates() {
     );
     let inspection = LogInspection::parse_unsealed(&bad_hash).unwrap();
     assert_eq!(inspection.stop(), InspectionStop::Eof);
-    assert_eq!(inspection.records().count(), 8);
+    assert_eq!(inspection.records().count(), 9);
 
     let full = full_log();
     let stripped = full[..full.len() - 64].to_vec();
     let inspection = LogInspection::parse_unsealed(&stripped).unwrap();
     assert_eq!(inspection.stop(), InspectionStop::Eof);
-    assert_eq!(inspection.records().count(), 7);
+    assert_eq!(inspection.records().count(), 8);
 
     let mut end_cross_check = full_log();
     let end_rec_off = end_cross_check.len() - 64;
@@ -471,7 +492,7 @@ fn rejects_record_count_mismatch() {
         LogReader::parse(&log).unwrap_err(),
         ReadError::RecordCountMismatch {
             header: 99,
-            actual: 8
+            actual: 9
         }
     );
 }
@@ -482,7 +503,7 @@ fn rejects_missing_end_and_record_after_end() {
     // record_count so the count check is not what fires.
     let log = full_log();
     let mut stripped = log[..log.len() - 64].to_vec();
-    stripped[152..160].copy_from_slice(&7u64.to_le_bytes());
+    stripped[152..160].copy_from_slice(&8u64.to_le_bytes());
     reseal(&mut stripped);
     assert_eq!(
         LogReader::parse(&stripped).unwrap_err(),
@@ -573,7 +594,7 @@ fn rejects_epoch_hashes_flag_mismatch() {
     );
 }
 
-// ---- spec kinds the writer does not emit yet (NET_RX, EPOCH_HASH) -----------
+// ---- additional kind-specific codec checks ----------------------------------
 
 /// Frame one raw §3.2 record.
 fn make_record(kind: u8, rflags: u8, seq: u32, icount: u64, rip: u64, payload: &[u8]) -> Vec<u8> {
@@ -673,6 +694,266 @@ fn epoch_hash_positive_path() {
         }
         other => panic!("expected EpochHash, got {other:?}"),
     }
+}
+
+fn bisection_checkpoint_payload(
+    format_version: u16,
+    flags: u16,
+    max_covered_gap: u32,
+    checkpoint_snapshot_ref: [u8; 32],
+    checkpoint_icount: u64,
+    checkpoint_vns: u64,
+) -> [u8; BISECTION_CHECKPOINT_PAYLOAD_LEN] {
+    let mut payload = [0u8; BISECTION_CHECKPOINT_PAYLOAD_LEN];
+    payload[0..2].copy_from_slice(&format_version.to_le_bytes());
+    payload[2..4].copy_from_slice(&flags.to_le_bytes());
+    payload[4..8].copy_from_slice(&max_covered_gap.to_le_bytes());
+    payload[8..40].copy_from_slice(&checkpoint_snapshot_ref);
+    payload[40..48].copy_from_slice(&checkpoint_icount.to_le_bytes());
+    payload[48..56].copy_from_slice(&checkpoint_vns.to_le_bytes());
+    payload
+}
+
+#[test]
+fn bisection_checkpoint_round_trip_preserves_record_seq() {
+    let mut w = LogWriter::new(header());
+    w.pad_set(100, 0x1000, 0, 0xDEAD_BEEF, FRAME_HINT_NONE)
+        .unwrap();
+    w.bisection_checkpoint(100, 0x2000, 512, [0xA5; 32], 1000)
+        .unwrap();
+    let log = w.seal(seal_params()).unwrap();
+
+    let r = LogReader::parse(&log).unwrap();
+    assert_eq!(r.header().flags, FLAG_SEALED | FLAG_HAS_AUX);
+    let checkpoint = r
+        .aux()
+        .find(|rec| rec.kind() == KIND_BISECTION_CHECKPOINT)
+        .expect("checkpoint record");
+    assert_eq!(checkpoint.seq(), 1);
+    assert_eq!(checkpoint.icount(), 100);
+    assert_eq!(checkpoint.boundary_rip(), 0x2000);
+    match checkpoint.body() {
+        RecordBody::BisectionCheckpoint {
+            format_version,
+            flags,
+            max_covered_gap,
+            checkpoint_snapshot_ref,
+            checkpoint_icount,
+            checkpoint_vns,
+        } => {
+            assert_eq!(format_version, BISECTION_CHECKPOINT_FORMAT_VERSION);
+            assert_eq!(flags, BISECTION_CHECKPOINT_FLAGS);
+            assert_eq!(max_covered_gap, 512);
+            assert_eq!(checkpoint_snapshot_ref, [0xA5; 32]);
+            assert_eq!(checkpoint_icount, 100);
+            assert_eq!(checkpoint_vns, 1000);
+        }
+        other => panic!("expected BisectionCheckpoint, got {other:?}"),
+    }
+
+    let inspection = LogInspection::parse_unsealed(&log).unwrap();
+    let inspected = inspection
+        .records()
+        .find(|rec| rec.kind() == KIND_BISECTION_CHECKPOINT)
+        .expect("inspection checkpoint");
+    assert_eq!(inspected.seq(), checkpoint.seq());
+}
+
+#[test]
+fn rejects_malformed_bisection_checkpoint_payload_length() {
+    let payload = bisection_checkpoint_payload(
+        BISECTION_CHECKPOINT_FORMAT_VERSION,
+        BISECTION_CHECKPOINT_FLAGS,
+        1024,
+        [0x46; 32],
+        10,
+        20,
+    );
+    let rec = make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        10,
+        0x1000,
+        &payload[..BISECTION_CHECKPOINT_PAYLOAD_LEN - 1],
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX)).unwrap_err(),
+        ReadError::BadPayloadLayout {
+            kind: KIND_BISECTION_CHECKPOINT,
+            seq: 0
+        }
+    );
+}
+
+#[test]
+fn rejects_unsupported_bisection_checkpoint_format_version() {
+    let payload =
+        bisection_checkpoint_payload(2, BISECTION_CHECKPOINT_FLAGS, 1024, [0x46; 32], 10, 20);
+    let rec = make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        10,
+        0x1000,
+        &payload,
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX)).unwrap_err(),
+        ReadError::UnsupportedBisectionCheckpointVersion { found: 2, seq: 0 }
+    );
+}
+
+#[test]
+fn rejects_invalid_bisection_checkpoint_flags() {
+    let payload = bisection_checkpoint_payload(
+        BISECTION_CHECKPOINT_FORMAT_VERSION,
+        1,
+        1024,
+        [0x46; 32],
+        10,
+        20,
+    );
+    let rec = make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        10,
+        0x1000,
+        &payload,
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX)).unwrap_err(),
+        ReadError::InvalidBisectionCheckpointFlags { flags: 1, seq: 0 }
+    );
+}
+
+#[test]
+fn rejects_bisection_checkpoint_icount_mismatch() {
+    let payload = bisection_checkpoint_payload(
+        BISECTION_CHECKPOINT_FORMAT_VERSION,
+        BISECTION_CHECKPOINT_FLAGS,
+        1024,
+        [0x46; 32],
+        11,
+        20,
+    );
+    let rec = make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        10,
+        0x1000,
+        &payload,
+    );
+    assert_eq!(
+        LogReader::parse(&splice_before_end(&[rec], FLAG_SEALED | FLAG_HAS_AUX)).unwrap_err(),
+        ReadError::BisectionCheckpointIcountMismatch {
+            seq: 0,
+            record_icount: 10,
+            checkpoint_icount: 11
+        }
+    );
+}
+
+#[test]
+fn bisection_checkpoint_golden_bytes_decode_pinned() {
+    // A minimal hand-pinned log: header + one BISECTION_CHECKPOINT + END.
+    // This protects the nested payload offsets from writer/reader drift.
+    let mut log = Vec::new();
+    log.extend_from_slice(b"DHILOG");
+    log.extend_from_slice(&[0x00, 0x01]);
+    log.extend_from_slice(&256u32.to_le_bytes());
+    log.extend_from_slice(&(FLAG_SEALED | FLAG_HAS_AUX).to_le_bytes());
+    log.extend_from_slice(&[0x11; 32]);
+    log.extend_from_slice(&[0x22; 32]);
+    log.extend_from_slice(&[0x33; 32]);
+    log.extend_from_slice(&[0x44; 32]);
+    log.extend_from_slice(&1u32.to_le_bytes());
+    log.extend_from_slice(&1u32.to_le_bytes());
+    log.extend_from_slice(&2u64.to_le_bytes());
+    log.extend_from_slice(&777u64.to_le_bytes());
+    log.extend_from_slice(&999u64.to_le_bytes());
+    log.extend_from_slice(&[0x55; 32]);
+    log.extend_from_slice(&[0u8; 32]);
+    log.extend_from_slice(&0xFEED_FACE_CAFE_BEEFu64.to_le_bytes());
+    log.extend_from_slice(&[0u8; 8]);
+    assert_eq!(log.len(), HEADER_LEN);
+
+    let checkpoint = bisection_checkpoint_payload(
+        BISECTION_CHECKPOINT_FORMAT_VERSION,
+        BISECTION_CHECKPOINT_FLAGS,
+        1024,
+        [0x46; 32],
+        42,
+        1234,
+    );
+    assert_eq!(
+        &checkpoint[0..8],
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00]
+    );
+    assert_eq!(&checkpoint[8..40], &[0x46; 32]);
+    assert_eq!(&checkpoint[40..48], &42u64.to_le_bytes());
+    assert_eq!(&checkpoint[48..56], &1234u64.to_le_bytes());
+    log.extend_from_slice(&make_record(
+        KIND_BISECTION_CHECKPOINT,
+        RFLAG_AUX,
+        0,
+        42,
+        0xFFFF_8000_0000_4646,
+        &checkpoint,
+    ));
+    let mut end = [0u8; 40];
+    end[0] = 1;
+    end[8..40].copy_from_slice(&[0x55; 32]);
+    log.extend_from_slice(&make_record(KIND_END, RFLAG_AUX, 1, 777, 0, &end));
+    reseal(&mut log);
+
+    let r = LogReader::parse(&log).expect("golden checkpoint bytes must parse");
+    let first = r.records().next().unwrap();
+    assert_eq!(first.kind(), KIND_BISECTION_CHECKPOINT);
+    assert_eq!(first.seq(), 0);
+    assert_eq!(first.icount(), 42);
+    assert_eq!(first.boundary_rip(), 0xFFFF_8000_0000_4646);
+    match first.body() {
+        RecordBody::BisectionCheckpoint {
+            format_version,
+            flags,
+            max_covered_gap,
+            checkpoint_snapshot_ref,
+            checkpoint_icount,
+            checkpoint_vns,
+        } => {
+            assert_eq!(format_version, BISECTION_CHECKPOINT_FORMAT_VERSION);
+            assert_eq!(flags, BISECTION_CHECKPOINT_FLAGS);
+            assert_eq!(max_covered_gap, 1024);
+            assert_eq!(checkpoint_snapshot_ref, [0x46; 32]);
+            assert_eq!(checkpoint_icount, 42);
+            assert_eq!(checkpoint_vns, 1234);
+        }
+        other => panic!("expected BisectionCheckpoint, got {other:?}"),
+    }
+
+    let mut w = LogWriter::new(SegmentHeader {
+        base_snapshot_id: [0x11; 32],
+        entropy_seed: [0x33; 32],
+        machine_config_hash: [0x44; 32],
+        clock_num: 1,
+        clock_den: 1,
+        encoder_fingerprint: 0xFEED_FACE_CAFE_BEEF,
+    });
+    w.bisection_checkpoint(42, 0xFFFF_8000_0000_4646, 1024, [0x46; 32], 1234)
+        .unwrap();
+    let written = w
+        .seal(SealParams {
+            end_snapshot_id: [0x22; 32],
+            end_icount: 777,
+            end_vns: 999,
+            end_state_hash: [0x55; 32],
+            stop_reason: 1,
+        })
+        .unwrap();
+    assert_eq!(written, log);
 }
 
 // ---- golden bytes (layout pinned against coordinated writer/reader drift) ----
