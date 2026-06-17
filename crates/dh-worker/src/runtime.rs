@@ -420,6 +420,7 @@ pub struct SlotRuntime {
     pub counter: Option<dh_detclock::counter::InstRetired>,
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
+    pub bisection_checkpoint_anchor_icount: u64,
     pub queued_inputs: Vec<QueuedInput>,
     /// Drained detchannel events not yet selected by StreamGuestEvents.
     /// The worker keeps only the newest capped backlog per slot; matching
@@ -456,6 +457,7 @@ impl SlotRuntime {
             counter,
             base_snapshot,
             position,
+            bisection_checkpoint_anchor_icount: 0,
             queued_inputs: Vec::new(),
             guest_events: Vec::new(),
             next_input_order: 0,
@@ -477,6 +479,7 @@ impl SlotRuntime {
             counter: parts.counter,
             base_snapshot: parts.base_snapshot,
             position: parts.position,
+            bisection_checkpoint_anchor_icount: parts.bisection_checkpoint_anchor_icount,
             queued_inputs: parts.queued_inputs,
             guest_events: parts.guest_events,
             next_input_order: parts.next_input_order,
@@ -545,6 +548,7 @@ pub struct SlotRuntimeParts {
     pub counter: Option<dh_detclock::counter::InstRetired>,
     pub base_snapshot: Option<snapstore_types::SnapshotRef>,
     pub position: SlotPosition,
+    pub bisection_checkpoint_anchor_icount: u64,
     pub queued_inputs: Vec<QueuedInput>,
     pub guest_events: Vec<DrainedGuestEvent>,
     pub next_input_order: u64,

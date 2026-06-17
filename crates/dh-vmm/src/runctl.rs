@@ -280,7 +280,12 @@ pub fn run_segment_with_epochs(
     until: Until,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    epoch_sink: &mut dyn FnMut(u64, Boundary, [u8; 32], &SlotVm) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(
+        u64,
+        Boundary,
+        [u8; 32],
+        Option<&SlotVm>,
+    ) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_epoch_options(seg, until, RunOptions::default(), goal, on_exit, epoch_sink)
 }
@@ -337,7 +342,9 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
 
 /// [`run_segment_with_scheduled_inputs_and_frames`] plus observable epoch
 /// links. Recorders use this to persist EPOCH_HASH records while preserving
-/// the scheduled input landing contract.
+/// the scheduled input landing contract. The final sink argument is
+/// `Some(slot)` only when the epoch boundary has no transient queued vector
+/// state and is therefore safe for restoreable checkpoint capture.
 pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
     seg: &mut Segment<'_>,
     until: Until,
@@ -347,7 +354,12 @@ pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
-    epoch_sink: &mut dyn FnMut(u64, Boundary, [u8; 32], &SlotVm) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(
+        u64,
+        Boundary,
+        [u8; 32],
+        Option<&SlotVm>,
+    ) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
@@ -370,7 +382,12 @@ pub fn run_segment_with_epoch_options(
     options: RunOptions,
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    epoch_sink: &mut dyn FnMut(u64, Boundary, [u8; 32], &SlotVm) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(
+        u64,
+        Boundary,
+        [u8; 32],
+        Option<&SlotVm>,
+    ) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
@@ -397,7 +414,12 @@ fn run_segment_inner(
     goal: &mut dyn FnMut() -> bool,
     on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
     input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
-    epoch_sink: &mut dyn FnMut(u64, Boundary, [u8; 32], &SlotVm) -> Result<(), BoundaryError>,
+    epoch_sink: &mut dyn FnMut(
+        u64,
+        Boundary,
+        [u8; 32],
+        Option<&SlotVm>,
+    ) -> Result<(), BoundaryError>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {
@@ -641,6 +663,10 @@ fn run_segment_inner(
                 .iter()
                 .map(|idx| (all_injections[*idx].vector, Some(*idx))),
         );
+        // A queued or delivered vector leaves transient run-control/KVM
+        // interrupt state that DHSNAP does not persist. Epoch hashes still
+        // record normally, but checkpoint producers must skip these points.
+        let checkpointable_epoch = vectors.is_empty();
         for (i, (vector, injection_idx)) in vectors.into_iter().enumerate() {
             if i > 0 {
                 // ONE ENTRY, not one retirement: the entry delivering the
@@ -693,6 +719,7 @@ fn run_segment_inner(
                 .push_final_link(seg.slot, &[], point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             let epoch = seg.config.epoch_len.max(1);
+            let checkpointable_slot = checkpointable_epoch.then_some(&*seg.slot);
             let epoch_boundary = Boundary {
                 icount: point.icount,
                 rip: at.rip,
@@ -702,7 +729,7 @@ fn run_segment_inner(
                 point.icount / epoch,
                 epoch_boundary,
                 seg.chain.value(),
-                &*seg.slot,
+                checkpointable_slot,
             )
             .map_err(RunError::Boundary)?;
         }
@@ -780,7 +807,7 @@ fn run_segment_inner(
             // paranoid audit option deliberately overrides that for soak
             // runs that want every full-memory link observable.
             if epoch_hashes_enabled {
-                epoch_sink(b.icount / epoch, b, seg.chain.value(), &*seg.slot)
+                epoch_sink(b.icount / epoch, b, seg.chain.value(), Some(&*seg.slot))
                     .map_err(RunError::Boundary)?;
             }
             return Ok(SegmentOutcome {
