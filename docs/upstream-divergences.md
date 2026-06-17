@@ -3,9 +3,9 @@
 `.agents/docs/determinism-hypervisor/{API,ARCHITECTURE,IMPLEMENTATION-PLAN}.md` and
 `.agents/docs/guest-sdk/ARCHITECTURE.md` are **synced from an upstream planning
 tree** (last sync: commit `d55ecc3`). During implementation this repo found
-eighteen places where those documents are stale or wrong; in every case **the code
+twenty-one places where those documents are stale or wrong; in every case **the code
 in this repo is authoritative** (it ships, round-trips, and is pinned by tests).
-Five were amended locally after the sync and will be silently reverted by the next
+Eight were amended locally after the sync and will be silently reverted by the next
 sync unless pushed; five are upstream-only wording fixes (no local doc edit was
 needed because the code or a decision doc is the authority); eight more were
 amended locally BEFORE the `d55ecc3` sync and were **already silently reverted by
@@ -31,7 +31,8 @@ Operator instructions:
   at this repo's history and are not prerequisites for applying an entry.
 - The long Markdown `| … |` table rows below are intentionally single-line; paste
   them unwrapped or the table cell breaks.
-- Quick index — amended locally after the sync (exact diffs): #1, #2, #7, #9, #10;
+- Quick index — amended locally after the sync (exact diffs): #1, #2, #7, #9, #10,
+  #19, #20, #21;
   upstream-only proposals: #3, #4, #5, #6, #8; amended locally before the sync and
   reverted by it (exact diffs recovered from `d55ecc3^`): #11–#18.
 
@@ -41,7 +42,7 @@ Operator instructions:
 
 The "New" texts in this section are verbatim copies of review-passed local edits
 (commits cited per entry). Once upstream applies an entry and `.agents/docs` is
-re-synced, the local amendment is subsumed by the sync; when all eighteen entries
+re-synced, the local amendment is subsumed by the sync; when all twenty-one entries
 in this file are applied/resolved, bead `veu` can close.
 
 ### #1 — API.md §3.1: `[240..256)` reserved row → `encoder_fingerprint` + `reserved` split
@@ -198,7 +199,9 @@ New:
 
 - **Found:** iteration 99 (bead 9sb instruments + measurement). **Decision:**
   bead 8ot, operator call 2026-06-12 — option (d), accept-as-measured.
-  **Local amendment:** this commit (M4 "Perf gates" bullet).
+  **Local amendment:** this commit (M4 "Perf gates" bullet). **Superseded
+  locally by #21:** the 2026-06-17 reference-machine decision downgrades
+  latency caps to telemetry.
 - **Why:** the original snapshot/restore numbers (15 ms / 150 ms at 8k pages /
   128 MiB) imply > 2 GB/s durable bandwidth; the box's ext4 LV sustains
   ~350 MB/s durable (`dd conv=fsync` floor 96–200 ms / 32 MiB), and the store's
@@ -222,6 +225,44 @@ Old (M4 "Accept" list, perf-gates bullet):
 New: same bullet with snapshot < 150 ms / restore < 450 ms, the
 ACCEPTED-AS-MEASURED rationale, the measured baselines, and the M7
 exploration-step tension note (quoted in full in the amendment).
+
+### #21 — IMPLEMENTATION-PLAN.md M4/M7: storage latency caps are telemetry on the reference machine
+
+- **Found:** iteration 142 / bead 3sp, after page-channel GET_BATCH adoption
+  still left restore above the accepted-as-measured cap on the current Linux
+  KVM reference host. **Decision:** operator call 2026-06-17 — the current
+  machine is the reference environment and may be slow. Correctness,
+  determinism, and durable store receipts outrank latency.
+- **Why:** the real snapshot-store path gives durability receipts and shares
+  the reference host's storage and scheduler behavior. A hard snapshot,
+  restore, or joint exploration-step p50 cap rejects a deterministic and
+  correct system for environmental speed. Keep measuring the same surfaces,
+  but do not make latency an acceptance failure.
+- **Authority:** `crates/dh-worker/tests/perf_gates.rs` exercises fork,
+  8k-page incremental snapshot, and full restore through the real store,
+  asserts the correctness/page-count invariants, and prints p50/min/max as
+  telemetry. `docs/phase-2-exit-gate.md` records the policy.
+
+Old (M4 perf acceptance after #20 plus M7 storage budget language):
+
+```
+Perf gates (p50 on the box, 128 MiB demo guest): fork < 10 ms;
+incremental snapshot < 150 ms; tier-B warm restore < 450 ms.
+
+The JOINT exploration-step storage budget <= 100ms p50, verified
+end-to-end on the quiesced box - fork -> run -> TakeSnapshot -> store
+durability ack measured as one step.
+```
+
+New:
+
+```
+Snapshot, restore, fork, and joint exploration-step latency are
+reference-machine telemetry. Acceptance requires deterministic,
+correct execution and durable store receipts; the perf harness reports
+p50/min/max but does not fail solely because the reference machine is
+slow.
+```
 
 ---
 

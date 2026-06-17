@@ -1,8 +1,9 @@
 //! Criterion latency distributions for the M4 perf surfaces (bead 9sb):
 //! tier-A fork, incremental snapshot at 8k dirty pages, tier-B warm
 //! restore — all on the 128 MiB canonical guest. This target is the
-//! NIGHTLY TREND instrument (bead 1pa wires the >20% regression gate);
-//! the hard p50 acceptance thresholds live in tests/perf_gates.rs.
+//! NIGHTLY TREND instrument; the ignored test in tests/perf_gates.rs
+//! records the same surfaces as telemetry while correctness remains the
+//! hard gate.
 //!
 //! Skips cleanly (empty benchmark set) without /dev/kvm. The crate root
 //! is NOT cfg-gated: a harness=false bench must link a main() on every

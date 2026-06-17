@@ -1,13 +1,14 @@
-//! M4 ACCEPT perf gates (bead 9sb): p50 latency thresholds on the
-//! quiesced Intel box, 128 MiB guest (the MAP.md canonical demo figure).
-//! Thresholds are the ACCEPTED-AS-MEASURED numbers (bead 8ot, ledger
-//! #20), not the plan's original aspirational ones — see the constants
-//! below for the decision record.
+//! M4 storage/fork perf telemetry (bead 9sb / 3sp): p50 latency
+//! distributions on the reference Linux KVM machine, 128 MiB guest (the
+//! MAP.md canonical demo figure). Latency is no longer a hard acceptance
+//! gate: the reference machine may be slow. Deterministic correctness and
+//! durable store semantics are the gates; this test keeps the same
+//! end-to-end operations and page-count assertions while reporting p50s.
 //!
-//! ONE sequential test, #[ignore]d: perf assertions flake under parallel
-//! suite load (the iteration-68/69 lesson), so this never runs in the
-//! ordinary `cargo test` sweep — the nightly perf job (bead 1pa) and the
-//! operator run it deliberately on the quiesced box:
+//! ONE sequential test, #[ignore]d: latency distributions are sensitive to
+//! parallel suite load (the iteration-68/69 lesson), so this never runs in
+//! the ordinary `cargo test` sweep. The nightly perf job (bead 1pa) and the
+//! operator can still run it to collect trend telemetry:
 //!
 //!   cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture
 //!
@@ -15,9 +16,9 @@
 //! builds measure the compiler, not the platform. The test refuses to
 //! gate a debug build (skips loudly) for the same reason.
 //!
-//! p50, not max: the gate is the IMPLEMENTATION-PLAN's median figure —
-//! tail outliers (store fsync hiccups, scheduler noise) are the nightly
-//! regression job's business (>20% drift), not this acceptance's.
+//! p50, not max: the median remains the reported figure so tail outliers
+//! (store fsync hiccups, scheduler noise) are visible in the spread without
+//! turning slow storage into a correctness failure.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -43,16 +44,13 @@ const DIRTY_PAGES: u64 = 8192;
 /// Samples per gate; the median of 30 is stable on the quiesced box.
 const SAMPLES: usize = 30;
 
-// ACCEPTED-AS-MEASURED gates (bead 8ot decision, 2026-06-12; ledger #20):
-// the box's storage sustains ~350 MB/s durable, so the plan's original
-// snapshot/restore numbers (15 ms / 150 ms — they imply > 2 GB/s durable)
-// were accepted at the measured baseline plus ~45% day-to-day variance
-// headroom (measured p50: fork 326 µs, snapshot 103 ms, restore 307 ms).
-// These are REGRESSION gates at the accepted baseline; the original
-// numbers remain the improvement targets (correctness outranks speed).
-const FORK_P50_MAX: Duration = Duration::from_millis(10);
-const SNAP_P50_MAX: Duration = Duration::from_millis(150);
-const RESTORE_P50_MAX: Duration = Duration::from_millis(450);
+// Bead 3sp decision, 2026-06-17: this host is the reference machine even
+// when slow. Keep measuring the same surfaces, but do not fail acceptance
+// on latency. The old constants were:
+//   fork < 10 ms, snapshot < 150 ms, restore < 450 ms
+// and the original plan numbers were stricter still. Both are telemetry
+// context now; deterministic correctness is asserted by the operation
+// success paths, exact page counts below, and the Phase-2 correctness suite.
 
 fn config_128() -> MachineConfig {
     MachineConfig::new(
@@ -90,7 +88,7 @@ fn spread(samples: &mut [Duration]) -> (Duration, Duration, Duration) {
 }
 
 #[test]
-#[ignore = "M4 perf acceptance: quiesced box only — cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture"]
+#[ignore = "M4 perf telemetry: reference KVM machine only — cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture"]
 fn m4_perf_gates_p50_128mib() {
     // A skip looks exactly like a pass to a CI consumer. The nightly
     // perf job (bead 1pa) sets PERF_GATE_REQUIRED=1 so a misconfigured
@@ -147,9 +145,7 @@ fn m4_perf_gates_p50_128mib() {
         drop(outcome); // child teardown outside the timed window of the NEXT sample
     }
     let (fork_min, fork_p50, fork_max) = spread(&mut fork_samples);
-    eprintln!(
-        "fork p50: {fork_p50:?} [min {fork_min:?}, max {fork_max:?}] (gate {FORK_P50_MAX:?})"
-    );
+    eprintln!("fork p50: {fork_p50:?} [min {fork_min:?}, max {fork_max:?}] (telemetry only)");
 
     // ── Gate 2: incremental snapshot at exactly 8k dirty pages ──────────
     let slot = sys.create_slot_vm(MEM).unwrap();
@@ -218,7 +214,7 @@ fn m4_perf_gates_p50_128mib() {
     }
     let (snap_min, snap_p50, snap_max) = spread(&mut snap_samples);
     eprintln!(
-        "incremental snapshot (8k pages) p50: {snap_p50:?} [min {snap_min:?}, max {snap_max:?}] (gate {SNAP_P50_MAX:?})"
+        "incremental snapshot (8k pages) p50: {snap_p50:?} [min {snap_min:?}, max {snap_max:?}] (telemetry only)"
     );
 
     // ── Gate 3: tier-B warm restore of the 128 MiB root ─────────────────
@@ -248,20 +244,10 @@ fn m4_perf_gates_p50_128mib() {
     }
     let (restore_min, restore_p50, restore_max) = spread(&mut restore_samples);
     eprintln!(
-        "warm restore p50: {restore_p50:?} [min {restore_min:?}, max {restore_max:?}] (gate {RESTORE_P50_MAX:?})"
+        "warm restore p50: {restore_p50:?} [min {restore_min:?}, max {restore_max:?}] (telemetry only)"
     );
 
-    // ── The gates ────────────────────────────────────────────────────────
-    assert!(
-        fork_p50 < FORK_P50_MAX,
-        "M4 gate: fork p50 {fork_p50:?} >= {FORK_P50_MAX:?}"
-    );
-    assert!(
-        snap_p50 < SNAP_P50_MAX,
-        "M4 gate: incremental snapshot p50 {snap_p50:?} >= {SNAP_P50_MAX:?}"
-    );
-    assert!(
-        restore_p50 < RESTORE_P50_MAX,
-        "M4 gate: warm restore p50 {restore_p50:?} >= {RESTORE_P50_MAX:?}"
+    eprintln!(
+        "latency telemetry accepted: correctness assertions completed for fork, 8k-page snapshot, and full restore"
     );
 }

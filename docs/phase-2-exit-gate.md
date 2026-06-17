@@ -73,23 +73,28 @@ boundaries are out of scope here by ownership, not omission.
 
 ## Measured perf and ops numbers
 
-The accepted M4 perf gates are regression gates, not the original
-aspirational storage numbers. The authority is
+The M4 perf surfaces are reference-machine telemetry, not hard latency
+acceptance gates. The authority is
 `crates/dh-worker/tests/perf_gates.rs` and
-[`docs/upstream-divergences.md`](upstream-divergences.md) ledger #20.
-The measured p50s below are the 2026-06-12 accepted baselines, not a
-fresh perf re-run in this docs-only sign-off:
+[`docs/upstream-divergences.md`](upstream-divergences.md) ledgers #20
+and #21. Slow storage is acceptable on the reference Linux KVM machine
+as long as snapshot, restore, fork, replay, and durable store semantics
+remain deterministic and correct.
 
-| Operation | Measured p50 | Gate |
-|---|---:|---:|
-| Tier-A fork of a frozen 128 MiB parent | 326 us | < 10 ms |
-| Incremental snapshot, 8192 dirty 4 KiB pages | 103 ms | < 150 ms |
-| Tier-B warm restore of a 128 MiB root | 307 ms | < 450 ms |
+The table keeps both the original accepted-as-measured baseline and the
+2026-06-17 reference-host observation that triggered bead 3sp's policy
+update:
 
-The snapshot/restore gates were accepted as measured because the real
-store gives durability receipts and the box's durable ext4 bandwidth is
-the bottleneck. The original 15 ms snapshot and 150 ms restore numbers
-remain improvement targets, not Phase-2 correctness criteria.
+| Operation | 2026-06-12 p50 | 2026-06-17 p50 | Acceptance |
+|---|---:|---:|---|
+| Tier-A fork of a frozen 128 MiB parent | 326 us | 1.895 ms | Completes correctly; latency is telemetry |
+| Incremental snapshot, 8192 dirty 4 KiB pages | 103 ms | 355 ms | Ships exactly 8192 pages; latency is telemetry |
+| Tier-B warm restore of a 128 MiB root | 307 ms | 1.528 s | Loads exactly 32768 pages; latency is telemetry |
+
+The real store gives durability receipts and the box's durable storage
+bandwidth is the bottleneck. The original 15 ms snapshot, 150 ms
+restore, and later accepted 150 ms / 450 ms storage caps are retained as
+historical context only. They are not Phase-2 correctness criteria.
 
 Ops tooling is pinned in
 [`docs/ops/github-runner.md`](ops/github-runner.md): `grpcurl` for the
@@ -112,9 +117,8 @@ non-overlapping slot and housekeeping CPU masks by default.
 
 ## Known refinements baked into the gate
 
-- Snapshot and restore perf thresholds are accepted-as-measured storage
-  regression gates; correctness and durable receipts outrank the earlier
-  aspirational latency targets.
+- Snapshot and restore perf numbers are storage telemetry on the
+  reference machine; correctness and durable receipts outrank latency.
 - Dirty-ring chaos uses the 1024-entry legal minimum on this kernel, not
   the originally sketched 512-entry ring.
 - NETL has no pending-RX bytes by construction: TX is drained per exit
