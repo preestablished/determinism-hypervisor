@@ -4,9 +4,47 @@
 //! so the executor imports this model, never the reverse).
 //!
 //! Phase-1 scope: epoch-grained verdicts only. `Divergence` reports the
-//! FIRST bad epoch and the hash pair; the icount-range bisection that
-//! narrows it to ≤1024 instructions is M8 (proto fields exist, the
-//! refinement does not).
+//! FIRST bad epoch and the hash pair. M8 bisection is represented as an
+//! explicit, evidence-carrying event so callers cannot launder coarse
+//! epoch mismatches into fake `icount_lo..hi` diagnostics.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BisectionMode {
+    /// Fresh replays of the same segment disagree; no recorded ground truth
+    /// is needed to prove replay instability.
+    ReplayVsReplay,
+    /// Replay is stable but disagrees with a recorded checkpoint artifact.
+    ReplayVsRecorded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BisectionEvidence {
+    pub mode: BisectionMode,
+    /// Recorded checkpoint snapshot ref used as expected state. Required
+    /// for replay-vs-recorded divergence; absent for replay-vs-replay.
+    pub expected_checkpoint_ref: Option<[u8; 32]>,
+    /// Snapshot ref captured from the replay probe, when one was taken.
+    pub actual_probe_ref: Option<[u8; 32]>,
+    /// The artifact coverage that justifies `icount_lo..icount_hi`.
+    pub coverage_icount_lo: u64,
+    pub coverage_icount_hi: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BisectionDivergence {
+    pub first_bad_epoch: Option<u64>,
+    pub icount_lo: u64,
+    pub icount_hi: u64,
+    pub rip_expected: u64,
+    pub rip_actual: u64,
+    /// Postcard-encoded `Vec<RegDiff>` per proto/API. The schema lives in
+    /// API.md until the runtime encoder lands.
+    pub reg_diff: Vec<u8>,
+    /// First differing flattened logical guest page indices.
+    pub diff_page_idx: Vec<u64>,
+    pub suspected_cause: String,
+    pub evidence: BisectionEvidence,
+}
 
 /// One verification event. `EpochOk`/`Done` mirror proto §2.7's
 /// `EpochOk`/`VerifyDone` field-for-field. `Divergence` mirrors the
@@ -40,6 +78,8 @@ pub enum VerifyProgress {
         expected: [u8; 32],
         got: [u8; 32],
     },
+    /// Terminal mismatch refined by recorded checkpoint/probe evidence.
+    BisectionDivergence(BisectionDivergence),
 }
 
 /// A collected verification run (the gate.rs-style library harness).
@@ -71,9 +111,12 @@ impl VerifyReport {
     }
 
     pub fn divergence(&self) -> Option<&VerifyProgress> {
-        self.events
-            .iter()
-            .find(|e| matches!(e, VerifyProgress::Divergence { .. }))
+        self.events.iter().find(|e| {
+            matches!(
+                e,
+                VerifyProgress::Divergence { .. } | VerifyProgress::BisectionDivergence(_)
+            )
+        })
     }
 
     pub fn epochs_ok(&self) -> usize {
@@ -114,5 +157,27 @@ mod tests {
         });
         assert!(!bad.verified());
         assert!(bad.divergence().is_some());
+
+        let refined = VerifyProgress::BisectionDivergence(BisectionDivergence {
+            first_bad_epoch: Some(2),
+            icount_lo: 59_392,
+            icount_hi: 60_000,
+            rip_expected: 0x1000,
+            rip_actual: 0x1004,
+            reg_diff: vec![1, 2, 3],
+            diff_page_idx: vec![7],
+            suspected_cause: "recorded checkpoint mismatch".into(),
+            evidence: BisectionEvidence {
+                mode: BisectionMode::ReplayVsRecorded,
+                expected_checkpoint_ref: Some([0xAA; 32]),
+                actual_probe_ref: Some([0xBB; 32]),
+                coverage_icount_lo: 59_392,
+                coverage_icount_hi: 60_000,
+            },
+        });
+        let mut report = VerifyReport::default();
+        report.push(refined);
+        assert!(!report.verified());
+        assert!(report.divergence().is_some());
     }
 }

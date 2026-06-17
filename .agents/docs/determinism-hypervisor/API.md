@@ -368,7 +368,7 @@ message VerifyReplayRequest {
                                        // verified segment-by-segment anyway)
     bytes input_log_id   = 3;          // fetch from snapshot-store
   }
-  bool bisect_on_divergence = 4;       // default true
+  optional bool bisect_on_divergence = 4; // absent => true; false returns coarse evidence only
 }
 message VerifyReplayProgress {
   oneof msg {
@@ -382,14 +382,15 @@ message VerifyDone {
   uint64 total_icount = 1;
   StateHash end_state_hash = 2;        // matched the log's end_state_hash
 }
-message Divergence {                   // diagnostics from dh-verify bisection
+message Divergence {
   uint64 first_bad_epoch   = 1;
-  uint64 icount_lo         = 2;        // diverging instruction range after bisection
-  uint64 icount_hi         = 3;        // (hi - lo ≤ 1024, or ≤ 1 if single-step compare ran)
+  uint64 icount_lo         = 2;        // bisected range when checkpoint evidence exists;
+  uint64 icount_hi         = 3;        // coarse evidence point/range when bisection is disabled
   uint64 rip_expected      = 4;
   uint64 rip_actual        = 5;
-  bytes  reg_diff          = 6;        // postcard-encoded Vec<RegDiff{name, expected, actual}>
-  repeated uint64 diff_page_idx = 7;   // first ≤ 64 differing page indices
+  bytes  reg_diff          = 6;        // postcard-encoded Vec<RegDiff{name, expected, actual}>;
+                                       // empty unless backed by bisection checkpoint evidence
+  repeated uint64 diff_page_idx = 7;   // first ≤ 64 differing flattened logical page indices
   string suspected_cause   = 8;        // decoder hint, e.g. "RDTSC at divergent RIP"
 }
 
@@ -584,6 +585,7 @@ during verification, skippable by minimal replayers:
 | `0x43` | `SDK_EVENT` | `stream: u16, _pad: u16, len: u32, digest8: u64` (`stream` carries the detchannel EventKind, guest-sdk API.md §3.1; payloads live in the gRPC stream, not the log) |
 | `0x44` | `NET_TX` | `len: u32, _pad: u32, digest8: u64` |
 | `0x45` | `FRAME_MARK` | `frame_index: u32, _pad: u32` (the per-segment frame table; `frame_index` is the **absolute** FRAME_COUNTER value, so the table maps absolute F → segment-relative icount — it resolves at_frame scheduling and `frame_budget` stops, and lets replay-renderer find frame boundaries) |
+| `0x46` | `BISECTION_CHECKPOINT` | `format_version: u16 (=1), flags: u16, max_covered_gap: u32, checkpoint_snapshot_ref: [u8;32], checkpoint_icount: u64, checkpoint_vns: u64` |
 | `0x7F` | `END` | `stop_reason: u8` (mirrors proto StopReason), `_pad: [u8;7]`, `end_state_hash: [u8;32]` — always last record, always present in sealed logs |
 
 ### 3.4 Semantics (normative)
@@ -594,12 +596,43 @@ during verification, skippable by minimal replayers:
 2. **Verification** additionally recomputes every AUX record and compares: entropy
    digests, timer delivery icounts, epoch chain values, SDK digests, boundary RIPs.
    First mismatch ⇒ divergence (bisect per ARCHITECTURE dh-verify).
+   Native bisection diagnostics require `BISECTION_CHECKPOINT` records. A checkpoint
+   record names a full, non-mutating snapshot-store checkpoint captured at that record's
+   `icount`; the record header's `boundary_rip` is the recorded RIP at the checkpoint.
+   `max_covered_gap` is the maximum distance to the previous checkpoint that this
+   evidence can justify. To emit a ≤1024-instruction `Divergence` range, the relevant
+   checkpoint gap MUST be ≤1024. Wider gaps may only produce the wider evidence-backed
+   window. Logs without checkpoint records are checkpoint-less: `bisect_on_divergence =
+   true` fails with `FAILED_PRECONDITION` naming the missing artifact, while
+   `bisect_on_divergence = false` returns the coarse epoch/hash divergence with
+   `rip_expected = rip_actual = 0` and empty `reg_diff` / `diff_page_idx`.
+   Checkpoint snapshots are diagnostic artifacts: taking one MUST NOT clear dirty-page
+   state, reseed entropy, advance the segment, perturb the DHILOG except for the AUX
+   record, or change the final snapshot/log lineage.
 3. **Concatenation**: logs compose along snapshot lineage — if `L1.end_snapshot_id ==
    L2.base_snapshot_id`, replaying `L1` then `L2` from `L1.base_snapshot_id` is defined
    and is how replay-renderer reconstructs root→node trajectories. (Each log's icounts
    restart at 0 from its own base; there is no global icount.)
 4. An unsealed log (crash artifact) is identified by `flags.SEALED == 0`; it MUST NOT
    be stored in snapshot-store or used for replay.
+
+### 3.5 Bisection diagnostics payloads
+
+`Divergence.reg_diff` is postcard-encoded `Vec<RegDiff>`:
+
+```rust
+struct RegDiff {
+    name: String,      // canonical vCPU field path, e.g. "regs.rax" or "sregs.cr3"
+    expected: Vec<u8>, // little-endian canonical field bytes from checkpoint DHSNAP VCPU
+    actual: Vec<u8>,   // little-endian canonical field bytes from replay probe
+}
+```
+
+The source of truth is the canonical DHSNAP `VCPU` section order, never raw padded KVM
+struct memory. `diff_page_idx` is computed by flattening the recorded checkpoint
+snapshot and replay probe snapshot through `ResolvePages(hashes_only = true)` and
+comparing logical page hashes by page index; delta manifest entries alone are
+insufficient evidence.
 
 ---
 

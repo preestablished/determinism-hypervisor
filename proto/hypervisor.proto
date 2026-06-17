@@ -340,7 +340,7 @@ message VerifyReplayRequest {
                                        // verified segment-by-segment anyway)
     bytes input_log_id   = 3;          // fetch from snapshot-store
   }
-  bool bisect_on_divergence = 4;       // default true
+  optional bool bisect_on_divergence = 4; // absent => true; false returns coarse evidence only
 }
 // Server-streamed from the verifier worker thread with a bounded progress
 // buffer. EpochOk records are emitted as epoch links verify; Done or
@@ -358,14 +358,15 @@ message VerifyDone {
   uint64 total_icount = 1;
   StateHash end_state_hash = 2;        // matched the log's end_state_hash
 }
-message Divergence {                   // diagnostics from dh-verify bisection
+message Divergence {
   uint64 first_bad_epoch   = 1;
-  uint64 icount_lo         = 2;        // diverging instruction range after bisection
-  uint64 icount_hi         = 3;        // (hi - lo ≤ 1024, or ≤ 1 if single-step compare ran)
+  uint64 icount_lo         = 2;        // bisected range when checkpoint evidence exists;
+  uint64 icount_hi         = 3;        // coarse evidence point/range when bisection is disabled
   uint64 rip_expected      = 4;
   uint64 rip_actual        = 5;
-  bytes  reg_diff          = 6;        // postcard-encoded Vec<RegDiff{name, expected, actual}>
-  repeated uint64 diff_page_idx = 7;   // first ≤ 64 differing page indices
+  bytes  reg_diff          = 6;        // postcard-encoded Vec<RegDiff{name, expected, actual}>;
+                                       // empty unless backed by bisection checkpoint evidence
+  repeated uint64 diff_page_idx = 7;   // first ≤ 64 differing flattened logical page indices
   string suspected_cause   = 8;        // decoder hint, e.g. "RDTSC at divergent RIP"
 }
 

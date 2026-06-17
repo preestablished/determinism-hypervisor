@@ -258,7 +258,7 @@ async fn stream_verify_like_output<W: std::io::Write + ?Sized>(
         .verify_replay(proto::VerifyReplayRequest {
             base: Some(proto::SnapshotRef { hash: base }),
             log: Some(log),
-            bisect_on_divergence,
+            bisect_on_divergence: Some(bisect_on_divergence),
         })
         .await
         .map_err(OpError::Rpc)?
@@ -1337,7 +1337,7 @@ mod tests {
         match &worker.calls()[0] {
             SeenCall::VerifyReplay(req) => {
                 assert_eq!(req.base.as_ref().unwrap().hash, vec![0xab; 32]);
-                assert!(!req.bisect_on_divergence);
+                assert_eq!(req.bisect_on_divergence, Some(false));
                 assert_eq!(
                     req.log,
                     Some(proto::verify_replay_request::Log::InputLogId(vec![
@@ -1364,7 +1364,7 @@ mod tests {
         match &worker.calls()[0] {
             SeenCall::VerifyReplay(req) => {
                 assert_eq!(req.base.as_ref().unwrap().hash, vec![0xee; 32]);
-                assert!(req.bisect_on_divergence);
+                assert_eq!(req.bisect_on_divergence, Some(true));
                 assert_eq!(
                     req.log,
                     Some(proto::verify_replay_request::Log::InputLogId(vec![

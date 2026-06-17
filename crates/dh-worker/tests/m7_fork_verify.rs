@@ -530,7 +530,7 @@ async fn verify_child(
             log: Some(proto::verify_replay_request::Log::InputLogId(
                 child.input_log_id.clone(),
             )),
-            bisect_on_divergence: false,
+            bisect_on_divergence: Some(false),
         }))
         .await
         .map_err(|e| format!("child {} VerifyReplay start: {e}", child.index))?

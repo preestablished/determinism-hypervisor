@@ -166,17 +166,28 @@ checked by the caller against `GetWorkerInfo().class` per §5.2).
 
 ```
 1. Replay full segment comparing EPOCH_HASH records → first bad epoch e.
-2. Binary search inside (e-1, e]: restore base, run to midpoint icount, compare chain
-   value against a fresh reference replay's value at the same icount (reference values
-   are recomputed on demand; determinism up to the divergence point makes prefix
-   re-runs exact). Each probe is one re-execution of ≤ epoch_len instructions from the
-   nearest verified boundary.
-3. Narrow to ≤ 1024 instructions, then run the reference and suspect in lockstep
-   single-step from icount_lo, comparing KVM_GET_REGS each step → first diverging
-   instruction; decode bytes at RIP (suspected_cause: RDTSC/RDRAND/unfiltered MSR/...).
-4. Emit Divergence{} with reg and page diffs. Mark slot FAULTED_S; never reuse it
-   without DestroyVm (host-state suspicion).
+2. Replay-vs-replay mode: repeat fresh replays of the same (base, log). If the fresh
+   replays disagree with each other, classify replay as unstable; no recorded midpoint
+   ground truth is needed.
+3. Replay-vs-recorded mode: if replay is stable but disagrees with the recording, use
+   recorded BISECTION_CHECKPOINT AUX records as the expected-state artifact. Each
+   checkpoint names a full snapshot-store checkpoint captured without perturbing the
+   segment. Restore base, run to candidate icounts, compare against checkpoint
+   coverage, and narrow only as far as the checkpoint spacing proves. A ≤1024
+   Divergence range requires a checkpoint gap ≤1024; otherwise report the wider
+   evidence-backed range or fail if no checkpoints exist.
+4. At the first evidence-backed mismatch, compare checkpoint DHSNAP VCPU state against
+   the replay probe VCPU state for rip_expected/rip_actual and postcard RegDiff. Compare
+   flattened logical page hashes (ResolvePages hashes_only=true), not raw delta
+   manifests, for diff_page_idx.
+5. Emit Divergence{} with provenance in suspected_cause. Mark slot FAULTED_S; never
+   reuse it without DestroyVm (host-state suspicion).
 ```
+
+Hash-only EPOCH_HASH records are enough to find the first bad epoch but not enough to
+produce honest `rip_expected`, `reg_diff`, or `diff_page_idx`. A checkpoint-less log
+therefore cannot satisfy native `bisect_on_divergence = true`; callers may retry with
+`bisect_on_divergence = false` to receive the coarse epoch/hash verdict.
 
 ## 5. guest-sdk contract summary (the channel is guest-sdk's; these are our obligations)
 

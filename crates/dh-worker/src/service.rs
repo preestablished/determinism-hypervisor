@@ -24,7 +24,7 @@ use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotMa
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
 #[cfg(target_arch = "x86_64")]
-use dh_verify::verify::VerifyProgress;
+use dh_verify::verify::{BisectionMode, VerifyProgress};
 use prost::Message;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -1205,6 +1205,11 @@ fn hex32(bytes: &[u8; 32]) -> String {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn maybe_hex32(bytes: Option<[u8; 32]>) -> String {
+    bytes.as_ref().map(hex32).unwrap_or_else(|| "none".into())
+}
+
+#[cfg(target_arch = "x86_64")]
 fn verify_log_header_matches_request(
     header: &dh_inputlog::reader::Header,
     base_snapshot: &snapstore_types::SnapshotRef,
@@ -1262,8 +1267,8 @@ fn verify_progress_to_proto(
             got,
         } => {
             if bisect_on_divergence {
-                return Err(Status::unimplemented(
-                    "VerifyReplay divergence bisection is M8 and is not implemented yet; retry without bisection",
+                return Err(Status::failed_precondition(
+                    "VerifyReplay divergence bisection requires recorded bisection checkpoints; retry without bisection for the coarse epoch verdict",
                 ));
             }
             let first_bad_epoch_value = first_bad_epoch.unwrap_or(0);
@@ -1282,6 +1287,48 @@ fn verify_progress_to_proto(
                     "coarse:{what}; first_bad_epoch={first_bad_epoch_note}; expected_hash={}; got_hash={}",
                     hex32(&expected),
                     hex32(&got)
+                ),
+            })
+        }
+        VerifyProgress::BisectionDivergence(divergence) => {
+            if divergence.icount_hi < divergence.icount_lo {
+                return Err(Status::internal(
+                    "VerifyReplay bisection produced an inverted icount range",
+                ));
+            }
+            if divergence.evidence.coverage_icount_lo > divergence.icount_lo
+                || divergence.evidence.coverage_icount_hi < divergence.icount_hi
+            {
+                return Err(Status::internal(
+                    "VerifyReplay bisection range is not covered by its evidence",
+                ));
+            }
+            if matches!(divergence.evidence.mode, BisectionMode::ReplayVsRecorded)
+                && divergence.evidence.expected_checkpoint_ref.is_none()
+            {
+                return Err(Status::internal(
+                    "VerifyReplay replay-vs-recorded bisection lacks an expected checkpoint ref",
+                ));
+            }
+            let mode = match divergence.evidence.mode {
+                BisectionMode::ReplayVsReplay => "replay-vs-replay",
+                BisectionMode::ReplayVsRecorded => "replay-vs-recorded",
+            };
+            Msg::Divergence(proto::Divergence {
+                first_bad_epoch: divergence.first_bad_epoch.unwrap_or(0),
+                icount_lo: divergence.icount_lo,
+                icount_hi: divergence.icount_hi,
+                rip_expected: divergence.rip_expected,
+                rip_actual: divergence.rip_actual,
+                reg_diff: divergence.reg_diff,
+                diff_page_idx: divergence.diff_page_idx,
+                suspected_cause: format!(
+                    "{}; evidence_mode={mode}; evidence_window={}..{}; expected_checkpoint_ref={}; actual_probe_ref={}",
+                    divergence.suspected_cause,
+                    divergence.evidence.coverage_icount_lo,
+                    divergence.evidence.coverage_icount_hi,
+                    maybe_hex32(divergence.evidence.expected_checkpoint_ref),
+                    maybe_hex32(divergence.evidence.actual_probe_ref)
                 ),
             })
         }
@@ -3948,7 +3995,7 @@ impl HypervisorWorker for WorkerService {
             let request = request.into_inner();
             let base_snapshot = snapshot_ref_from_proto(request.base)?;
             let log_input = verify_replay_log_input(request.log)?;
-            let bisect_on_divergence = request.bisect_on_divergence;
+            let bisect_on_divergence = request.bisect_on_divergence.unwrap_or(true);
             let transport = self.snapstore_transport()?;
             let image_resolver = self.inner.image_resolver.clone();
             let manager = self.inner.manager.clone();
@@ -6186,9 +6233,9 @@ mod tests {
 
             let mut stream = svc
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
-                    base: Some(base_snapshot),
+                    base: Some(base_snapshot.clone()),
                     log: Some(VerifyLog::InputLogId(snap.input_log_id)),
-                    bisect_on_divergence: false,
+                    bisect_on_divergence: Some(false),
                 }))
                 .await
                 .unwrap()
@@ -6297,9 +6344,9 @@ mod tests {
 
             let mut stream = svc
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
-                    base: Some(base_snapshot),
+                    base: Some(base_snapshot.clone()),
                     log: Some(VerifyLog::InputLogId(snap.input_log_id)),
-                    bisect_on_divergence: true,
+                    bisect_on_divergence: Some(true),
                 }))
                 .await
                 .unwrap()
@@ -6421,9 +6468,9 @@ mod tests {
 
             let mut stream = svc
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
-                    base: Some(base_snapshot),
-                    log: Some(VerifyLog::InputLog(poisoned_log)),
-                    bisect_on_divergence: false,
+                    base: Some(base_snapshot.clone()),
+                    log: Some(VerifyLog::InputLog(poisoned_log.clone())),
+                    bisect_on_divergence: Some(false),
                 }))
                 .await
                 .unwrap()
@@ -6442,6 +6489,35 @@ mod tests {
                 }
             }
             assert!(saw_divergence, "VerifyReplay must stream a divergence");
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLog(poisoned_log)),
+                    bisect_on_divergence: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut saw_checkpoint_error = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(progress) => {
+                        if matches!(progress.msg, Some(VerifyMsg::Divergence(_))) {
+                            panic!("default bisection must not emit fabricated Divergence");
+                        }
+                    }
+                    Err(status) => {
+                        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                        assert!(status.message().contains("bisection checkpoints"));
+                        saw_checkpoint_error = true;
+                    }
+                }
+            }
+            assert!(
+                saw_checkpoint_error,
+                "default bisection must fail without checkpoint evidence"
+            );
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
@@ -6526,7 +6602,7 @@ mod tests {
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
                     base: Some(base_snapshot),
                     log: Some(VerifyLog::InputLogId(snap.input_log_id)),
-                    bisect_on_divergence: false,
+                    bisect_on_divergence: Some(false),
                 }))
                 .await
                 .unwrap();
@@ -6560,7 +6636,7 @@ mod tests {
                     VERIFY_REPLAY_INLINE_LOG_MAX_BYTES
                         + 1
                 ])),
-                bisect_on_divergence: false,
+                bisect_on_divergence: Some(false),
             }))
             .await
         {
@@ -6590,7 +6666,7 @@ mod tests {
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
                     base: Some(proto::SnapshotRef { hash: vec![0; 32] }),
                     log: Some(proto::verify_replay_request::Log::InputLog(vec![0; 256])),
-                    bisect_on_divergence: false,
+                    bisect_on_divergence: Some(false),
                 }))
                 .await
             {
@@ -6614,8 +6690,8 @@ mod tests {
             got: [0x22; 32],
         };
         let err = verify_progress_to_proto(divergence.clone(), true).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert!(err.message().contains("bisection"));
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("bisection checkpoints"));
 
         let progress = verify_progress_to_proto(divergence, false).unwrap();
         let div = match progress.msg.unwrap() {
@@ -6630,6 +6706,41 @@ mod tests {
         assert!(div.suspected_cause.contains("first_bad_epoch=none"));
         assert!(div.suspected_cause.contains("expected_hash="));
         assert!(div.suspected_cause.contains("got_hash="));
+
+        let refined = VerifyProgress::BisectionDivergence(dh_verify::verify::BisectionDivergence {
+            first_bad_epoch: Some(4),
+            icount_lo: 40_960,
+            icount_hi: 41_472,
+            rip_expected: 0x401000,
+            rip_actual: 0x401004,
+            reg_diff: vec![0xA1, 0xB2],
+            diff_page_idx: vec![17, 19],
+            suspected_cause: "RDTSC at divergent RIP".into(),
+            evidence: dh_verify::verify::BisectionEvidence {
+                mode: dh_verify::verify::BisectionMode::ReplayVsRecorded,
+                expected_checkpoint_ref: Some([0xE1; 32]),
+                actual_probe_ref: Some([0xA7; 32]),
+                coverage_icount_lo: 40_960,
+                coverage_icount_hi: 41_472,
+            },
+        });
+        let progress = verify_progress_to_proto(refined, true).unwrap();
+        let div = match progress.msg.unwrap() {
+            VerifyMsg::Divergence(div) => div,
+            other => panic!("expected refined Divergence, got {other:?}"),
+        };
+        assert_eq!(div.first_bad_epoch, 4);
+        assert_eq!(div.icount_lo, 40_960);
+        assert_eq!(div.icount_hi, 41_472);
+        assert_eq!(div.rip_expected, 0x401000);
+        assert_eq!(div.rip_actual, 0x401004);
+        assert_eq!(div.reg_diff, vec![0xA1, 0xB2]);
+        assert_eq!(div.diff_page_idx, vec![17, 19]);
+        assert!(div
+            .suspected_cause
+            .contains("evidence_mode=replay-vs-recorded"));
+        assert!(div.suspected_cause.contains("expected_checkpoint_ref="));
+        assert!(div.suspected_cause.contains("actual_probe_ref="));
     }
 
     #[cfg(target_arch = "x86_64")]
