@@ -163,6 +163,8 @@ pub struct WorkerConfig {
     pub image_cache_dir: PathBuf,
     #[cfg(target_arch = "x86_64")]
     pub snapstore: Option<snapstore_client::Transport>,
+    #[cfg(target_arch = "x86_64")]
+    pub bisection_checkpoints: BisectionCheckpointConfig,
 }
 
 impl WorkerConfig {
@@ -181,7 +183,37 @@ impl WorkerConfig {
             snapstore: Some(snapstore_client::Transport::Tcp(
                 DEFAULT_SNAPSTORE_TCP.into(),
             )),
+            #[cfg(target_arch = "x86_64")]
+            bisection_checkpoints: BisectionCheckpointConfig::default(),
         })
+    }
+}
+
+/// Private recorder-side bisection checkpoint controls.
+///
+/// When enabled, the recorder captures one full, parentless checkpoint
+/// snapshot at each recorded epoch hash boundary whose vCPU state is
+/// directly restoreable and appends a BISECTION_CHECKPOINT AUX record at
+/// the same segment-relative icount. The cadence is deterministic because
+/// it is inherited from `MachineConfig.epoch_len`; epochs that carry
+/// transient run-control vector state are skipped and the next checkpoint
+/// reports the widened gap since the previous checkpoint or segment start.
+/// This requires `MachineConfig.hash_epochs == EpochsOn` and a configured
+/// snapstore.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BisectionCheckpointConfig {
+    pub enabled: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BisectionCheckpointConfig {
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn every_epoch() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -595,6 +627,8 @@ struct WorkerInner {
     store: Option<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>>,
     #[cfg(target_arch = "x86_64")]
     snapstore_transport: Option<snapstore_client::Transport>,
+    #[cfg(target_arch = "x86_64")]
+    bisection_checkpoints: BisectionCheckpointConfig,
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
@@ -629,6 +663,8 @@ impl WorkerService {
                 store,
                 #[cfg(target_arch = "x86_64")]
                 snapstore_transport: config.snapstore,
+                #[cfg(target_arch = "x86_64")]
+                bisection_checkpoints: config.bisection_checkpoints,
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -3310,6 +3346,12 @@ impl HypervisorWorker for WorkerService {
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let metrics = self.inner.metrics.clone();
+            let bisection_checkpoints = self.inner.bisection_checkpoints;
+            let checkpoint_store = if bisection_checkpoints.enabled {
+                Some(self.store()?)
+            } else {
+                None
+            };
             let response = blocking_lifecycle("Run", move || {
                 manager
                     .checkout_write(&lease, "Run", lease_now_ms())
@@ -3319,10 +3361,24 @@ impl HypervisorWorker for WorkerService {
                     let start_segment_icount = runtime.position.segment_icount;
                     let start_cumulative_icount = runtime.position.cumulative_icount;
                     let start_vns = runtime.position.vns;
+                    let start_cumulative_epoch = runtime.position.epoch_index;
                     let start_segment_vns =
                         segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
                     let epoch_len = runtime.machine_config.epoch_len.max(1);
                     let start_segment_epoch = start_segment_icount / epoch_len;
+                    if bisection_checkpoints.enabled {
+                        if runtime.machine_config.hash_epochs != dh_vmm::config::HashEpochs::EpochsOn
+                        {
+                            return Err(Status::failed_precondition(
+                                "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
+                            ));
+                        }
+                    }
+                    let checkpoint_machine_config = bisection_checkpoints
+                        .enabled
+                        .then(|| runtime.machine_config.clone());
+                    let mut checkpoint_anchor_icount =
+                        runtime.bisection_checkpoint_anchor_icount;
                     manager
                         .mark_running(&lease, lease_now_ms())
                         .map_err(slot_error_to_status)?;
@@ -3402,14 +3458,127 @@ impl HypervisorWorker for WorkerService {
                             consumed_input_orders.push(input.order);
                             Ok(vectors)
                         };
-                        let mut epoch_sink = |epoch_index, icount, chain_value| {
-                            rail.borrow_mut()
-                                .log_epoch_hash(epoch_index, icount, chain_value)
-                                .map_err(|e| {
-                                    dh_vmm::boundary::BoundaryError::Exit(format!(
-                                        "epoch log: {e:?}"
-                                    ))
-                                })
+                        let mut epoch_sink =
+                            |epoch_index,
+                             boundary: dh_vmm::boundary::Boundary,
+                             chain_value,
+                             checkpoint_slot: Option<&dh_vmm::kvm::SlotVm>| {
+                                let icount = boundary.icount;
+                                let pending_checkpoint = if let Some(slot) = checkpoint_slot {
+                                    if let Some(machine_config) = checkpoint_machine_config.as_ref()
+                                    {
+                                        let checkpoint_vns =
+                                            segment_vns_from_icount(machine_config, icount)
+                                                .map_err(|e| {
+                                                    dh_vmm::boundary::BoundaryError::Exit(
+                                                        format!(
+                                                            "bisection checkpoint vns: {}: {}",
+                                                            e.code(),
+                                                            e.message()
+                                                        ),
+                                                    )
+                                                })?;
+                                        let max_covered_gap = u32::try_from(
+                                            icount.saturating_sub(checkpoint_anchor_icount),
+                                        )
+                                        .map_err(|_| {
+                                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                                "bisection checkpoint gap {} exceeds u32",
+                                                icount.saturating_sub(checkpoint_anchor_icount)
+                                            ))
+                                        })?;
+                                        let segment_delta =
+                                            icount.saturating_sub(start_segment_icount);
+                                        let vns_delta =
+                                            checkpoint_vns.saturating_sub(start_segment_vns);
+                                        let segment_epoch = icount / epoch_len;
+                                        let epoch_delta =
+                                            segment_epoch.saturating_sub(start_segment_epoch);
+                                        let agenda_empty = !pending_inputs.iter().any(|input| {
+                                            match input.at {
+                                                QueuedInputAt::Icount(at) => at > icount,
+                                                QueuedInputAt::Frame(_) => true,
+                                            }
+                                        });
+                                        let checkpoint_boundary =
+                                            crate::snapshot_engine::BoundaryState {
+                                                icount: start_cumulative_icount
+                                                    .saturating_add(segment_delta),
+                                                vns: start_vns.saturating_add(vns_delta),
+                                                epoch_index: start_cumulative_epoch
+                                                    .saturating_add(epoch_delta),
+                                                hash_chain: chain_value,
+                                                agenda_empty,
+                                            };
+                                        let rail_ref = rail.borrow();
+                                        let store = checkpoint_store
+                                            .as_ref()
+                                            .ok_or_else(|| {
+                                                dh_vmm::boundary::BoundaryError::Exit(
+                                                    "bisection checkpoint store missing".into(),
+                                                )
+                                            })?
+                                            .lock()
+                                            .map_err(|_| {
+                                                dh_vmm::boundary::BoundaryError::Exit(
+                                                    "snapshot-store client mutex poisoned".into(),
+                                                )
+                                            })?;
+                                        let checkpoint =
+                                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+                                            slot,
+                                            dh_vmm::SlotState::Paused,
+                                            &rail_ref.bus,
+                                            &rail_ref.entropy,
+                                            machine_config,
+                                            checkpoint_boundary,
+                                            &store,
+                                        )
+                                        .map_err(|e| {
+                                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                                "bisection checkpoint snapshot: {e:?}"
+                                            ))
+                                        })?;
+                                        Some((
+                                            checkpoint.snapshot_ref.to_bytes(),
+                                            checkpoint_vns,
+                                            max_covered_gap,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                rail.borrow_mut()
+                                    .log_epoch_hash(epoch_index, icount, chain_value)
+                                    .map_err(|e| {
+                                        dh_vmm::boundary::BoundaryError::Exit(format!(
+                                            "epoch log: {e:?}"
+                                        ))
+                                    })?;
+                                if let Some((
+                                    checkpoint_snapshot_ref,
+                                    checkpoint_vns,
+                                    max_covered_gap,
+                                )) = pending_checkpoint
+                                {
+                                    rail.borrow_mut()
+                                        .log_bisection_checkpoint(
+                                            icount,
+                                            boundary.rip,
+                                            max_covered_gap,
+                                            checkpoint_snapshot_ref,
+                                            checkpoint_vns,
+                                        )
+                                        .map_err(|e| {
+                                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                                "bisection checkpoint log: {e:?}"
+                                            ))
+                                        })?;
+                                    checkpoint_anchor_icount = icount;
+                                }
+                                Ok(())
                         };
                         let run_result = {
                             let mut segment = dh_vmm::runctl::Segment {
@@ -3471,6 +3640,8 @@ impl HypervisorWorker for WorkerService {
                                 cumulative_epoch,
                                 runtime.chain.clone(),
                             );
+                            runtime.bisection_checkpoint_anchor_icount =
+                                checkpoint_anchor_icount;
                             runtime.position.frame_counter =
                                 frame_counter_from_bus(&mut runtime.bus);
                             if !consumed_input_orders.is_empty() {
@@ -3719,6 +3890,7 @@ impl HypervisorWorker for WorkerService {
                     runtime.base_snapshot = Some(out.snapshot_ref.clone());
                     runtime.log = Some(next_log);
                     runtime.position.segment_icount = 0;
+                    runtime.bisection_checkpoint_anchor_icount = 0;
                     Ok((
                         out,
                         machine_config_hash,
@@ -4169,6 +4341,8 @@ mod tests {
             image_cache_dir: std::env::temp_dir(),
             #[cfg(target_arch = "x86_64")]
             snapstore: None,
+            #[cfg(target_arch = "x86_64")]
+            bisection_checkpoints: BisectionCheckpointConfig::default(),
         }
     }
 
@@ -4450,10 +4624,10 @@ mod tests {
                     service_exit_with_detchannel(&mut rail.borrow_mut(), icount, icount, exit)
                         .map(|_| ())
                 },
-                &mut |epoch_index, icount, chain_value| {
-                    epochs.push((epoch_index, icount, chain_value));
+                &mut |epoch_index, boundary, chain_value, _slot| {
+                    epochs.push((epoch_index, boundary.icount, chain_value));
                     rail.borrow_mut()
-                        .log_epoch_hash(epoch_index, icount, chain_value)
+                        .log_epoch_hash(epoch_index, boundary.icount, chain_value)
                         .map_err(|e| {
                             dh_vmm::boundary::BoundaryError::Exit(format!("epoch log: {e:?}"))
                         })
@@ -4506,7 +4680,94 @@ mod tests {
         log_bytes: Vec<u8>,
         slot_icount: u64,
         slot_base_snapshot_id: Option<[u8; 32]>,
-        checkpoint_ref: Option<[u8; 32]>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct ComparableLogRecord {
+        kind: u8,
+        rflags: u8,
+        icount: u64,
+        boundary_rip: u64,
+        payload: Vec<u8>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct BisectionCheckpointAuxRecord {
+        seq: u32,
+        icount: u64,
+        boundary_rip: u64,
+        format_version: u16,
+        flags: u16,
+        max_covered_gap: u32,
+        checkpoint_snapshot_ref: [u8; 32],
+        checkpoint_icount: u64,
+        checkpoint_vns: u64,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn log_records_without_bisection_checkpoints(log: &[u8]) -> Vec<ComparableLogRecord> {
+        let reader = dh_inputlog::reader::LogReader::parse(log).unwrap();
+        reader
+            .records()
+            .filter(|rec| {
+                !matches!(
+                    rec.body(),
+                    dh_inputlog::reader::RecordBody::BisectionCheckpoint { .. }
+                )
+            })
+            .map(|rec| ComparableLogRecord {
+                kind: rec.kind(),
+                rflags: rec.rflags(),
+                icount: rec.icount(),
+                boundary_rip: rec.boundary_rip(),
+                payload: rec.payload().to_vec(),
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn bisection_checkpoint_aux_records(log: &[u8]) -> Vec<BisectionCheckpointAuxRecord> {
+        let reader = dh_inputlog::reader::LogReader::parse(log).unwrap();
+        reader
+            .records()
+            .filter_map(|rec| match rec.body() {
+                dh_inputlog::reader::RecordBody::BisectionCheckpoint {
+                    format_version,
+                    flags,
+                    max_covered_gap,
+                    checkpoint_snapshot_ref,
+                    checkpoint_icount,
+                    checkpoint_vns,
+                } => Some(BisectionCheckpointAuxRecord {
+                    seq: rec.seq(),
+                    icount: rec.icount(),
+                    boundary_rip: rec.boundary_rip(),
+                    format_version,
+                    flags,
+                    max_covered_gap,
+                    checkpoint_snapshot_ref,
+                    checkpoint_icount,
+                    checkpoint_vns,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn epoch_hash_record_order(log: &[u8]) -> Vec<(u32, u64)> {
+        let reader = dh_inputlog::reader::LogReader::parse(log).unwrap();
+        reader
+            .records()
+            .filter_map(|rec| match rec.body() {
+                dh_inputlog::reader::RecordBody::EpochHash { .. } => {
+                    Some((rec.seq(), rec.icount()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4579,7 +4840,6 @@ mod tests {
     async fn bisection_checkpoint_equivalence_leg(
         svc: &WorkerService,
         base_snapshot: proto::SnapshotRef,
-        capture_checkpoint: bool,
     ) -> BisectionCheckpointEquivalenceLeg {
         let restored = svc
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
@@ -4631,69 +4891,6 @@ mod tests {
             1,
             "future input must still be queued at the checkpoint boundary"
         );
-
-        let checkpoint_ref = if capture_checkpoint {
-            let svc_for_capture = svc.clone();
-            let lease_for_capture = lease.clone();
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    let store = svc_for_capture.store().unwrap();
-                    let actor = svc_for_capture
-                        .runtime_table()
-                        .with(lease_for_capture.slot_id, Arc::clone)
-                        .unwrap();
-                    actor
-                        .with_runtime_mut(move |runtime| {
-                            let before = (
-                                runtime.base_snapshot.clone(),
-                                runtime.position,
-                                runtime.chain.value(),
-                                runtime.entropy.state(),
-                                runtime.dirty.len(),
-                                runtime.log.as_ref().map(|log| log.record_count()),
-                                runtime.queued_inputs.len(),
-                                runtime.next_input_order,
-                            );
-                            assert_eq!(before.6, 1);
-                            let boundary = runtime.boundary_state(runtime.queued_inputs.is_empty());
-                            assert!(
-                                !boundary.agenda_empty,
-                                "checkpoint leg must exercise queued future input"
-                            );
-                            let checkpoint = {
-                                let store = store.lock().unwrap();
-                                crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
-                                    &runtime.slot,
-                                    dh_vmm::SlotState::Paused,
-                                    &runtime.bus,
-                                    &runtime.entropy,
-                                    &runtime.machine_config,
-                                    boundary,
-                                    &store,
-                                )
-                                .unwrap()
-                            };
-                            let after = (
-                                runtime.base_snapshot.clone(),
-                                runtime.position,
-                                runtime.chain.value(),
-                                runtime.entropy.state(),
-                                runtime.dirty.len(),
-                                runtime.log.as_ref().map(|log| log.record_count()),
-                                runtime.queued_inputs.len(),
-                                runtime.next_input_order,
-                            );
-                            assert_eq!(after, before);
-                            checkpoint.snapshot_ref.to_bytes()
-                        })
-                        .unwrap()
-                })
-                .await
-                .unwrap(),
-            )
-        } else {
-            None
-        };
 
         let final_run = svc
             .run(Request::new(proto::RunRequest {
@@ -4763,7 +4960,6 @@ mod tests {
             log_bytes,
             slot_icount,
             slot_base_snapshot_id,
-            checkpoint_ref,
         }
     }
 
@@ -5580,25 +5776,36 @@ mod tests {
         let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
         let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
         let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
-        let svc = WorkerService::new(test_config_with_resources(
+        let svc_control = WorkerService::new(test_config_with_resources(
             1,
             image_cache.path().to_path_buf(),
-            Some(transport),
+            Some(transport.clone()),
         ))
         .unwrap();
+        let mut checkpoint_config =
+            test_config_with_resources(1, image_cache.path().to_path_buf(), Some(transport));
+        checkpoint_config.bisection_checkpoints = BisectionCheckpointConfig::every_epoch();
+        let svc_checkpoint = WorkerService::new(checkpoint_config).unwrap();
+        let machine_config = service_machine_config_with_mem_epoch_len(
+            base_hash,
+            kernel_hash,
+            2 * 1024 * 1024,
+            20_000,
+        );
+        let expected_machine_config = machine_config_from_proto(&machine_config).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let created = svc
+            let created = svc_control
                 .create_vm(Request::new(proto::CreateVmRequest {
-                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    config: Some(machine_config),
                     entropy_seed: vec![0xB5; 32],
                 }))
                 .await
                 .unwrap()
                 .into_inner();
             let root_lease = created.lease.unwrap();
-            let base_snapshot = svc
+            let base_snapshot = svc_control
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
                     lease: Some(root_lease.clone()),
                     seal_input_log: Some(true),
@@ -5609,19 +5816,17 @@ mod tests {
                 .into_inner()
                 .snapshot
                 .unwrap();
-            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
-                lease: Some(root_lease),
-            }))
-            .await
-            .unwrap();
+            svc_control
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(root_lease),
+                }))
+                .await
+                .unwrap();
 
             let control =
-                bisection_checkpoint_equivalence_leg(&svc, base_snapshot.clone(), false).await;
-            let captured = bisection_checkpoint_equivalence_leg(&svc, base_snapshot, true).await;
-            assert!(
-                captured.checkpoint_ref.is_some(),
-                "capture leg must store a checkpoint artifact"
-            );
+                bisection_checkpoint_equivalence_leg(&svc_control, base_snapshot.clone()).await;
+            let captured =
+                bisection_checkpoint_equivalence_leg(&svc_checkpoint, base_snapshot).await;
 
             assert_eq!(captured.first_run.icount, control.first_run.icount);
             assert_eq!(captured.first_run.vns, control.first_run.vns);
@@ -5634,15 +5839,79 @@ mod tests {
                 control.snap.snapshot.as_ref().unwrap().hash,
                 "checkpoint capture must not perturb the final snapshot ref"
             );
-            assert_eq!(captured.snap.input_log_id, control.snap.input_log_id);
+            assert_ne!(
+                captured.snap.input_log_id, control.snap.input_log_id,
+                "checkpoint AUX records should change the stored DHILOG id"
+            );
             assert_eq!(captured.snap.icount, control.snap.icount);
             assert_eq!(captured.snap.vns, control.snap.vns);
             assert_eq!(captured.snap.state_hash, control.snap.state_hash);
             assert_eq!(captured.snap.dirty_pages, control.snap.dirty_pages);
             assert_eq!(
-                captured.log_bytes, control.log_bytes,
-                "checkpoint capture must not perturb the sealed DHILOG"
+                log_records_without_bisection_checkpoints(&captured.log_bytes),
+                log_records_without_bisection_checkpoints(&control.log_bytes),
+                "only BISECTION_CHECKPOINT AUX records may differ"
             );
+            assert!(
+                bisection_checkpoint_aux_records(&control.log_bytes).is_empty(),
+                "disabled recorder must not emit checkpoint AUX records"
+            );
+            let checkpoints = bisection_checkpoint_aux_records(&captured.log_bytes);
+            let epoch_hashes = epoch_hash_record_order(&captured.log_bytes);
+            assert_eq!(checkpoints.len(), 2);
+            assert!(
+                checkpoints
+                    .windows(2)
+                    .all(|pair| (pair[0].icount, pair[0].seq) < (pair[1].icount, pair[1].seq)),
+                "checkpoint records must preserve monotone (icount, seq) order"
+            );
+            for (record, expected_icount) in checkpoints.iter().zip([20_000, 40_000]) {
+                let epoch_seq = epoch_hashes
+                    .iter()
+                    .find_map(|(seq, icount)| (*icount == record.icount).then_some(*seq))
+                    .expect("checkpoint must share an icount with an EPOCH_HASH record");
+                assert!(
+                    epoch_seq < record.seq,
+                    "checkpoint evidence must follow its EPOCH_HASH chain link"
+                );
+                assert_eq!(
+                    record.format_version,
+                    dh_inputlog::dhilog::BISECTION_CHECKPOINT_FORMAT_VERSION
+                );
+                assert_eq!(
+                    record.flags,
+                    dh_inputlog::dhilog::BISECTION_CHECKPOINT_FLAGS
+                );
+                assert_eq!(record.icount, expected_icount);
+                assert_ne!(record.boundary_rip, 0);
+                assert_eq!(record.checkpoint_icount, expected_icount);
+                assert_eq!(record.max_covered_gap, 20_000);
+                assert_eq!(
+                    record.checkpoint_vns,
+                    expected_machine_config
+                        .clock
+                        .vns_from_icount(expected_icount)
+                        .unwrap()
+                );
+            }
+            let checkpoint_refs: Vec<[u8; 32]> = checkpoints
+                .iter()
+                .map(|record| record.checkpoint_snapshot_ref)
+                .collect();
+            let svc_for_store = svc_checkpoint.clone();
+            tokio::task::spawn_blocking(move || {
+                let store = svc_for_store.store().unwrap();
+                let store = store.lock().unwrap();
+                for snapshot_ref in checkpoint_refs {
+                    let container = store
+                        .get_snapshot(snapstore_types::SnapshotRef::from_bytes(snapshot_ref))
+                        .unwrap();
+                    let manifest = snapstore_manifest::Manifest::decode(&container).unwrap();
+                    assert_eq!(manifest.parent, None);
+                }
+            })
+            .await
+            .unwrap();
             assert_eq!(captured.slot_icount, control.slot_icount);
             assert_eq!(
                 captured.slot_base_snapshot_id,

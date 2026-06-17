@@ -194,9 +194,9 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
                 }
                 Ok(())
             },
-            &mut |idx, icount, value| {
+            &mut |idx, boundary, value, _slot| {
                 rail.borrow_mut()
-                    .log_epoch_hash(idx, icount, value)
+                    .log_epoch_hash(idx, boundary.icount, value)
                     .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
             },
         )
@@ -256,9 +256,9 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
                 serial.borrow_mut().extend(rail.serial.take_output());
                 Ok(())
             },
-            &mut |idx, icount, value| {
+            &mut |idx, boundary, value, _slot| {
                 rail.borrow_mut()
-                    .log_epoch_hash(idx, icount, value)
+                    .log_epoch_hash(idx, boundary.icount, value)
                     .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
             },
         )

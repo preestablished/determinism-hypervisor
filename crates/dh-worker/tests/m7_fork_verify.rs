@@ -185,6 +185,7 @@ fn worker_config(
         preflight: PreflightHealth::skipped("m7 acceptance harness"),
         image_cache_dir,
         snapstore: Some(snapstore),
+        bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
     }
 }
 

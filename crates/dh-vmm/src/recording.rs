@@ -304,6 +304,28 @@ impl<M: GuestMem> DeviceRail<M> {
             .map_err(RecordError::Log)
     }
 
+    /// Land one BISECTION_CHECKPOINT AUX record after its full checkpoint
+    /// snapshot has been durably stored. The caller owns cadence and must
+    /// pass the true maximum gap this checkpoint can cover.
+    pub fn log_bisection_checkpoint(
+        &mut self,
+        icount: u64,
+        boundary_rip: u64,
+        max_covered_gap: u32,
+        checkpoint_snapshot_ref: [u8; 32],
+        checkpoint_vns: u64,
+    ) -> Result<(), RecordError> {
+        self.log
+            .bisection_checkpoint(
+                icount,
+                boundary_rip,
+                max_covered_gap,
+                checkpoint_snapshot_ref,
+                checkpoint_vns,
+            )
+            .map_err(RecordError::Log)
+    }
+
     /// Seal the segment from its outcome (§3.1: SealParams come from the
     /// boundary outcome, the END stop_reason mirrors proto StopReason).
     /// Errors if any device-queued vector was never drained — a dropped
@@ -716,10 +738,10 @@ mod live_tests {
                         .map_err(|e| crate::boundary::BoundaryError::Exit(format!("{e:?}")))?;
                     rail.borrow_mut().service_exit(icount, exit)
                 },
-                &mut |idx, icount, value| {
-                    links_r.push((idx, icount, value));
+                &mut |idx, boundary, value, _slot| {
+                    links_r.push((idx, boundary.icount, value));
                     rail.borrow_mut()
-                        .log_epoch_hash(idx, icount, value)
+                        .log_epoch_hash(idx, boundary.icount, value)
                         .map_err(|e| {
                             crate::boundary::BoundaryError::Exit(format!("epoch log: {e:?}"))
                         })

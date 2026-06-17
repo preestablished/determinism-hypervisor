@@ -163,9 +163,9 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
                         .map_err(|e| BoundaryError::Exit(format!("{e:?}")))?;
                     rail.borrow_mut().service_exit(icount, exit)
                 },
-                &mut |idx, icount, value| {
+                &mut |idx, boundary, value, _slot| {
                     rail.borrow_mut()
-                        .log_epoch_hash(idx, icount, value)
+                        .log_epoch_hash(idx, boundary.icount, value)
                         .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
                 },
             )
@@ -360,9 +360,9 @@ fn replay_does_not_hash_intermediate_canonical_record_landings() {
                     .map(|vector| vector.into_iter().collect())
                     .map_err(|e| BoundaryError::Exit(format!("input: {e:?}")))
             },
-            &mut |idx, icount, value| {
+            &mut |idx, boundary, value, _slot| {
                 rail.borrow_mut()
-                    .log_epoch_hash(idx, icount, value)
+                    .log_epoch_hash(idx, boundary.icount, value)
                     .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))
             },
         )
