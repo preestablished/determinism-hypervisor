@@ -256,13 +256,15 @@ fn bisection_checkpoint_capture_is_full_and_preserves_dirty_tracking() {
     run_guest_byte_writes(&mut slot, &[(0x2000, 0x42), (0x5000, 0x43), (0x9000, 0x44)]);
 
     let entropy_before = entropy.state();
+    let mut checkpoint_boundary = boundary();
+    checkpoint_boundary.agenda_empty = false;
     let checkpoint = capture_bisection_checkpoint_snapshot(
         &slot,
         SlotState::Paused,
         &bus,
         &entropy,
         &config,
-        boundary(),
+        checkpoint_boundary,
         &store,
     )
     .expect("bisection checkpoint capture");
@@ -357,18 +359,6 @@ fn preconditions_fail_loudly_without_touching_the_store() {
             &config,
             b,
             PageSource::Full,
-            &store
-        ),
-        Err(EngineError::AgendaNotEmpty)
-    ));
-    assert!(matches!(
-        capture_bisection_checkpoint_snapshot(
-            &slot,
-            SlotState::Paused,
-            &bus,
-            &entropy,
-            &config,
-            b,
             &store
         ),
         Err(EngineError::AgendaNotEmpty)

@@ -55,8 +55,11 @@ pub struct BoundaryState {
     /// Current StateHashChain value — recorded in TIME; the child segment
     /// resumes the chain from it (`StateHashChain::from_value`).
     pub hash_chain: [u8; 32],
-    /// MUST be true: snapshots only happen at quiescent boundaries with no
-    /// unconsumed scheduled events (§8.1).
+    /// MUST be true for public TakeSnapshot lineage boundaries: those
+    /// snapshots rotate the segment and therefore require no unconsumed
+    /// scheduled events (§8.1). Non-mutating bisection checkpoint captures
+    /// may be taken at a paused deterministic boundary while future inputs
+    /// remain queued.
     pub agenda_empty: bool,
 }
 
@@ -119,7 +122,7 @@ pub fn take_snapshot(
     source: PageSource<'_>,
     store: &SnapstoreClient,
 ) -> Result<TakeSnapshotOutcome, EngineError> {
-    validate_preconditions(slot_state, &boundary)?;
+    validate_take_snapshot_preconditions(slot_state, &boundary)?;
 
     // ── 1. Page set (§8.2: drain ring at the pause) ───────────────────────
     let total_pages = slot.mem_bytes / PAGE_SIZE;
@@ -187,7 +190,7 @@ pub fn capture_bisection_checkpoint_snapshot(
     boundary: BoundaryState,
     store: &SnapstoreClient,
 ) -> Result<BisectionCheckpointSnapshotOutcome, EngineError> {
-    validate_preconditions(slot_state, &boundary)?;
+    validate_paused(slot_state)?;
 
     let total_pages = slot.mem_bytes / PAGE_SIZE;
     let page_indices: Vec<u64> = (0..total_pages).collect();
@@ -203,13 +206,17 @@ pub fn capture_bisection_checkpoint_snapshot(
     })
 }
 
-fn validate_preconditions(
+fn validate_take_snapshot_preconditions(
     slot_state: SlotState,
     boundary: &BoundaryState,
 ) -> Result<(), EngineError> {
     if !boundary.agenda_empty {
         return Err(EngineError::AgendaNotEmpty);
     }
+    validate_paused(slot_state)
+}
+
+fn validate_paused(slot_state: SlotState) -> Result<(), EngineError> {
     if slot_state != SlotState::Paused {
         return Err(EngineError::NotPaused { state: slot_state });
     }
