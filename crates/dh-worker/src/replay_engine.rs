@@ -212,6 +212,22 @@ struct ActualBisectionProbe {
     snapshot_ref: SnapshotRef,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReplayBisectionBase {
+    cumulative_icount: u64,
+    vns: u64,
+    epoch_index: u64,
+    segment_start_vns: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingBisectionDivergence {
+    selected: SelectedBisectionCheckpoint,
+    what: &'static str,
+    expected_hash: [u8; 32],
+    got_hash: [u8; 32],
+}
+
 fn hex32(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for b in bytes {
@@ -261,11 +277,21 @@ fn select_terminal_bisection(
         })
 }
 
+fn selected_checkpoint_is_at_epoch(
+    selected: SelectedBisectionCheckpoint,
+    epoch_index: u64,
+    icount: u64,
+) -> bool {
+    selected.checkpoint.preceding_epoch_hash.epoch_index == epoch_index
+        && selected.checkpoint.preceding_epoch_hash.position.icount == icount
+}
+
 fn capture_bisection_probe<M>(
     slot: &SlotVm,
     rail: &DeviceRail<M>,
     machine_config: &MachineConfig,
     store: &SnapstoreClient,
+    base: ReplayBisectionBase,
     checkpoint: IndexedBisectionCheckpoint,
     boundary_icount: u64,
     chain_value: [u8; 32],
@@ -289,14 +315,17 @@ where
         })?;
     if vns != checkpoint.checkpoint_vns {
         return Err(ReplayError::BisectionPrecondition(format!(
-            "VerifyReplay bisection checkpoint vns mismatch at icount {boundary_icount}: log {}, computed {vns}",
+                "VerifyReplay bisection checkpoint vns mismatch at icount {boundary_icount}: log {}, computed {vns}",
             checkpoint.checkpoint_vns
         )));
     }
+    let vns_delta = vns.saturating_sub(base.segment_start_vns);
+    let epoch_len = machine_config.epoch_len.max(1);
+    let epoch_delta = boundary_icount / epoch_len;
     let boundary = crate::snapshot_engine::BoundaryState {
-        icount: boundary_icount,
-        vns,
-        epoch_index: checkpoint.preceding_epoch_hash.epoch_index,
+        icount: base.cumulative_icount.saturating_add(boundary_icount),
+        vns: base.vns.saturating_add(vns_delta),
+        epoch_index: base.epoch_index.saturating_add(epoch_delta),
         hash_chain: chain_value,
         agenda_empty: false,
     };
@@ -471,6 +500,16 @@ where
         store,
     )
     .map_err(ReplayError::Restore)?;
+    let segment_start_vns = machine_config
+        .clock
+        .vns_from_icount(0)
+        .ok_or_else(|| ReplayError::Run("segment-start vns conversion overflow".into()))?;
+    let bisection_base = ReplayBisectionBase {
+        cumulative_icount: restored.cumulative_icount,
+        vns: restored.vns,
+        epoch_index: restored.epoch_index,
+        segment_start_vns,
+    };
     // §3.1: zero seed ⇒ continue the snapshot's PRNG; nonzero ⇒ fresh.
     rail.entropy = if header.entropy_seed == [0u8; 32] {
         restored.entropy
@@ -531,6 +570,7 @@ where
     let last_epoch_icount = std::cell::Cell::new(None);
     let divergence: DivergenceCell = std::cell::Cell::new(None);
     let bisection_error = std::cell::RefCell::new(None);
+    let pending_bisection = std::cell::RefCell::new(None::<PendingBisectionDivergence>);
     let progress_error = std::cell::RefCell::new(None);
     let run_to = |slot: &mut SlotVm,
                   chain: &mut StateHashChain,
@@ -579,13 +619,85 @@ where
                 },
                 &mut |idx, boundary, value, epoch_slot| {
                     let icount = boundary.icount;
+                    if let Some(pending) = *pending_bisection.borrow() {
+                        if selected_checkpoint_is_at_epoch(pending.selected, idx, icount) {
+                            let Some(epoch_slot) = epoch_slot else {
+                                bisection_error.replace(Some(
+                                    ReplayError::BisectionPrecondition(format!(
+                                        "VerifyReplay bisection checkpoint at icount {icount} is not checkpoint-safe"
+                                    )),
+                                ));
+                                return Err(BoundaryError::Exit(
+                                    "bisection epoch divergence".into(),
+                                ));
+                            };
+                            let outcome = capture_bisection_probe(
+                                epoch_slot,
+                                &rail.borrow(),
+                                machine_config,
+                                store,
+                                bisection_base,
+                                pending.selected.checkpoint,
+                                icount,
+                                value,
+                            )
+                            .and_then(|probe| {
+                                bisection_divergence_from_probe(
+                                    pending.selected,
+                                    probe.snapshot_ref,
+                                    pending.what,
+                                    pending.expected_hash,
+                                    pending.got_hash,
+                                    store,
+                                )
+                            });
+                            bisection_error.replace(Some(match outcome {
+                                Ok(divergence) => ReplayError::BisectionDivergence(divergence),
+                                Err(e) => e,
+                            }));
+                            return Err(BoundaryError::Exit(
+                                "bisection epoch divergence".into(),
+                            ));
+                        }
+                        rail.borrow_mut()
+                            .log_epoch_hash(idx, icount, value)
+                            .map_err(|e| BoundaryError::Exit(format!("epoch log: {e:?}")))?;
+                        return Ok(());
+                    }
                     let i = verified.get();
                     match expected_epochs.get(i) {
                         Some((e_idx, e_icount, e_value))
                             if *e_idx == idx && *e_icount == icount && *e_value == value => {}
                         Some((e_idx, e_icount, e_value)) => {
                             if bisection_index.is_some() {
-                                let outcome = if *e_icount == icount {
+                                let selected = if *e_icount == icount {
+                                    match select_epoch_bisection(bisection_index, *e_idx, icount) {
+                                        Ok(selected) => selected,
+                                        Err(e) => {
+                                            bisection_error.replace(Some(e));
+                                            return Err(BoundaryError::Exit(
+                                                "bisection epoch divergence".into(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    bisection_error.replace(Some(
+                                        ReplayError::BisectionPrecondition(format!(
+                                            "VerifyReplay bisection cannot select checkpoint evidence: expected epoch {e_idx} at icount {e_icount}, replay reached icount {icount}"
+                                        )),
+                                    ));
+                                    return Err(BoundaryError::Exit(
+                                        "bisection epoch divergence".into(),
+                                    ));
+                                };
+                                let pending = PendingBisectionDivergence {
+                                    selected,
+                                    what: "EPOCH_HASH chain value",
+                                    expected_hash: *e_value,
+                                    got_hash: value,
+                                };
+                                let outcome =
+                                    if selected_checkpoint_is_at_epoch(selected, idx, icount) {
                                     let Some(epoch_slot) = epoch_slot else {
                                         bisection_error.replace(Some(
                                             ReplayError::BisectionPrecondition(format!(
@@ -596,37 +708,39 @@ where
                                             "bisection epoch divergence".into(),
                                         ));
                                     };
-                                    match select_epoch_bisection(bisection_index, *e_idx, icount)
-                                        .and_then(|selected| {
-                                            capture_bisection_probe(
-                                                epoch_slot,
-                                                &rail.borrow(),
-                                                machine_config,
-                                                store,
-                                                selected.checkpoint,
-                                                icount,
-                                                value,
-                                            )
-                                            .and_then(|probe| {
-                                                bisection_divergence_from_probe(
-                                                    selected,
-                                                    probe.snapshot_ref,
-                                                    "EPOCH_HASH chain value",
-                                                    *e_value,
-                                                    value,
-                                                    store,
-                                                )
-                                            })
-                                        }) {
+                                    match capture_bisection_probe(
+                                        epoch_slot,
+                                        &rail.borrow(),
+                                        machine_config,
+                                        store,
+                                        bisection_base,
+                                        selected.checkpoint,
+                                        icount,
+                                        value,
+                                    )
+                                    .and_then(|probe| {
+                                        bisection_divergence_from_probe(
+                                            selected,
+                                            probe.snapshot_ref,
+                                            pending.what,
+                                            pending.expected_hash,
+                                            pending.got_hash,
+                                            store,
+                                        )
+                                    }) {
                                         Ok(divergence) => {
                                             ReplayError::BisectionDivergence(divergence)
                                         }
                                         Err(e) => e,
                                     }
                                 } else {
-                                    ReplayError::BisectionPrecondition(format!(
-                                        "VerifyReplay bisection cannot select checkpoint evidence: expected epoch {e_idx} at icount {e_icount}, replay reached icount {icount}"
-                                    ))
+                                    pending_bisection.replace(Some(pending));
+                                    rail.borrow_mut()
+                                        .log_epoch_hash(idx, icount, value)
+                                        .map_err(|e| {
+                                            BoundaryError::Exit(format!("epoch log: {e:?}"))
+                                        })?;
+                                    return Ok(());
                                 };
                                 bisection_error.replace(Some(outcome));
                                 return Err(BoundaryError::Exit(
@@ -664,9 +778,7 @@ where
                     verified.set(i + 1);
                     last_epoch_icount.set(Some(icount));
                     if let Some(selected) = terminal_selection {
-                        if selected.checkpoint.preceding_epoch_hash.epoch_index == idx
-                            && selected.checkpoint.preceding_epoch_hash.position.icount == icount
-                        {
+                        if selected_checkpoint_is_at_epoch(selected, idx, icount) {
                             let Some(epoch_slot) = epoch_slot else {
                                 bisection_error.replace(Some(
                                     ReplayError::BisectionPrecondition(format!(
@@ -682,6 +794,7 @@ where
                                 &rail.borrow(),
                                 machine_config,
                                 store,
+                                bisection_base,
                                 selected.checkpoint,
                                 icount,
                                 value,
@@ -732,6 +845,7 @@ where
     };
     macro_rules! verify_current_epoch {
         ($slot:expr, $chain:expr, $icount:expr) => {{
+            'verify_current_epoch: {
             let i = verified.get();
             match expected_epochs.get(i) {
                 Some((_, e_icount, _)) if *e_icount != $icount => Ok(false),
@@ -746,6 +860,33 @@ where
                     let epoch = machine_config.epoch_len.max(1);
                     let idx = $icount / epoch;
                     let value = $chain.value();
+                    if let Some(pending) = *pending_bisection.borrow() {
+                        if selected_checkpoint_is_at_epoch(pending.selected, idx, $icount) {
+                            let probe = capture_bisection_probe(
+                                $slot,
+                                &rail.borrow(),
+                                machine_config,
+                                store,
+                                bisection_base,
+                                pending.selected.checkpoint,
+                                $icount,
+                                value,
+                            )?;
+                            let divergence = bisection_divergence_from_probe(
+                                pending.selected,
+                                probe.snapshot_ref,
+                                pending.what,
+                                pending.expected_hash,
+                                pending.got_hash,
+                                store,
+                            )?;
+                            return Err(ReplayError::BisectionDivergence(divergence));
+                        }
+                        rail.borrow_mut()
+                            .log_epoch_hash(idx, $icount, value)
+                            .map_err(|e| ReplayError::Apply(format!("epoch log: {e:?}")))?;
+                        break 'verify_current_epoch Ok(true);
+                    }
                     if *e_idx != idx || *e_icount != $icount || *e_value != value {
                         if bisection_index.is_some() {
                             let selected = if *e_icount == $icount {
@@ -756,24 +897,38 @@ where
                                     $icount
                                 )));
                             };
-                            let probe = capture_bisection_probe(
-                                $slot,
-                                &rail.borrow(),
-                                machine_config,
-                                store,
-                                selected.checkpoint,
-                                $icount,
-                                value,
-                            )?;
-                            let divergence = bisection_divergence_from_probe(
+                            let pending = PendingBisectionDivergence {
                                 selected,
-                                probe.snapshot_ref,
-                                "EPOCH_HASH chain value",
-                                *e_value,
-                                value,
-                                store,
-                            )?;
-                            return Err(ReplayError::BisectionDivergence(divergence));
+                                what: "EPOCH_HASH chain value",
+                                expected_hash: *e_value,
+                                got_hash: value,
+                            };
+                            if selected_checkpoint_is_at_epoch(selected, idx, $icount) {
+                                let probe = capture_bisection_probe(
+                                    $slot,
+                                    &rail.borrow(),
+                                    machine_config,
+                                    store,
+                                    bisection_base,
+                                    selected.checkpoint,
+                                    $icount,
+                                    value,
+                                )?;
+                                let divergence = bisection_divergence_from_probe(
+                                    selected,
+                                    probe.snapshot_ref,
+                                    pending.what,
+                                    pending.expected_hash,
+                                    pending.got_hash,
+                                    store,
+                                )?;
+                                return Err(ReplayError::BisectionDivergence(divergence));
+                            }
+                            pending_bisection.replace(Some(pending));
+                            rail.borrow_mut()
+                                .log_epoch_hash(idx, $icount, value)
+                                .map_err(|e| ReplayError::Apply(format!("epoch log: {e:?}")))?;
+                            break 'verify_current_epoch Ok(true);
                         }
                         return Err(ReplayError::Divergence {
                             what: "EPOCH_HASH chain value",
@@ -785,14 +940,13 @@ where
                     verified.set(i + 1);
                     last_epoch_icount.set(Some($icount));
                     if let Some(selected) = terminal_selection {
-                        if selected.checkpoint.preceding_epoch_hash.epoch_index == idx
-                            && selected.checkpoint.preceding_epoch_hash.position.icount == $icount
-                        {
+                        if selected_checkpoint_is_at_epoch(selected, idx, $icount) {
                             let probe = capture_bisection_probe(
                                 $slot,
                                 &rail.borrow(),
                                 machine_config,
                                 store,
+                                bisection_base,
                                 selected.checkpoint,
                                 $icount,
                                 value,
@@ -807,6 +961,7 @@ where
                     Ok(true)
                 }
                 None => Ok(false),
+            }
             }
         }};
     }
