@@ -100,7 +100,7 @@ pub fn load_bzimage_and_enter(
     crate::msr::apply_default_deny_filter(&slot.vm).map_err(|e| BootError::Kvm(e.0))?;
     enter_linux_64bit(
         &slot.vcpu,
-        plan.layout.kernel_payload.start + LINUX_64BIT_ENTRY_OFFSET,
+        plan.layout.kernel_image.start + LINUX_64BIT_ENTRY_OFFSET,
         plan.layout.boot_params.start,
     )?;
     Ok(plan.layout)
@@ -238,19 +238,19 @@ fn write_bzimage_plan<M>(
 where
     M: Bytes<GuestAddress, E = vm_memory::GuestMemoryError>,
 {
-    let payload_start = usize::try_from(plan.layout.kernel_payload_file_offset)
-        .map_err(|_| BootError::BzImage("payload offset exceeds usize".into()))?;
-    let payload_len = usize::try_from(plan.layout.kernel_payload.len)
-        .map_err(|_| BootError::BzImage("payload length exceeds usize".into()))?;
-    let payload_end = payload_start
-        .checked_add(payload_len)
-        .ok_or_else(|| BootError::BzImage("payload range overflows usize".into()))?;
-    let payload = bzimage
-        .get(payload_start..payload_end)
-        .ok_or_else(|| BootError::BzImage("payload range exceeds bzImage bytes".into()))?;
+    let kernel_image_start = usize::try_from(plan.layout.kernel_image_file_offset)
+        .map_err(|_| BootError::BzImage("kernel image offset exceeds usize".into()))?;
+    let kernel_image_len = usize::try_from(plan.layout.kernel_image.len)
+        .map_err(|_| BootError::BzImage("kernel image length exceeds usize".into()))?;
+    let kernel_image_end = kernel_image_start
+        .checked_add(kernel_image_len)
+        .ok_or_else(|| BootError::BzImage("kernel image range overflows usize".into()))?;
+    let kernel_image = bzimage
+        .get(kernel_image_start..kernel_image_end)
+        .ok_or_else(|| BootError::BzImage("kernel image range exceeds bzImage bytes".into()))?;
 
-    mem.write_slice(payload, GuestAddress(plan.layout.kernel_payload.start))
-        .map_err(|e| BootError::Mem(format!("bzImage payload copy: {e}")))?;
+    mem.write_slice(kernel_image, GuestAddress(plan.layout.kernel_image.start))
+        .map_err(|e| BootError::Mem(format!("bzImage kernel image copy: {e}")))?;
     mem.write_slice(
         &plan.boot_params,
         GuestAddress(plan.layout.boot_params.start),
@@ -413,7 +413,7 @@ mod tests {
 
         let setup_sects = 4u8;
         let setup_bytes = (u64::from(setup_sects) + 1) * 512;
-        let payload_offset = 0x100u32;
+        let payload_offset = 0x400u32;
         let init_size = 0x40_0000u32;
         let total = setup_bytes as usize + payload_offset as usize + payload.len();
         let mut image = vec![0u8; total];
@@ -440,6 +440,9 @@ mod tests {
         image[PREF_ADDRESS_OFF..PREF_ADDRESS_OFF + 8].copy_from_slice(&0x20_0000u64.to_le_bytes());
         image[INIT_SIZE_OFF..INIT_SIZE_OFF + 4].copy_from_slice(&init_size.to_le_bytes());
         let payload_start = setup_bytes as usize + payload_offset as usize;
+        image[setup_bytes as usize..payload_start].fill(0x5a);
+        let entry_byte = setup_bytes as usize + LINUX_64BIT_ENTRY_OFFSET as usize;
+        image[entry_byte] = 0xcc;
         image[payload_start..payload_start + payload.len()].copy_from_slice(payload);
         image
     }
@@ -495,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn bzimage_plan_writer_copies_linux_payloads() {
+    fn bzimage_plan_writer_copies_linux_kernel_image_and_aux_data() {
         let payload = vec![0xa5; 0x800];
         let bzimage = synthetic_bzimage(&payload);
         let initramfs = b"initramfs-bytes";
@@ -508,10 +511,36 @@ mod tests {
         let mem = ram(64 << 20);
         write_bzimage_plan(&mem, &bzimage, initramfs, &plan).unwrap();
 
+        let kernel_start = plan.layout.kernel_image_file_offset as usize;
+        let kernel_len = plan.layout.kernel_image.len as usize;
+        let expected_kernel_image = &bzimage[kernel_start..kernel_start + kernel_len];
+        assert_eq!(
+            expected_kernel_image[LINUX_64BIT_ENTRY_OFFSET as usize],
+            0xcc
+        );
+        assert_eq!(
+            &expected_kernel_image
+                [plan.layout.compressed_payload_file_offset as usize - kernel_start..]
+                [..payload.len()],
+            payload
+        );
+
+        let mut got_kernel_image = vec![0u8; kernel_len];
+        mem.read_slice(
+            &mut got_kernel_image,
+            GuestAddress(plan.layout.kernel_image.start),
+        )
+        .unwrap();
+        assert_eq!(got_kernel_image, expected_kernel_image);
+
         let mut got_payload = vec![0u8; payload.len()];
         mem.read_slice(
             &mut got_payload,
-            GuestAddress(linux_bzimage::LINUX_KERNEL_LOAD_GPA),
+            GuestAddress(
+                linux_bzimage::LINUX_KERNEL_LOAD_GPA
+                    + (plan.layout.compressed_payload_file_offset
+                        - plan.layout.kernel_image_file_offset),
+            ),
         )
         .unwrap();
         assert_eq!(got_payload, payload);
@@ -581,7 +610,13 @@ mod tests {
 
         let mut got_payload = vec![0u8; payload.len()];
         slot.guest_mem
-            .read_slice(&mut got_payload, GuestAddress(layout.kernel_payload.start))
+            .read_slice(
+                &mut got_payload,
+                GuestAddress(
+                    layout.kernel_image.start
+                        + (layout.compressed_payload_file_offset - layout.kernel_image_file_offset),
+                ),
+            )
             .unwrap();
         assert_eq!(got_payload, payload);
     }

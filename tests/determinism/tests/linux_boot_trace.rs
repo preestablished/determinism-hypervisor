@@ -9,6 +9,7 @@ mod common;
 use dh_vmm::config::canonicalize_bzimage_cmdline_extras;
 use dh_vmm::kvm::KvmSystem;
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
 
 const M9_LINUX_MEM_BYTES: u64 = 512 * 1024 * 1024;
@@ -29,7 +30,7 @@ fn linux_entry_smoke() {
     let cmdline = canonicalize_bzimage_cmdline_extras(b"quiet").expect("canonical cmdline");
 
     let sys = KvmSystem::open().expect("KVM gate");
-    let slot = sys
+    let mut slot = sys
         .create_slot_vm(M9_LINUX_MEM_BYTES)
         .expect("create Linux entry slot");
     let layout = dh_vmm::boot::load_bzimage_and_enter(&slot, &bzimage, &initramfs, &cmdline)
@@ -61,11 +62,18 @@ fn linux_entry_smoke() {
         .expect("read boot_params magic");
     assert_eq!(&boot_params_magic, b"HdrS");
     assert_eq!(
-        layout.kernel_payload.start,
+        layout.kernel_image.start,
         dh_vmm::boot::linux_bzimage::LINUX_KERNEL_LOAD_GPA
     );
 
     assert_masked_cpuid_surface(&slot);
+
+    match slot.vcpu.run().expect("first Linux KVM_RUN") {
+        VcpuExit::Shutdown | VcpuExit::InternalError | VcpuExit::FailEntry(..) => {
+            panic!("Linux entry failed before the first serviceable KVM exit")
+        }
+        exit => eprintln!("first Linux KVM exit after entry: {exit:?}"),
+    }
 }
 
 fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {

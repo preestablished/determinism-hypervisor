@@ -24,8 +24,11 @@ const KERNEL_ALIGNMENT_OFF: usize = 0x230;
 const RELOCATABLE_KERNEL_OFF: usize = 0x234;
 const XLOADFLAGS_OFF: usize = 0x236;
 const CMDLINE_SIZE_OFF: usize = 0x238;
+const HARDWARE_SUBARCH_OFF: usize = 0x23c;
+const HARDWARE_SUBARCH_DATA_OFF: usize = 0x240;
 const PAYLOAD_OFFSET_OFF: usize = 0x248;
 const PAYLOAD_LENGTH_OFF: usize = 0x24c;
+const SETUP_DATA_OFF: usize = 0x250;
 const PREF_ADDRESS_OFF: usize = 0x258;
 const INIT_SIZE_OFF: usize = 0x260;
 const SETUP_HEADER_END: usize = 0x268;
@@ -77,6 +80,8 @@ pub struct BzImageLayout {
     pub protocol_version: u16,
     pub setup_sects: u8,
     pub setup_bytes: u64,
+    pub kernel_image_file_offset: u64,
+    pub kernel_image_length: u64,
     pub payload_file_offset: u64,
     pub payload_length: u64,
     pub init_size: u64,
@@ -136,6 +141,10 @@ pub enum BzImageError {
     CmdlineTooLong {
         len: usize,
         limit: usize,
+    },
+    UnsupportedSetupHeaderField {
+        field: &'static str,
+        value: u64,
     },
 }
 
@@ -202,6 +211,10 @@ impl std::fmt::Display for BzImageError {
             BzImageError::CmdlineTooLong { len, limit } => {
                 write!(f, "Linux cmdline length {len} exceeds limit {limit}")
             }
+            BzImageError::UnsupportedSetupHeaderField { field, value } => write!(
+                f,
+                "bzImage setup header field {field}={value:#x} is outside the deterministic subset"
+            ),
         }
     }
 }
@@ -305,11 +318,36 @@ pub fn parse_bzimage(
             image_len,
         });
     }
+    let kernel_image_length =
+        image_len
+            .checked_sub(setup_bytes)
+            .ok_or(BzImageError::PayloadOutsideImage {
+                start: setup_bytes,
+                len: image_len,
+                image_len,
+            })?;
+    if kernel_image_length == 0 {
+        return Err(BzImageError::PayloadOutsideImage {
+            start: setup_bytes,
+            len: 0,
+            image_len,
+        });
+    }
 
     let init_size = u32le(image, INIT_SIZE_OFF);
     if init_size == 0 {
         return Err(BzImageError::BadInitSize { init_size });
     }
+
+    reject_unsupported_header_field(
+        "hardware_subarch",
+        u64::from(u32le(image, HARDWARE_SUBARCH_OFF)),
+    )?;
+    reject_unsupported_header_field(
+        "hardware_subarch_data",
+        u64le(image, HARDWARE_SUBARCH_DATA_OFF),
+    )?;
+    reject_unsupported_header_field("setup_data", u64le(image, SETUP_DATA_OFF))?;
 
     let cmdline_size = u32le(image, CMDLINE_SIZE_OFF);
     let cmdline_limit = usize::try_from(cmdline_size)
@@ -338,6 +376,8 @@ pub fn parse_bzimage(
         protocol_version,
         setup_sects,
         setup_bytes,
+        kernel_image_file_offset: setup_bytes,
+        kernel_image_length,
         payload_file_offset,
         payload_length,
         init_size: u64::from(init_size),
@@ -349,6 +389,14 @@ pub fn parse_bzimage(
         initrd_addr_max,
         cmdline_size,
     })
+}
+
+fn reject_unsupported_header_field(field: &'static str, value: u64) -> Result<(), BzImageError> {
+    if value == 0 {
+        Ok(())
+    } else {
+        Err(BzImageError::UnsupportedSetupHeaderField { field, value })
+    }
 }
 
 fn u16le(bytes: &[u8], at: usize) -> u16 {
@@ -400,8 +448,10 @@ pub struct LinuxBootLayout {
     pub boot_params: LinuxMemoryRange,
     pub cmdline: LinuxMemoryRange,
     pub cmdline_len: u32,
-    pub kernel_payload: LinuxMemoryRange,
-    pub kernel_payload_file_offset: u64,
+    pub kernel_image: LinuxMemoryRange,
+    pub kernel_image_file_offset: u64,
+    pub compressed_payload_file_offset: u64,
+    pub compressed_payload_length: u64,
     pub initramfs: Option<LinuxMemoryRange>,
     pub device_mmio: LinuxMemoryRange,
     pub apic_mmio: LinuxMemoryRange,
@@ -477,7 +527,7 @@ impl std::fmt::Display for LinuxBootLayoutError {
             }
             LinuxBootLayoutError::KernelOutsideRam { end, mem_bytes } => write!(
                 f,
-                "bzImage payload end {end:#x} exceeds guest RAM {mem_bytes:#x}"
+                "bzImage kernel image end {end:#x} exceeds guest RAM {mem_bytes:#x}"
             ),
             LinuxBootLayoutError::InitramfsTooLarge { len, limit } => {
                 write!(f, "initramfs length {len} exceeds placement limit {limit}")
@@ -531,7 +581,8 @@ pub fn plan_bzimage_boot(
         });
     }
 
-    let kernel_reserved_len = align_up(header.payload_length.max(header.init_size), PAGE_SIZE)?;
+    let kernel_reserved_len =
+        align_up(header.kernel_image_length.max(header.init_size), PAGE_SIZE)?;
     let kernel_reserved_end = LINUX_KERNEL_LOAD_GPA
         .checked_add(kernel_reserved_len)
         .ok_or(LinuxBootLayoutError::RangeOverflow { label: "kernel" })?;
@@ -573,7 +624,7 @@ pub fn plan_bzimage_boot(
     let page_tables = LinuxMemoryRange::new(LINUX_PAGE_TABLES_GPA, LINUX_PAGE_TABLES_LEN);
     let boot_params = LinuxMemoryRange::new(LINUX_BOOT_PARAMS_GPA, LINUX_BOOT_PARAMS_SIZE as u64);
     let cmdline_range = LinuxMemoryRange::new(LINUX_CMDLINE_GPA, LINUX_CMDLINE_RESERVED_LEN);
-    let kernel_payload = LinuxMemoryRange::new(LINUX_KERNEL_LOAD_GPA, header.payload_length);
+    let kernel_image = LinuxMemoryRange::new(LINUX_KERNEL_LOAD_GPA, header.kernel_image_length);
     let device_mmio = LinuxMemoryRange::new(MMIO_HOLE_BASE, MMIO_HOLE_LEN);
     let apic_mmio = LinuxMemoryRange::new(LINUX_APIC_MMIO_BASE, LINUX_APIC_MMIO_LEN);
 
@@ -583,8 +634,10 @@ pub fn plan_bzimage_boot(
         boot_params,
         cmdline: cmdline_range,
         cmdline_len: cmdline.len() as u32,
-        kernel_payload,
-        kernel_payload_file_offset: header.payload_file_offset,
+        kernel_image,
+        kernel_image_file_offset: header.kernel_image_file_offset,
+        compressed_payload_file_offset: header.payload_file_offset,
+        compressed_payload_length: header.payload_length,
         initramfs,
         device_mmio,
         apic_mmio,
@@ -636,7 +689,7 @@ fn build_boot_params(
     put_u32(
         &mut page,
         CODE32_START_OFF,
-        layout.kernel_payload.start as u32,
+        layout.kernel_image.start as u32,
     );
     if let Some(initramfs) = layout.initramfs {
         put_u32(&mut page, RAMDISK_IMAGE_OFF, initramfs.start as u32);
@@ -760,7 +813,7 @@ mod tests {
     fn synthetic_bzimage() -> Vec<u8> {
         let setup_sects = 4u8;
         let setup_bytes = (u64::from(setup_sects) + 1) * SECTOR;
-        let payload_offset = 0x100u32;
+        let payload_offset = 0x400u32;
         let payload_length = 0x800u32;
         let init_size = 0x40_0000u32;
         let total = setup_bytes as usize + payload_offset as usize + payload_length as usize;
@@ -788,6 +841,8 @@ mod tests {
         image[PREF_ADDRESS_OFF..PREF_ADDRESS_OFF + 8].copy_from_slice(&0x20_0000u64.to_le_bytes());
         image[INIT_SIZE_OFF..INIT_SIZE_OFF + 4].copy_from_slice(&init_size.to_le_bytes());
         let payload_start = setup_bytes as usize + payload_offset as usize;
+        image[setup_bytes as usize..payload_start].fill(0x5a);
+        image[setup_bytes as usize + 0x200] = 0xcc;
         image[payload_start..payload_start + payload_length as usize].fill(0xa5);
         image
     }
@@ -799,7 +854,9 @@ mod tests {
         assert_eq!(layout.protocol_version, MIN_PROTOCOL_VERSION);
         assert_eq!(layout.setup_sects, 4);
         assert_eq!(layout.setup_bytes, 5 * SECTOR);
-        assert_eq!(layout.payload_file_offset, 5 * SECTOR + 0x100);
+        assert_eq!(layout.kernel_image_file_offset, 5 * SECTOR);
+        assert_eq!(layout.kernel_image_length, 0xc00);
+        assert_eq!(layout.payload_file_offset, 5 * SECTOR + 0x400);
         assert_eq!(layout.payload_length, 0x800);
         assert_eq!(layout.init_size, 0x40_0000);
         assert_eq!(layout.kernel_alignment, MIN_KERNEL_ALIGNMENT);
@@ -963,6 +1020,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn linux_bzimage_rejects_unsupported_setup_header_pointers() {
+        let mut image = synthetic_bzimage();
+        image[SETUP_DATA_OFF..SETUP_DATA_OFF + 8].copy_from_slice(&0xfeed_cafeu64.to_le_bytes());
+        assert_eq!(
+            parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM),
+            Err(BzImageError::UnsupportedSetupHeaderField {
+                field: "setup_data",
+                value: 0xfeed_cafe,
+            })
+        );
+
+        let mut image = synthetic_bzimage();
+        image[HARDWARE_SUBARCH_OFF..HARDWARE_SUBARCH_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM),
+            Err(BzImageError::UnsupportedSetupHeaderField {
+                field: "hardware_subarch",
+                value: 1,
+            })
+        );
+
+        let mut image = synthetic_bzimage();
+        image[HARDWARE_SUBARCH_DATA_OFF..HARDWARE_SUBARCH_DATA_OFF + 8]
+            .copy_from_slice(&0x1234u64.to_le_bytes());
+        assert_eq!(
+            parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM),
+            Err(BzImageError::UnsupportedSetupHeaderField {
+                field: "hardware_subarch_data",
+                value: 0x1234,
+            })
+        );
+    }
+
     fn parsed_header() -> BzImageLayout {
         let image = synthetic_bzimage();
         parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM).unwrap()
@@ -999,10 +1090,15 @@ mod tests {
             LinuxMemoryRange::new(LINUX_CMDLINE_GPA, 0x2000)
         );
         assert_eq!(
-            plan.layout.kernel_payload,
-            LinuxMemoryRange::new(LINUX_KERNEL_LOAD_GPA, 0x800)
+            plan.layout.kernel_image,
+            LinuxMemoryRange::new(LINUX_KERNEL_LOAD_GPA, 0xc00)
         );
-        assert_eq!(plan.layout.kernel_payload_file_offset, 5 * SECTOR + 0x100);
+        assert_eq!(plan.layout.kernel_image_file_offset, 5 * SECTOR);
+        assert_eq!(
+            plan.layout.compressed_payload_file_offset,
+            5 * SECTOR + 0x400
+        );
+        assert_eq!(plan.layout.compressed_payload_length, 0x800);
         assert_eq!(
             initramfs,
             LinuxMemoryRange::new(MEM - PAGE_SIZE, INITRAMFS_LEN as u64)
@@ -1020,7 +1116,7 @@ mod tests {
             plan.layout.page_tables,
             plan.layout.boot_params,
             plan.layout.cmdline,
-            plan.layout.kernel_payload,
+            plan.layout.kernel_image,
             initramfs,
         ];
         for (index, left) in ranges.iter().enumerate() {
