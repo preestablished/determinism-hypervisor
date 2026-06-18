@@ -4,8 +4,9 @@
 //! ranges only for MSRs the guest legitimately uses. Everything else exits
 //! KVM_EXIT_X86_RDMSR/WRMSR (USER_SPACE_MSR + EXIT_REASON_FILTER, enabled
 //! per-VM in kvm.rs) and is emulated deterministically:
-//! - unknown READ → a fixed config value (0), trace-logged by the caller;
-//! - unknown WRITE → guest #GP (kvm_run.msr.error = 1). Surfacing beats
+//! - denied READ -> a fixed config value (0), trace-logged by the caller;
+//! - denied WRITE -> guest #GP (kvm_run.msr.error = 1), except for
+//!   explicitly classified deterministic no-ops. Surfacing beats
 //!   silently absorbing nondeterminism (risk R6).
 //!
 //! Allow-list note: the bead names "EFER, STAR/LSTAR/CSTAR/FMASK, FS/GS
@@ -15,8 +16,8 @@
 //! time), and every 64-bit kernel writes it on context switch (swapgs).
 
 use kvm_bindings::{
-    kvm_msr_filter, kvm_msr_filter_range, KVM_MSR_FILTER_DEFAULT_DENY, KVM_MSR_FILTER_READ,
-    KVM_MSR_FILTER_WRITE,
+    KVM_MSR_FILTER_DEFAULT_DENY, KVM_MSR_FILTER_READ, KVM_MSR_FILTER_WRITE, kvm_msr_filter,
+    kvm_msr_filter_range,
 };
 use kvm_ioctls::VmFd;
 use std::os::fd::AsRawFd;
@@ -25,10 +26,18 @@ use vmm_sys_util::ioctl_iow_nr;
 
 // Allowed architectural MSRs (Intel SDM numbers).
 pub const MSR_SPEC_CTRL: u32 = 0x48;
+pub const MSR_IA32_TSC: u32 = 0x10;
+pub const MSR_IA32_PLATFORM_ID: u32 = 0x17;
+pub const MSR_IA32_APIC_BASE: u32 = 0x1B;
+pub const MSR_IA32_BIOS_SIGN_ID: u32 = 0x8B;
+pub const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x10A;
 pub const MSR_SYSENTER_CS: u32 = 0x174;
 pub const MSR_SYSENTER_ESP: u32 = 0x175;
 pub const MSR_SYSENTER_EIP: u32 = 0x176;
 pub const MSR_PAT: u32 = 0x277;
+pub const MSR_IA32_MISC_ENABLE: u32 = 0x1A0;
+pub const MSR_X2APIC_BASE: u32 = 0x800;
+pub const MSR_X2APIC_END: u32 = 0x8FF;
 pub const MSR_EFER: u32 = 0xC000_0080;
 pub const MSR_STAR: u32 = 0xC000_0081;
 pub const MSR_LSTAR: u32 = 0xC000_0082;
@@ -102,19 +111,55 @@ pub fn apply_default_deny_filter(vm: &VmFd) -> Result<(), MsrFilterError> {
 pub enum MsrAction {
     /// RDMSR: supply this fixed value (and trace-log the index upstream).
     SupplyValue(u64),
+    /// WRMSR: acknowledge as a deterministic no-op.
+    AckWrite,
     /// WRMSR: inject #GP (set kvm_run.msr.error = 1).
     InjectGp,
 }
 
-/// Unknown READ → fixed value 0 for every denied MSR. One fixed table,
+/// Trace classification for filter-denied MSR exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeniedMsrClass {
+    /// Non-lAPIC Linux early-boot architectural probe or benign write.
+    LinuxCpuCompat,
+    /// Local APIC/x2APIC surface. This stays denied until the lAPIC model.
+    LapicRequired,
+    /// Anything else remains visible as an unclassified denial.
+    Unclassified,
+}
+
+pub fn is_lapic_msr(index: u32) -> bool {
+    index == MSR_IA32_APIC_BASE || (MSR_X2APIC_BASE..=MSR_X2APIC_END).contains(&index)
+}
+
+pub fn denied_msr_class(index: u32, write: bool) -> DeniedMsrClass {
+    if is_lapic_msr(index) {
+        return DeniedMsrClass::LapicRequired;
+    }
+    match (index, write) {
+        (MSR_IA32_PLATFORM_ID, false)
+        | (MSR_IA32_BIOS_SIGN_ID, false)
+        | (MSR_IA32_BIOS_SIGN_ID, true)
+        | (MSR_IA32_ARCH_CAPABILITIES, false)
+        | (MSR_IA32_MISC_ENABLE, false) => DeniedMsrClass::LinuxCpuCompat,
+        _ => DeniedMsrClass::Unclassified,
+    }
+}
+
+/// Denied READ -> fixed value 0 for every denied MSR. One fixed table,
 /// part of machine behavior — never the hardware value (risk R6).
 pub fn on_denied_rdmsr(_index: u32) -> MsrAction {
     MsrAction::SupplyValue(0)
 }
 
-/// Unknown WRITE → #GP, always. Surfacing beats absorbing.
-pub fn on_denied_wrmsr(_index: u32) -> MsrAction {
-    MsrAction::InjectGp
+/// Denied WRITE -> #GP, except for Linux's IA32_BIOS_SIGN_ID microcode
+/// signature trigger, which is architecturally safe to acknowledge as a
+/// deterministic no-op because reads also return the fixed value 0.
+pub fn on_denied_wrmsr(index: u32) -> MsrAction {
+    match index {
+        MSR_IA32_BIOS_SIGN_ID => MsrAction::AckWrite,
+        _ => MsrAction::InjectGp,
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +177,52 @@ mod tests {
         assert_eq!(on_denied_rdmsr(0xE7), MsrAction::SupplyValue(0));
         assert_eq!(on_denied_rdmsr(0x1A0), MsrAction::SupplyValue(0));
         assert_eq!(on_denied_wrmsr(0xE7), MsrAction::InjectGp);
+        assert_eq!(on_denied_wrmsr(MSR_IA32_BIOS_SIGN_ID), MsrAction::AckWrite);
+    }
+
+    #[test]
+    fn linux_cpu_compat_msr_policy_is_explicit() {
+        assert_eq!(
+            denied_msr_class(MSR_IA32_PLATFORM_ID, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_BIOS_SIGN_ID, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_BIOS_SIGN_ID, true),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_ARCH_CAPABILITIES, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_MISC_ENABLE, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_APIC_BASE, false),
+            DeniedMsrClass::LapicRequired
+        );
+        assert_eq!(
+            denied_msr_class(MSR_X2APIC_BASE, true),
+            DeniedMsrClass::LapicRequired
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_TSC, false),
+            DeniedMsrClass::Unclassified,
+            "raw TSC must not become a Linux compat surface"
+        );
+        assert_eq!(on_denied_rdmsr(MSR_IA32_TSC), MsrAction::SupplyValue(0));
+        assert_eq!(on_denied_wrmsr(MSR_IA32_TSC), MsrAction::InjectGp);
+        assert_eq!(on_denied_wrmsr(MSR_IA32_BIOS_SIGN_ID), MsrAction::AckWrite);
+        assert_eq!(
+            denied_msr_class(MSR_IA32_MISC_ENABLE, true),
+            DeniedMsrClass::Unclassified,
+            "unexpected writes to read-probe MSRs remain visible"
+        );
     }
 
     #[test]
@@ -254,6 +345,49 @@ mod tests {
             "Hlt",
             "denied WRMSR must fault, never silently succeed"
         );
+    }
+
+    #[test]
+    fn linux_cpu_compat_bios_sign_id_wrmsr_is_deterministic_noop_live() {
+        if !kvm_available() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
+        apply_default_deny_filter(&slot.vm).unwrap();
+
+        // mov ecx, IA32_BIOS_SIGN_ID; mov eax, 1; xor edx, edx; wrmsr; hlt
+        slot.guest_mem
+            .write_slice(
+                &[
+                    0x66, 0xB9, 0x8B, 0x00, 0x00, 0x00, // mov ecx, 0x8B
+                    0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                    0x66, 0x31, 0xD2, // xor edx, edx
+                    0x0F, 0x30, // wrmsr
+                    0xF4, // hlt
+                ],
+                GuestAddress(0),
+            )
+            .unwrap();
+        let mut sregs = slot.vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        slot.vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = slot.vcpu.get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        slot.vcpu.set_regs(&regs).unwrap();
+
+        match crate::kvm::classify_exit(slot.vcpu.run().unwrap()) {
+            crate::kvm::ExitEvent::MsrWriteDenied { index, data } => {
+                assert_eq!(index, MSR_IA32_BIOS_SIGN_ID);
+                assert_eq!(data, 1);
+            }
+            other => panic!("expected MsrWriteDenied, got {other:?}"),
+        }
+        let exit = slot.vcpu.run().unwrap();
+        assert_eq!(format!("{exit:?}"), "Hlt", "BIOS_SIGN_ID write must ack");
     }
 
     /// Live: allowed MSR (EFER read) does NOT exit — KVM handles it.

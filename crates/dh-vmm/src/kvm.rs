@@ -6,7 +6,7 @@
 //! DISABLE_EXITS) is enforced by construction — this module simply never
 //! creates them, and the smoke test asserts a fresh VM has no irqchip.
 
-use kvm_bindings::{kvm_userspace_memory_region, KVM_API_VERSION};
+use kvm_bindings::{KVM_API_VERSION, kvm_userspace_memory_region};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 
@@ -601,8 +601,8 @@ pub enum ExitEvent {
     MsrReadDenied {
         index: u32,
     },
-    /// Filter-denied WRMSR: #GP already armed by dispatch (msr policy);
-    /// run control surfaces it (never silently absorbed).
+    /// Filter-denied WRMSR: deterministic policy already applied by
+    /// dispatch (#GP or an explicit no-op ack); run control trace-logs it.
     MsrWriteDenied {
         index: u32,
         data: u64,
@@ -670,6 +670,7 @@ pub fn classify_exit(exit: VcpuExit<'_>) -> ExitEvent {
                     *exit.data = v;
                     *exit.error = 0;
                 }
+                crate::msr::MsrAction::AckWrite => *exit.error = 1,
                 crate::msr::MsrAction::InjectGp => *exit.error = 1,
             }
             ExitEvent::MsrReadDenied { index: exit.index }
@@ -677,7 +678,9 @@ pub fn classify_exit(exit: VcpuExit<'_>) -> ExitEvent {
         VcpuExit::X86Wrmsr(exit) => {
             match crate::msr::on_denied_wrmsr(exit.index) {
                 crate::msr::MsrAction::InjectGp => *exit.error = 1,
-                crate::msr::MsrAction::SupplyValue(_) => *exit.error = 0,
+                crate::msr::MsrAction::AckWrite | crate::msr::MsrAction::SupplyValue(_) => {
+                    *exit.error = 0
+                }
             }
             ExitEvent::MsrWriteDenied {
                 index: exit.index,
@@ -967,6 +970,35 @@ mod tests {
         // Second: HLT reaches userspace (no in-kernel irqchip absorption).
         let exit = slot.vcpu.run().unwrap();
         assert_eq!(classify_exit(exit), ExitEvent::Hlt);
+    }
+
+    #[test]
+    fn linux_cpu_compat_rejects_in_kernel_irqchip_pit_and_ioapic_by_construction() {
+        if !kvm_available() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let sys = KvmSystem::open().unwrap();
+        let mut slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
+        use vm_memory::{Bytes, GuestAddress};
+        slot.guest_mem
+            .write_slice(&[0xF4], GuestAddress(0))
+            .unwrap();
+        let mut sregs = slot.vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        slot.vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = slot.vcpu.get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        slot.vcpu.set_regs(&regs).unwrap();
+
+        let exit = slot.vcpu.run().unwrap();
+        assert_eq!(
+            classify_exit(exit),
+            ExitEvent::Hlt,
+            "HLT must exit to userspace when no in-kernel irqchip/PIT/IOAPIC exists"
+        );
     }
 
     #[test]

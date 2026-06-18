@@ -28,7 +28,7 @@ use vmm_sys_util::ioctl_iow_nr;
 
 use dh_detclock::counter::InstRetired;
 
-use crate::boundary::{land_at, Boundary, BoundaryError, Margins};
+use crate::boundary::{Boundary, BoundaryError, Margins, land_at};
 
 // kvm-ioctls 0.24 does not wrap KVM_INTERRUPT (userspace-irqchip vector
 // queue); raw ioctl per the msr.rs pattern.
@@ -236,6 +236,41 @@ mod tests {
         assert_eq!(a, b, "deferral must replay identically");
         assert_eq!(a.0, 250);
         assert_eq!(a.1, 10_000 + 250, "one retirement per deferral step");
+    }
+
+    #[test]
+    fn linux_cpu_compat_interrupt_deferral_is_guest_state_only_live() {
+        let run = || {
+            let (mut slot, counter) = rig()?;
+            let b = land_at(
+                &mut slot.vcpu,
+                &counter,
+                2_000,
+                &Margins::default(),
+                &mut no_exits,
+            )
+            .unwrap();
+            assert!(!injectable(&mut slot.vcpu).unwrap(), "IF=0 guest");
+            let err = inject_at_boundary(
+                &mut slot.vcpu,
+                &counter,
+                0x41,
+                &b,
+                &Margins::default(),
+                32,
+                &mut no_exits,
+            )
+            .unwrap_err();
+            let InjectError::WindowNeverOpened { stepped } = err else {
+                panic!("expected WindowNeverOpened, got {err:?}");
+            };
+            Some((stepped, counter.read().unwrap()))
+        };
+        let (Some(a), Some(b)) = (run(), run()) else {
+            return;
+        };
+        assert_eq!(a, b, "closed-window deferral must replay identically");
+        assert_eq!(a, (32, 2_032));
     }
 
     /// Force the window open (test-only: set IF in RFLAGS at a boundary,

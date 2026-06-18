@@ -37,6 +37,9 @@ const L7_EBX_AVX512_GROUP: u32 =
 // Leaf 7 (subleaf 0) ECX
 const L7_ECX_WAITPKG: u32 = 1 << 5; // UMWAIT/TPAUSE: wall-clock waits in userspace
 
+// Leaf 7 (subleaf 0) EDX
+const L7_EDX_ARCH_CAPABILITIES: u32 = 1 << 29; // host vulnerability/mitigation MSR surface
+
 // Leaf 0x80000001 EDX
 const L8_1_EDX_RDTSCP: u32 = 1 << 27; // RDTSCP: raw TSC + IA32_TSC_AUX reads
 
@@ -93,6 +96,7 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
             (7, 0) => {
                 e.ebx &= !(L7_EBX_RDSEED | L7_EBX_AVX2 | L7_EBX_AVX512_GROUP);
                 e.ecx &= !L7_ECX_WAITPKG;
+                e.edx &= !L7_EDX_ARCH_CAPABILITIES;
             }
             (0xD, _) => {
                 // XSAVE enumeration: host-specific state-area layout,
@@ -231,6 +235,7 @@ mod tests {
                 (7, 0) => {
                     assert_eq!(e.ebx & L7_EBX_RDSEED, 0, "RDSEED");
                     assert_eq!(e.ecx & L7_ECX_WAITPKG, 0, "WAITPKG");
+                    assert_eq!(e.edx & L7_EDX_ARCH_CAPABILITIES, 0, "ARCH_CAPABILITIES");
                     assert_eq!(
                         e.ebx & (L7_EBX_AVX2 | L7_EBX_AVX512_GROUP),
                         0,
@@ -280,6 +285,76 @@ mod tests {
         reversed_entries.reverse();
         let reversed = CpuId::from_entries(&reversed_entries).unwrap();
         assert_eq!(cpuid_table_hash(&masked), cpuid_table_hash(&reversed));
+    }
+
+    #[test]
+    fn linux_cpu_compat_rejects_host_time_entropy_and_kvmclock_live() {
+        if !kvm_available() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let kvm = Kvm::new().unwrap();
+        let masked = masked_cpuid(&kvm).unwrap();
+
+        assert!(
+            !masked
+                .as_slice()
+                .iter()
+                .any(|e| (0x4000_0000..0x4000_0100).contains(&e.function)),
+            "KVM paravirt leaves, including kvmclock, must be removed"
+        );
+        for e in masked.as_slice() {
+            match (e.function, e.index) {
+                (1, _) => {
+                    assert_eq!(e.ecx & L1_ECX_RDRAND, 0, "RDRAND");
+                    assert_eq!(e.ecx & L1_ECX_TSC_DEADLINE, 0, "TSC_DEADLINE");
+                    assert_eq!(e.ecx & L1_ECX_X2APIC, 0, "x2APIC");
+                    assert_eq!(e.ecx & L1_ECX_PDCM, 0, "PDCM");
+                }
+                (7, 0) => {
+                    assert_eq!(e.ebx & L7_EBX_RDSEED, 0, "RDSEED");
+                    assert_eq!(e.edx & L7_EDX_ARCH_CAPABILITIES, 0, "ARCH_CAPABILITIES");
+                }
+                (0x8000_0001, _) => assert_eq!(e.edx & L8_1_EDX_RDTSCP, 0, "RDTSCP"),
+                (0x8000_0007, _) => assert_eq!(e.edx & L8_7_EDX_INVTSC, 0, "INVTSC"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn linux_cpu_compat_cpuid_table_is_in_state_hash_preimage_live() {
+        if !kvm_available() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+        let kvm = Kvm::new().unwrap();
+        let masked = masked_cpuid(&kvm).unwrap();
+        let leaves = to_leaves(&masked);
+        let Some(leaf7) = leaves.iter().position(|e| e.function == 7 && e.index == 0) else {
+            eprintln!("skipping: KVM CPUID table has no leaf 7 subleaf 0");
+            return;
+        };
+
+        let boot = crate::config::BootSpec::Elf {
+            kernel_hash: [0x11; 32],
+            cmdline: Vec::new(),
+        };
+        let mut config =
+            crate::config::MachineConfig::new(2 * 1024 * 1024, [0x22; 32], boot.clone());
+        config.cpuid_table = leaves.clone();
+        let base_config_hash = config.config_hash().unwrap();
+        let base_chain = crate::hash::StateHashChain::new(&base_config_hash, &[0x33; 32]);
+
+        let mut changed_leaves = leaves;
+        changed_leaves[leaf7].edx ^= L7_EDX_ARCH_CAPABILITIES;
+        let mut changed = crate::config::MachineConfig::new(2 * 1024 * 1024, [0x22; 32], boot);
+        changed.cpuid_table = changed_leaves;
+        let changed_config_hash = changed.config_hash().unwrap();
+        let changed_chain = crate::hash::StateHashChain::new(&changed_config_hash, &[0x33; 32]);
+
+        assert_ne!(base_config_hash, changed_config_hash);
+        assert_ne!(base_chain.value(), changed_chain.value());
     }
 
     #[test]
