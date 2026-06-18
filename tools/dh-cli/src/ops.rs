@@ -265,8 +265,15 @@ async fn stream_verify_like_output<W: std::io::Write + ?Sized>(
         .into_inner();
 
     let mut saw_progress = false;
+    let mut saw_divergence = false;
     while let Some(progress) = stream.message().await.map_err(OpError::Rpc)? {
         saw_progress = true;
+        if matches!(
+            progress.msg,
+            Some(proto::verify_replay_progress::Msg::Divergence(_))
+        ) {
+            saw_divergence = true;
+        }
         if json {
             writeln!(
                 out,
@@ -282,11 +289,14 @@ async fn stream_verify_like_output<W: std::io::Write + ?Sized>(
             .map_err(|e| OpError::Io(format!("flush stdout: {e}")))?;
     }
     if json {
-        writeln!(out, "{{\"op\":\"{}\",\"status\":\"ok\"}}", op)
+        let status = if saw_divergence { "divergence" } else { "ok" };
+        writeln!(out, "{{\"op\":\"{}\",\"status\":\"{}\"}}", op, status)
             .map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     } else if !saw_progress {
         writeln!(out, "{op}: no progress")
             .map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
+    } else if saw_divergence {
+        writeln!(out, "{op}: divergence").map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     } else {
         writeln!(out, "{op}: ok").map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     }
@@ -674,10 +684,26 @@ fn progress_human(progress: &proto::VerifyReplayProgress) -> String {
             done.total_icount,
             state_hash_human(done.end_state_hash.as_ref())
         ),
-        Some(Msg::Divergence(div)) => format!(
-            "divergence first_bad_epoch={} icount_range={}..{} suspected_cause={}",
-            div.first_bad_epoch, div.icount_lo, div.icount_hi, div.suspected_cause
-        ),
+        Some(Msg::Divergence(div)) => {
+            let diff_page_idx = div
+                .diff_page_idx
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "divergence first_bad_epoch={} icount_range={}..{} rip_expected={} \
+                 rip_actual={} reg_diff={} diff_page_idx=[{}] suspected_cause={}",
+                div.first_bad_epoch,
+                div.icount_lo,
+                div.icount_hi,
+                div.rip_expected,
+                div.rip_actual,
+                hex(&div.reg_diff),
+                diff_page_idx,
+                div.suspected_cause
+            )
+        }
         None => "missing_progress".into(),
     }
 }
@@ -849,6 +875,7 @@ mod tests {
         #[default]
         Ok,
         ErrorAfterFirst,
+        BisectionDivergence,
     }
 
     #[derive(Clone, Default)]
@@ -1020,10 +1047,27 @@ mod tests {
                     },
                 )),
             };
+            let divergence = proto::VerifyReplayProgress {
+                msg: Some(proto::verify_replay_progress::Msg::Divergence(
+                    proto::Divergence {
+                        first_bad_epoch: 7,
+                        icount_lo: 60_000,
+                        icount_hi: 80_000,
+                        rip_expected: 0xffff_8000_0000_1000,
+                        rip_actual: 0xffff_8000_0000_1004,
+                        reg_diff: vec![0xa1, 0xb2],
+                        diff_page_idx: vec![1536, 1537],
+                        suspected_cause:
+                            "replay-vs-recorded:EPOCH_HASH chain value; evidence_mode=replay-vs-recorded; expected_checkpoint_ref=eeee; actual_probe_ref=aaaa"
+                                .into(),
+                    },
+                )),
+            };
             let mode = *self.verify_mode.lock().unwrap();
             let items = match mode {
                 VerifyMode::Ok => vec![Ok(epoch), Ok(done)],
                 VerifyMode::ErrorAfterFirst => vec![Ok(epoch), Err(Status::data_loss("boom"))],
+                VerifyMode::BisectionDivergence => vec![Ok(divergence)],
             };
             Ok(Response::new(Box::pin(tokio_stream::iter(items))))
         }
@@ -1405,6 +1449,58 @@ mod tests {
             "progress must be written before the stream error: {out}"
         );
         assert!(matches!(worker.calls()[0], SeenCall::VerifyReplay(_)));
+    }
+
+    #[tokio::test]
+    async fn verify_renders_bisection_divergence_json_and_human() {
+        let worker = FakeWorker::default();
+        worker.set_verify_mode(VerifyMode::BisectionDivergence);
+        let (result, out, worker) = run_fake(
+            "verify",
+            &[
+                "--snapshot",
+                "abababababababababababababababababababababababababababababababab",
+                "--input-log-id",
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                "--json",
+            ],
+            worker,
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("\"type\":\"divergence\""));
+        assert!(out.contains("\"first_bad_epoch\":7"));
+        assert!(out.contains("\"icount_lo\":60000"));
+        assert!(out.contains("\"icount_hi\":80000"));
+        assert!(out.contains("\"rip_expected\":18446603336221200384"));
+        assert!(out.contains("\"rip_actual\":18446603336221200388"));
+        assert!(out.contains("\"reg_diff\":\"a1b2\""));
+        assert!(out.contains("\"diff_page_idx\":[1536,1537]"));
+        assert!(out.contains("evidence_mode=replay-vs-recorded"));
+        assert!(out.contains("\"status\":\"divergence\""));
+        assert!(matches!(worker.calls()[0], SeenCall::VerifyReplay(_)));
+
+        let worker = FakeWorker::default();
+        worker.set_verify_mode(VerifyMode::BisectionDivergence);
+        let (result, out, _worker) = run_fake(
+            "verify",
+            &[
+                "--snapshot",
+                "abababababababababababababababababababababababababababababababab",
+                "--input-log-id",
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            ],
+            worker,
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("divergence first_bad_epoch=7 icount_range=60000..80000"));
+        assert!(out.contains("rip_expected=18446603336221200384"));
+        assert!(out.contains("rip_actual=18446603336221200388"));
+        assert!(out.contains("reg_diff=a1b2"));
+        assert!(out.contains("diff_page_idx=[1536,1537]"));
+        assert!(out.contains("expected_checkpoint_ref=eeee"));
+        assert!(out.contains("verify: divergence"));
     }
 
     #[test]
