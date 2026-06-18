@@ -34,22 +34,21 @@
 //! TIME, ENTR + one section per non-entropy bus device). Anything else is
 //! a loud error: restoring a snapshot into a differently-shaped machine is
 //! a determinism bug, never a "best effort". Two deliberate special
-//! shapes: LAPC is EXPECTED to be an empty v1 section (no lapic-stub
-//! struct exists yet; a future struct is a sec_version bump on both
-//! sides), and ENTR v2 splits into the VMM-owned PRNG
+//! shapes: legacy empty LAPC v1 is reset-state compatibility while LAPC
+//! v2 carries the deterministic lAPIC model, and ENTR v2 splits into the VMM-owned PRNG
 //! (`DetEntropy::restore`) + the pv-entropy device regs fed to
 //! `device.restore(&regs, 1)` — the DEVICE's version 1, never the
 //! section's 2 (the 6yl version-domain split).
 
 use dh_detclock::counter::InstRetired;
-use dh_devices::clock::{PvClock, DEVICE_ID_PV_CLOCK};
-use dh_devices::entropy::{DetEntropy, EntropyState, DEVICE_ID_PV_ENTROPY};
-use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, TimeSection};
+use dh_devices::clock::{DEVICE_ID_PV_CLOCK, PvClock};
+use dh_devices::entropy::{DEVICE_ID_PV_ENTROPY, DetEntropy, EntropyState};
+use dh_snapshot::dhsnap::{Container, EntrSectionV2, LapcSection, TimeSection, tag};
 use dh_vmm::config::MachineConfig;
 use dh_vmm::dirty::{DirtyPageSet, PAGE_SIZE};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
-use dh_vmm::{vcpu_state, SlotState};
+use dh_vmm::{SlotState, vcpu_state};
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 use vm_memory::{Bytes, GuestAddress};
@@ -94,6 +93,8 @@ pub struct RestoreOutcome {
     pub chain: StateHashChain,
     /// The restored §5 PRNG. Replaces the slot's `DetEntropy` wholesale.
     pub entropy: DetEntropy,
+    /// Restored deterministic lAPIC model.
+    pub lapic: dh_vmm::lapic::LocalApic,
 }
 
 /// Recover the `MachineConfig` embedded in a snapshot's DHSNAP `MCFG`
@@ -200,6 +201,7 @@ pub fn restore_snapshot(
         epoch_index: applied.epoch_index,
         chain: applied.chain,
         entropy: applied.entropy,
+        lapic: applied.lapic,
     })
 }
 
@@ -211,6 +213,7 @@ pub(crate) struct AppliedMachine {
     pub epoch_index: u64,
     pub chain: StateHashChain,
     pub entropy: DetEntropy,
+    pub lapic: dh_vmm::lapic::LocalApic,
 }
 
 fn validate_dhsnap_blob(blob: &snapstore_manifest::DeviceBlob) -> Result<(), RestoreError> {
@@ -300,17 +303,14 @@ pub(crate) fn apply_dhsnap(
     let time = TimeSection::decode(t.contents, t.sec_version)
         .map_err(|e| RestoreError::Codec(format!("TIME: {e:?}")))?;
 
-    // LAPC: empty v1 IS the expected shape (capture writes it that way —
-    // no in-kernel irqchip, injection state lives in run control). Anything
-    // else came from a newer writer this engine cannot restore.
+    // LAPC: v2 carries the deterministic userspace lAPIC model. Empty v1
+    // remains a compatibility alias for reset state; any other malformed
+    // LAPC is a loud restore failure.
     let lapc = section(tag::LAPC)?;
-    if lapc.sec_version != 1 || !lapc.contents.is_empty() {
-        return Err(RestoreError::Codec(format!(
-            "LAPC v{} with {} bytes — this engine only restores the empty v1 placeholder",
-            lapc.sec_version,
-            lapc.contents.len()
-        )));
-    }
+    let lapc_section = LapcSection::decode_compat(lapc.contents, lapc.sec_version)
+        .map_err(|e| RestoreError::Codec(format!("LAPC: {e:?}")))?;
+    let lapic = dh_vmm::lapic::LocalApic::from_lapc_section(lapc_section)
+        .map_err(|e| RestoreError::Codec(format!("LAPC: {e:?}")))?;
 
     let e = section(tag::ENTR)?;
     let entr = EntrSectionV2::decode(e.contents, e.sec_version)
@@ -412,5 +412,6 @@ pub(crate) fn apply_dhsnap(
             stream: entr.stream,
             word_pos: entr.word_pos,
         }),
+        lapic,
     })
 }

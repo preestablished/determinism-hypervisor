@@ -17,23 +17,23 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::ctx::VecGuestMem;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
-use dh_devices::pad::{PvPad, PV_PAD_BASE, REG_FRAME_COUNTER};
+use dh_devices::pad::{PV_PAD_BASE, PvPad, REG_FRAME_COUNTER};
 use dh_devices::{DevCtx, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
-use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, Until};
-use dh_vmm::SlotState;
+use dh_vmm::runctl::{Segment, SegmentOutcome, StopReason, Until, run_segment};
 use dh_worker::restore_engine::restore_snapshot;
-use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
+use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
 
 const MEM: u64 = 16 << 20;
 const FIRST_FRAMES: u64 = 3;
@@ -127,6 +127,7 @@ fn run_frames(
         timer: None,
         pause: &pause,
         sdk_events: None,
+        hash_device_sections: None,
     };
     let out = run_segment(
         &mut seg,

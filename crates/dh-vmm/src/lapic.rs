@@ -5,6 +5,7 @@
 //! before the full interrupt/timer persistence bead lands.
 
 use crate::msr::{MSR_IA32_APIC_BASE, MSR_X2APIC_BASE, MSR_X2APIC_END};
+use dh_snapshot::dhsnap::LapcSection;
 
 pub const XAPIC_MMIO_BASE: u64 = 0xfee0_0000;
 pub const XAPIC_MMIO_LEN: u64 = 0x1000;
@@ -105,6 +106,7 @@ pub enum LapicError {
     UnsupportedApicBase { value: u64 },
     UnsupportedTimer { offset: u64, value: u32 },
     UnsupportedIcr { offset: u64, value: u32 },
+    MalformedSnapshot(&'static str),
     InterruptsDisabled,
     BadVector { vector: u8 },
 }
@@ -176,6 +178,84 @@ impl LocalApic {
 
     pub fn is_reset(&self) -> bool {
         self == &Self::default()
+    }
+
+    pub fn to_lapc_section(&self) -> LapcSection {
+        LapcSection {
+            apic_base_msr: self.apic_base_msr,
+            id: self.id,
+            tpr: self.tpr,
+            ldr: self.ldr,
+            dfr: self.dfr,
+            svr: self.svr,
+            isr: self.isr,
+            tmr: self.tmr,
+            irr: self.irr,
+            esr: self.esr,
+            icr_low: self.icr_low,
+            icr_high: self.icr_high,
+            lvt_timer: self.lvt_timer,
+            lvt_thermal: self.lvt_thermal,
+            lvt_perf: self.lvt_perf,
+            lvt_lint0: self.lvt_lint0,
+            lvt_lint1: self.lvt_lint1,
+            lvt_error: self.lvt_error,
+            timer_initial: self.timer_initial,
+            timer_divide: self.timer_divide,
+        }
+    }
+
+    pub fn from_lapc_section(section: LapcSection) -> Result<Self, LapicError> {
+        let apic_base = section.apic_base_msr;
+        if apic_base & APIC_BASE_X2APIC != 0 {
+            return Err(LapicError::MalformedSnapshot(
+                "x2APIC mode is not persisted",
+            ));
+        }
+        if apic_base & APIC_BASE_ADDR_MASK != XAPIC_MMIO_BASE {
+            return Err(LapicError::MalformedSnapshot(
+                "APIC base address is not xAPIC",
+            ));
+        }
+        if apic_base & !(APIC_BASE_ADDR_MASK | APIC_BASE_BSP | APIC_BASE_ENABLE) != 0 {
+            return Err(LapicError::MalformedSnapshot(
+                "APIC base has unsupported bits",
+            ));
+        }
+        if apic_base & APIC_BASE_BSP == 0 {
+            return Err(LapicError::MalformedSnapshot("BSP bit must remain set"));
+        }
+        if section.lvt_timer & LVT_MASKED == 0 {
+            return Err(LapicError::MalformedSnapshot("unmasked lAPIC timer"));
+        }
+        if section.timer_initial != 0 {
+            return Err(LapicError::MalformedSnapshot("armed lAPIC timer"));
+        }
+        if section.icr_low != 0 || section.icr_high != 0 {
+            return Err(LapicError::MalformedSnapshot("pending ICR delivery"));
+        }
+        Ok(Self {
+            apic_base_msr: section.apic_base_msr,
+            id: section.id,
+            tpr: section.tpr,
+            ldr: section.ldr,
+            dfr: section.dfr,
+            svr: section.svr,
+            isr: section.isr,
+            tmr: section.tmr,
+            irr: section.irr,
+            esr: section.esr,
+            icr_low: section.icr_low,
+            icr_high: section.icr_high,
+            lvt_timer: section.lvt_timer,
+            lvt_thermal: section.lvt_thermal,
+            lvt_perf: section.lvt_perf,
+            lvt_lint0: section.lvt_lint0,
+            lvt_lint1: section.lvt_lint1,
+            lvt_error: section.lvt_error,
+            timer_initial: section.timer_initial,
+            timer_divide: section.timer_divide,
+        })
     }
 
     pub fn next_pending_interrupt(&mut self) -> Option<u8> {
@@ -436,6 +516,35 @@ mod tests {
         write4(&mut apic, REG_ICR_LOW, 0).unwrap();
         write4(&mut apic, REG_ICR_HIGH, 0).unwrap();
         assert!(apic.is_reset());
+    }
+
+    #[test]
+    fn linux_lapic_lapc_section_roundtrips_and_rejects_malformed_state() {
+        let mut apic = LocalApic::new();
+        write4(&mut apic, REG_TPR, 0x44).unwrap();
+        write4(&mut apic, REG_LDR, 0x0102_0304).unwrap();
+        write4(&mut apic, REG_SVR, 0x0000_01ff).unwrap();
+        apic.accept_interrupt(0x41).unwrap();
+        assert_eq!(
+            LocalApic::from_lapc_section(apic.to_lapc_section()).unwrap(),
+            apic
+        );
+
+        let mut bad = apic.to_lapc_section();
+        bad.apic_base_msr = RESET_APIC_BASE_MSR | APIC_BASE_X2APIC;
+        assert_eq!(
+            LocalApic::from_lapc_section(bad),
+            Err(LapicError::MalformedSnapshot(
+                "x2APIC mode is not persisted"
+            ))
+        );
+
+        let mut bad = apic.to_lapc_section();
+        bad.lvt_timer = 0;
+        assert_eq!(
+            LocalApic::from_lapc_section(bad),
+            Err(LapicError::MalformedSnapshot("unmasked lAPIC timer"))
+        );
     }
 
     #[test]

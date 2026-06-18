@@ -7,7 +7,8 @@ Checked-in corpus for nightly determinism drift detection:
 - `recording.dhilog`: sealed DHILOG for the 6 guest-second pad-echo recording.
 - `expected.txt`: expected snapshot ref, fixture hashes, end hash, and epoch chain hashes.
 
-Re-baseline only when `ci/determinism-class.lock` is intentionally bumped:
+Re-baseline only when `ci/determinism-class.lock` is intentionally bumped or
+a reviewed code change intentionally changes the state-hash input contract:
 
 ```bash
 DH_WORKER_REGEN_RR_CORPUS=1 cargo test -p dh-worker --test m5_record_replay regenerate_record_replay_corpus_pad_echo_6s -- --ignored --nocapture

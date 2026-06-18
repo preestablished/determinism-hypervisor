@@ -24,18 +24,19 @@
 //! therefore stale wording; veu divergence #8 tracks the upstream fix.
 //!
 //! Section presence (v1): MCFG, VCPU, TIME, ENTR (v2: PRNG + device regs)
-//! always; LAPC always, as an EMPTY v1 section (no lapic-stub struct
-//! exists yet — no in-kernel irqchip, injection state lives in run
-//! control; the struct lands with a later bead as a sec_version bump);
+//! always; LAPC always, as a v2 section carrying the deterministic Rust
+//! lAPIC model (legacy empty v1 restores as reset state);
 //! one section per bus device via the dhsnap id↔tag map (CLKD, PADD,
 //! BLKO, SERL, EVTC…, NETL when bead mmv lands the device). The entropy
 //! device (0x0004) is the documented special case: its reg blob folds
 //! into ENTR v2 instead of being framed alone.
 
-use dh_snapshot::dhsnap::{tag, ContainerWriter, EntrSection, EntrSectionV2, TimeSection};
-use dh_vmm::dirty::{harvest_at_boundary, DirtyPageSet, DirtyRing, PAGE_SIZE};
+use dh_snapshot::dhsnap::{
+    ContainerWriter, EntrSection, EntrSectionV2, LapcSection, TimeSection, tag,
+};
+use dh_vmm::dirty::{DirtyPageSet, DirtyRing, PAGE_SIZE, harvest_at_boundary};
 use dh_vmm::kvm::SlotVm;
-use dh_vmm::{vcpu_state, SlotState};
+use dh_vmm::{SlotState, vcpu_state};
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;
@@ -122,6 +123,32 @@ pub fn take_snapshot(
     source: PageSource<'_>,
     store: &SnapstoreClient,
 ) -> Result<TakeSnapshotOutcome, EngineError> {
+    take_snapshot_with_lapic(
+        slot,
+        slot_state,
+        bus,
+        &dh_vmm::lapic::LocalApic::new(),
+        entropy,
+        machine_config,
+        boundary,
+        source,
+        store,
+    )
+}
+
+/// [`take_snapshot`] with an explicit deterministic lAPIC model.
+#[allow(clippy::too_many_arguments)]
+pub fn take_snapshot_with_lapic(
+    slot: &SlotVm,
+    slot_state: SlotState,
+    bus: &dh_devices::MmioBus,
+    lapic: &dh_vmm::lapic::LocalApic,
+    entropy: &dh_devices::entropy::DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    source: PageSource<'_>,
+    store: &SnapstoreClient,
+) -> Result<TakeSnapshotOutcome, EngineError> {
     validate_take_snapshot_preconditions(slot_state, &boundary)?;
 
     // ── 1. Page set (§8.2: drain ring at the pause) ───────────────────────
@@ -149,7 +176,7 @@ pub fn take_snapshot(
     let pages_shipped = pages.len() as u64;
 
     // ── 3. Assemble DHSNAP ────────────────────────────────────────────────
-    let dhsnap = build_dhsnap(slot, bus, entropy, machine_config, &boundary)?;
+    let dhsnap = build_dhsnap_with_lapic(slot, bus, lapic, entropy, machine_config, &boundary)?;
 
     // ── 4. Ship + manifest + PutSnapshot in one seam: the client's
     //       put_snapshot_from_parts uploads the bare page bytes FIRST
@@ -190,13 +217,37 @@ pub fn capture_bisection_checkpoint_snapshot(
     boundary: BoundaryState,
     store: &SnapstoreClient,
 ) -> Result<BisectionCheckpointSnapshotOutcome, EngineError> {
+    capture_bisection_checkpoint_snapshot_with_lapic(
+        slot,
+        slot_state,
+        bus,
+        &dh_vmm::lapic::LocalApic::new(),
+        entropy,
+        machine_config,
+        boundary,
+        store,
+    )
+}
+
+/// [`capture_bisection_checkpoint_snapshot`] with explicit lAPIC state.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_bisection_checkpoint_snapshot_with_lapic(
+    slot: &SlotVm,
+    slot_state: SlotState,
+    bus: &dh_devices::MmioBus,
+    lapic: &dh_vmm::lapic::LocalApic,
+    entropy: &dh_devices::entropy::DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    store: &SnapstoreClient,
+) -> Result<BisectionCheckpointSnapshotOutcome, EngineError> {
     validate_paused(slot_state)?;
 
     let total_pages = slot.mem_bytes / PAGE_SIZE;
     let page_indices: Vec<u64> = (0..total_pages).collect();
     let pages = read_pages(slot, &page_indices)?;
     let pages_shipped = pages.len() as u64;
-    let dhsnap = build_dhsnap(slot, bus, entropy, machine_config, &boundary)?;
+    let dhsnap = build_dhsnap_with_lapic(slot, bus, lapic, entropy, machine_config, &boundary)?;
     let snapshot_ref = put_snapshot_from_pages(store, None, slot.mem_bytes, pages, dhsnap)?;
 
     Ok(BisectionCheckpointSnapshotOutcome {
@@ -264,9 +315,10 @@ fn put_snapshot_from_pages(
 /// `pub(crate)`: the tier-A fork engine builds the parent's IN-MEMORY
 /// DHSNAP through this exact assembler (§8.4 "decode the parent's
 /// in-memory DHSNAP") — one codec, never a parallel fork-only encoding.
-pub(crate) fn build_dhsnap(
+pub(crate) fn build_dhsnap_with_lapic(
     slot: &SlotVm,
     bus: &dh_devices::MmioBus,
+    lapic: &dh_vmm::lapic::LocalApic,
     entropy: &dh_devices::entropy::DetEntropy,
     machine_config: &dh_vmm::config::MachineConfig,
     boundary: &BoundaryState,
@@ -292,10 +344,13 @@ pub(crate) fn build_dhsnap(
     )
     .map_err(codec)?;
 
-    // LAPC: empty v1 — no lapic-stub struct exists yet (no in-kernel
-    // irqchip; injection state lives in run control). sec_version bump
-    // when the struct lands.
-    w.push_section(tag::LAPC, 1, &[]).map_err(codec)?;
+    // LAPC: deterministic userspace lAPIC model, no in-kernel irqchip.
+    w.push_section(
+        tag::LAPC,
+        LapcSection::VERSION,
+        &lapic.to_lapc_section().encode(),
+    )
+    .map_err(codec)?;
 
     // TIME: the boundary position + chain value.
     w.push_section(

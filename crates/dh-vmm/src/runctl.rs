@@ -232,6 +232,14 @@ pub struct Segment<'a> {
     /// runctl stops when it rises above its segment-start value. `None`
     /// is fine for every other mode; NextSdkEvent without it errs loud.
     pub sdk_events: Option<&'a std::cell::Cell<u64>>,
+    /// Deterministic device-state bytes to fold into each state-hash link.
+    /// The producer is called at the exact hash point, after any exits or
+    /// inputs that landed at that boundary have updated their Rust models.
+    pub hash_device_sections: Option<&'a dyn Fn() -> Vec<u8>>,
+}
+
+fn hash_device_sections(seg: &Segment<'_>) -> Vec<u8> {
+    seg.hash_device_sections.map(|f| f()).unwrap_or_default()
 }
 
 /// Run one segment to its stop. `goal` is consulted only for
@@ -715,8 +723,9 @@ fn run_segment_inner(
         let hashed_epoch =
             point.epoch_hash && (point.final_stop.is_none() || options.hash_final_epoch);
         if hashed_epoch {
+            let device_sections = hash_device_sections(seg);
             seg.chain
-                .push_final_link(seg.slot, &[], point.icount, vns)
+                .push_final_link(seg.slot, &device_sections, point.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             let epoch = seg.config.epoch_len.max(1);
             let checkpointable_slot = checkpointable_epoch.then_some(&*seg.slot);
@@ -798,8 +807,9 @@ fn run_segment_inner(
             let vns = clock
                 .vns_from_icount(b.icount)
                 .ok_or(RunError::ClockOverflow)?;
+            let device_sections = hash_device_sections(seg);
             seg.chain
-                .push_final_link(seg.slot, &[], b.icount, vns)
+                .push_final_link(seg.slot, &device_sections, b.icount, vns)
                 .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
             // The roll-forward lands ON the epoch grid by construction —
             // this link IS an epoch hash (b.icount is a grid multiple) —
@@ -840,8 +850,9 @@ fn finish(
     // every final pause") — exactly ONE link per boundary: a stop point
     // that is also an epoch-hash point was linked in the walk already.
     if hash_final_stop && !already_hashed {
+        let device_sections = hash_device_sections(seg);
         seg.chain
-            .push_final_link(seg.slot, &[], boundary.icount, vns)
+            .push_final_link(seg.slot, &device_sections, boundary.icount, vns)
             .map_err(|e| RunError::Kvm(format!("{e:?}")))?;
     }
     Ok(SegmentOutcome {
@@ -969,6 +980,7 @@ mod tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -1010,6 +1022,7 @@ mod tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let mut polls = 0u32;
         let out = run_segment(
@@ -1049,6 +1062,7 @@ mod tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1086,6 +1100,7 @@ mod tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let mut epochs = Vec::new();
         let out = run_segment_with_epoch_options(
@@ -1132,6 +1147,7 @@ mod tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let mut epochs = Vec::new();
         let out = run_segment_with_epoch_options(
@@ -1178,6 +1194,7 @@ mod tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         assert!(matches!(
             run_segment(
@@ -1251,6 +1268,7 @@ mod halt_tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1320,6 +1338,7 @@ mod halt_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -1495,6 +1514,7 @@ mod timer_tests {
             }),
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         // Budget EQUAL to the deadline: injection and final stop merge
         // into one agenda point, so the queued vector never enters the
@@ -1618,6 +1638,7 @@ mod idt_guest_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -1662,6 +1683,7 @@ mod idt_guest_tests {
             }),
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1700,6 +1722,7 @@ mod idt_guest_tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let err = run_segment(
             &mut seg,
@@ -1814,6 +1837,7 @@ mod event_until_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -1854,6 +1878,7 @@ mod event_until_tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let frame_inputs = [ScheduledFrameInput { frame: 2, index: 0 }];
         let mut landed = Vec::new();
@@ -1906,6 +1931,7 @@ mod event_until_tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1942,6 +1968,7 @@ mod event_until_tests {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,
@@ -1980,6 +2007,7 @@ mod event_until_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: Some(&events),
+                hash_device_sections: None,
             };
             let out = run_segment(
                 &mut seg,
@@ -2033,6 +2061,7 @@ mod event_until_tests {
             timer: None,
             pause: &pause,
             sdk_events: Some(&events),
+            hash_device_sections: None,
         };
         let out = run_segment(
             &mut seg,

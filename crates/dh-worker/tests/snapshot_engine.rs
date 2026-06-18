@@ -6,20 +6,20 @@
 mod common;
 
 use common::{kvm_available, spawn_store_blocking, test_bus};
+use dh_devices::MmioBus;
 use dh_devices::clock::PvClock;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_devices::MmioBus;
-use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, TimeSection};
+use dh_snapshot::dhsnap::{Container, EntrSectionV2, LapcSection, TimeSection, tag};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::{
-    enable_dirty_logging, harvest_at_boundary, DirtyPageSet, DirtyRing, PAGE_SIZE,
+    DirtyPageSet, DirtyRing, PAGE_SIZE, enable_dirty_logging, harvest_at_boundary,
 };
-use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem, SlotVm};
-use dh_vmm::{vcpu_state, SlotState};
+use dh_vmm::kvm::{ExitEvent, KvmSystem, SlotVm, classify_exit};
+use dh_vmm::{SlotState, vcpu_state};
 use dh_worker::snapshot_engine::{
-    capture_bisection_checkpoint_snapshot, take_snapshot, BoundaryState, EngineError, PageSource,
-    DEVICE_BLOB_FORMAT_DHSNAP,
+    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, EngineError, PageSource,
+    capture_bisection_checkpoint_snapshot, take_snapshot,
 };
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
@@ -152,8 +152,13 @@ fn full_snapshot_round_trips_through_the_real_store() {
     let decoded = vcpu_state::decode_section(v.contents, v.sec_version).unwrap();
     let fresh = vcpu_state::capture(&slot).unwrap();
     assert_eq!(decoded, fresh, "VCPU section is the live capture");
-    // LAPC present and empty (v1 placeholder).
-    assert_eq!(dhsnap.get(tag::LAPC).unwrap().contents, &[] as &[u8]);
+    // LAPC carries the reset deterministic userspace lAPIC state by default.
+    let l = dhsnap.get(tag::LAPC).unwrap();
+    assert_eq!(l.sec_version, LapcSection::VERSION);
+    assert_eq!(
+        LapcSection::decode(l.contents, l.sec_version).unwrap(),
+        LapcSection::default()
+    );
 }
 
 #[test]

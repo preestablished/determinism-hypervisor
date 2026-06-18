@@ -33,15 +33,15 @@ use dh_detclock::counter::InstRetired;
 use dh_devices::ctx::GuestMem;
 use dh_inputlog::reader::{LogReader, ReadError, RecordBody};
 use dh_verify::verify::{BisectionDivergence, BisectionEvidence, BisectionMode};
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::MachineConfig;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
 use dh_vmm::recording::{DeviceRail, RecordError};
 use dh_vmm::runctl::{
-    run_segment_with_epoch_options, RunError, RunOptions, Segment, StopReason, Until,
+    RunError, RunOptions, Segment, StopReason, Until, run_segment_with_epoch_options,
 };
-use dh_vmm::SlotState;
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 use std::sync::atomic::AtomicBool;
@@ -50,7 +50,7 @@ use crate::bisection_index::{
     BisectionCheckpointIndex, BisectionDivergenceSite, BisectionSelectionTarget,
     IndexedBisectionCheckpoint, RecordPosition, SelectedBisectionCheckpoint,
 };
-use crate::restore_engine::{restore_snapshot, RestoreError};
+use crate::restore_engine::{RestoreError, restore_snapshot};
 
 /// The structured divergence captured by the epoch sink:
 /// `(what, at_icount, expected, got)`.
@@ -360,7 +360,7 @@ where
         })?;
     if vns != checkpoint.checkpoint_vns {
         return Err(ReplayError::BisectionPrecondition(format!(
-                "VerifyReplay bisection checkpoint vns mismatch at icount {boundary_icount}: log {}, computed {vns}",
+            "VerifyReplay bisection checkpoint vns mismatch at icount {boundary_icount}: log {}, computed {vns}",
             checkpoint.checkpoint_vns
         )));
     }
@@ -545,6 +545,7 @@ where
         store,
     )
     .map_err(ReplayError::Restore)?;
+    rail.lapic = restored.lapic;
     let segment_start_vns = machine_config
         .clock
         .vns_from_icount(0)
@@ -636,6 +637,7 @@ where
             return Ok(None);
         }
         let out = {
+            let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
             let mut seg = Segment {
                 slot,
                 counter,
@@ -646,6 +648,7 @@ where
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: Some(&hash_device_sections),
             };
             run_segment_with_epoch_options(
                 &mut seg,
@@ -899,8 +902,9 @@ where
                         .clock
                         .vns_from_icount($icount)
                         .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
+                    let device_sections = dh_vmm::hash::lapic_section(&rail.borrow().lapic);
                     $chain
-                        .push_final_link($slot, &[], $icount, vns)
+                        .push_final_link($slot, &device_sections, $icount, vns)
                         .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
                     let epoch = machine_config.epoch_len.max(1);
                     let idx = $icount / epoch;
@@ -1166,8 +1170,9 @@ where
             .clock
             .vns_from_icount(header.end_icount)
             .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
+        let device_sections = dh_vmm::hash::lapic_section(&rail.borrow().lapic);
         chain
-            .push_final_link(slot, &[], header.end_icount, vns)
+            .push_final_link(slot, &device_sections, header.end_icount, vns)
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
     }
     let mut live_end = chain.value();

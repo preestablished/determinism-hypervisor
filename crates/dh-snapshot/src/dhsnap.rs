@@ -321,6 +321,181 @@ impl TimeSection {
     }
 }
 
+/// `LAPC` section, sec_version 2: deterministic userspace xAPIC/lAPIC
+/// model state. v1 was the empty placeholder. This layout is field-by-field
+/// little-endian, with explicit reserved bytes after the byte-sized ID/TPR
+/// fields so future readers never depend on Rust struct padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LapcSection {
+    pub apic_base_msr: u64,
+    pub id: u8,
+    pub tpr: u8,
+    pub ldr: u32,
+    pub dfr: u32,
+    pub svr: u32,
+    pub isr: [u32; 8],
+    pub tmr: [u32; 8],
+    pub irr: [u32; 8],
+    pub esr: u32,
+    pub icr_low: u32,
+    pub icr_high: u32,
+    pub lvt_timer: u32,
+    pub lvt_thermal: u32,
+    pub lvt_perf: u32,
+    pub lvt_lint0: u32,
+    pub lvt_lint1: u32,
+    pub lvt_error: u32,
+    pub timer_initial: u32,
+    pub timer_divide: u32,
+}
+
+impl Default for LapcSection {
+    fn default() -> Self {
+        Self {
+            apic_base_msr: 0xfee0_0000 | (1 << 8) | (1 << 11),
+            id: 0,
+            tpr: 0,
+            ldr: 0,
+            dfr: 0xffff_ffff,
+            svr: 0xff,
+            isr: [0; 8],
+            tmr: [0; 8],
+            irr: [0; 8],
+            esr: 0,
+            icr_low: 0,
+            icr_high: 0,
+            lvt_timer: 1 << 16,
+            lvt_thermal: 1 << 16,
+            lvt_perf: 1 << 16,
+            lvt_lint0: 1 << 16,
+            lvt_lint1: 1 << 16,
+            lvt_error: 1 << 16,
+            timer_initial: 0,
+            timer_divide: 0,
+        }
+    }
+}
+
+impl LapcSection {
+    pub const LEN: usize = 168;
+    pub const VERSION: u16 = 2;
+    pub const LEGACY_EMPTY_VERSION: u16 = 1;
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        let mut at = 0usize;
+
+        fn put_u64(out: &mut [u8], at: &mut usize, value: u64) {
+            out[*at..*at + 8].copy_from_slice(&value.to_le_bytes());
+            *at += 8;
+        }
+        fn put_u32(out: &mut [u8], at: &mut usize, value: u32) {
+            out[*at..*at + 4].copy_from_slice(&value.to_le_bytes());
+            *at += 4;
+        }
+        fn put_u32s(out: &mut [u8], at: &mut usize, values: &[u32]) {
+            for value in values {
+                put_u32(out, at, *value);
+            }
+        }
+
+        put_u64(&mut out, &mut at, self.apic_base_msr);
+        out[at] = self.id;
+        at += 1;
+        out[at] = self.tpr;
+        at += 1;
+        at += 6; // reserved, already zero
+        put_u32(&mut out, &mut at, self.ldr);
+        put_u32(&mut out, &mut at, self.dfr);
+        put_u32(&mut out, &mut at, self.svr);
+        put_u32s(&mut out, &mut at, &self.isr);
+        put_u32s(&mut out, &mut at, &self.tmr);
+        put_u32s(&mut out, &mut at, &self.irr);
+        put_u32(&mut out, &mut at, self.esr);
+        put_u32(&mut out, &mut at, self.icr_low);
+        put_u32(&mut out, &mut at, self.icr_high);
+        put_u32(&mut out, &mut at, self.lvt_timer);
+        put_u32(&mut out, &mut at, self.lvt_thermal);
+        put_u32(&mut out, &mut at, self.lvt_perf);
+        put_u32(&mut out, &mut at, self.lvt_lint0);
+        put_u32(&mut out, &mut at, self.lvt_lint1);
+        put_u32(&mut out, &mut at, self.lvt_error);
+        put_u32(&mut out, &mut at, self.timer_initial);
+        put_u32(&mut out, &mut at, self.timer_divide);
+        debug_assert_eq!(at, Self::LEN);
+        out
+    }
+
+    pub fn decode(bytes: &[u8], sec_version: u16) -> Result<Self, SectionError> {
+        if sec_version != Self::VERSION {
+            return Err(SectionError::BadVersion { found: sec_version });
+        }
+        if bytes.len() != Self::LEN {
+            return Err(SectionError::BadLength { found: bytes.len() });
+        }
+        let mut at = 0usize;
+
+        fn take_u64(bytes: &[u8], at: &mut usize) -> u64 {
+            let value = u64::from_le_bytes(bytes[*at..*at + 8].try_into().unwrap());
+            *at += 8;
+            value
+        }
+        fn take_u32(bytes: &[u8], at: &mut usize) -> u32 {
+            let value = u32::from_le_bytes(bytes[*at..*at + 4].try_into().unwrap());
+            *at += 4;
+            value
+        }
+        fn take_u32s<const N: usize>(bytes: &[u8], at: &mut usize) -> [u32; N] {
+            let mut values = [0u32; N];
+            for value in &mut values {
+                *value = take_u32(bytes, at);
+            }
+            values
+        }
+
+        let apic_base_msr = take_u64(bytes, &mut at);
+        let id = bytes[at];
+        at += 1;
+        let tpr = bytes[at];
+        at += 1;
+        if bytes[at..at + 6] != [0u8; 6] {
+            return Err(SectionError::NonzeroReserved { offset: at });
+        }
+        at += 6;
+        let out = Self {
+            apic_base_msr,
+            id,
+            tpr,
+            ldr: take_u32(bytes, &mut at),
+            dfr: take_u32(bytes, &mut at),
+            svr: take_u32(bytes, &mut at),
+            isr: take_u32s(bytes, &mut at),
+            tmr: take_u32s(bytes, &mut at),
+            irr: take_u32s(bytes, &mut at),
+            esr: take_u32(bytes, &mut at),
+            icr_low: take_u32(bytes, &mut at),
+            icr_high: take_u32(bytes, &mut at),
+            lvt_timer: take_u32(bytes, &mut at),
+            lvt_thermal: take_u32(bytes, &mut at),
+            lvt_perf: take_u32(bytes, &mut at),
+            lvt_lint0: take_u32(bytes, &mut at),
+            lvt_lint1: take_u32(bytes, &mut at),
+            lvt_error: take_u32(bytes, &mut at),
+            timer_initial: take_u32(bytes, &mut at),
+            timer_divide: take_u32(bytes, &mut at),
+        };
+        debug_assert_eq!(at, Self::LEN);
+        Ok(out)
+    }
+
+    pub fn decode_compat(bytes: &[u8], sec_version: u16) -> Result<Self, SectionError> {
+        if sec_version == Self::LEGACY_EMPTY_VERSION && bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        Self::decode(bytes, sec_version)
+    }
+}
+
 /// `ENTR` section (§4): ChaCha20 PRNG state, exactly 56 bytes —
 /// `seed [u8;32], stream u64, word_pos u128`. Mirrors dh-devices'
 /// `EntropyState` (rand_chacha's exportable state); restore re-seeds via
@@ -448,4 +623,5 @@ impl EntrSectionV2 {
 pub enum SectionError {
     BadVersion { found: u16 },
     BadLength { found: usize },
+    NonzeroReserved { offset: usize },
 }

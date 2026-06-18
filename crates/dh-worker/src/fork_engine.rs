@@ -30,12 +30,12 @@
 
 use dh_detclock::counter::InstRetired;
 use dh_devices::entropy::DetEntropy;
+use dh_vmm::SlotState;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
-use dh_vmm::SlotState;
 
-use crate::restore_engine::{apply_dhsnap, RestoreError};
-use crate::snapshot_engine::{build_dhsnap, BoundaryState, EngineError};
+use crate::restore_engine::{RestoreError, apply_dhsnap};
+use crate::snapshot_engine::{BoundaryState, EngineError, build_dhsnap_with_lapic};
 
 #[derive(Debug)]
 pub enum ForkError {
@@ -77,6 +77,7 @@ pub struct ForkOutcome {
     /// divergence between siblings comes from inputs or from a caller-chosen
     /// new segment seed, never from host entropy or the fork operation itself.
     pub entropy: DetEntropy,
+    pub lapic: dh_vmm::lapic::LocalApic,
 }
 
 /// One tier-A fork, end to end. On success the child is Paused at the
@@ -97,10 +98,40 @@ pub fn fork_slot(
     child_bus: &mut dh_devices::MmioBus,
     counter: Option<&InstRetired>,
 ) -> Result<ForkOutcome, ForkError> {
+    fork_slot_with_lapic(
+        sys,
+        parent,
+        parent_state,
+        parent_bus,
+        &dh_vmm::lapic::LocalApic::new(),
+        parent_entropy,
+        machine_config,
+        boundary,
+        entropy_seed,
+        child_bus,
+        counter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fork_slot_with_lapic(
+    sys: &KvmSystem,
+    parent: &SlotVm,
+    parent_state: SlotState,
+    parent_bus: &dh_devices::MmioBus,
+    parent_lapic: &dh_vmm::lapic::LocalApic,
+    parent_entropy: &DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    entropy_seed: Option<[u8; 32]>,
+    child_bus: &mut dh_devices::MmioBus,
+    counter: Option<&InstRetired>,
+) -> Result<ForkOutcome, ForkError> {
     let dhsnap = prepare_parent_dhsnap(
         parent,
         parent_state,
         parent_bus,
+        parent_lapic,
         parent_entropy,
         machine_config,
         boundary,
@@ -136,10 +167,43 @@ pub fn fork_slot_with_child_bus<F>(
 where
     F: FnOnce(&SlotVm) -> Result<dh_devices::MmioBus, String>,
 {
+    fork_slot_with_child_bus_with_lapic(
+        sys,
+        parent,
+        parent_state,
+        parent_bus,
+        &dh_vmm::lapic::LocalApic::new(),
+        parent_entropy,
+        machine_config,
+        boundary,
+        entropy_seed,
+        counter,
+        build_child_bus,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fork_slot_with_child_bus_with_lapic<F>(
+    sys: &KvmSystem,
+    parent: &SlotVm,
+    parent_state: SlotState,
+    parent_bus: &dh_devices::MmioBus,
+    parent_lapic: &dh_vmm::lapic::LocalApic,
+    parent_entropy: &DetEntropy,
+    machine_config: &dh_vmm::config::MachineConfig,
+    boundary: BoundaryState,
+    entropy_seed: Option<[u8; 32]>,
+    counter: Option<&InstRetired>,
+    build_child_bus: F,
+) -> Result<(ForkOutcome, dh_devices::MmioBus), ForkError>
+where
+    F: FnOnce(&SlotVm) -> Result<dh_devices::MmioBus, String>,
+{
     let dhsnap = prepare_parent_dhsnap(
         parent,
         parent_state,
         parent_bus,
+        parent_lapic,
         parent_entropy,
         machine_config,
         boundary,
@@ -164,6 +228,7 @@ fn prepare_parent_dhsnap(
     parent: &SlotVm,
     parent_state: SlotState,
     parent_bus: &dh_devices::MmioBus,
+    parent_lapic: &dh_vmm::lapic::LocalApic,
     parent_entropy: &DetEntropy,
     machine_config: &dh_vmm::config::MachineConfig,
     boundary: BoundaryState,
@@ -179,9 +244,10 @@ fn prepare_parent_dhsnap(
 
     // ── 1. The parent's in-memory DHSNAP (§8.4: "decode the parent's
     //       in-memory DHSNAP, cheap, ~tens of KiB") ───────────────────────
-    build_dhsnap(
+    build_dhsnap_with_lapic(
         parent,
         parent_bus,
+        parent_lapic,
         parent_entropy,
         machine_config,
         &boundary,
@@ -221,5 +287,6 @@ fn finish_fork(
         epoch_index: applied.epoch_index,
         chain: applied.chain,
         entropy,
+        lapic: applied.lapic,
     })
 }

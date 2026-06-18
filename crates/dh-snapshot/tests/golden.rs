@@ -1,19 +1,22 @@
 //! DHSNAP v1.0 golden-bytes freeze (bead 9tl) — same triple-freeze
 //! discipline as the DHILOG fixtures (dh-inputlog/tests/golden.rs, bp9):
 //!
-//! `tests/fixtures/v1_kitchen_sink.dhsnap` carries one section per §4 tag
-//! (all 11), with the engine-owned TIME/ENTR typed layouts and
+//! `tests/fixtures/v1_kitchen_sink_lapc_v2.dhsnap` carries one section per
+//! §4 tag (all 11), with the engine-owned TIME/ENTR/LAPC typed layouts and
 //! representative owner-shaped payloads for the rest (EVTC at its v1
-//! 39-byte length, PADD at 21, empty NETL/SERL per their rules).
+//! 39-byte length, PADD at 21, empty NETL/SERL per their rules). The legacy
+//! `tests/fixtures/v1_kitchen_sink.dhsnap` remains hash-pinned as the
+//! pre-LAPC-v2 container fixture.
 //! `tests/fixtures/v1_minimal.dhsnap` is the empty container (header only).
 //!
 //! THE V1.0 CONTAINER LAYOUT FREEZES HERE: (1) checked-in fixture bytes are
 //! BLAKE3-pinned, (2) today's writer re-serializes the same inputs to the
 //! identical bytes, (3) the reader decodes every section to pinned values.
-//! A layout change requires a format-version bump plus NEW fixture files —
-//! never edit the checked-in v1.0 files, and never regenerate + re-pin the
-//! hashes in the same change (that is exactly the laundering the pins
-//! exist to catch).
+//! A container layout change requires a format-version bump plus NEW fixture
+//! files; a section layout version bump also lands under a NEW fixture name.
+//! Never edit old checked-in fixture files, and never regenerate + re-pin
+//! hashes in the same change unless it is an explicit versioned fixture
+//! addition (that is exactly the laundering the pins exist to catch).
 //!
 //! Section CONTENTS here are framing-representative, not authoritative
 //! device states: each device freezes its own contents via its
@@ -32,10 +35,13 @@ use std::path::PathBuf;
 /// any change touching BOTH these constants and the fixture files in one
 /// PR is laundering a format break — reject unless it is an explicit
 /// version bump landing NEW fixture file names.
-const KITCHEN_SINK_BLAKE3: &str =
+const LEGACY_KITCHEN_SINK_BLAKE3: &str =
     "9014b09685b48490c4e93a708ad3a56d074554174d8e008d41168571b4853a91";
+const KITCHEN_SINK_LAPC_V2_BLAKE3: &str =
+    "f67536b64965ac7f783a5f2a42993754b0efbb1b8af3b249d7c4d603fa29e367";
 const ENTR_V2_BLAKE3: &str = "17c06b954816baebff872761013d067bb43872761ac25bf86035b972d00e79cf";
 const MINIMAL_BLAKE3: &str = "2e9df50e686e7d1c167d61beb669c6fadb67636d34c06807bfeb30fe50e084aa";
+const KITCHEN_SINK_LAPC_V2: &str = "v1_kitchen_sink_lapc_v2.dhsnap";
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -43,9 +49,9 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The canonical kitchen-sink build: one section per §4 tag in table
+/// The canonical current kitchen-sink build: one section per §4 tag in table
 /// order, deliberately byte-order-sensitive values. This function's output
-/// is what v1.0 freezes.
+/// freezes the v1.0 container framing with a LAPC v2 typed section.
 fn build_kitchen_sink() -> Vec<u8> {
     let mut w = ContainerWriter::new();
     // Owner-shaped representative payloads (sizes match the real owners).
@@ -57,7 +63,12 @@ fn build_kitchen_sink() -> Vec<u8> {
         &(0u8..200).map(|i| i ^ 0xA5).collect::<Vec<u8>>(),
     )
     .unwrap();
-    w.push_section(tag::LAPC, 1, &[0x4C; 40]).unwrap();
+    w.push_section(
+        tag::LAPC,
+        LapcSection::VERSION,
+        &kitchen_sink_lapc().encode(),
+    )
+    .unwrap();
     w.push_section(
         tag::TIME,
         TimeSection::VERSION,
@@ -88,6 +99,21 @@ fn build_kitchen_sink() -> Vec<u8> {
     w.push_section(tag::NETL, 1, &[]).unwrap();
     w.push_section(tag::SERL, 1, &[]).unwrap();
     w.finish()
+}
+
+fn kitchen_sink_lapc() -> LapcSection {
+    let mut lapc = LapcSection::default();
+    lapc.id = 0x20;
+    lapc.tpr = 0x44;
+    lapc.ldr = 0x0102_0304;
+    lapc.svr = 0x0000_01ff;
+    lapc.isr[2] = 0x8000_0000;
+    lapc.tmr[4] = 0x0000_0001;
+    lapc.irr[7] = 0x4000_0000;
+    lapc.esr = 0x55aa;
+    lapc.lvt_lint0 = 0x0001_0700;
+    lapc.timer_divide = 0x3;
+    lapc
 }
 
 fn build_minimal() -> Vec<u8> {
@@ -126,17 +152,27 @@ fn load_or_regen(name: &str, built: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn kitchen_sink_fixture_is_frozen() {
-    let built = build_kitchen_sink();
-    let fixture = load_or_regen("v1_kitchen_sink.dhsnap", &built);
+fn legacy_kitchen_sink_fixture_bytes_remain_frozen() {
+    let fixture = std::fs::read(fixture_path("v1_kitchen_sink.dhsnap")).unwrap();
     assert_eq!(
         blake3::hash(&fixture).to_hex().as_str(),
-        KITCHEN_SINK_BLAKE3,
-        "checked-in fixture changed — the v1.0 freeze is violated"
+        LEGACY_KITCHEN_SINK_BLAKE3,
+        "legacy pre-LAPC-v2 fixture changed"
+    );
+}
+
+#[test]
+fn kitchen_sink_lapc_v2_fixture_is_frozen() {
+    let built = build_kitchen_sink();
+    let fixture = load_or_regen(KITCHEN_SINK_LAPC_V2, &built);
+    assert_eq!(
+        blake3::hash(&fixture).to_hex().as_str(),
+        KITCHEN_SINK_LAPC_V2_BLAKE3,
+        "checked-in LAPC v2 fixture changed — the v1.0/LAPC-v2 freeze is violated"
     );
     assert_eq!(
         built, fixture,
-        "writer output drifted from the frozen v1.0 fixture"
+        "writer output drifted from the frozen v1.0/LAPC-v2 fixture"
     );
 }
 
@@ -157,14 +193,24 @@ fn minimal_fixture_is_frozen() {
 
 #[test]
 fn kitchen_sink_fixture_parses_to_pinned_sections() {
-    let fixture = std::fs::read(fixture_path("v1_kitchen_sink.dhsnap")).unwrap();
+    let fixture = std::fs::read(fixture_path(KITCHEN_SINK_LAPC_V2)).unwrap();
     let c = Container::parse(&fixture).expect("frozen fixture must parse");
 
     let tags: Vec<[u8; 4]> = c.sections().map(|s| s.tag).collect();
     assert_eq!(tags, KNOWN_TAGS.to_vec());
     // Header version + every section's declared layout version.
     assert_eq!(&fixture[6..8], &FORMAT_VERSION.to_le_bytes());
-    assert!(c.sections().all(|s| s.sec_version == 1));
+    assert_eq!(c.get(tag::MCFG).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::VCPU).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::LAPC).unwrap().sec_version, LapcSection::VERSION);
+    assert_eq!(c.get(tag::TIME).unwrap().sec_version, TimeSection::VERSION);
+    assert_eq!(c.get(tag::ENTR).unwrap().sec_version, EntrSection::VERSION);
+    assert_eq!(c.get(tag::CLKD).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::PADD).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::EVTC).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::BLKO).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::NETL).unwrap().sec_version, 1);
+    assert_eq!(c.get(tag::SERL).unwrap().sec_version, 1);
 
     // Reader half of the freeze: every section's contents pinned. (The
     // expected-value expressions are shared with build_kitchen_sink, so
@@ -178,7 +224,11 @@ fn kitchen_sink_fixture_parses_to_pinned_sections() {
         c.get(tag::VCPU).unwrap().contents,
         (0u8..200).map(|i| i ^ 0xA5).collect::<Vec<u8>>().as_slice()
     );
-    assert_eq!(c.get(tag::LAPC).unwrap().contents, &[0x4C; 40][..]);
+    let l = c.get(tag::LAPC).unwrap();
+    assert_eq!(
+        LapcSection::decode(l.contents, l.sec_version).unwrap(),
+        kitchen_sink_lapc()
+    );
 
     let t = c.get(tag::TIME).unwrap();
     assert_eq!(
