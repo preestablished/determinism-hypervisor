@@ -1,7 +1,9 @@
 //! Shared rig for the determinism gate tests: boot a guest, run one
 //! segment at a time, read the timer-guest ISR table.
 
+use std::ffi::OsString;
 use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
@@ -23,6 +25,118 @@ pub fn kvm_usable() -> bool {
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => false,
         Err(e) => panic!("unexpected /dev/kvm probe failure: {e}"),
     }
+}
+
+#[allow(dead_code)]
+pub const DH_M9_BZIMAGE: &str = "DH_M9_BZIMAGE";
+#[allow(dead_code)]
+pub const DH_M9_INITRAMFS: &str = "DH_M9_INITRAMFS";
+#[allow(dead_code)]
+pub const DH_M9_BASE_IMAGE: &str = "DH_M9_BASE_IMAGE";
+#[allow(dead_code)]
+pub const DH_M9_GAME_IMAGE: &str = "DH_M9_GAME_IMAGE";
+#[allow(dead_code)]
+pub const DH_M9_IMAGE_CACHE: &str = "DH_M9_IMAGE_CACHE";
+
+#[allow(dead_code)]
+pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [
+    DH_M9_BZIMAGE,
+    DH_M9_INITRAMFS,
+    DH_M9_BASE_IMAGE,
+    DH_M9_GAME_IMAGE,
+    DH_M9_IMAGE_CACHE,
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct M9LinuxArtifacts {
+    pub bzimage: PathBuf,
+    pub initramfs: PathBuf,
+    pub base_image: PathBuf,
+    pub game_image: PathBuf,
+    pub image_cache: PathBuf,
+}
+
+#[allow(dead_code)]
+impl M9LinuxArtifacts {
+    pub fn from_env_required(test_name: &str) -> Result<Self, String> {
+        let artifacts = Self::from_lookup(test_name, |name| std::env::var_os(name))?;
+        artifacts.validate_paths()?;
+        Ok(artifacts)
+    }
+
+    pub fn from_lookup<F>(test_name: &str, mut lookup: F) -> Result<Self, String>
+    where
+        F: FnMut(&str) -> Option<OsString>,
+    {
+        let mut missing = Vec::new();
+        let mut required = |name: &'static str| -> Option<PathBuf> {
+            match lookup(name) {
+                Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+                _ => {
+                    missing.push(name);
+                    None
+                }
+            }
+        };
+
+        let bzimage = required(DH_M9_BZIMAGE);
+        let initramfs = required(DH_M9_INITRAMFS);
+        let base_image = required(DH_M9_BASE_IMAGE);
+        let game_image = required(DH_M9_GAME_IMAGE);
+        let image_cache = required(DH_M9_IMAGE_CACHE);
+
+        if !missing.is_empty() {
+            return Err(format!(
+                "M9 Linux acceptance test {test_name:?} requested, but missing required artifact env vars: {}. Set all of {}. *_ALLOW_SKIP=1 is not accepted for final M9 gates.",
+                missing.join(", "),
+                M9_LINUX_ARTIFACT_ENV_VARS.join(", ")
+            ));
+        }
+
+        Ok(Self {
+            bzimage: bzimage.expect("missing handled above"),
+            initramfs: initramfs.expect("missing handled above"),
+            base_image: base_image.expect("missing handled above"),
+            game_image: game_image.expect("missing handled above"),
+            image_cache: image_cache.expect("missing handled above"),
+        })
+    }
+
+    fn validate_paths(&self) -> Result<(), String> {
+        require_regular_file(DH_M9_BZIMAGE, &self.bzimage)?;
+        require_regular_file(DH_M9_INITRAMFS, &self.initramfs)?;
+        require_regular_file(DH_M9_BASE_IMAGE, &self.base_image)?;
+        require_regular_file(DH_M9_GAME_IMAGE, &self.game_image)?;
+        require_directory(DH_M9_IMAGE_CACHE, &self.image_cache)?;
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+fn require_regular_file(env_name: &str, path: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("{env_name}={} is not readable: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{env_name}={} must name a regular file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn require_directory(env_name: &str, path: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("{env_name}={} is not readable: {e}", path.display()))?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "{env_name}={} must name an existing directory",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)] // used by if0_deferral, not timer_determinism (per-test compilation)
@@ -115,5 +229,32 @@ impl Rig {
             )
             .unwrap();
         (count, vecs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m9_artifact_lookup_reports_all_missing_vars() {
+        let err = M9LinuxArtifacts::from_lookup("linux-ready", |_| None).unwrap_err();
+        for name in M9_LINUX_ARTIFACT_ENV_VARS {
+            assert!(err.contains(name), "error did not mention {name}: {err}");
+        }
+        assert!(err.contains("*_ALLOW_SKIP=1"));
+    }
+
+    #[test]
+    fn m9_artifact_lookup_accepts_all_required_vars() {
+        let artifacts = M9LinuxArtifacts::from_lookup("linux-ready", |name| {
+            Some(OsString::from(format!("/tmp/{name}")))
+        })
+        .unwrap();
+        assert_eq!(artifacts.bzimage, PathBuf::from("/tmp/DH_M9_BZIMAGE"));
+        assert_eq!(
+            artifacts.image_cache,
+            PathBuf::from("/tmp/DH_M9_IMAGE_CACHE")
+        );
     }
 }

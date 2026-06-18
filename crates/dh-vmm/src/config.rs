@@ -89,6 +89,125 @@ pub const DEFAULT_RESYNC_SLACK: u32 = 1024;
 pub const MAX_CMDLINE: usize = 4096;
 pub const MAX_CPUID_LEAVES: usize = 4096;
 pub const MAX_DEVICES: usize = 256;
+pub const BZIMAGE_FORCED_CMDLINE: &[u8] = b"console=ttyS0 nokaslr norandmaps random.trust_cpu=off tsc=unstable clocksource=dh-pvclock nohz=off highres=off init=/init";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BzImageCmdlineExtras {
+    quiet: bool,
+    loglevel: Option<u8>,
+}
+
+pub fn canonicalize_bzimage_cmdline_extras(extras: &[u8]) -> Result<Vec<u8>, ConfigError> {
+    let extras = parse_bzimage_cmdline_extras(extras)?;
+    compose_bzimage_cmdline(BZIMAGE_FORCED_CMDLINE, extras)
+}
+
+pub fn bzimage_cmdline_extras_from_canonical(cmdline: &[u8]) -> Result<Vec<u8>, ConfigError> {
+    if cmdline == BZIMAGE_FORCED_CMDLINE {
+        return Ok(Vec::new());
+    }
+    let Some(rest) = cmdline.strip_prefix(BZIMAGE_FORCED_CMDLINE) else {
+        return Err(ConfigError::BzImageCmdlineNotCanonical);
+    };
+    let Some(extras) = rest.strip_prefix(b" ") else {
+        return Err(ConfigError::BzImageCmdlineNotCanonical);
+    };
+    let recanonicalized = canonicalize_bzimage_cmdline_extras(extras)?;
+    if recanonicalized != cmdline {
+        return Err(ConfigError::BzImageCmdlineNotCanonical);
+    }
+    Ok(extras.to_vec())
+}
+
+fn parse_bzimage_cmdline_extras(extras: &[u8]) -> Result<BzImageCmdlineExtras, ConfigError> {
+    if extras.is_empty() {
+        return Ok(BzImageCmdlineExtras::default());
+    }
+    if extras.contains(&0) {
+        return Err(ConfigError::BzImageCmdlineNul);
+    }
+    if !extras.is_ascii() {
+        return Err(ConfigError::BzImageCmdlineNonAscii);
+    }
+    if extras.first().is_some_and(u8::is_ascii_whitespace)
+        || extras.last().is_some_and(u8::is_ascii_whitespace)
+        || extras
+            .windows(2)
+            .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
+    {
+        return Err(ConfigError::BzImageCmdlineEmptyToken);
+    }
+
+    let mut parsed = BzImageCmdlineExtras::default();
+    for token in extras.split(u8::is_ascii_whitespace) {
+        if is_forced_bzimage_baseline_key(token) {
+            return Err(ConfigError::BzImageCmdlineBaselineOverride);
+        }
+        if token == b"quiet" {
+            if parsed.quiet {
+                return Err(ConfigError::BzImageCmdlineDuplicateToken);
+            }
+            parsed.quiet = true;
+            continue;
+        }
+        if let Some(raw) = token.strip_prefix(b"loglevel=") {
+            if parsed.loglevel.is_some() {
+                return Err(ConfigError::BzImageCmdlineDuplicateToken);
+            }
+            if raw.len() != 1 || !(b'0'..=b'7').contains(&raw[0]) {
+                return Err(ConfigError::BzImageCmdlineUnsupportedToken);
+            }
+            parsed.loglevel = Some(raw[0] - b'0');
+            continue;
+        }
+        return Err(ConfigError::BzImageCmdlineUnsupportedToken);
+    }
+    Ok(parsed)
+}
+
+fn compose_bzimage_cmdline(
+    baseline: &[u8],
+    extras: BzImageCmdlineExtras,
+) -> Result<Vec<u8>, ConfigError> {
+    let mut out = baseline.to_vec();
+    if extras.quiet {
+        out.extend_from_slice(b" quiet");
+    }
+    if let Some(level) = extras.loglevel {
+        out.extend_from_slice(b" loglevel=");
+        out.push(b'0' + level);
+    }
+    if out.len() > MAX_CMDLINE {
+        return Err(ConfigError::CmdlineTooLong);
+    }
+    Ok(out)
+}
+
+fn validate_canonical_bzimage_cmdline(cmdline: &[u8]) -> Result<(), ConfigError> {
+    if cmdline.len() > MAX_CMDLINE {
+        return Err(ConfigError::CmdlineTooLong);
+    }
+    bzimage_cmdline_extras_from_canonical(cmdline).map(|_| ())
+}
+
+fn is_forced_bzimage_baseline_key(token: &[u8]) -> bool {
+    let key = token
+        .split(|b| *b == b'=')
+        .next()
+        .expect("split always yields one item");
+    matches!(
+        key,
+        b"console"
+            | b"nokaslr"
+            | b"norandmaps"
+            | b"random.trust_cpu"
+            | b"tsc"
+            | b"clocksource"
+            | b"nohz"
+            | b"highres"
+            | b"init"
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineConfig {
@@ -157,6 +276,9 @@ impl MachineConfig {
         };
         if cmdline.len() > MAX_CMDLINE {
             return Err(ConfigError::CmdlineTooLong);
+        }
+        if let BootSpec::BzImage { cmdline, .. } = &self.boot {
+            validate_canonical_bzimage_cmdline(cmdline)?;
         }
         if self.cpuid_table.len() > MAX_CPUID_LEAVES {
             return Err(ConfigError::CpuidTableTooLarge);
@@ -326,6 +448,18 @@ impl MachineConfig {
     }
 }
 
+impl BootSpec {
+    pub fn bzimage_boot_params_cmdline(&self) -> Result<Option<&[u8]>, ConfigError> {
+        match self {
+            BootSpec::Elf { .. } => Ok(None),
+            BootSpec::BzImage { cmdline, .. } => {
+                validate_canonical_bzimage_cmdline(cmdline)?;
+                Ok(Some(cmdline))
+            }
+        }
+    }
+}
+
 struct ConfigReader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -397,6 +531,13 @@ pub enum ConfigError {
     VcpusNotOne,
     ZeroEpochLen,
     CmdlineTooLong,
+    BzImageCmdlineNonAscii,
+    BzImageCmdlineNul,
+    BzImageCmdlineEmptyToken,
+    BzImageCmdlineUnsupportedToken,
+    BzImageCmdlineDuplicateToken,
+    BzImageCmdlineBaselineOverride,
+    BzImageCmdlineNotCanonical,
     CpuidTableTooLarge,
     DeviceSetTooLarge,
     CpuidTableUnsorted,
@@ -565,7 +706,7 @@ mod tests {
         c.boot = BootSpec::BzImage {
             kernel_hash: [0x33; 32],
             initramfs_hash: [0x44; 32],
-            cmdline: b"quiet".to_vec(),
+            cmdline: canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
         };
         let bytes = c.canonical_encode().unwrap();
         assert_ne!(
@@ -605,7 +746,7 @@ mod tests {
         c.boot = BootSpec::BzImage {
             kernel_hash: [0x33; 32],
             initramfs_hash: [0x44; 32],
-            cmdline: b"quiet".to_vec(),
+            cmdline: canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
         };
         c.hash_epochs = HashEpochs::FinalOnly;
         let bytes = c.canonical_encode().unwrap();
@@ -613,6 +754,122 @@ mod tests {
         assert_eq!(decoded.canonical_encode().unwrap(), bytes);
         assert_eq!(decoded.boot, c.boot);
         assert_eq!(decoded.hash_epochs, HashEpochs::FinalOnly);
+    }
+
+    #[test]
+    fn bzimage_cmdline_canonicalizes_allowed_extras() {
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"").unwrap(),
+            BZIMAGE_FORCED_CMDLINE
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
+            [BZIMAGE_FORCED_CMDLINE, b" quiet"].concat()
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"loglevel=4 quiet").unwrap(),
+            [BZIMAGE_FORCED_CMDLINE, b" quiet loglevel=4"].concat(),
+            "caller order normalizes to whitelist order"
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet\tloglevel=7").unwrap(),
+            [BZIMAGE_FORCED_CMDLINE, b" quiet loglevel=7"].concat()
+        );
+    }
+
+    #[test]
+    fn bzimage_cmdline_rejects_unsupported_duplicates_and_baseline_tokens() {
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"root=/dev/vda"),
+            Err(ConfigError::BzImageCmdlineUnsupportedToken)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet quiet"),
+            Err(ConfigError::BzImageCmdlineDuplicateToken)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"loglevel=3 loglevel=4"),
+            Err(ConfigError::BzImageCmdlineDuplicateToken)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"console=ttyS0"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"nokaslr"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"loglevel=8"),
+            Err(ConfigError::BzImageCmdlineUnsupportedToken)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet  loglevel=3"),
+            Err(ConfigError::BzImageCmdlineEmptyToken)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet\0"),
+            Err(ConfigError::BzImageCmdlineNul)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"quiet \xff"),
+            Err(ConfigError::BzImageCmdlineNonAscii)
+        );
+    }
+
+    #[test]
+    fn bzimage_config_requires_canonical_cmdline() {
+        let mut c = config();
+        c.boot = BootSpec::BzImage {
+            kernel_hash: [0x33; 32],
+            initramfs_hash: [0x44; 32],
+            cmdline: b"quiet".to_vec(),
+        };
+        assert_eq!(c.validate(), Err(ConfigError::BzImageCmdlineNotCanonical));
+
+        c.boot = BootSpec::BzImage {
+            kernel_hash: [0x33; 32],
+            initramfs_hash: [0x44; 32],
+            cmdline: [BZIMAGE_FORCED_CMDLINE, b" loglevel=4 quiet"].concat(),
+        };
+        assert_eq!(c.validate(), Err(ConfigError::BzImageCmdlineNotCanonical));
+    }
+
+    #[test]
+    fn bzimage_cmdline_max_is_checked_after_composition() {
+        let baseline = vec![b'x'; MAX_CMDLINE + 1];
+        assert_eq!(
+            compose_bzimage_cmdline(&baseline, BzImageCmdlineExtras::default()),
+            Err(ConfigError::CmdlineTooLong)
+        );
+    }
+
+    #[test]
+    fn bzimage_hash_preimage_cmdline_matches_boot_params_bytes() {
+        let canonical = canonicalize_bzimage_cmdline_extras(b"loglevel=3 quiet").unwrap();
+        let mut c = config();
+        c.boot = BootSpec::BzImage {
+            kernel_hash: [0x33; 32],
+            initramfs_hash: [0x44; 32],
+            cmdline: canonical.clone(),
+        };
+        let bytes = c.canonical_encode().unwrap();
+        let cmdline_len_off = 8 + 4 + 8 + 4 + 4 + 4 + 32 + 1 + 32 + 32;
+        let len = u32::from_le_bytes(
+            bytes[cmdline_len_off..cmdline_len_off + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let cmdline_off = cmdline_len_off + 4;
+        let preimage_cmdline = &bytes[cmdline_off..cmdline_off + len];
+        let boot_params_cmdline = c
+            .boot
+            .bzimage_boot_params_cmdline()
+            .unwrap()
+            .expect("BzImage cmdline");
+        assert_eq!(preimage_cmdline, canonical);
+        assert_eq!(boot_params_cmdline, canonical);
+        assert_eq!(preimage_cmdline, boot_params_cmdline);
     }
 
     #[test]

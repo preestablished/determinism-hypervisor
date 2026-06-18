@@ -30,6 +30,22 @@ below.
 | 6 | CI determinism regression required-for-merge and green | Branch protection live: `kvm-intel` + both host legs are required checks (`ci/branch-protection.json`); latest main run 27284395335 SUCCESS; nightly drift + canary wired (`nightly-drift.yaml`) |
 | 7 | TSC alignment decision recorded with measured numbers | [`docs/decisions/tsc-alignment.md`](decisions/tsc-alignment.md): KVM_VCPU_TSC_OFFSET device attr chosen; 932 vs 1107 ns/call measured, MSR-path sync-heuristic hazard documented |
 
+## M9 pre-Linux baseline refresh (2026-06-18)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`; live values match
+`ci/determinism-class.lock`.
+
+Before M9 Linux edits, the nanokernel default gate was rerun on this
+host:
+
+| Command | Evidence |
+|---|---|
+| `cargo run -p dh-cli -- gate --runs 100` | PASS: `PHASE-1 DETERMINISM GATE: PASS (100 runs each)` |
+| `dh-cli gate` default mode | Still nanokernel-only: `tools/dh-cli/src/gate.rs` boots `nanokernel::landing_loop_elf()` for `plain-landing` and `nanokernel::timer_guest_elf()` for `timer-event`, both through `BootSpec::Elf` |
+| `plain-landing` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000b4`, `vns=2000000`, state hash `64eecca97eed5c9a3f75c14d76bc6d6a810242ad31366ba84fe4168d72ec6b6a`, `timer=None` |
+| `timer-event` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000ea`, `vns=2000000`, state hash `25ec9e0e8cf4389caeb7b6c7714c2f647cea49a089289d1c52d82c98f993fc88`, `timer=Some(1234567)` |
+
 ## Known refinements baked into the gate (not exceptions)
 
 - §3.1 exit-instruction retirement is the MEASURED rule (retire zero,

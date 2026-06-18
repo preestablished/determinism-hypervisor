@@ -20,6 +20,7 @@ blake3.workspace = true
 detguest-host.workspace = true
 dh-devices.workspace = true
 dh-inputlog.workspace = true
+kvm-bindings = "0.14.0"
 kvm-ioctls.workspace = true
 nanokernel = { path = "../nanokernel" }
 libc.workspace = true
