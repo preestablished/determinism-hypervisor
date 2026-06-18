@@ -94,6 +94,11 @@ fn linux_entry_smoke() {
         trace.terminal_reason.as_deref().unwrap_or("unknown"),
         trace_path.display(),
     );
+    assert!(
+        !fatal_before_serviceable_exit(&trace),
+        "Linux entry failed before the first serviceable KVM exit: {}",
+        trace.terminal_reason.as_deref().unwrap_or("unknown")
+    );
 
     if trace_required() {
         assert!(
@@ -101,6 +106,13 @@ fn linux_entry_smoke() {
             "{TRACE_BOOT_ENV}=1 must produce {TRACE_OUTPUT}"
         );
     }
+}
+
+fn fatal_before_serviceable_exit(trace: &LinuxBootTrace) -> bool {
+    trace.total_exits == 1
+        && trace.terminal_reason.as_deref().is_some_and(|reason| {
+            reason == "shutdown" || reason == "internal_error" || reason.starts_with("fail_entry(")
+        })
 }
 
 fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {
@@ -226,6 +238,10 @@ fn trace_linux_boot(
         let event = dh_vmm::kvm::classify_exit(exit);
         observe_classified_event(&mut trace, &event);
 
+        if let Some(reason) = terminal_after_classification(&event) {
+            trace.terminal_reason = Some(reason);
+            return trace;
+        }
         if let Some(reason) = terminal {
             trace.terminal_reason = Some(reason);
             return trace;
@@ -242,13 +258,31 @@ fn trace_linux_boot_with_icount(
     exit_limit: u64,
     icount_limit: u64,
 ) -> LinuxBootTrace {
-    dh_vmm::run::install_kick_handler().expect("install KVM kick handler");
-    let counter = InstRetired::open_for_current_thread().expect("open guest instruction counter");
-    counter
-        .route_overflow_to_thread(dh_vmm::run::current_tid(), dh_vmm::run::kick_signal())
-        .expect("route instruction-counter overflow to vCPU thread");
-    counter.reset().expect("reset instruction counter");
-    counter.enable().expect("enable instruction counter");
+    if let Err(e) = dh_vmm::run::install_kick_handler() {
+        trace.terminal_reason = Some(format!("icount_setup_failed: install kick handler: {e}"));
+        return trace;
+    }
+    let counter = match InstRetired::open_for_current_thread() {
+        Ok(counter) => counter,
+        Err(e) => {
+            trace.terminal_reason = Some(format!("icount_unavailable: {e:?}"));
+            return trace;
+        }
+    };
+    if let Err(e) =
+        counter.route_overflow_to_thread(dh_vmm::run::current_tid(), dh_vmm::run::kick_signal())
+    {
+        trace.terminal_reason = Some(format!("icount_setup_failed: route overflow: {e:?}"));
+        return trace;
+    }
+    if let Err(e) = counter.reset() {
+        trace.terminal_reason = Some(format!("icount_setup_failed: reset: {e:?}"));
+        return trace;
+    }
+    if let Err(e) = counter.enable() {
+        trace.terminal_reason = Some(format!("icount_setup_failed: enable: {e:?}"));
+        return trace;
+    }
 
     let mut guard = dh_vmm::run::KickGuard::register(&mut slot.vcpu);
     for _ in 0..exit_limit {
@@ -261,9 +295,10 @@ fn trace_linux_boot_with_icount(
             return trace;
         }
 
-        counter
-            .arm_period(icount_limit - counted)
-            .expect("arm instruction-counter trace limit");
+        if let Err(e) = counter.arm_period(icount_limit - counted) {
+            trace.terminal_reason = Some(format!("icount_setup_failed: arm period: {e:?}"));
+            return trace;
+        }
         let mut exit = match guard.run() {
             Ok(exit) => exit,
             Err(e) if e.errno() == libc::EINTR => {
@@ -291,6 +326,11 @@ fn trace_linux_boot_with_icount(
         let event = dh_vmm::kvm::classify_exit(exit);
         observe_classified_event(&mut trace, &event);
 
+        if let Some(reason) = terminal_after_classification(&event) {
+            trace.final_icount = counter.read().ok();
+            trace.terminal_reason = Some(reason);
+            return trace;
+        }
         if let Some(reason) = terminal {
             trace.final_icount = counter.read().ok();
             trace.terminal_reason = Some(reason);
@@ -305,18 +345,31 @@ fn trace_linux_boot_with_icount(
 
 fn prepare_exit_for_trace(trace: &mut LinuxBootTrace, exit: &mut VcpuExit<'_>) {
     match exit {
+        VcpuExit::IoIn(port, _) if is_detchannel_port(*port) || is_serial_port(*port) => {}
+        VcpuExit::IoIn(_, data) => data.fill(0),
         VcpuExit::MmioRead(gpa, data) => {
             trace.observe_mmio(*gpa);
             data.fill(0);
         }
         VcpuExit::MmioWrite(gpa, _) => trace.observe_mmio(*gpa),
-        VcpuExit::IoIn(_, data) => data.fill(0),
         VcpuExit::IrqWindowOpen => trace.irq_window_open_count += 1,
         VcpuExit::Intr => trace.intr_count += 1,
         VcpuExit::IoapicEoi(vector) => {
             trace.ioapic_eoi_vectors.insert(*vector);
         }
         _ => {}
+    }
+}
+
+fn terminal_after_classification(event: &ExitEvent) -> Option<String> {
+    match event {
+        ExitEvent::DetcallIn { port, len } => Some(format!(
+            "first_detchannel_in_requires_model(port={port:#x}, len={len})"
+        )),
+        ExitEvent::SerialIn { port, len } => Some(format!(
+            "serial_in_requires_model(port={port:#x}, len={len})"
+        )),
+        _ => None,
     }
 }
 
@@ -328,6 +381,16 @@ fn observe_classified_event(trace: &mut LinuxBootTrace, event: &ExitEvent) {
         ExitEvent::DetcallOut { port, data } => trace.observe_detchannel("out", *port, data.len()),
         _ => {}
     }
+}
+
+fn is_detchannel_port(port: u16) -> bool {
+    let end = dh_vmm::kvm::PIO_DETCALL_BASE + dh_vmm::kvm::PIO_DETCALL_LEN;
+    (dh_vmm::kvm::PIO_DETCALL_BASE..end).contains(&port)
+}
+
+fn is_serial_port(port: u16) -> bool {
+    let end = dh_vmm::kvm::PIO_SERIAL_BASE + dh_vmm::kvm::PIO_SERIAL_LEN;
+    (dh_vmm::kvm::PIO_SERIAL_BASE..end).contains(&port)
 }
 
 fn raw_exit_kind(exit: &VcpuExit<'_>) -> &'static str {
@@ -650,5 +713,22 @@ mod trace_tests {
         assert!(json.contains("\"apic_mmio_addresses\": [\"0xfee00030\"]"));
         assert!(json.contains("\"lapic_required\": true"));
         assert!(json.contains("\"first_detchannel_status\": {\"reached\": true"));
+    }
+
+    #[test]
+    fn fatal_before_serviceable_exit_preserves_smoke_contract() {
+        let trace = LinuxBootTrace {
+            total_exits: 1,
+            terminal_reason: Some("shutdown".to_string()),
+            ..LinuxBootTrace::default()
+        };
+        assert!(fatal_before_serviceable_exit(&trace));
+
+        let trace = LinuxBootTrace {
+            total_exits: 1,
+            terminal_reason: Some("icount_limit_reached(limit=1, counted=1)".to_string()),
+            ..LinuxBootTrace::default()
+        };
+        assert!(!fatal_before_serviceable_exit(&trace));
     }
 }
