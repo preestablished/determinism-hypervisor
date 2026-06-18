@@ -47,25 +47,25 @@ mod common;
 use std::sync::atomic::AtomicBool;
 use std::{collections::BTreeMap, fs, path::Path};
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::PAGE_SIZE;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
-use dh_vmm::runctl::{run_segment_with_epochs, Segment, SegmentOutcome, StopReason, Until};
+use dh_vmm::runctl::{Segment, SegmentOutcome, StopReason, Until, run_segment_with_epochs};
 use dh_vmm::vt::ClockRatio;
-use dh_vmm::SlotState;
 use dh_worker::replay_engine::replay_segment;
 use dh_worker::snapshot_engine::{
-    take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
+    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, PageSource, take_snapshot,
 };
 use kvm_ioctls::VcpuExit;
 use snapstore_manifest::{DeviceBlob, Manifest};
@@ -465,6 +465,7 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, seconds: u64) -> 
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: Some(&|| dh_vmm::hash::lapic_section(&rail.borrow().lapic)),
             };
             let counter_ref = &counter;
             run_segment_with_epochs(
@@ -669,7 +670,7 @@ fn expected_corpus_text(rec: &Recording, root_sparse: &[u8]) -> String {
     let mut out = String::new();
     out.push_str("# Pad-echo 6 guest-second record/replay corpus.\n");
     out.push_str(
-        "# Re-baseline only with ci/determinism-class.lock in the same reviewed commit.\n",
+        "# Re-baseline only with ci/determinism-class.lock or a reviewed hash-input contract change.\n",
     );
     out.push_str("name=pad_echo_6s\n");
     out.push_str(&format!("seconds={CORPUS_SECONDS}\n"));

@@ -805,6 +805,7 @@ mod live_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let counter_ref = &counter;
             let links_r = &mut links;
@@ -929,6 +930,7 @@ mod live_tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             let counter_ref = &counter;
             let out = run_segment(

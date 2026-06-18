@@ -1852,22 +1852,10 @@ fn config_hash_for_slot(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn ensure_lapic_snapshotable(
-    lapic: &dh_vmm::lapic::LocalApic,
-    context: &str,
-) -> Result<(), Status> {
-    if !lapic.is_reset() {
-        return Err(Status::failed_precondition(format!(
-            "{context} cannot persist non-reset lAPIC state until the LAPC snapshot format lands"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(target_arch = "x86_64")]
 fn runtime_with_log(
     slot: dh_vmm::kvm::SlotVm,
     bus: dh_devices::MmioBus,
+    lapic: dh_vmm::lapic::LocalApic,
     entropy: dh_devices::entropy::DetEntropy,
     config: dh_vmm::config::MachineConfig,
     chain: dh_vmm::hash::StateHashChain,
@@ -1888,6 +1876,7 @@ fn runtime_with_log(
         position,
     )
     .map_err(|e| kvm_error_to_status("create runtime", e))?;
+    runtime.lapic = lapic;
     runtime.log = Some(log);
     Ok(runtime)
 }
@@ -3213,6 +3202,7 @@ impl HypervisorWorker for WorkerService {
                     runtime_with_log(
                         slot,
                         bus,
+                        dh_vmm::lapic::LocalApic::new(),
                         dh_devices::entropy::DetEntropy::from_seed(entropy_seed),
                         config,
                         dh_vmm::hash::StateHashChain::new(&config_hash, &[0; 32]),
@@ -3302,6 +3292,7 @@ impl HypervisorWorker for WorkerService {
                     runtime_with_log(
                         slot,
                         bus,
+                        outcome.lapic,
                         entropy,
                         config,
                         outcome.chain,
@@ -3360,7 +3351,6 @@ impl HypervisorWorker for WorkerService {
             let child_leases = self
                 .install_forked_runtimes(parent.clone(), count, move |table, _leases| {
                     with_runtime_mut(table, parent.slot_id, move |parent_runtime| {
-                        ensure_lapic_snapshotable(&parent_runtime.lapic, "Fork")?;
                         parent_runtime
                             .slot
                             .freeze_ram()
@@ -3380,29 +3370,32 @@ impl HypervisorWorker for WorkerService {
                             let assets = image_resolver
                                 .resolve_create_vm(&parent_runtime.machine_config)
                                 .map_err(image_error_to_status)?;
-                            let (forked, child_bus) = crate::fork_engine::fork_slot_with_child_bus(
-                                &sys,
-                                &parent_runtime.slot,
-                                dh_vmm::SlotState::Frozen,
-                                &parent_runtime.bus,
-                                &parent_runtime.entropy,
-                                &parent_runtime.machine_config,
-                                parent_boundary,
-                                seed,
-                                None,
-                                |child| {
-                                    build_bus(
-                                        &parent_runtime.machine_config,
-                                        assets.base_image,
-                                        RuntimeVmMem(child.guest_mem.clone()),
-                                    )
-                                    .map_err(|e| format!("{}: {}", e.code(), e.message()))
-                                },
-                            )
-                            .map_err(fork_engine_error_to_status)?;
+                            let (forked, child_bus) =
+                                crate::fork_engine::fork_slot_with_child_bus_with_lapic(
+                                    &sys,
+                                    &parent_runtime.slot,
+                                    dh_vmm::SlotState::Frozen,
+                                    &parent_runtime.bus,
+                                    &parent_runtime.lapic,
+                                    &parent_runtime.entropy,
+                                    &parent_runtime.machine_config,
+                                    parent_boundary,
+                                    seed,
+                                    None,
+                                    |child| {
+                                        build_bus(
+                                            &parent_runtime.machine_config,
+                                            assets.base_image,
+                                            RuntimeVmMem(child.guest_mem.clone()),
+                                        )
+                                        .map_err(|e| format!("{}: {}", e.code(), e.message()))
+                                    },
+                                )
+                                .map_err(fork_engine_error_to_status)?;
                             out.push(runtime_with_log(
                                 forked.child,
                                 child_bus,
+                                forked.lapic,
                                 forked.entropy,
                                 parent_runtime.machine_config.clone(),
                                 forked.chain,
@@ -3659,17 +3652,6 @@ impl HypervisorWorker for WorkerService {
                                                 agenda_empty,
                                             };
                                         let rail_ref = rail.borrow();
-                                        ensure_lapic_snapshotable(
-                                            &rail_ref.lapic,
-                                            "bisection checkpoint",
-                                        )
-                                        .map_err(|e| {
-                                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                                "{}: {}",
-                                                e.code(),
-                                                e.message()
-                                            ))
-                                        })?;
                                         let store = checkpoint_store
                                             .as_ref()
                                             .ok_or_else(|| {
@@ -3684,10 +3666,11 @@ impl HypervisorWorker for WorkerService {
                                                 )
                                             })?;
                                         let checkpoint =
-                                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+                                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
                                             slot,
                                             dh_vmm::SlotState::Paused,
                                             &rail_ref.bus,
+                                            &rail_ref.lapic,
                                             &rail_ref.entropy,
                                             machine_config,
                                             checkpoint_boundary,
@@ -3739,6 +3722,8 @@ impl HypervisorWorker for WorkerService {
                                 }
                                 Ok(())
                         };
+                        let hash_device_sections =
+                            || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
                         let run_result = {
                             let mut segment = dh_vmm::runctl::Segment {
                                 slot: &mut runtime.slot,
@@ -3750,6 +3735,7 @@ impl HypervisorWorker for WorkerService {
                                 timer: None,
                                 pause: pause.as_ref(),
                                 sdk_events: None,
+                                hash_device_sections: Some(&hash_device_sections),
                             };
                             dh_vmm::runctl::run_segment_with_scheduled_inputs_frames_and_epochs(
                                 &mut segment,
@@ -3960,7 +3946,6 @@ impl HypervisorWorker for WorkerService {
                         .machine_config
                         .config_hash()
                         .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
-                    ensure_lapic_snapshotable(&runtime.lapic, "TakeSnapshot")?;
                     let source = match runtime.base_snapshot.clone() {
                         Some(parent) => crate::snapshot_engine::PageSource::Incremental {
                             parent,
@@ -3969,10 +3954,11 @@ impl HypervisorWorker for WorkerService {
                         },
                         None => crate::snapshot_engine::PageSource::Full,
                     };
-                    let out = crate::snapshot_engine::take_snapshot(
+                    let out = crate::snapshot_engine::take_snapshot_with_lapic(
                         &runtime.slot,
                         slot_state,
                         &runtime.bus,
+                        &runtime.lapic,
                         &runtime.entropy,
                         &runtime.machine_config,
                         boundary,
@@ -4618,23 +4604,6 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn linux_lapic_snapshot_guard_rejects_non_reset_state() {
-        let mut lapic = dh_vmm::lapic::LocalApic::new();
-        ensure_lapic_snapshotable(&lapic, "test").unwrap();
-
-        lapic
-            .write_mmio(
-                dh_vmm::lapic::XAPIC_MMIO_BASE + 0x80,
-                &0x44u32.to_le_bytes(),
-            )
-            .unwrap();
-        let err = ensure_lapic_snapshotable(&lapic, "test").unwrap_err();
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("LAPC snapshot format"));
-    }
-
-    #[cfg(target_arch = "x86_64")]
     fn write_cache_blob(root: &Path, bytes: &[u8]) -> [u8; 32] {
         let hash = *blake3::hash(bytes).as_bytes();
         std::fs::write(root.join(crate::image_resolver::cache_key(&hash)), bytes).unwrap();
@@ -4970,6 +4939,7 @@ mod tests {
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: None,
             };
             dh_vmm::runctl::run_segment_with_epochs(
                 &mut segment,

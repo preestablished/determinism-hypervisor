@@ -15,9 +15,10 @@
 //! blob normalizes the TSC slot to vns (§8.1), and the landing loop never
 //! RDTSCs, so control's free-running TSC vs the restored leg's
 //! vns-programmed TSC_OFFSET is invisible here (the TSC≡vns discipline is
-//! tsc.rs's contract, pinned by its own tests); (2) device/bus state —
-//! runctl links hash device_sections=&[] in Phase 1 and these segments
-//! never touch MMIO, so device transparency is owned by the
+//! tsc.rs's contract, pinned by its own tests); (2) device/bus state for
+//! this M4 rig — these segments pass no device hash callback and never
+//! touch MMIO. Production record/replay now folds deterministic LAPIC
+//! state into hashes; the remaining device transparency is owned by the
 //! restore_engine joint tests (byte-level section round-trip + identical
 //! re-snapshot ref) and the ENTR golden bead (dy8).
 //!
@@ -50,15 +51,15 @@ use std::sync::atomic::AtomicBool;
 use common::{gettid, kvm_available, spawn_store_blocking, test_bus};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::DetEntropy;
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
-use dh_vmm::runctl::{run_segment, ScheduledInjection, Segment, SegmentOutcome, StopReason, Until};
-use dh_vmm::SlotState;
+use dh_vmm::runctl::{ScheduledInjection, Segment, SegmentOutcome, StopReason, Until, run_segment};
 use dh_worker::fork_engine::fork_slot;
 use dh_worker::restore_engine::restore_snapshot;
-use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
+use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
 
@@ -133,6 +134,7 @@ fn run_more(
         timer: None,
         pause: &pause,
         sdk_events: None,
+        hash_device_sections: None,
     };
     let out = run_segment(
         &mut seg,

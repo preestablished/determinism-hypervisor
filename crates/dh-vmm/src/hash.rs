@@ -20,11 +20,12 @@
 //! The chain VALUE (not just the last link) is the state hash exchanged
 //! with other services: comparing chains compares execution histories.
 
-use kvm_bindings::{kvm_msr_entry, kvm_segment, Msrs};
+use kvm_bindings::{Msrs, kvm_msr_entry, kvm_segment};
 use kvm_ioctls::VcpuFd;
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::kvm::{KvmError, SlotVm};
+use crate::lapic::LocalApic;
 use crate::msr::{
     MSR_CSTAR, MSR_EFER, MSR_FS_BASE, MSR_GS_BASE, MSR_KERNEL_GS_BASE, MSR_LSTAR, MSR_PAT,
     MSR_SFMASK, MSR_SPEC_CTRL, MSR_STAR, MSR_SYSENTER_CS, MSR_SYSENTER_EIP, MSR_SYSENTER_ESP,
@@ -363,6 +364,19 @@ pub fn device_sections(bus: &dh_devices::MmioBus) -> Vec<u8> {
     out
 }
 
+/// Frame the deterministic lAPIC section for the state-hash preimage.
+/// This is deliberately tag/version/len framed rather than just raw LAPC
+/// contents, so it cannot collide with future device-section extensions.
+pub fn lapic_section(lapic: &LocalApic) -> Vec<u8> {
+    let contents = lapic.to_lapc_section().encode();
+    let mut out = Vec::with_capacity(4 + 2 + 4 + contents.len());
+    out.extend_from_slice(&dh_snapshot::dhsnap::tag::LAPC);
+    out.extend_from_slice(&dh_snapshot::dhsnap::LapcSection::VERSION.to_le_bytes());
+    out.extend_from_slice(&(contents.len() as u32).to_le_bytes());
+    out.extend_from_slice(&contents);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,8 +404,8 @@ mod tests {
         let mut xsave = slot.vcpu.get_xsave().unwrap();
         xsave.region[6] = 0x7F80; // flip a rounding-control-relevant bit set
         xsave.region[128] |= 0b10; // XSTATE_BV.SSE: the area is live, not init
-                                   // SAFETY: plain kvm_xsave (no FAM tail in the 0.24 binding); the
-                                   // struct came from GET_XSAVE on this same vCPU.
+        // SAFETY: plain kvm_xsave (no FAM tail in the 0.24 binding); the
+        // struct came from GET_XSAVE on this same vCPU.
         #[allow(unsafe_code)]
         unsafe {
             slot.vcpu.set_xsave(&xsave).unwrap();
@@ -499,6 +513,16 @@ mod tests {
         for v in &variants {
             assert_ne!(*v, reference);
         }
+
+        let mut c = StateHashChain::new(&MC, &BASE);
+        c.push_link(
+            b"vcpu",
+            b"devX",
+            [(0u64, &page_a[..]), (5u64, &page_b[..])].into_iter(),
+            100,
+            200,
+        );
+        assert_ne!(c.value(), reference);
     }
 
     #[test]
@@ -557,11 +581,34 @@ mod tests {
 }
 
 #[cfg(test)]
+mod lapic_section_tests {
+    use super::*;
+
+    #[test]
+    fn lapic_hash_section_frames_lapc_v2_bytes() {
+        let mut lapic = LocalApic::new();
+        lapic
+            .write_mmio(crate::lapic::XAPIC_MMIO_BASE + 0x80, &0x44u32.to_le_bytes())
+            .unwrap();
+        let bytes = lapic_section(&lapic);
+        assert_eq!(&bytes[0..4], b"LAPC");
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            dh_snapshot::dhsnap::LapcSection::VERSION
+        );
+        let len = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+        assert_eq!(len, dh_snapshot::dhsnap::LapcSection::LEN);
+        assert_eq!(&bytes[10..], lapic.to_lapc_section().encode().as_slice());
+        assert_ne!(lapic_section(&LocalApic::new()), bytes);
+    }
+}
+
+#[cfg(test)]
 mod device_section_tests {
     use super::*;
+    use dh_devices::MmioBus;
     use dh_devices::blk::{BaseIoError, BlockBase, PvBlk};
     use dh_devices::pad::PvPad;
-    use dh_devices::MmioBus;
 
     struct ZeroBase;
     impl BlockBase for ZeroBase {

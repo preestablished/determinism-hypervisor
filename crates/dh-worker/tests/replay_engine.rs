@@ -15,26 +15,29 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
+use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_devices::MmioBus;
-use dh_inputlog::dhilog::{LogWriter, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER};
+use dh_inputlog::dhilog::{DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER, LogWriter, SegmentHeader};
+use dh_inputlog::reader::LogReader;
 use dh_verify::verify::VerifyProgress;
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
 use dh_vmm::runctl::{
-    run_segment_with_epochs, run_segment_with_scheduled_inputs_frames_and_epochs, Segment,
-    SegmentOutcome, StopReason, Until,
+    Segment, SegmentOutcome, StopReason, Until, run_segment_with_epochs,
+    run_segment_with_scheduled_inputs_frames_and_epochs,
 };
-use dh_vmm::SlotState;
-use dh_worker::replay_engine::{replay_segment, ReplayError};
-use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
-use dh_worker::verify_replay::verify_replay;
+use dh_worker::bisection_index::BisectionCheckpointIndex;
+use dh_worker::replay_engine::{ReplayError, replay_segment};
+use dh_worker::snapshot_compare::RegDiff;
+use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
+use dh_worker::verify_replay::{verify_replay, verify_replay_with_bisection_progress};
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
 
@@ -71,6 +74,13 @@ struct Recording {
     cfg: MachineConfig,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RecordOptions {
+    poison_ram: bool,
+    poison_lapic_after_snapshot: bool,
+    log_lapic_bisection_checkpoint: bool,
+}
+
 /// Boot pad_echo, snapshot at the boot boundary, then record three
 /// quanta with PAD_SETs at the two inter-quantum boundaries — sealed
 /// from the final outcome. `poison_ram` mutates guest RAM AFTER the
@@ -78,7 +88,7 @@ struct Recording {
 /// the snapshot does not describe — the divergence negative. (A
 /// poisoned chain SEED would travel through TIME and stay
 /// self-consistent; RAM divergence is the honest mismatch.)
-fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool) -> Recording {
+fn record(store: &snapstore_client::blocking::SnapstoreClient, opts: RecordOptions) -> Recording {
     dh_vmm::run::install_kick_handler().unwrap();
     let sys = KvmSystem::open().unwrap();
     let mut slot = sys.create_slot_vm(MEM).unwrap();
@@ -117,7 +127,7 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
     .expect("base snapshot")
     .snapshot_ref;
 
-    if poison_ram {
+    if opts.poison_ram {
         slot.guest_mem
             .write_slice(&[0xDD; 64], GuestAddress(0x60_0000))
             .unwrap();
@@ -136,11 +146,21 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
         }),
         VmMem(slot.guest_mem.clone()),
     ));
+    if opts.poison_lapic_after_snapshot {
+        rail.borrow_mut()
+            .lapic
+            .write_mmio(
+                dh_vmm::lapic::XAPIC_MMIO_BASE + 0x80,
+                &0x44u32.to_le_bytes(),
+            )
+            .unwrap();
+    }
     let pause = AtomicBool::new(false);
 
     let run_one = |slot: &mut SlotVm, chain: &mut StateHashChain| -> SegmentOutcome {
         let start = counter.read().unwrap();
         let out = {
+            let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
             let mut seg = Segment {
                 slot,
                 counter: &counter,
@@ -151,6 +171,7 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
+                hash_device_sections: Some(&hash_device_sections),
             };
             let counter_ref = &counter;
             run_segment_with_epochs(
@@ -176,6 +197,37 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, poison_ram: bool)
     };
 
     let o1 = run_one(&mut slot, &mut chain);
+    if opts.log_lapic_bisection_checkpoint {
+        let checkpoint = {
+            let rail_ref = rail.borrow();
+            dh_worker::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
+                &slot,
+                SlotState::Paused,
+                &rail_ref.bus,
+                &rail_ref.lapic,
+                &rail_ref.entropy,
+                &cfg,
+                BoundaryState {
+                    icount: o1.boundary.icount,
+                    vns: o1.vns,
+                    epoch_index: o1.boundary.icount / cfg.epoch_len.max(1),
+                    hash_chain: o1.state_hash,
+                    agenda_empty: false,
+                },
+                store,
+            )
+            .expect("bisection checkpoint snapshot")
+        };
+        rail.borrow_mut()
+            .log_bisection_checkpoint(
+                o1.boundary.icount,
+                o1.boundary.rip,
+                u32::try_from(o1.boundary.icount).unwrap(),
+                checkpoint.snapshot_ref.to_bytes(),
+                o1.vns,
+            )
+            .expect("bisection checkpoint log");
+    }
     rail.borrow_mut()
         .apply_pad_set(o1.boundary.icount, o1.boundary.rip, 0, 0xA1B2, 0)
         .unwrap();
@@ -212,7 +264,7 @@ fn replay_reproduces_the_recording_bit_identically() {
         return;
     }
     let (_rt, _handle, store, _dir) = spawn_store_blocking();
-    let rec = record(&store, false);
+    let rec = record(&store, RecordOptions::default());
 
     // Fresh machine for the replay leg (same thread, counter reset by
     // the restore inside replay_segment).
@@ -329,6 +381,7 @@ fn replay_does_not_hash_intermediate_canonical_record_landings() {
     let pause = AtomicBool::new(false);
     let scheduled_inputs = [40_000, cfg.epoch_len, QUANTUM];
     let out = {
+        let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
         let mut seg = Segment {
             slot: &mut slot,
             counter: &counter,
@@ -339,6 +392,7 @@ fn replay_does_not_hash_intermediate_canonical_record_landings() {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: Some(&hash_device_sections),
         };
         let counter_ref = &counter;
         run_segment_with_scheduled_inputs_frames_and_epochs(
@@ -430,7 +484,13 @@ fn replay_refuses_foreign_headers_and_reports_divergence() {
     // A recording whose guest RAM was mutated AFTER the snapshot: every
     // EPOCH_HASH it carries belongs to a machine the snapshot does not
     // describe. Parse-valid, semantically divergent from the restore.
-    let poisoned = record(&store, true);
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_ram: true,
+            ..RecordOptions::default()
+        },
+    );
 
     let sys = KvmSystem::open().unwrap();
     let counter = InstRetired::open_for_current_thread().unwrap();
@@ -503,6 +563,61 @@ fn replay_refuses_foreign_headers_and_reports_divergence() {
     }
 }
 
+#[test]
+fn lapc_replay_fails_on_deliberate_lapic_mutation_after_snapshot() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_lapic_after_snapshot: true,
+            ..RecordOptions::default()
+        },
+    );
+
+    let sys = KvmSystem::open().unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    let rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: poisoned.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: poisoned.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    );
+    match replay_segment(
+        &mut slot,
+        rail,
+        &poisoned.cfg,
+        poisoned.snapshot_ref,
+        &counter,
+        &store,
+        &poisoned.log,
+    ) {
+        Err(ReplayError::Divergence { what, .. }) => {
+            assert!(what.contains("EPOCH_HASH"), "{what}");
+        }
+        Err(e) => panic!("wrong error class: {e:?}"),
+        Ok(_) => panic!("LAPC-mutated recording must diverge"),
+    }
+}
+
 /// The 1py library harness: a good recording verifies end-to-end with
 /// one EpochOk per recorded epoch and a Done carrying the END identity;
 /// a machine-mismatched recording yields a Divergence verdict (an Ok
@@ -516,7 +631,7 @@ fn verify_replay_reports_done_and_divergence() {
     let (_rt, _handle, store, _dir) = spawn_store_blocking();
 
     // Good recording → verified.
-    let rec = record(&store, false);
+    let rec = record(&store, RecordOptions::default());
     let sys = KvmSystem::open().unwrap();
     let counter = InstRetired::open_for_current_thread().unwrap();
     counter
@@ -556,7 +671,13 @@ fn verify_replay_reports_done_and_divergence() {
     assert_ne!(end_hash, [0u8; 32]);
 
     // Poisoned recording → a DIVERGENCE VERDICT, not an error.
-    let poisoned = record(&store, true);
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_ram: true,
+            ..RecordOptions::default()
+        },
+    );
     let mut slot2 = sys.create_slot_vm(MEM).unwrap();
     let rail2 = DeviceRail::new(
         record_bus(),
@@ -593,6 +714,140 @@ fn verify_replay_reports_done_and_divergence() {
             assert_eq!(*first_bad_epoch, Some(1), "the very first epoch diverges");
             assert!(what.contains("EPOCH_HASH"));
             assert_ne!(expected, got);
+        }
+        other => panic!("wrong event: {other:?}"),
+    }
+}
+
+#[test]
+fn lapc_verify_replay_reports_divergence_on_lapic_mutation() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_lapic_after_snapshot: true,
+            ..RecordOptions::default()
+        },
+    );
+
+    let sys = KvmSystem::open().unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    let rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: poisoned.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: poisoned.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    );
+    let report = verify_replay(
+        &mut slot,
+        rail,
+        &poisoned.cfg,
+        poisoned.snapshot_ref.clone(),
+        &counter,
+        &store,
+        &poisoned.log,
+    )
+    .expect("verification ran");
+    assert!(!report.verified());
+    match report.divergence().unwrap() {
+        VerifyProgress::Divergence {
+            first_bad_epoch,
+            what,
+            expected,
+            got,
+            ..
+        } => {
+            assert_eq!(*first_bad_epoch, Some(1), "the very first epoch diverges");
+            assert!(what.contains("EPOCH_HASH"));
+            assert_ne!(expected, got);
+        }
+        other => panic!("wrong event: {other:?}"),
+    }
+}
+
+#[test]
+fn lapc_verify_replay_bisection_reports_lapic_reg_diff_on_mutation() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_lapic_after_snapshot: true,
+            log_lapic_bisection_checkpoint: true,
+            ..RecordOptions::default()
+        },
+    );
+    let reader = LogReader::parse(&poisoned.log).expect("parse recording");
+    let index = BisectionCheckpointIndex::from_reader(&reader).expect("bisection index");
+    assert!(!index.is_empty(), "recording must carry bisection evidence");
+
+    let sys = KvmSystem::open().unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    let rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: poisoned.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: poisoned.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    );
+
+    let terminal = verify_replay_with_bisection_progress(
+        &mut slot,
+        rail,
+        &poisoned.cfg,
+        poisoned.snapshot_ref.clone(),
+        &counter,
+        &store,
+        &poisoned.log,
+        Some(&index),
+        |_| Ok(()),
+    )
+    .expect("verification ran");
+    match terminal {
+        VerifyProgress::BisectionDivergence(divergence) => {
+            let decoded: Vec<RegDiff> =
+                postcard::from_bytes(&divergence.reg_diff).expect("reg diff postcard");
+            let lapic = decoded
+                .iter()
+                .find(|diff| diff.name == "lapic")
+                .expect("bisection evidence should carry the LAPC mismatch");
+            assert_ne!(lapic.expected, lapic.actual);
+            assert!(divergence.evidence.expected_checkpoint_ref.is_some());
+            assert!(divergence.evidence.actual_probe_ref.is_some());
         }
         other => panic!("wrong event: {other:?}"),
     }

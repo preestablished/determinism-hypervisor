@@ -10,7 +10,8 @@ fn full_container() -> Vec<u8> {
     let mut w = ContainerWriter::new();
     w.push_section(tag::MCFG, 1, &[0x11; 64]).unwrap(); // canonical MachineConfig encoding (dh-vmm owns)
     w.push_section(tag::VCPU, 1, &[0x22; 200]).unwrap(); // canonical_vcpu_blob (dh-vmm owns)
-    w.push_section(tag::LAPC, 1, &[0x33; 40]).unwrap();
+    w.push_section(tag::LAPC, LapcSection::VERSION, &lapc_fixture().encode())
+        .unwrap();
     w.push_section(
         tag::TIME,
         TimeSection::VERSION,
@@ -66,6 +67,10 @@ fn typed_sections_roundtrip_and_pin_their_layout() {
     let bytes = full_container();
     let c = Container::parse(&bytes).unwrap();
 
+    let l = c.get(tag::LAPC).unwrap();
+    let lapc = LapcSection::decode(l.contents, l.sec_version).unwrap();
+    assert_eq!(lapc, lapc_fixture());
+
     let t = c.get(tag::TIME).unwrap();
     let time = TimeSection::decode(t.contents, t.sec_version).unwrap();
     assert_eq!(time.cumulative_icount, 1_000_000_000);
@@ -85,10 +90,45 @@ fn typed_sections_roundtrip_and_pin_their_layout() {
     assert_eq!(&te[8..16], &3_000_000_000u64.to_le_bytes());
     assert_eq!(&te[16..24], &20u64.to_le_bytes());
     assert_eq!(&te[24..56], &[0x44; 32]);
+    let le = lapc.encode();
+    assert_eq!(&le[0..8], &lapc.apic_base_msr.to_le_bytes());
+    assert_eq!(le[8], lapc.id);
+    assert_eq!(le[9], lapc.tpr);
+    assert_eq!(&le[10..16], &[0; 6]);
+    assert_eq!(&le[16..20], &lapc.ldr.to_le_bytes());
+    assert_eq!(&le[76..80], &lapc.tmr[4].to_le_bytes());
+    assert_eq!(&le[164..168], &lapc.timer_divide.to_le_bytes());
     let ee = entr.encode();
     assert_eq!(&ee[0..32], &[0x55; 32]);
     assert_eq!(&ee[32..40], &7u64.to_le_bytes());
     assert_eq!(&ee[40..56], &123_456u128.to_le_bytes());
+}
+
+fn lapc_fixture() -> LapcSection {
+    let mut lapc = LapcSection::default();
+    lapc.id = 0x20;
+    lapc.tpr = 0x44;
+    lapc.ldr = 0x0102_0304;
+    lapc.svr = 0x0000_01ff;
+    lapc.isr[2] = 0x8000_0000;
+    lapc.tmr[4] = 0x0000_0001;
+    lapc.irr[7] = 0x4000_0000;
+    lapc.esr = 0x55aa;
+    lapc.lvt_lint0 = 0x0001_0700;
+    lapc.timer_divide = 0x3;
+    lapc
+}
+
+#[test]
+fn lapc_decode_accepts_legacy_empty_v1_as_reset_only() {
+    assert_eq!(
+        LapcSection::decode_compat(&[], LapcSection::LEGACY_EMPTY_VERSION).unwrap(),
+        LapcSection::default()
+    );
+    assert!(matches!(
+        LapcSection::decode_compat(&[0], LapcSection::LEGACY_EMPTY_VERSION),
+        Err(SectionError::BadVersion { found: 1 })
+    ));
 }
 
 #[test]
@@ -108,10 +148,12 @@ fn empty_container_is_just_header() {
 fn known_tags_table_is_complete_and_unique() {
     assert_eq!(KNOWN_TAGS.len(), 11);
     for (i, a) in KNOWN_TAGS.iter().enumerate() {
-        assert!(std::str::from_utf8(a)
-            .unwrap()
-            .chars()
-            .all(|c| c.is_ascii_uppercase()));
+        assert!(
+            std::str::from_utf8(a)
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_uppercase())
+        );
         for b in &KNOWN_TAGS[i + 1..] {
             assert_ne!(a, b, "duplicate tag in KNOWN_TAGS");
         }
@@ -154,7 +196,7 @@ fn golden_bytes_minimal_container() {
     expect.extend_from_slice(&84u64.to_le_bytes()); // vns
     expect.extend_from_slice(&1u64.to_le_bytes()); // epoch_index
     expect.extend_from_slice(&[0xAB; 32]); // hash_chain
-                                           // 56 % 8 == 0: no alignment padding.
+    // 56 % 8 == 0: no alignment padding.
 
     let mut w = ContainerWriter::new();
     w.push_section(
@@ -324,6 +366,12 @@ fn typed_section_decode_negatives() {
     assert_eq!(
         EntrSection::decode(&[0; 56], 0),
         Err(SectionError::BadVersion { found: 0 })
+    );
+    let mut lapc = LapcSection::default().encode();
+    lapc[10] = 1;
+    assert_eq!(
+        LapcSection::decode(&lapc, LapcSection::VERSION),
+        Err(SectionError::NonzeroReserved { offset: 10 })
     );
 }
 

@@ -5,7 +5,8 @@
 //! diagnostic payloads later VerifyReplay bisection code can attach to a
 //! refined divergence.
 
-use dh_snapshot::dhsnap::{tag, Container};
+use dh_snapshot::dhsnap::{Container, LapcSection, tag};
+use dh_vmm::lapic::LocalApic;
 use dh_vmm::vcpu_state::{self, VcpuState};
 use serde::{Deserialize, Serialize};
 use snapstore_client::blocking::SnapstoreClient;
@@ -46,6 +47,12 @@ pub struct SnapshotComparison {
     pub diff_page_idx: Vec<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct MachineSnapshot {
+    vcpu: VcpuState,
+    lapic: LocalApic,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotComparisonError {
     Store {
@@ -71,6 +78,10 @@ pub enum SnapshotComparisonError {
         tag: [u8; 4],
     },
     Vcpu {
+        side: SnapshotSide,
+        reason: String,
+    },
+    Lapc {
         side: SnapshotSide,
         reason: String,
     },
@@ -104,6 +115,9 @@ impl fmt::Display for SnapshotComparisonError {
             }
             Self::Vcpu { side, reason } => {
                 write!(f, "{side} snapshot VCPU decode failed: {reason}")
+            }
+            Self::Lapc { side, reason } => {
+                write!(f, "{side} snapshot LAPC decode failed: {reason}")
             }
             Self::RegDiffEncode(reason) => write!(f, "reg_diff postcard encode failed: {reason}"),
         }
@@ -168,9 +182,10 @@ where
             reason: e.to_string(),
         })?;
 
-    let expected_vcpu = decode_vcpu(&expected_container, SnapshotSide::Expected)?;
-    let actual_vcpu = decode_vcpu(&actual_container, SnapshotSide::Actual)?;
-    let reg_diffs = compare_vcpu(&expected_vcpu, &actual_vcpu);
+    let expected = decode_machine_snapshot(&expected_container, SnapshotSide::Expected)?;
+    let actual = decode_machine_snapshot(&actual_container, SnapshotSide::Actual)?;
+    let mut reg_diffs = compare_vcpu(&expected.vcpu, &actual.vcpu);
+    push_lapic_diff(&mut reg_diffs, &expected.lapic, &actual.lapic);
     let reg_diff = postcard::to_allocvec(&reg_diffs)
         .map_err(|e| SnapshotComparisonError::RegDiffEncode(e.to_string()))?;
 
@@ -192,15 +207,18 @@ where
             })?;
 
     Ok(SnapshotComparison {
-        rip_expected: expected_vcpu.regs.rip,
-        rip_actual: actual_vcpu.regs.rip,
+        rip_expected: expected.vcpu.regs.rip,
+        rip_actual: actual.vcpu.regs.rip,
         reg_diffs,
         reg_diff,
         diff_page_idx: first_diff_page_indices(expected_pages, actual_pages),
     })
 }
 
-fn decode_vcpu(container: &[u8], side: SnapshotSide) -> Result<VcpuState, SnapshotComparisonError> {
+fn decode_machine_snapshot(
+    container: &[u8],
+    side: SnapshotSide,
+) -> Result<MachineSnapshot, SnapshotComparisonError> {
     let manifest = Manifest::decode(container).map_err(|e| SnapshotComparisonError::Manifest {
         side,
         reason: e.to_string(),
@@ -223,12 +241,29 @@ fn decode_vcpu(container: &[u8], side: SnapshotSide) -> Result<VcpuState, Snapsh
             side,
             tag: tag::VCPU,
         })?;
-    vcpu_state::decode_section(vcpu.contents, vcpu.sec_version).map_err(|e| {
+    let vcpu = vcpu_state::decode_section(vcpu.contents, vcpu.sec_version).map_err(|e| {
         SnapshotComparisonError::Vcpu {
             side,
             reason: format!("{e:?}"),
         }
-    })
+    })?;
+    let lapc = dhsnap
+        .get(tag::LAPC)
+        .ok_or(SnapshotComparisonError::MissingSection {
+            side,
+            tag: tag::LAPC,
+        })?;
+    let lapc = LapcSection::decode_compat(lapc.contents, lapc.sec_version).map_err(|e| {
+        SnapshotComparisonError::Lapc {
+            side,
+            reason: format!("{e:?}"),
+        }
+    })?;
+    let lapic = LocalApic::from_lapc_section(lapc).map_err(|e| SnapshotComparisonError::Lapc {
+        side,
+        reason: format!("{e:?}"),
+    })?;
+    Ok(MachineSnapshot { vcpu, lapic })
 }
 
 fn compare_vcpu(expected: &VcpuState, actual: &VcpuState) -> Vec<RegDiff> {
@@ -274,6 +309,16 @@ fn push_u64_diff(diffs: &mut Vec<RegDiff>, name: &'static str, expected: u64, ac
             name: name.into(),
             expected: expected.to_le_bytes().to_vec(),
             actual: actual.to_le_bytes().to_vec(),
+        });
+    }
+}
+
+fn push_lapic_diff(diffs: &mut Vec<RegDiff>, expected: &LocalApic, actual: &LocalApic) {
+    if expected != actual {
+        diffs.push(RegDiff {
+            name: "lapic".into(),
+            expected: expected.to_lapc_section().encode().to_vec(),
+            actual: actual.to_lapc_section().encode().to_vec(),
         });
     }
 }
@@ -326,7 +371,7 @@ fn tag_name(tag: [u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dh_snapshot::dhsnap::{tag, ContainerWriter};
+    use dh_snapshot::dhsnap::{ContainerWriter, tag};
     use dh_vmm::vcpu_state::{RESTORE_MSR_LIST, VCPU_SECTION_VERSION, XSAVE_AREA_LEN};
     use kvm_bindings::kvm_msr_entry;
     use snapstore_manifest::{DeviceBlob, Manifest, ManifestEntry};
@@ -423,6 +468,13 @@ mod tests {
                 tag::VCPU,
                 VCPU_SECTION_VERSION,
                 &vcpu_state::encode_section(state),
+            )
+            .unwrap();
+        writer
+            .push_section(
+                tag::LAPC,
+                dh_snapshot::dhsnap::LapcSection::VERSION,
+                &LocalApic::new().to_lapc_section().encode(),
             )
             .unwrap();
         fixture_with_dhsnap(writer.finish(), pages)

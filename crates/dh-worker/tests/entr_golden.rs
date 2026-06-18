@@ -30,19 +30,19 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{gettid, kvm_available, spawn_store_blocking, test_bus, VmMem};
+use common::{VmMem, gettid, kvm_available, spawn_store_blocking, test_bus};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::DetEntropy;
 use dh_devices::{DevCtx, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
+use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
-use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, Until};
-use dh_vmm::SlotState;
+use dh_vmm::runctl::{Segment, SegmentOutcome, StopReason, Until, run_segment};
 use dh_worker::restore_engine::restore_snapshot;
-use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
+use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -146,6 +146,7 @@ fn run_one_batch(
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let mut on_exit = |exit: VcpuExit| {
             let icount = counter_ref
