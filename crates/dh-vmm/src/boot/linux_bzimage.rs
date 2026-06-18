@@ -44,11 +44,17 @@ const XLF_CAN_BE_LOADED_ABOVE_4G: u16 = 0x0002;
 const XLF_EFI_HANDOVER_32: u16 = 0x0004;
 const XLF_EFI_HANDOVER_64: u16 = 0x0008;
 const XLF_EFI_KEXEC: u16 = 0x0010;
+const XLF_5LEVEL: u16 = 0x0020;
+const XLF_5LEVEL_ENABLED: u16 = 0x0040;
+#[cfg(test)]
+const XLF_MEM_ENCRYPTION: u16 = 0x0080;
 const XLOADFLAGS_SUPPORTED: u16 = XLF_KERNEL_64
     | XLF_CAN_BE_LOADED_ABOVE_4G
     | XLF_EFI_HANDOVER_32
     | XLF_EFI_HANDOVER_64
-    | XLF_EFI_KEXEC;
+    | XLF_EFI_KEXEC
+    | XLF_5LEVEL
+    | XLF_5LEVEL_ENABLED;
 const MIN_KERNEL_ALIGNMENT: u32 = 0x20_0000;
 const PAGE_SIZE: u64 = 4096;
 
@@ -953,11 +959,12 @@ mod tests {
     #[test]
     fn linux_bzimage_rejects_unsupported_xloadflags() {
         let mut image = synthetic_bzimage();
-        image[XLOADFLAGS_OFF..XLOADFLAGS_OFF + 2].copy_from_slice(&0x0020u16.to_le_bytes());
+        image[XLOADFLAGS_OFF..XLOADFLAGS_OFF + 2]
+            .copy_from_slice(&(XLF_KERNEL_64 | XLF_MEM_ENCRYPTION).to_le_bytes());
         assert_eq!(
             parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM),
             Err(BzImageError::UnsupportedXloadflags {
-                xloadflags: 0x0020,
+                xloadflags: XLF_KERNEL_64 | XLF_MEM_ENCRYPTION,
                 supported: XLOADFLAGS_SUPPORTED
             })
         );
@@ -970,6 +977,18 @@ mod tests {
             .copy_from_slice(&(XLF_KERNEL_64 | XLF_EFI_HANDOVER_64).to_le_bytes());
         let layout = parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM).unwrap();
         assert_eq!(layout.xloadflags, XLF_KERNEL_64 | XLF_EFI_HANDOVER_64);
+    }
+
+    #[test]
+    fn linux_bzimage_accepts_known_5level_xloadflags() {
+        let mut image = synthetic_bzimage();
+        image[XLOADFLAGS_OFF..XLOADFLAGS_OFF + 2]
+            .copy_from_slice(&(XLF_KERNEL_64 | XLF_5LEVEL | XLF_5LEVEL_ENABLED).to_le_bytes());
+        let layout = parse_bzimage(&image, INITRAMFS_LEN, CMDLINE_LEN, MEM).unwrap();
+        assert_eq!(
+            layout.xloadflags,
+            XLF_KERNEL_64 | XLF_5LEVEL | XLF_5LEVEL_ENABLED
+        );
     }
 
     #[test]
