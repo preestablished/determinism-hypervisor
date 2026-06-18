@@ -849,6 +849,7 @@ mod tests {
         #[default]
         Ok,
         ErrorAfterFirst,
+        BisectionDivergence,
     }
 
     #[derive(Clone, Default)]
@@ -1020,10 +1021,27 @@ mod tests {
                     },
                 )),
             };
+            let divergence = proto::VerifyReplayProgress {
+                msg: Some(proto::verify_replay_progress::Msg::Divergence(
+                    proto::Divergence {
+                        first_bad_epoch: 7,
+                        icount_lo: 60_000,
+                        icount_hi: 80_000,
+                        rip_expected: 0xffff_8000_0000_1000,
+                        rip_actual: 0xffff_8000_0000_1004,
+                        reg_diff: vec![0xa1, 0xb2],
+                        diff_page_idx: vec![1536, 1537],
+                        suspected_cause:
+                            "replay-vs-recorded:EPOCH_HASH chain value; evidence_mode=replay-vs-recorded; expected_checkpoint_ref=eeee; actual_probe_ref=aaaa"
+                                .into(),
+                    },
+                )),
+            };
             let mode = *self.verify_mode.lock().unwrap();
             let items = match mode {
                 VerifyMode::Ok => vec![Ok(epoch), Ok(done)],
                 VerifyMode::ErrorAfterFirst => vec![Ok(epoch), Err(Status::data_loss("boom"))],
+                VerifyMode::BisectionDivergence => vec![Ok(divergence)],
             };
             Ok(Response::new(Box::pin(tokio_stream::iter(items))))
         }
@@ -1405,6 +1423,54 @@ mod tests {
             "progress must be written before the stream error: {out}"
         );
         assert!(matches!(worker.calls()[0], SeenCall::VerifyReplay(_)));
+    }
+
+    #[tokio::test]
+    async fn verify_renders_bisection_divergence_json_and_human() {
+        let worker = FakeWorker::default();
+        worker.set_verify_mode(VerifyMode::BisectionDivergence);
+        let (result, out, worker) = run_fake(
+            "verify",
+            &[
+                "--snapshot",
+                "abababababababababababababababababababababababababababababababab",
+                "--input-log-id",
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                "--json",
+            ],
+            worker,
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("\"type\":\"divergence\""));
+        assert!(out.contains("\"first_bad_epoch\":7"));
+        assert!(out.contains("\"icount_lo\":60000"));
+        assert!(out.contains("\"icount_hi\":80000"));
+        assert!(out.contains("\"rip_expected\":18446603336221200384"));
+        assert!(out.contains("\"rip_actual\":18446603336221200388"));
+        assert!(out.contains("\"reg_diff\":\"a1b2\""));
+        assert!(out.contains("\"diff_page_idx\":[1536,1537]"));
+        assert!(out.contains("evidence_mode=replay-vs-recorded"));
+        assert!(out.contains("\"status\":\"ok\""));
+        assert!(matches!(worker.calls()[0], SeenCall::VerifyReplay(_)));
+
+        let worker = FakeWorker::default();
+        worker.set_verify_mode(VerifyMode::BisectionDivergence);
+        let (result, out, _worker) = run_fake(
+            "verify",
+            &[
+                "--snapshot",
+                "abababababababababababababababababababababababababababababababab",
+                "--input-log-id",
+                "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            ],
+            worker,
+        )
+        .await;
+        result.unwrap();
+        assert!(out.contains("divergence first_bad_epoch=7 icount_range=60000..80000"));
+        assert!(out.contains("expected_checkpoint_ref=eeee"));
+        assert!(out.contains("verify: ok"));
     }
 
     #[test]

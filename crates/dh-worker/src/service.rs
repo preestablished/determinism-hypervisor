@@ -7186,7 +7186,7 @@ mod tests {
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
                     base: Some(base_snapshot),
                     log: Some(VerifyLog::InputLog(poisoned_log)),
-                    bisect_on_divergence: None,
+                    bisect_on_divergence: Some(true),
                 }))
                 .await
                 .unwrap()
@@ -7196,7 +7196,7 @@ mod tests {
                 match item {
                     Ok(progress) => {
                         if matches!(progress.msg, Some(VerifyMsg::Divergence(_))) {
-                            panic!("default bisection must not emit fabricated Divergence");
+                            panic!("bisection must not emit fabricated Divergence");
                         }
                     }
                     Err(status) => {
@@ -7208,7 +7208,7 @@ mod tests {
             }
             assert!(
                 saw_checkpoint_error,
-                "default bisection must fail without checkpoint evidence"
+                "explicit bisection must fail without checkpoint evidence"
             );
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
@@ -7327,8 +7327,26 @@ mod tests {
             }
             let divergence = divergence.expect("VerifyReplay must stream a bisection divergence");
             assert_eq!(divergence.first_bad_epoch, 1);
+            assert_eq!(divergence.icount_lo, 0);
             assert_eq!(divergence.icount_hi, 10_000);
-            assert!(divergence.icount_lo < divergence.icount_hi);
+            assert_eq!(divergence.icount_hi - divergence.icount_lo, 10_000);
+            assert_ne!(
+                divergence.icount_hi - divergence.icount_lo,
+                1024,
+                "bisection evidence must not fabricate the old coarse 1024-instruction window"
+            );
+            assert_ne!(
+                divergence.rip_expected, 0,
+                "RIP fields must come from compared snapshots"
+            );
+            assert_eq!(
+                divergence.rip_expected, divergence.rip_actual,
+                "this memory-only divergence should not fabricate a register/RIP mismatch"
+            );
+            assert!(
+                !divergence.reg_diff.is_empty(),
+                "register diff must come from the expected-vs-actual snapshot comparison"
+            );
             assert!(divergence
                 .diff_page_idx
                 .contains(&(0x60_0000u64 / snapstore_types::PAGE_SIZE as u64)));
@@ -7346,6 +7364,73 @@ mod tests {
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
                 .unwrap();
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn verify_replay_rpc_rejects_invalid_bisection_checkpoint_gap() {
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let config =
+            machine_config_from_proto(&service_machine_config([0x01; 32], [0x02; 32])).unwrap();
+        let recorded_base = snapstore_types::SnapshotRef::from_bytes([0x10; 32]);
+        let mut writer = new_segment_log(&config, Some(&recorded_base), [0x30; 32]).unwrap();
+        writer.epoch_hash(20, 0x2000, 1, [0x01; 32]).unwrap();
+        writer
+            .bisection_checkpoint(20, 0x2000, 10, [0xEE; 32], 20)
+            .unwrap();
+        let log = writer
+            .seal(dh_inputlog::dhilog::SealParams {
+                end_snapshot_id: [0; 32],
+                end_icount: 20,
+                end_vns: 20,
+                end_state_hash: [0x44; 32],
+                stop_reason: 0,
+            })
+            .unwrap();
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            Some(transport),
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(proto::SnapshotRef {
+                        hash: recorded_base.to_bytes().to_vec(),
+                    }),
+                    log: Some(VerifyLog::InputLog(log)),
+                    bisect_on_divergence: Some(true),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+
+            let mut saw_gap_error = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(progress) => panic!("invalid bisection checkpoint streamed {progress:?}"),
+                    Err(status) => {
+                        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                        assert!(status.message().contains("checkpoint index invalid"));
+                        assert!(status.message().contains("max_covered_gap 10"));
+                        assert!(status.message().contains("requires 20"));
+                        saw_gap_error = true;
+                    }
+                }
+            }
+            assert!(
+                saw_gap_error,
+                "VerifyReplay must fail publicly on invalid checkpoint gap metadata"
+            );
         });
     }
 
