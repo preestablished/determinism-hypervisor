@@ -20,7 +20,7 @@ use crate::runtime::{
     DrainedGuestEvent, QueuedInput, QueuedInputAt, QueuedInputKind, RuntimeActorError,
     RuntimeError, RuntimeThreadState, SlotActor, SlotRuntime, WorkerRuntimeTable,
 };
-use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
+use crate::slot_manager::{Lease, LeasePolicy, SlotError, SlotManager, parse_core_list};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
 #[cfg(target_arch = "x86_64")]
@@ -1197,11 +1197,7 @@ fn segment_vns_from_icount(
 
 #[cfg(target_arch = "x86_64")]
 fn hard_icount_cap(raw: u64) -> u64 {
-    if raw == 0 {
-        10_000_000_000
-    } else {
-        raw
-    }
+    if raw == 0 { 10_000_000_000 } else { raw }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1856,6 +1852,19 @@ fn config_hash_for_slot(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn ensure_lapic_snapshotable(
+    lapic: &dh_vmm::lapic::LocalApic,
+    context: &str,
+) -> Result<(), Status> {
+    if !lapic.is_reset() {
+        return Err(Status::failed_precondition(format!(
+            "{context} cannot persist non-reset lAPIC state until the LAPC snapshot format lands"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 fn runtime_with_log(
     slot: dh_vmm::kvm::SlotVm,
     bus: dh_devices::MmioBus,
@@ -2110,6 +2119,57 @@ fn service_exit_with_detchannel(
             rail.serial.pio_read(port, data);
             Vec::new()
         }
+        kvm_ioctls::VcpuExit::MmioRead(gpa, data)
+            if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
+        {
+            rail.lapic.read_mmio(gpa, data).map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}"))
+            })?;
+            Vec::new()
+        }
+        kvm_ioctls::VcpuExit::MmioWrite(gpa, data)
+            if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
+        {
+            rail.lapic.write_mmio(gpa, data).map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!("lapic mmio write {gpa:#x}: {e:?}"))
+            })?;
+            Vec::new()
+        }
+        kvm_ioctls::VcpuExit::X86Rdmsr(msr)
+            if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
+        {
+            match rail.lapic.read_msr(msr.index) {
+                Ok(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                    Vec::new()
+                }
+                Err(e) => {
+                    *msr.error = 1;
+                    return Err(dh_vmm::boundary::BoundaryError::Exit(format!(
+                        "lapic rdmsr {:#x}: {e:?}",
+                        msr.index
+                    )));
+                }
+            }
+        }
+        kvm_ioctls::VcpuExit::X86Wrmsr(msr)
+            if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
+        {
+            match rail.lapic.write_msr(msr.index, msr.data) {
+                Ok(()) => {
+                    *msr.error = 0;
+                    Vec::new()
+                }
+                Err(e) => {
+                    *msr.error = 1;
+                    return Err(dh_vmm::boundary::BoundaryError::Exit(format!(
+                        "lapic wrmsr {:#x}: {e:?}",
+                        msr.index
+                    )));
+                }
+            }
+        }
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
         {
@@ -2269,12 +2329,14 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
         &mut runtime.entropy,
         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
     );
+    let lapic = std::mem::take(&mut runtime.lapic);
     let mut rail = dh_vmm::recording::DeviceRail::new(
         bus,
         entropy,
         log,
         RuntimeVmMem(runtime.slot.guest_mem.clone()),
     );
+    rail.lapic = lapic;
     let log_icount = runtime.position.segment_icount;
     let event_icount = runtime.position.cumulative_icount;
     let result = (|| {
@@ -2302,6 +2364,7 @@ fn drain_runtime_detchannel_at_pause(runtime: &mut SlotRuntime) -> Result<(), St
             .map_err(|e| Status::data_loss(e.to_string()))
     })();
     runtime.bus = rail.bus;
+    runtime.lapic = rail.lapic;
     runtime.entropy = rail.entropy;
     runtime.log = Some(rail.log);
     append_guest_events_with_retention_cap(&mut runtime.guest_events, result?);
@@ -2940,8 +3003,8 @@ impl WorkerService {
         // publication/removal so SlotManager and WorkerRuntimeTable stay
         // transactionally aligned.
         build_runtimes: impl FnOnce(&WorkerRuntimeTable, &[Lease]) -> Result<Vec<SlotRuntime>, Status>
-            + Send
-            + 'static,
+        + Send
+        + 'static,
     ) -> Result<Vec<Lease>, Status> {
         let manager = self.inner.manager.clone();
         let runtimes = self.inner.runtimes.clone();
@@ -3297,64 +3360,65 @@ impl HypervisorWorker for WorkerService {
             let child_leases = self
                 .install_forked_runtimes(parent.clone(), count, move |table, _leases| {
                     with_runtime_mut(table, parent.slot_id, move |parent_runtime| {
-                            parent_runtime
-                                .slot
-                                .freeze_ram()
-                                .map_err(|e| kvm_error_to_status("freeze parent RAM", e))?;
-                            let sys = dh_vmm::kvm::KvmSystem::open()
-                                .map_err(|e| kvm_error_to_status("open KVM", e))?;
-                            if parent_runtime.position.segment_icount != 0 {
-                                return Err(Status::failed_precondition(
-                                    "Fork requires the parent at its segment base; take a snapshot before forking a dirty segment",
-                                ));
-                            }
-                            let parent_base = parent_runtime.base_snapshot.clone();
-                            let parent_boundary =
-                                parent_runtime.boundary_state(parent_runtime.queued_inputs.is_empty());
-                            let mut out = Vec::with_capacity(entropy_seeds.len());
-                            for seed in entropy_seeds {
-                                let assets = image_resolver
-                                    .resolve_create_vm(&parent_runtime.machine_config)
-                                    .map_err(image_error_to_status)?;
-                                let (forked, child_bus) = crate::fork_engine::fork_slot_with_child_bus(
-                                    &sys,
-                                    &parent_runtime.slot,
-                                    dh_vmm::SlotState::Frozen,
-                                    &parent_runtime.bus,
-                                    &parent_runtime.entropy,
-                                    &parent_runtime.machine_config,
-                                    parent_boundary,
-                                    seed,
-                                    None,
-                                    |child| {
-                                        build_bus(
-                                            &parent_runtime.machine_config,
-                                            assets.base_image,
-                                            RuntimeVmMem(child.guest_mem.clone()),
-                                        )
-                                        .map_err(|e| format!("{}: {}", e.code(), e.message()))
-                                    },
-                                )
-                                .map_err(fork_engine_error_to_status)?;
-                                out.push(runtime_with_log(
-                                    forked.child,
-                                    child_bus,
-                                    forked.entropy,
-                                    parent_runtime.machine_config.clone(),
-                                    forked.chain,
-                                    parent_base.clone(),
-                                    crate::runtime::SlotPosition {
-                                        cumulative_icount: forked.cumulative_icount,
-                                        segment_icount: 0,
-                                        vns: forked.vns,
-                                        epoch_index: forked.epoch_index,
-                                        frame_counter: parent_runtime.position.frame_counter,
-                                    },
-                                    seed.unwrap_or([0; 32]),
-                                )?);
-                            }
-                            Ok(out)
-                        })?
+                        ensure_lapic_snapshotable(&parent_runtime.lapic, "Fork")?;
+                        parent_runtime
+                            .slot
+                            .freeze_ram()
+                            .map_err(|e| kvm_error_to_status("freeze parent RAM", e))?;
+                        let sys = dh_vmm::kvm::KvmSystem::open()
+                            .map_err(|e| kvm_error_to_status("open KVM", e))?;
+                        if parent_runtime.position.segment_icount != 0 {
+                            return Err(Status::failed_precondition(
+                                "Fork requires the parent at its segment base; take a snapshot before forking a dirty segment",
+                            ));
+                        }
+                        let parent_base = parent_runtime.base_snapshot.clone();
+                        let parent_boundary =
+                            parent_runtime.boundary_state(parent_runtime.queued_inputs.is_empty());
+                        let mut out = Vec::with_capacity(entropy_seeds.len());
+                        for seed in entropy_seeds {
+                            let assets = image_resolver
+                                .resolve_create_vm(&parent_runtime.machine_config)
+                                .map_err(image_error_to_status)?;
+                            let (forked, child_bus) = crate::fork_engine::fork_slot_with_child_bus(
+                                &sys,
+                                &parent_runtime.slot,
+                                dh_vmm::SlotState::Frozen,
+                                &parent_runtime.bus,
+                                &parent_runtime.entropy,
+                                &parent_runtime.machine_config,
+                                parent_boundary,
+                                seed,
+                                None,
+                                |child| {
+                                    build_bus(
+                                        &parent_runtime.machine_config,
+                                        assets.base_image,
+                                        RuntimeVmMem(child.guest_mem.clone()),
+                                    )
+                                    .map_err(|e| format!("{}: {}", e.code(), e.message()))
+                                },
+                            )
+                            .map_err(fork_engine_error_to_status)?;
+                            out.push(runtime_with_log(
+                                forked.child,
+                                child_bus,
+                                forked.entropy,
+                                parent_runtime.machine_config.clone(),
+                                forked.chain,
+                                parent_base.clone(),
+                                crate::runtime::SlotPosition {
+                                    cumulative_icount: forked.cumulative_icount,
+                                    segment_icount: 0,
+                                    vns: forked.vns,
+                                    epoch_index: forked.epoch_index,
+                                    frame_counter: parent_runtime.position.frame_counter,
+                                },
+                                seed.unwrap_or([0; 32]),
+                            )?);
+                        }
+                        Ok(out)
+                    })?
                 })
                 .await?;
             self.inner.metrics.observe_fork(started.elapsed());
@@ -3475,6 +3539,7 @@ impl HypervisorWorker for WorkerService {
                         Status::failed_precondition("slot has no active DHILOG segment")
                     })?;
                     let bus = std::mem::take(&mut runtime.bus);
+                    let lapic = std::mem::take(&mut runtime.lapic);
                     let entropy = std::mem::replace(
                         &mut runtime.entropy,
                         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
@@ -3498,12 +3563,14 @@ impl HypervisorWorker for WorkerService {
                         })
                         .collect();
                     let (run_result, consumed_input_orders, drained_guest_events, rail) = {
-                        let rail = std::cell::RefCell::new(dh_vmm::recording::DeviceRail::new(
+                        let mut rail_inner = dh_vmm::recording::DeviceRail::new(
                             bus,
                             entropy,
                             log,
                             RuntimeVmMem(runtime.slot.guest_mem.clone()),
-                        ));
+                        );
+                        rail_inner.lapic = lapic;
+                        let rail = std::cell::RefCell::new(rail_inner);
                         let mut consumed_input_orders = Vec::new();
                         let mut drained_guest_events = Vec::new();
                         let counter_ref = counter;
@@ -3592,6 +3659,17 @@ impl HypervisorWorker for WorkerService {
                                                 agenda_empty,
                                             };
                                         let rail_ref = rail.borrow();
+                                        ensure_lapic_snapshotable(
+                                            &rail_ref.lapic,
+                                            "bisection checkpoint",
+                                        )
+                                        .map_err(|e| {
+                                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                                "{}: {}",
+                                                e.code(),
+                                                e.message()
+                                            ))
+                                        })?;
                                         let store = checkpoint_store
                                             .as_ref()
                                             .ok_or_else(|| {
@@ -3693,6 +3771,7 @@ impl HypervisorWorker for WorkerService {
                         )
                     };
                     runtime.bus = rail.bus;
+                    runtime.lapic = rail.lapic;
                     runtime.entropy = rail.entropy;
                     runtime.log = Some(rail.log);
                     append_guest_events_with_retention_cap(
@@ -3881,6 +3960,7 @@ impl HypervisorWorker for WorkerService {
                         .machine_config
                         .config_hash()
                         .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
+                    ensure_lapic_snapshotable(&runtime.lapic, "TakeSnapshot")?;
                     let source = match runtime.base_snapshot.clone() {
                         Some(parent) => crate::snapshot_engine::PageSource::Incremental {
                             parent,
@@ -4379,8 +4459,8 @@ impl HypervisorWorker for WorkerService {
         &self,
         _request: Request<proto::WatchSlotsRequest>,
     ) -> Result<Response<Self::WatchSlotsStream>, Status> {
-        use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
         use tokio_stream::StreamExt;
+        use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(self.inner.manager.subscribe())
             .map(|event| match event {
@@ -4438,6 +4518,120 @@ mod tests {
             snapstore,
             ..test_config(slots)
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn service_test_rail() -> dh_vmm::recording::DeviceRail<RuntimeVmMem> {
+        let mem = RuntimeVmMem(
+            vm_memory::GuestMemoryMmap::<()>::from_ranges(&[(vm_memory::GuestAddress(0), 0x1000)])
+                .unwrap(),
+        );
+        dh_vmm::recording::DeviceRail::new(
+            dh_devices::MmioBus::new(),
+            dh_devices::entropy::DetEntropy::from_seed([7; 32]),
+            dh_inputlog::dhilog::LogWriter::new(dh_inputlog::dhilog::SegmentHeader {
+                base_snapshot_id: [0; 32],
+                entropy_seed: [7; 32],
+                machine_config_hash: [8; 32],
+                clock_num: 1,
+                clock_den: 1,
+                encoder_fingerprint: 0,
+            }),
+            mem,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linux_lapic_worker_service_handles_apic_exits_before_generic_paths() {
+        let mut rail = service_test_rail();
+
+        let mut version = [0u8; 4];
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::MmioRead(dh_vmm::lapic::XAPIC_MMIO_BASE + 0x30, &mut version),
+        )
+        .unwrap();
+        assert_eq!(u32::from_le_bytes(version), (5 << 16) | 0x14);
+
+        let tpr = 0x44u32.to_le_bytes();
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::MmioWrite(dh_vmm::lapic::XAPIC_MMIO_BASE + 0x80, &tpr),
+        )
+        .unwrap();
+        let mut tpr_back = [0u8; 4];
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::MmioRead(dh_vmm::lapic::XAPIC_MMIO_BASE + 0x80, &mut tpr_back),
+        )
+        .unwrap();
+        assert_eq!(u32::from_le_bytes(tpr_back), 0x44);
+
+        let mut read_error = 0u8;
+        let mut read_data = 0u64;
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::X86Rdmsr(kvm_ioctls::ReadMsrExit {
+                error: &mut read_error,
+                reason: kvm_ioctls::MsrExitReason::Unknown,
+                index: dh_vmm::msr::MSR_IA32_APIC_BASE,
+                data: &mut read_data,
+            }),
+        )
+        .unwrap();
+        assert_eq!(read_error, 0);
+        assert_eq!(read_data, dh_vmm::lapic::RESET_APIC_BASE_MSR);
+
+        let mut write_error = 0u8;
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::X86Wrmsr(kvm_ioctls::WriteMsrExit {
+                error: &mut write_error,
+                reason: kvm_ioctls::MsrExitReason::Unknown,
+                index: dh_vmm::msr::MSR_IA32_APIC_BASE,
+                data: dh_vmm::lapic::RESET_APIC_BASE_MSR,
+            }),
+        )
+        .unwrap();
+        assert_eq!(write_error, 0);
+
+        let icr_delivery = 0x40u32.to_le_bytes();
+        let err = service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::MmioWrite(dh_vmm::lapic::XAPIC_MMIO_BASE + 0x300, &icr_delivery),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("UnsupportedIcr"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linux_lapic_snapshot_guard_rejects_non_reset_state() {
+        let mut lapic = dh_vmm::lapic::LocalApic::new();
+        ensure_lapic_snapshotable(&lapic, "test").unwrap();
+
+        lapic
+            .write_mmio(
+                dh_vmm::lapic::XAPIC_MMIO_BASE + 0x80,
+                &0x44u32.to_le_bytes(),
+            )
+            .unwrap();
+        let err = ensure_lapic_snapshotable(&lapic, "test").unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("LAPC snapshot format"));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -7904,9 +8098,10 @@ mod tests {
         assert_eq!(div.rip_actual, 0x401004);
         assert_eq!(div.reg_diff, vec![0xA1, 0xB2]);
         assert_eq!(div.diff_page_idx, vec![17, 19]);
-        assert!(div
-            .suspected_cause
-            .contains("evidence_mode=replay-vs-recorded"));
+        assert!(
+            div.suspected_cause
+                .contains("evidence_mode=replay-vs-recorded")
+        );
         assert!(div.suspected_cause.contains("expected_checkpoint_ref="));
         assert!(div.suspected_cause.contains("actual_probe_ref="));
     }
@@ -8150,13 +8345,13 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(a_info.0, a_info.1 .0);
-        assert_eq!(b_info.0, b_info.1 .0);
+        assert_eq!(a_info.0, a_info.1.0);
+        assert_eq!(b_info.0, b_info.1.0);
         assert_ne!(a_info.0, b_info.0);
-        assert!(a_info.1 .1);
-        assert!(b_info.1 .1);
-        assert_eq!(a_info.1 .2, 0);
-        assert_eq!(b_info.1 .2, 0);
+        assert!(a_info.1.1);
+        assert!(b_info.1.1);
+        assert_eq!(a_info.1.2, 0);
+        assert_eq!(b_info.1.2, 0);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -8544,9 +8739,11 @@ mod tests {
             .into_inner()
             .slots;
         assert_eq!(slots.len(), 2);
-        assert!(slots
-            .iter()
-            .all(|slot| slot.state == i32::from(proto::SlotState::Empty)));
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot.state == i32::from(proto::SlotState::Empty))
+        );
 
         handle.abort();
     }

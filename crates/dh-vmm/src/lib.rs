@@ -28,6 +28,8 @@ pub mod inject;
 #[cfg(target_arch = "x86_64")]
 pub mod kvm;
 #[cfg(target_arch = "x86_64")]
+pub mod lapic;
+#[cfg(target_arch = "x86_64")]
 pub mod msr;
 #[cfg(target_arch = "x86_64")]
 pub mod recording;

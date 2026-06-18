@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -409,6 +409,7 @@ pub struct QueuedInput {
 pub struct SlotRuntime {
     pub slot: dh_vmm::kvm::SlotVm,
     pub bus: dh_devices::MmioBus,
+    pub lapic: dh_vmm::lapic::LocalApic,
     pub entropy: dh_devices::entropy::DetEntropy,
     /// Active DHILOG segment for this slot. Lifecycle RPCs create a fresh
     /// segment; Run wiring records into it and TakeSnapshot seals it.
@@ -448,6 +449,7 @@ impl SlotRuntime {
         Ok(Self::from_parts(SlotRuntimeParts {
             slot,
             bus,
+            lapic: dh_vmm::lapic::LocalApic::new(),
             entropy,
             log: None,
             machine_config,
@@ -470,6 +472,7 @@ impl SlotRuntime {
         Self {
             slot: parts.slot,
             bus: parts.bus,
+            lapic: parts.lapic,
             entropy: parts.entropy,
             log: parts.log,
             machine_config: parts.machine_config,
@@ -539,6 +542,7 @@ impl SlotRuntime {
 pub struct SlotRuntimeParts {
     pub slot: dh_vmm::kvm::SlotVm,
     pub bus: dh_devices::MmioBus,
+    pub lapic: dh_vmm::lapic::LocalApic,
     pub entropy: dh_devices::entropy::DetEntropy,
     pub log: Option<dh_inputlog::dhilog::LogWriter>,
     pub machine_config: dh_vmm::config::MachineConfig,

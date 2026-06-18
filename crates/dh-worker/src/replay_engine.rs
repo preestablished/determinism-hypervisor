@@ -104,6 +104,51 @@ where
         {
             rail.serial.pio_read(port, data);
         }
+        kvm_ioctls::VcpuExit::MmioRead(gpa, data)
+            if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
+        {
+            rail.lapic
+                .read_mmio(gpa, data)
+                .map_err(|e| BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}")))?;
+        }
+        kvm_ioctls::VcpuExit::MmioWrite(gpa, data)
+            if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
+        {
+            rail.lapic
+                .write_mmio(gpa, data)
+                .map_err(|e| BoundaryError::Exit(format!("lapic mmio write {gpa:#x}: {e:?}")))?;
+        }
+        kvm_ioctls::VcpuExit::X86Rdmsr(msr)
+            if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
+        {
+            match rail.lapic.read_msr(msr.index) {
+                Ok(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                }
+                Err(e) => {
+                    *msr.error = 1;
+                    return Err(BoundaryError::Exit(format!(
+                        "lapic rdmsr {:#x}: {e:?}",
+                        msr.index
+                    )));
+                }
+            }
+        }
+        kvm_ioctls::VcpuExit::X86Wrmsr(msr)
+            if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
+        {
+            match rail.lapic.write_msr(msr.index, msr.data) {
+                Ok(()) => *msr.error = 0,
+                Err(e) => {
+                    *msr.error = 1;
+                    return Err(BoundaryError::Exit(format!(
+                        "lapic wrmsr {:#x}: {e:?}",
+                        msr.index
+                    )));
+                }
+            }
+        }
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
         {
