@@ -74,6 +74,7 @@ pub enum RecordError {
 /// their landed boundaries, then `seal` once with the final outcome.
 pub struct DeviceRail<M: GuestMem> {
     pub bus: MmioBus,
+    pub lapic: crate::lapic::LocalApic,
     pub serial: DebugSerial,
     pub entropy: DetEntropy,
     pub log: LogWriter,
@@ -88,6 +89,7 @@ impl<M: GuestMem> DeviceRail<M> {
     pub fn new(bus: MmioBus, entropy: DetEntropy, log: LogWriter, mem: M) -> Self {
         Self {
             bus,
+            lapic: crate::lapic::LocalApic::new(),
             serial: DebugSerial::new(),
             entropy,
             log,
@@ -117,6 +119,43 @@ impl<M: GuestMem> DeviceRail<M> {
             }
             VcpuExit::IoIn(port, data) if (PIO_SERIAL_BASE..serial_end).contains(&port) => {
                 self.serial.pio_read(port, data);
+            }
+            VcpuExit::MmioRead(gpa, data) if crate::lapic::LocalApic::contains_mmio(gpa) => {
+                self.lapic.read_mmio(gpa, data).map_err(|e| {
+                    BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}"))
+                })?;
+            }
+            VcpuExit::MmioWrite(gpa, data) if crate::lapic::LocalApic::contains_mmio(gpa) => {
+                self.lapic.write_mmio(gpa, data).map_err(|e| {
+                    BoundaryError::Exit(format!("lapic mmio write {gpa:#x}: {e:?}"))
+                })?;
+            }
+            VcpuExit::X86Rdmsr(msr) if crate::lapic::LocalApic::is_lapic_msr(msr.index) => {
+                match self.lapic.read_msr(msr.index) {
+                    Ok(value) => {
+                        *msr.data = value;
+                        *msr.error = 0;
+                    }
+                    Err(e) => {
+                        *msr.error = 1;
+                        return Err(BoundaryError::Exit(format!(
+                            "lapic rdmsr {:#x}: {e:?}",
+                            msr.index
+                        )));
+                    }
+                }
+            }
+            VcpuExit::X86Wrmsr(msr) if crate::lapic::LocalApic::is_lapic_msr(msr.index) => {
+                match self.lapic.write_msr(msr.index, msr.data) {
+                    Ok(()) => *msr.error = 0,
+                    Err(e) => {
+                        *msr.error = 1;
+                        return Err(BoundaryError::Exit(format!(
+                            "lapic wrmsr {:#x}: {e:?}",
+                            msr.index
+                        )));
+                    }
+                }
             }
             VcpuExit::MmioRead(gpa, data) => {
                 self.bus
@@ -377,6 +416,47 @@ mod tests {
             clock_den: 1,
             encoder_fingerprint: 0,
         }
+    }
+
+    #[test]
+    fn linux_lapic_device_rail_services_apic_mmio_before_bus() {
+        let mut rail = DeviceRail::new(
+            MmioBus::new(),
+            DetEntropy::from_seed([7; 32]),
+            LogWriter::new(header()),
+            VecGuestMem(vec![0u8; 64]),
+        );
+
+        let mut version = [0u8; 4];
+        rail.service_exit(
+            0,
+            VcpuExit::MmioRead(crate::lapic::XAPIC_MMIO_BASE + 0x30, &mut version),
+        )
+        .unwrap();
+        assert_eq!(u32::from_le_bytes(version), (5 << 16) | 0x14);
+
+        let tpr = 0x44u32.to_le_bytes();
+        rail.service_exit(
+            0,
+            VcpuExit::MmioWrite(crate::lapic::XAPIC_MMIO_BASE + 0x80, &tpr),
+        )
+        .unwrap();
+        let mut tpr_back = [0u8; 4];
+        rail.service_exit(
+            0,
+            VcpuExit::MmioRead(crate::lapic::XAPIC_MMIO_BASE + 0x80, &mut tpr_back),
+        )
+        .unwrap();
+        assert_eq!(u32::from_le_bytes(tpr_back), 0x44);
+
+        let unmasked_timer = 0x40u32.to_le_bytes();
+        let err = rail
+            .service_exit(
+                0,
+                VcpuExit::MmioWrite(crate::lapic::XAPIC_MMIO_BASE + 0x320, &unmasked_timer),
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("UnsupportedTimer"));
     }
 
     #[test]

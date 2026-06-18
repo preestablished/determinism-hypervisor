@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use dh_detclock::counter::InstRetired;
 use dh_vmm::config::canonicalize_bzimage_cmdline_extras;
 use dh_vmm::kvm::{ExitEvent, KvmSystem};
+use dh_vmm::lapic::{LapicError, LocalApic};
 use dh_vmm::msr::{DeniedMsrClass, MSR_IA32_APIC_BASE, denied_msr_class};
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::VcpuExit;
@@ -213,6 +214,14 @@ impl LinuxBootTrace {
         }
     }
 
+    fn observe_lapic_mmio(&mut self, gpa: u64) {
+        self.apic_mmio_addresses.insert(gpa);
+    }
+
+    fn observe_lapic_msr(&mut self, index: u32) {
+        self.apic_msr_indices.insert(index);
+    }
+
     fn observe_denied_msr(&mut self, index: u32, write: bool) {
         self.denied_msr_indices.insert(index);
         if write {
@@ -267,9 +276,16 @@ fn trace_linux_boot(
     };
 
     if let Some(icount_limit) = icount_limit {
-        return trace_linux_boot_with_icount(slot, trace, exit_limit, icount_limit);
+        return trace_linux_boot_with_icount(
+            slot,
+            trace,
+            exit_limit,
+            icount_limit,
+            LocalApic::new(),
+        );
     }
 
+    let mut lapic = LocalApic::new();
     for _ in 0..exit_limit {
         let mut exit = match slot.vcpu.run() {
             Ok(exit) => exit,
@@ -281,6 +297,14 @@ fn trace_linux_boot(
 
         trace.total_exits += 1;
         trace.bump(raw_exit_kind(&exit));
+        match service_lapic_exit_for_trace(&mut trace, &mut lapic, &mut exit) {
+            TraceExitService::Handled => continue,
+            TraceExitService::Terminal(reason) => {
+                trace.terminal_reason = Some(reason);
+                return trace;
+            }
+            TraceExitService::Unhandled => {}
+        }
         prepare_exit_for_trace(&mut trace, &mut exit);
         let terminal = terminal_reason(&exit);
         let event = dh_vmm::kvm::classify_exit(exit);
@@ -305,6 +329,7 @@ fn trace_linux_boot_with_icount(
     mut trace: LinuxBootTrace,
     exit_limit: u64,
     icount_limit: u64,
+    mut lapic: LocalApic,
 ) -> LinuxBootTrace {
     if let Err(e) = dh_vmm::run::install_kick_handler() {
         trace.terminal_reason = Some(format!("icount_setup_failed: install kick handler: {e}"));
@@ -369,6 +394,15 @@ fn trace_linux_boot_with_icount(
 
         trace.total_exits += 1;
         trace.bump(raw_exit_kind(&exit));
+        match service_lapic_exit_for_trace(&mut trace, &mut lapic, &mut exit) {
+            TraceExitService::Handled => continue,
+            TraceExitService::Terminal(reason) => {
+                trace.final_icount = counter.read().ok();
+                trace.terminal_reason = Some(reason);
+                return trace;
+            }
+            TraceExitService::Unhandled => {}
+        }
         prepare_exit_for_trace(&mut trace, &mut exit);
         let terminal = terminal_reason(&exit);
         let event = dh_vmm::kvm::classify_exit(exit);
@@ -389,6 +423,68 @@ fn trace_linux_boot_with_icount(
     trace.final_icount = counter.read().ok();
     trace.terminal_reason = Some(format!("exit_limit_reached({exit_limit})"));
     trace
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TraceExitService {
+    Handled,
+    Terminal(String),
+    Unhandled,
+}
+
+fn service_lapic_exit_for_trace(
+    trace: &mut LinuxBootTrace,
+    lapic: &mut LocalApic,
+    exit: &mut VcpuExit<'_>,
+) -> TraceExitService {
+    match exit {
+        VcpuExit::MmioRead(gpa, data) if LocalApic::contains_mmio(*gpa) => {
+            trace.observe_lapic_mmio(*gpa);
+            match lapic.read_mmio(*gpa, data) {
+                Ok(()) => TraceExitService::Handled,
+                Err(e) => TraceExitService::Terminal(lapic_error("mmio_read", e)),
+            }
+        }
+        VcpuExit::MmioWrite(gpa, data) if LocalApic::contains_mmio(*gpa) => {
+            trace.observe_lapic_mmio(*gpa);
+            match lapic.write_mmio(*gpa, data) {
+                Ok(()) => TraceExitService::Handled,
+                Err(e) => TraceExitService::Terminal(lapic_error("mmio_write", e)),
+            }
+        }
+        VcpuExit::X86Rdmsr(msr) if LocalApic::is_lapic_msr(msr.index) => {
+            trace.observe_lapic_msr(msr.index);
+            match lapic.read_msr(msr.index) {
+                Ok(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                    TraceExitService::Handled
+                }
+                Err(e) => {
+                    *msr.error = 1;
+                    TraceExitService::Terminal(lapic_error("rdmsr", e))
+                }
+            }
+        }
+        VcpuExit::X86Wrmsr(msr) if LocalApic::is_lapic_msr(msr.index) => {
+            trace.observe_lapic_msr(msr.index);
+            match lapic.write_msr(msr.index, msr.data) {
+                Ok(()) => {
+                    *msr.error = 0;
+                    TraceExitService::Handled
+                }
+                Err(e) => {
+                    *msr.error = 1;
+                    TraceExitService::Terminal(lapic_error("wrmsr", e))
+                }
+            }
+        }
+        _ => TraceExitService::Unhandled,
+    }
+}
+
+fn lapic_error(context: &'static str, error: LapicError) -> String {
+    format!("lapic_{context}_error({error:?})")
 }
 
 fn prepare_exit_for_trace(trace: &mut LinuxBootTrace, exit: &mut VcpuExit<'_>) {
