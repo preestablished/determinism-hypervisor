@@ -15,9 +15,10 @@
 //! blob normalizes the TSC slot to vns (§8.1), and the landing loop never
 //! RDTSCs, so control's free-running TSC vs the restored leg's
 //! vns-programmed TSC_OFFSET is invisible here (the TSC≡vns discipline is
-//! tsc.rs's contract, pinned by its own tests); (2) device/bus state —
-//! runctl links hash device_sections=&[] in Phase 1 and these segments
-//! never touch MMIO, so device transparency is owned by the
+//! tsc.rs's contract, pinned by its own tests); (2) device/bus state for
+//! this M4 rig — these segments pass no device hash callback and never
+//! touch MMIO. Production record/replay now folds deterministic LAPIC
+//! state into hashes; the remaining device transparency is owned by the
 //! restore_engine joint tests (byte-level section round-trip + identical
 //! re-snapshot ref) and the ENTR golden bead (dy8).
 //!

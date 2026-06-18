@@ -367,6 +367,12 @@ fn typed_section_decode_negatives() {
         EntrSection::decode(&[0; 56], 0),
         Err(SectionError::BadVersion { found: 0 })
     );
+    let mut lapc = LapcSection::default().encode();
+    lapc[10] = 1;
+    assert_eq!(
+        LapcSection::decode(&lapc, LapcSection::VERSION),
+        Err(SectionError::NonzeroReserved { offset: 10 })
+    );
 }
 
 // ---- totality smoke -------------------------------------------------------------

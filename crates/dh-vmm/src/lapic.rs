@@ -520,6 +520,11 @@ mod tests {
 
     #[test]
     fn linux_lapic_lapc_section_roundtrips_and_rejects_malformed_state() {
+        assert_eq!(
+            LocalApic::from_lapc_section(LapcSection::default()).unwrap(),
+            LocalApic::new()
+        );
+
         let mut apic = LocalApic::new();
         write4(&mut apic, REG_TPR, 0x44).unwrap();
         write4(&mut apic, REG_LDR, 0x0102_0304).unwrap();

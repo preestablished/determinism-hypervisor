@@ -374,10 +374,11 @@ where
         hash_chain: chain_value,
         agenda_empty: false,
     };
-    let snapshot = crate::snapshot_engine::capture_bisection_checkpoint_snapshot(
+    let snapshot = crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
         slot,
         dh_vmm::SlotState::Paused,
         &rail.bus,
+        &rail.lapic,
         &rail.entropy,
         machine_config,
         boundary,

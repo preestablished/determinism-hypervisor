@@ -21,6 +21,7 @@ use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
 use dh_inputlog::dhilog::{DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER, LogWriter, SegmentHeader};
+use dh_inputlog::reader::LogReader;
 use dh_verify::verify::VerifyProgress;
 use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
@@ -32,9 +33,11 @@ use dh_vmm::runctl::{
     Segment, SegmentOutcome, StopReason, Until, run_segment_with_epochs,
     run_segment_with_scheduled_inputs_frames_and_epochs,
 };
+use dh_worker::bisection_index::BisectionCheckpointIndex;
 use dh_worker::replay_engine::{ReplayError, replay_segment};
+use dh_worker::snapshot_compare::RegDiff;
 use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
-use dh_worker::verify_replay::verify_replay;
+use dh_worker::verify_replay::{verify_replay, verify_replay_with_bisection_progress};
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
 
@@ -75,6 +78,7 @@ struct Recording {
 struct RecordOptions {
     poison_ram: bool,
     poison_lapic_after_snapshot: bool,
+    log_lapic_bisection_checkpoint: bool,
 }
 
 /// Boot pad_echo, snapshot at the boot boundary, then record three
@@ -193,6 +197,37 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, opts: RecordOptio
     };
 
     let o1 = run_one(&mut slot, &mut chain);
+    if opts.log_lapic_bisection_checkpoint {
+        let checkpoint = {
+            let rail_ref = rail.borrow();
+            dh_worker::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
+                &slot,
+                SlotState::Paused,
+                &rail_ref.bus,
+                &rail_ref.lapic,
+                &rail_ref.entropy,
+                &cfg,
+                BoundaryState {
+                    icount: o1.boundary.icount,
+                    vns: o1.vns,
+                    epoch_index: o1.boundary.icount / cfg.epoch_len.max(1),
+                    hash_chain: o1.state_hash,
+                    agenda_empty: false,
+                },
+                store,
+            )
+            .expect("bisection checkpoint snapshot")
+        };
+        rail.borrow_mut()
+            .log_bisection_checkpoint(
+                o1.boundary.icount,
+                o1.boundary.rip,
+                u32::try_from(o1.boundary.icount).unwrap(),
+                checkpoint.snapshot_ref.to_bytes(),
+                o1.vns,
+            )
+            .expect("bisection checkpoint log");
+    }
     rail.borrow_mut()
         .apply_pad_set(o1.boundary.icount, o1.boundary.rip, 0, 0xA1B2, 0)
         .unwrap();
@@ -743,6 +778,76 @@ fn lapc_verify_replay_reports_divergence_on_lapic_mutation() {
             assert_eq!(*first_bad_epoch, Some(1), "the very first epoch diverges");
             assert!(what.contains("EPOCH_HASH"));
             assert_ne!(expected, got);
+        }
+        other => panic!("wrong event: {other:?}"),
+    }
+}
+
+#[test]
+fn lapc_verify_replay_bisection_reports_lapic_reg_diff_on_mutation() {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return;
+    }
+    let (_rt, _handle, store, _dir) = spawn_store_blocking();
+    let poisoned = record(
+        &store,
+        RecordOptions {
+            poison_lapic_after_snapshot: true,
+            log_lapic_bisection_checkpoint: true,
+            ..RecordOptions::default()
+        },
+    );
+    let reader = LogReader::parse(&poisoned.log).expect("parse recording");
+    let index = BisectionCheckpointIndex::from_reader(&reader).expect("bisection index");
+    assert!(!index.is_empty(), "recording must carry bisection evidence");
+
+    let sys = KvmSystem::open().unwrap();
+    let counter = InstRetired::open_for_current_thread().unwrap();
+    counter
+        .route_overflow_to_thread(gettid(), dh_vmm::run::kick_signal())
+        .unwrap();
+    counter.arm_period(NEVER_FIRES_PERIOD).unwrap();
+    counter.reset().unwrap();
+    counter.enable().unwrap();
+    let mut slot = sys.create_slot_vm(MEM).unwrap();
+    let rail = DeviceRail::new(
+        record_bus(),
+        DetEntropy::from_seed([0; 32]),
+        LogWriter::new(SegmentHeader {
+            base_snapshot_id: poisoned.snapshot_ref.to_bytes(),
+            entropy_seed: [0; 32],
+            machine_config_hash: poisoned.cfg.config_hash().unwrap(),
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }),
+        VmMem(slot.guest_mem.clone()),
+    );
+
+    let terminal = verify_replay_with_bisection_progress(
+        &mut slot,
+        rail,
+        &poisoned.cfg,
+        poisoned.snapshot_ref.clone(),
+        &counter,
+        &store,
+        &poisoned.log,
+        Some(&index),
+        |_| Ok(()),
+    )
+    .expect("verification ran");
+    match terminal {
+        VerifyProgress::BisectionDivergence(divergence) => {
+            let decoded: Vec<RegDiff> =
+                postcard::from_bytes(&divergence.reg_diff).expect("reg diff postcard");
+            let lapic = decoded
+                .iter()
+                .find(|diff| diff.name == "lapic")
+                .expect("bisection evidence should carry the LAPC mismatch");
+            assert_ne!(lapic.expected, lapic.actual);
+            assert!(divergence.evidence.expected_checkpoint_ref.is_some());
+            assert!(divergence.evidence.actual_probe_ref.is_some());
         }
         other => panic!("wrong event: {other:?}"),
     }
