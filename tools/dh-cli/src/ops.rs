@@ -265,8 +265,15 @@ async fn stream_verify_like_output<W: std::io::Write + ?Sized>(
         .into_inner();
 
     let mut saw_progress = false;
+    let mut saw_divergence = false;
     while let Some(progress) = stream.message().await.map_err(OpError::Rpc)? {
         saw_progress = true;
+        if matches!(
+            progress.msg,
+            Some(proto::verify_replay_progress::Msg::Divergence(_))
+        ) {
+            saw_divergence = true;
+        }
         if json {
             writeln!(
                 out,
@@ -282,11 +289,14 @@ async fn stream_verify_like_output<W: std::io::Write + ?Sized>(
             .map_err(|e| OpError::Io(format!("flush stdout: {e}")))?;
     }
     if json {
-        writeln!(out, "{{\"op\":\"{}\",\"status\":\"ok\"}}", op)
+        let status = if saw_divergence { "divergence" } else { "ok" };
+        writeln!(out, "{{\"op\":\"{}\",\"status\":\"{}\"}}", op, status)
             .map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     } else if !saw_progress {
         writeln!(out, "{op}: no progress")
             .map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
+    } else if saw_divergence {
+        writeln!(out, "{op}: divergence").map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     } else {
         writeln!(out, "{op}: ok").map_err(|e| OpError::Io(format!("write stdout: {e}")))?;
     }
@@ -674,10 +684,26 @@ fn progress_human(progress: &proto::VerifyReplayProgress) -> String {
             done.total_icount,
             state_hash_human(done.end_state_hash.as_ref())
         ),
-        Some(Msg::Divergence(div)) => format!(
-            "divergence first_bad_epoch={} icount_range={}..{} suspected_cause={}",
-            div.first_bad_epoch, div.icount_lo, div.icount_hi, div.suspected_cause
-        ),
+        Some(Msg::Divergence(div)) => {
+            let diff_page_idx = div
+                .diff_page_idx
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "divergence first_bad_epoch={} icount_range={}..{} rip_expected={} \
+                 rip_actual={} reg_diff={} diff_page_idx=[{}] suspected_cause={}",
+                div.first_bad_epoch,
+                div.icount_lo,
+                div.icount_hi,
+                div.rip_expected,
+                div.rip_actual,
+                hex(&div.reg_diff),
+                diff_page_idx,
+                div.suspected_cause
+            )
+        }
         None => "missing_progress".into(),
     }
 }
@@ -1451,7 +1477,7 @@ mod tests {
         assert!(out.contains("\"reg_diff\":\"a1b2\""));
         assert!(out.contains("\"diff_page_idx\":[1536,1537]"));
         assert!(out.contains("evidence_mode=replay-vs-recorded"));
-        assert!(out.contains("\"status\":\"ok\""));
+        assert!(out.contains("\"status\":\"divergence\""));
         assert!(matches!(worker.calls()[0], SeenCall::VerifyReplay(_)));
 
         let worker = FakeWorker::default();
@@ -1469,8 +1495,12 @@ mod tests {
         .await;
         result.unwrap();
         assert!(out.contains("divergence first_bad_epoch=7 icount_range=60000..80000"));
+        assert!(out.contains("rip_expected=18446603336221200384"));
+        assert!(out.contains("rip_actual=18446603336221200388"));
+        assert!(out.contains("reg_diff=a1b2"));
+        assert!(out.contains("diff_page_idx=[1536,1537]"));
         assert!(out.contains("expected_checkpoint_ref=eeee"));
-        assert!(out.contains("verify: ok"));
+        assert!(out.contains("verify: divergence"));
     }
 
     #[test]

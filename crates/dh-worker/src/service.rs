@@ -4833,6 +4833,76 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn skip_first_checkpoint_and_widen_second(log: &[u8]) -> Vec<u8> {
+        let reader = dh_inputlog::reader::LogReader::parse(log).unwrap();
+        let header = reader.header().clone();
+        let (stop_reason, end_state_hash) = reader.end();
+        let mut writer = log_writer_from_reader_header(&header);
+        let mut checkpoint_count = 0usize;
+        let mut widened_second = false;
+
+        for rec in reader.records() {
+            match rec.body() {
+                dh_inputlog::reader::RecordBody::EpochHash {
+                    epoch_index,
+                    chain_value,
+                } => writer
+                    .epoch_hash(rec.icount(), rec.boundary_rip(), epoch_index, chain_value)
+                    .unwrap(),
+                dh_inputlog::reader::RecordBody::BisectionCheckpoint {
+                    format_version,
+                    flags,
+                    max_covered_gap,
+                    checkpoint_snapshot_ref,
+                    checkpoint_vns,
+                    ..
+                } => {
+                    assert_eq!(
+                        format_version,
+                        dh_inputlog::dhilog::BISECTION_CHECKPOINT_FORMAT_VERSION
+                    );
+                    assert_eq!(flags, dh_inputlog::dhilog::BISECTION_CHECKPOINT_FLAGS);
+                    checkpoint_count += 1;
+                    if checkpoint_count == 1 {
+                        continue;
+                    }
+                    let max_covered_gap = if checkpoint_count == 2 {
+                        widened_second = true;
+                        u32::try_from(rec.icount()).unwrap()
+                    } else {
+                        max_covered_gap
+                    };
+                    writer
+                        .bisection_checkpoint(
+                            rec.icount(),
+                            rec.boundary_rip(),
+                            max_covered_gap,
+                            checkpoint_snapshot_ref,
+                            checkpoint_vns,
+                        )
+                        .unwrap();
+                }
+                dh_inputlog::reader::RecordBody::End { .. } => {}
+                other => panic!("test log contains unexpected record {other:?}"),
+            }
+        }
+
+        assert!(
+            widened_second,
+            "test fixture must contain at least two checkpoint records"
+        );
+        writer
+            .seal(dh_inputlog::dhilog::SealParams {
+                end_snapshot_id: header.end_snapshot_id,
+                end_icount: header.end_icount,
+                end_vns: header.end_vns,
+                end_state_hash,
+                stop_reason,
+            })
+            .unwrap()
+    }
+
+    #[cfg(target_arch = "x86_64")]
     async fn capture_neutrality_leg(
         svc: &WorkerService,
         base_snapshot: proto::SnapshotRef,
@@ -7182,34 +7252,36 @@ mod tests {
             }
             assert!(saw_divergence, "VerifyReplay must stream a divergence");
 
-            let mut stream = svc
-                .verify_replay(Request::new(proto::VerifyReplayRequest {
-                    base: Some(base_snapshot),
-                    log: Some(VerifyLog::InputLog(poisoned_log)),
-                    bisect_on_divergence: Some(true),
-                }))
-                .await
-                .unwrap()
-                .into_inner();
-            let mut saw_checkpoint_error = false;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(progress) => {
-                        if matches!(progress.msg, Some(VerifyMsg::Divergence(_))) {
-                            panic!("bisection must not emit fabricated Divergence");
+            for (bisect_on_divergence, label) in [(Some(true), "explicit"), (None, "default")] {
+                let mut stream = svc
+                    .verify_replay(Request::new(proto::VerifyReplayRequest {
+                        base: Some(base_snapshot.clone()),
+                        log: Some(VerifyLog::InputLog(poisoned_log.clone())),
+                        bisect_on_divergence,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let mut saw_checkpoint_error = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(progress) => {
+                            if matches!(progress.msg, Some(VerifyMsg::Divergence(_))) {
+                                panic!("{label} bisection must not emit fabricated Divergence");
+                            }
+                        }
+                        Err(status) => {
+                            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                            assert!(status.message().contains("checkpoint evidence"));
+                            saw_checkpoint_error = true;
                         }
                     }
-                    Err(status) => {
-                        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-                        assert!(status.message().contains("checkpoint evidence"));
-                        saw_checkpoint_error = true;
-                    }
                 }
+                assert!(
+                    saw_checkpoint_error,
+                    "{label} bisection must fail without checkpoint evidence"
+                );
             }
-            assert!(
-                saw_checkpoint_error,
-                "explicit bisection must fail without checkpoint evidence"
-            );
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
@@ -7310,8 +7382,8 @@ mod tests {
 
             let mut stream = svc
                 .verify_replay(Request::new(proto::VerifyReplayRequest {
-                    base: Some(base_snapshot),
-                    log: Some(VerifyLog::InputLog(poisoned_log)),
+                    base: Some(base_snapshot.clone()),
+                    log: Some(VerifyLog::InputLog(poisoned_log.clone())),
                     bisect_on_divergence: Some(true),
                 }))
                 .await
@@ -7347,6 +7419,12 @@ mod tests {
                 !divergence.reg_diff.is_empty(),
                 "register diff must come from the expected-vs-actual snapshot comparison"
             );
+            let decoded_reg_diff: Vec<crate::snapshot_compare::RegDiff> =
+                postcard::from_bytes(&divergence.reg_diff).unwrap();
+            assert!(
+                decoded_reg_diff.is_empty(),
+                "memory-only divergence should encode an empty register diff, got {decoded_reg_diff:?}"
+            );
             assert!(divergence
                 .diff_page_idx
                 .contains(&(0x60_0000u64 / snapstore_types::PAGE_SIZE as u64)));
@@ -7360,6 +7438,38 @@ mod tests {
                 .suspected_cause
                 .contains("expected_checkpoint_ref="));
             assert!(divergence.suspected_cause.contains("actual_probe_ref="));
+
+            let wide_log = skip_first_checkpoint_and_widen_second(&poisoned_log);
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLog(wide_log)),
+                    bisect_on_divergence: Some(true),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut wide_divergence = None;
+            while let Some(item) = stream.next().await {
+                match item.unwrap().msg.unwrap() {
+                    VerifyMsg::EpochOk(_) => {}
+                    VerifyMsg::Done(done) => {
+                        panic!("expected wide bisection divergence, got {done:?}")
+                    }
+                    VerifyMsg::Divergence(div) => wide_divergence = Some(div),
+                }
+            }
+            let wide_divergence =
+                wide_divergence.expect("VerifyReplay must stream a wide bisection divergence");
+            assert_eq!(wide_divergence.first_bad_epoch, 1);
+            assert_eq!(wide_divergence.icount_lo, 0);
+            assert_eq!(wide_divergence.icount_hi, 20_000);
+            assert!(wide_divergence
+                .diff_page_idx
+                .contains(&(0x60_0000u64 / snapstore_types::PAGE_SIZE as u64)));
+            assert!(wide_divergence
+                .suspected_cause
+                .contains("evidence_mode=replay-vs-recorded"));
 
             svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
                 .await
