@@ -156,6 +156,14 @@ impl KvmSystem {
         Ok(Self { kvm, dirty_ring })
     }
 
+    /// The exact CPUID table installed on newly constructed vCPUs, in
+    /// MachineConfig's sorted canonical representation.
+    pub fn masked_cpuid_table(&self) -> Result<Vec<crate::config::CpuidLeaf>, KvmError> {
+        Ok(crate::cpuid::to_leaves(&crate::cpuid::masked_cpuid(
+            &self.kvm,
+        )?))
+    }
+
     /// Construct one slot's VM: VM fd, exactly one vCPU, and guest RAM as a
     /// single memfd-backed region [0, mem_bytes) with MADV_NOHUGEPAGE
     /// (ARCH §7.4: 4 KiB-exact dirty granularity). No irqchip, no PIT, no
@@ -333,6 +341,7 @@ impl KvmSystem {
         // The §7.2 determinism mask is part of slot construction: every
         // vCPU in this hypervisor runs the same fixed, hashed CPUID table.
         let masked = crate::cpuid::masked_cpuid(&self.kvm)?;
+        let cpuid_table = crate::cpuid::to_leaves(&masked);
         vcpu.set_cpuid2(&masked)
             .map_err(|e| KvmError::VcpuCreate(format!("KVM_SET_CPUID2: {e}")))?;
 
@@ -348,6 +357,7 @@ impl KvmSystem {
             vcpu,
             guest_mem: region,
             mem_bytes,
+            cpuid_table,
             ram_is_cow,
             dirty_ring_entries: ring_entries,
         })
@@ -481,6 +491,9 @@ pub struct SlotVm {
     pub vcpu: VcpuFd,
     pub guest_mem: GuestMemoryMmap<()>,
     pub mem_bytes: u64,
+    /// The masked CPUID table actually installed on `vcpu`, sorted in the
+    /// same canonical representation MachineConfig hashes.
+    pub cpuid_table: Vec<crate::config::CpuidLeaf>,
     /// True for tier-A CoW children: `guest_mem` is a PRIVATE mapping of
     /// the parent's memfd, so the child's diverged pages live in
     /// anonymous memory the memfd never sees. `freeze_ram` and

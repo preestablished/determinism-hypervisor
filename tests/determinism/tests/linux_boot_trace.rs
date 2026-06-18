@@ -103,6 +103,7 @@ fn linux_entry_smoke() {
             trace_path.is_file(),
             "{TRACE_BOOT_ENV}=1 must produce {TRACE_OUTPUT}"
         );
+        assert_trace_acceptance(&trace);
     }
 }
 
@@ -111,6 +112,31 @@ fn fatal_before_serviceable_exit(trace: &LinuxBootTrace) -> bool {
         && trace.terminal_reason.as_deref().is_some_and(|reason| {
             reason == "shutdown" || reason == "internal_error" || reason.starts_with("fail_entry(")
         })
+}
+
+fn assert_trace_acceptance(trace: &LinuxBootTrace) {
+    assert!(
+        trace.unclassified_denied_msr_indices.is_empty(),
+        "unclassified denied MSRs remain before READY: {:?}",
+        trace.unclassified_denied_msr_indices
+    );
+    assert!(
+        trace.unclassified_mmio_addresses.is_empty(),
+        "unclassified MMIO exits remain before READY: {:?}",
+        trace.unclassified_mmio_addresses
+    );
+    assert!(
+        trace.unclassified_irq_timer_exit_counts.is_empty(),
+        "unclassified IRQ/timer exits remain before READY: {:?}",
+        trace.unclassified_irq_timer_exit_counts
+    );
+    let reason = trace.terminal_reason.as_deref().unwrap_or("unknown");
+    assert!(
+        reason.starts_with("icount_limit_reached(")
+            || reason.starts_with("first_detchannel_")
+            || reason.starts_with("exit_limit_reached("),
+        "trace stopped for unexpected reason: {reason}"
+    );
 }
 
 fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {
@@ -784,5 +810,31 @@ mod trace_tests {
             ..LinuxBootTrace::default()
         };
         assert!(!fatal_before_serviceable_exit(&trace));
+    }
+
+    #[test]
+    fn trace_acceptance_rejects_unclassified_surfaces() {
+        let mut trace = LinuxBootTrace {
+            terminal_reason: Some("icount_limit_reached(limit=10, counted=10)".to_string()),
+            ..LinuxBootTrace::default()
+        };
+        assert_trace_acceptance(&trace);
+
+        trace.unclassified_denied_msr_indices.insert(0x10);
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(panic.is_err(), "unclassified MSRs must fail acceptance");
+        trace.unclassified_denied_msr_indices.clear();
+
+        trace.unclassified_mmio_addresses.insert(0xdead_beef);
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(panic.is_err(), "unclassified MMIO must fail acceptance");
+        trace.unclassified_mmio_addresses.clear();
+
+        trace.observe_irq_timer("intr");
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(
+            panic.is_err(),
+            "unclassified IRQ/timer exits must fail acceptance"
+        );
     }
 }
