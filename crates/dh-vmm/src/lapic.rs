@@ -104,6 +104,7 @@ pub enum LapicError {
     X2ApicUnsupported,
     UnsupportedApicBase { value: u64 },
     UnsupportedTimer { offset: u64, value: u32 },
+    UnsupportedIcr { offset: u64, value: u32 },
     InterruptsDisabled,
     BadVector { vector: u8 },
 }
@@ -171,6 +172,10 @@ impl LocalApic {
         }
         set_vector(&mut self.irr, vector);
         Ok(())
+    }
+
+    pub fn is_reset(&self) -> bool {
+        self == &Self::default()
     }
 
     pub fn next_pending_interrupt(&mut self) -> Option<u8> {
@@ -245,8 +250,16 @@ impl LocalApic {
             REG_DFR => self.dfr = value,
             REG_SVR => self.svr = value,
             REG_ESR => self.esr = 0,
-            REG_ICR_LOW => self.icr_low = value,
-            REG_ICR_HIGH => self.icr_high = value,
+            REG_ICR_LOW | REG_ICR_HIGH => {
+                if value != 0 {
+                    return Err(LapicError::UnsupportedIcr { offset: off, value });
+                }
+                if off == REG_ICR_LOW {
+                    self.icr_low = 0;
+                } else {
+                    self.icr_high = 0;
+                }
+            }
             REG_LVT_TIMER => {
                 if value & LVT_MASKED == 0 {
                     return Err(LapicError::UnsupportedTimer { offset: off, value });
@@ -401,6 +414,28 @@ mod tests {
             apic.write_msr(MSR_IA32_APIC_BASE, RESET_APIC_BASE_MSR | APIC_BASE_X2APIC),
             Err(LapicError::X2ApicUnsupported)
         );
+    }
+
+    #[test]
+    fn linux_lapic_rejects_icr_delivery_without_silent_ack() {
+        let mut apic = LocalApic::new();
+        assert_eq!(
+            write4(&mut apic, REG_ICR_LOW, 0x40),
+            Err(LapicError::UnsupportedIcr {
+                offset: REG_ICR_LOW,
+                value: 0x40
+            })
+        );
+        assert_eq!(
+            write4(&mut apic, REG_ICR_HIGH, 0x0100_0000),
+            Err(LapicError::UnsupportedIcr {
+                offset: REG_ICR_HIGH,
+                value: 0x0100_0000
+            })
+        );
+        write4(&mut apic, REG_ICR_LOW, 0).unwrap();
+        write4(&mut apic, REG_ICR_HIGH, 0).unwrap();
+        assert!(apic.is_reset());
     }
 
     #[test]

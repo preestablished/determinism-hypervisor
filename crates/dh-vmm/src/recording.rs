@@ -24,8 +24,8 @@
 
 use dh_devices::clock::PvClock;
 use dh_devices::entropy::DetEntropy;
-use dh_devices::net::{NetRxError, PvNet, DEVICE_ID_PV_NET};
-use dh_devices::pad::{PadError, PvPad, DEVICE_ID_PV_PAD};
+use dh_devices::net::{DEVICE_ID_PV_NET, NetRxError, PvNet};
+use dh_devices::pad::{DEVICE_ID_PV_PAD, PadError, PvPad};
 use dh_devices::{DebugSerial, DevCtx, GuestMem, IrqRequest, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SealParams, WriteError};
 use kvm_ioctls::VcpuExit;
@@ -121,9 +121,9 @@ impl<M: GuestMem> DeviceRail<M> {
                 self.serial.pio_read(port, data);
             }
             VcpuExit::MmioRead(gpa, data) if crate::lapic::LocalApic::contains_mmio(gpa) => {
-                self.lapic.read_mmio(gpa, data).map_err(|e| {
-                    BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}"))
-                })?;
+                self.lapic
+                    .read_mmio(gpa, data)
+                    .map_err(|e| BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}")))?;
             }
             VcpuExit::MmioWrite(gpa, data) if crate::lapic::LocalApic::contains_mmio(gpa) => {
                 self.lapic.write_mmio(gpa, data).map_err(|e| {
@@ -716,7 +716,7 @@ mod live_tests {
     use crate::hash::StateHashChain;
     use crate::kvm::KvmSystem;
     use crate::run::install_kick_handler;
-    use crate::runctl::{run_segment, Segment, Until};
+    use crate::runctl::{Segment, Until, run_segment};
     use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
     use dh_inputlog::dhilog::SegmentHeader;
     use dh_inputlog::reader::{LogReader, RecordBody};
