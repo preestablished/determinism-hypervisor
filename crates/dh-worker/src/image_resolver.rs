@@ -408,6 +408,12 @@ mod tests {
             file.write_all(bytes).unwrap();
             file.sync_all().unwrap();
         }
+
+        fn create_sparse_at_hash(&self, hash: &[u8; 32], len: u64) {
+            let file = File::create(self.path.join(cache_key(hash))).unwrap();
+            file.set_len(len).unwrap();
+            file.sync_all().unwrap();
+        }
     }
 
     impl Drop for CacheDir {
@@ -464,7 +470,7 @@ mod tests {
             BootSpec::BzImage {
                 kernel_hash,
                 initramfs_hash,
-                cmdline: b"panic=-1".to_vec(),
+                cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
             },
         );
 
@@ -476,9 +482,36 @@ mod tests {
             ResolvedBoot::BzImage {
                 kernel: b"bzimage".to_vec(),
                 initramfs: b"initramfs".to_vec(),
-                cmdline: b"panic=-1".to_vec(),
+                cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
             }
         );
+    }
+
+    #[test]
+    fn missing_bzimage_initramfs_is_not_found_before_boot_escapes() {
+        let cache = CacheDir::new("missing-initramfs");
+        let base_hash = cache.write_blob(b"base");
+        let kernel_hash = cache.write_blob(b"bzimage");
+        let missing_initramfs = [0xB7; 32];
+        let config = MachineConfig::new(
+            64 * 1024 * 1024,
+            base_hash,
+            BootSpec::BzImage {
+                kernel_hash,
+                initramfs_hash: missing_initramfs,
+                cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
+            },
+        );
+
+        match ImageResolver::new(&cache.path).resolve_create_vm(&config) {
+            Err(ImageResolverError::NotFound {
+                kind: ImageBlobKind::Initramfs,
+                hash,
+                ..
+            }) => assert_eq!(hash, missing_initramfs),
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("unexpected resolver success"),
+        }
     }
 
     #[test]
@@ -529,6 +562,39 @@ mod tests {
     }
 
     #[test]
+    fn bzimage_initramfs_hash_mismatch_is_loud_before_boot_escapes() {
+        let cache = CacheDir::new("initramfs-mismatch");
+        let base_hash = cache.write_blob(b"base");
+        let kernel_hash = cache.write_blob(b"bzimage");
+        let expected_initramfs = [0x5B; 32];
+        cache.write_at_hash(&expected_initramfs, b"tampered-initramfs");
+        let actual_initramfs = *blake3::hash(b"tampered-initramfs").as_bytes();
+        let config = MachineConfig::new(
+            64 * 1024 * 1024,
+            base_hash,
+            BootSpec::BzImage {
+                kernel_hash,
+                initramfs_hash: expected_initramfs,
+                cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet").unwrap(),
+            },
+        );
+
+        match ImageResolver::new(&cache.path).resolve_create_vm(&config) {
+            Err(ImageResolverError::HashMismatch {
+                kind: ImageBlobKind::Initramfs,
+                expected,
+                actual,
+                ..
+            }) => {
+                assert_eq!(expected, expected_initramfs);
+                assert_eq!(actual, actual_initramfs);
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("unexpected resolver success"),
+        }
+    }
+
+    #[test]
     fn oversized_boot_blobs_are_rejected_before_hashing() {
         let cache = CacheDir::new("too-large");
         let expected_kernel = [0x61; 32];
@@ -565,6 +631,42 @@ mod tests {
     }
 
     #[test]
+    fn boot_blob_caps_use_contract_constants() {
+        let cache = CacheDir::new("contract-caps");
+        let expected_kernel = [0x63; 32];
+        cache.create_sparse_at_hash(&expected_kernel, MAX_KERNEL_BYTES + 1);
+        match ImageResolver::new(&cache.path).read_blob(ImageBlobKind::Kernel, &expected_kernel) {
+            Err(ImageResolverError::TooLarge {
+                kind: ImageBlobKind::Kernel,
+                len,
+                max,
+                ..
+            }) => {
+                assert_eq!(len, MAX_KERNEL_BYTES + 1);
+                assert_eq!(max, MAX_KERNEL_BYTES);
+            }
+            other => panic!("wrong result: {other:?}"),
+        }
+
+        let expected_initramfs = [0x64; 32];
+        cache.create_sparse_at_hash(&expected_initramfs, MAX_INITRAMFS_BYTES + 1);
+        match ImageResolver::new(&cache.path)
+            .read_blob(ImageBlobKind::Initramfs, &expected_initramfs)
+        {
+            Err(ImageResolverError::TooLarge {
+                kind: ImageBlobKind::Initramfs,
+                len,
+                max,
+                ..
+            }) => {
+                assert_eq!(len, MAX_INITRAMFS_BYTES + 1);
+                assert_eq!(max, MAX_INITRAMFS_BYTES);
+            }
+            other => panic!("wrong result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn cache_entries_must_be_regular_non_symlink_files() {
         let cache = CacheDir::new("not-file");
         let dir_hash = [0x71; 32];
@@ -595,6 +697,35 @@ mod tests {
                 ..
             }) => {}
             other => panic!("wrong result for symlink entry: {other:?}"),
+        }
+
+        let initramfs_dir_hash = [0x73; 32];
+        std::fs::create_dir(cache.path.join(cache_key(&initramfs_dir_hash))).unwrap();
+        match ImageResolver::new(&cache.path).read_blob_limited(
+            ImageBlobKind::Initramfs,
+            &initramfs_dir_hash,
+            1024,
+        ) {
+            Err(ImageResolverError::NotFile {
+                kind: ImageBlobKind::Initramfs,
+                ..
+            }) => {}
+            other => panic!("wrong result for initramfs directory entry: {other:?}"),
+        }
+
+        let initramfs_link_hash = [0x74; 32];
+        std::os::unix::fs::symlink(&target, cache.path.join(cache_key(&initramfs_link_hash)))
+            .unwrap();
+        match ImageResolver::new(&cache.path).read_blob_limited(
+            ImageBlobKind::Initramfs,
+            &initramfs_link_hash,
+            1024,
+        ) {
+            Err(ImageResolverError::NotFile {
+                kind: ImageBlobKind::Initramfs,
+                ..
+            }) => {}
+            other => panic!("wrong result for initramfs symlink entry: {other:?}"),
         }
     }
 }

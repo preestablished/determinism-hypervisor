@@ -41,6 +41,45 @@ aarch64 cross-check needs a C compiler that can target aarch64:
   cargo clippy --workspace --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
   ```
 
+## M9 Linux artifact inputs
+
+Linux acceptance tests do not commit large guest artifacts. Operators stage the
+reference-workload outputs outside this repo and point tests at them with exactly
+these environment variables:
+
+| Env var | Required shape |
+|---|---|
+| `DH_M9_BZIMAGE` | Regular file: pinned Linux `bzImage` |
+| `DH_M9_INITRAMFS` | Regular file: deterministic initramfs containing `/init` |
+| `DH_M9_BASE_IMAGE` | Regular file: deterministic writable base image for the VM |
+| `DH_M9_GAME_IMAGE` | Regular file: read-only game image exposed in-guest as `/dev/vdb` |
+| `DH_M9_IMAGE_CACHE` | Existing directory: worker image cache keyed by lowercase BLAKE3 hex |
+
+Recommended staging layout on the `kvm-intel` box:
+
+```bash
+m9_artifact_root="$HOME/.cache/dh-m9/reference-workload"
+export DH_M9_BZIMAGE="$m9_artifact_root/bzImage"
+export DH_M9_INITRAMFS="$m9_artifact_root/initramfs.cpio"
+export DH_M9_BASE_IMAGE="$m9_artifact_root/base.img"
+export DH_M9_GAME_IMAGE="$m9_artifact_root/game.img"
+export DH_M9_IMAGE_CACHE="$HOME/.cache/dh-m9/image-cache"
+mkdir -p "$DH_M9_IMAGE_CACHE"
+```
+
+M9 test helpers in `tests/determinism/tests/common/mod.rs` and
+`crates/dh-worker/tests/common/mod.rs` fail loudly when a Linux acceptance test
+is requested and any required artifact is missing or has the wrong file type.
+Final M9 gates must not accept `*_ALLOW_SKIP=1`; a missing artifact is a failed
+gate, not a skip.
+
+For worker-service tests, register artifacts into `DH_M9_IMAGE_CACHE` before
+building `MachineConfig`: BLAKE3-hash each staged file and copy/link it to
+`$DH_M9_IMAGE_CACHE/<lowercase-blake3-hex>`, matching
+`dh_worker::image_resolver::cache_key`. The original staged paths are operator
+inputs; the image-cache entries are the bytes the worker resolves for
+`CreateVm`.
+
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 
 These self-skip elsewhere; on the box they run for real:
@@ -57,6 +96,7 @@ These self-skip elsewhere; on the box they run for real:
 | M1 device-surface acceptance | `cargo test -p determinism-tests --test m1_acceptance` | <1s |
 | Phase-1 gate (one command) | `cargo run -p dh-cli -- gate [--runs N]` | ~32s at 100 runs |
 | M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
+| M9 Linux acceptance gates | Export `DH_M9_BZIMAGE`, `DH_M9_INITRAMFS`, `DH_M9_BASE_IMAGE`, `DH_M9_GAME_IMAGE`, and `DH_M9_IMAGE_CACHE` as above, then run the M9-specific test commands introduced by the implementation beads | operator-run; no `*_ALLOW_SKIP=1` for final gates |
 | M7 nightly fork/VerifyReplay canary | `DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | scheduled in `nightly-drift.yaml` |
 | M7 fork/VerifyReplay acceptance | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | long |
 | M7 cross-slot rerun determinism | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | operator-run; 10 sampled jobs across all child slots |

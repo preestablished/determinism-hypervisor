@@ -4429,6 +4429,69 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn image_resolver_errors_map_to_create_vm_status_codes() {
+        let path = PathBuf::from("/cache/blob");
+        let hash = [0x11; 32];
+        let expected = [0x22; 32];
+        let actual = [0x33; 32];
+
+        let cases = [
+            (
+                image_error_to_status(ImageResolverError::InvalidConfig(
+                    dh_vmm::config::ConfigError::CmdlineTooLong,
+                )),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                image_error_to_status(ImageResolverError::NotFound {
+                    kind: crate::image_resolver::ImageBlobKind::Initramfs,
+                    hash,
+                    path: path.clone(),
+                }),
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                image_error_to_status(ImageResolverError::NotFile {
+                    kind: crate::image_resolver::ImageBlobKind::Kernel,
+                    path: path.clone(),
+                }),
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                image_error_to_status(ImageResolverError::HashMismatch {
+                    kind: crate::image_resolver::ImageBlobKind::Kernel,
+                    path: path.clone(),
+                    expected,
+                    actual,
+                }),
+                tonic::Code::DataLoss,
+            ),
+            (
+                image_error_to_status(ImageResolverError::TooLarge {
+                    kind: crate::image_resolver::ImageBlobKind::Initramfs,
+                    path: path.clone(),
+                    len: crate::image_resolver::MAX_INITRAMFS_BYTES + 1,
+                    max: crate::image_resolver::MAX_INITRAMFS_BYTES,
+                }),
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                image_error_to_status(ImageResolverError::Io {
+                    kind: crate::image_resolver::ImageBlobKind::BaseImage,
+                    path,
+                    source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                }),
+                tonic::Code::Unavailable,
+            ),
+        ];
+
+        for (status, code) in cases {
+            assert_eq!(status.code(), code, "{status}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn service_machine_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::MachineConfig {
         service_machine_config_with_mem_epoch_len(
             base_hash,

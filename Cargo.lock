@@ -396,6 +396,7 @@ dependencies = [
  "dh-inputlog",
  "dh-verify",
  "dh-vmm",
+ "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "nanokernel",

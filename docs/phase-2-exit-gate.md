@@ -115,6 +115,25 @@ non-overlapping slot and housekeeping CPU masks by default.
 | 7 | M7 full slot-core gates are preserved as operator commands | Full acceptance, 100-child nightly canary, cross-slot rerun determinism, and throughput soak commands are listed in [`docs/ops/test-partitioning.md`](ops/test-partitioning.md). This shell only exposes CPUs 0-1, so `DH_M7_ACCEPT_SLOT_CORES=0-1 DH_M7_ACCEPT_ALLOW_SKIP=1 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` confirms the guard path but does not replace the 2-5 slot-core operator run. |
 | 8 | Runner/tooling state recorded | [`docs/ops/github-runner.md`](ops/github-runner.md) records runner identity, fork-PR security policy, slot-core isolation, and pinned tool versions for M6/M7 |
 
+## M9 pre-Linux baseline refresh (2026-06-18)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`; live values match
+`ci/determinism-class.lock`.
+
+Before M9 Linux edits, the current nanokernel and worker baselines were
+rerun or re-recorded on this host:
+
+| Command | Evidence |
+|---|---|
+| `cargo test --workspace` | PASS on 2026-06-18. The run included the Phase 1 KVM tests (`if0_deferral`, `landing_precision`, `m1_acceptance`, `regression`, `timer_determinism`), VMM live tests, worker restore/fork/replay tests, and nanokernel fixture drift tests. |
+| M5 corpus reverify | `crates/dh-worker/tests/m5_record_replay.rs`: `record_replay_corpus_pad_echo_6s_reverifies ... ok` during `cargo test --workspace`. The explicit rebaseline test remained ignored with the documented guard `DH_WORKER_REGEN_RR_CORPUS=1 cargo test -p dh-worker --test m5_record_replay regenerate_record_replay_corpus_pad_echo_6s -- --ignored --nocapture`. |
+| M5 long acceptance | Still host/operator-gated and ignored by default: `m5_accept_record_replay_60s_vns_pad_sequence_x100 ... ignored`, command `cargo test -p dh-worker --test m5_record_replay --release -- --ignored --nocapture`. |
+| M6 slot-core acceptance | Still host/operator-gated and ignored by default: `m6_full_api_uds_64_concurrent_slots_match_single_slot_baseline ... ignored`, command `cargo test -p dh-worker --test m6_full_api_uds --release -- --ignored --nocapture`. |
+| M7 full fork/VerifyReplay acceptance | Target discovered; helper test `cross_check_indices_cover_the_1000_job_universe ... ok`. Full operator command remains `cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture`. |
+| M7 cross-slot rerun acceptance | Target discovered and ignored by default. Operator command remains `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture`. |
+| M4 perf telemetry | Still ignored by default: `m4_perf_gates_p50_128mib ... ignored`, command `cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture`. |
+
 ## Known refinements baked into the gate
 
 - Snapshot and restore perf numbers are storage telemetry on the

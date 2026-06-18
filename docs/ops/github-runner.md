@@ -57,6 +57,30 @@ explicitly (`sched_setaffinity`/`taskset` to 2–5), which an inherited
 `CPUAffinity` mask would not prevent anyway. One rule: **nothing pins to slot
 cores except guest vCPU threads and the tests that stand in for them.**
 
+## M9 Linux artifacts
+
+M9 Linux gates use reference-workload artifacts staged outside the repository.
+The runner should keep them under a user-local cache, for example
+`$HOME/.cache/dh-m9/reference-workload`, with image-cache entries under
+`$HOME/.cache/dh-m9/image-cache`. Required environment variables are exactly:
+
+```bash
+DH_M9_BZIMAGE
+DH_M9_INITRAMFS
+DH_M9_BASE_IMAGE
+DH_M9_GAME_IMAGE
+DH_M9_IMAGE_CACHE
+```
+
+`DH_M9_BZIMAGE`, `DH_M9_INITRAMFS`, `DH_M9_BASE_IMAGE`, and
+`DH_M9_GAME_IMAGE` must name regular files. `DH_M9_IMAGE_CACHE` must name an
+existing directory containing files keyed by lowercase BLAKE3 hex, matching
+`dh_worker::image_resolver::cache_key`.
+
+Final M9 acceptance evidence must not set `*_ALLOW_SKIP=1`. Missing artifacts
+are gate failures, not skips. Keep staged artifact directories outside the repo
+so large bzImage/initramfs/disk images cannot be committed accidentally.
+
 ## Tool provisioning (beyond the base Rust toolchain)
 
 Tools the milestone jobs (M5 fuzz / M6 smoke / M7 soak — IMPLEMENTATION-PLAN)

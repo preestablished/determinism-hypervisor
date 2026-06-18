@@ -15,7 +15,10 @@
 //! with bead 4qo.)
 
 use dh_proto::v1 as proto;
-use dh_vmm::config::{BootSpec, ConfigError, CpuidLeaf, HashEpochs, MachineConfig};
+use dh_vmm::config::{
+    bzimage_cmdline_extras_from_canonical, canonicalize_bzimage_cmdline_extras, BootSpec,
+    ConfigError, CpuidLeaf, HashEpochs, MachineConfig,
+};
 use dh_vmm::{vt::ClockRatio, SlotState};
 
 /// Slot lifecycle → API.md §2.8 `SlotState` (the `_S` suffixes are the
@@ -173,7 +176,7 @@ pub fn machine_config_from_proto(
         proto::boot_spec::Kind::Bzimage(bzimage) => BootSpec::BzImage {
             kernel_hash: hash32("boot.bzimage.kernel_hash", &bzimage.kernel_hash)?,
             initramfs_hash: hash32("boot.bzimage.initramfs_hash", &bzimage.initramfs_hash)?,
-            cmdline: bzimage.cmdline.clone(),
+            cmdline: canonicalize_bzimage_cmdline_extras(&bzimage.cmdline)?,
         },
     };
     let hash_epochs = match proto::HashEpochs::try_from(config.hash_epochs)
@@ -231,7 +234,8 @@ fn boot_spec_to_proto(boot: &BootSpec) -> proto::BootSpec {
             } => proto::boot_spec::Kind::Bzimage(proto::BzImageBoot {
                 kernel_hash: kernel_hash.to_vec(),
                 initramfs_hash: initramfs_hash.to_vec(),
-                cmdline: cmdline.clone(),
+                cmdline: bzimage_cmdline_extras_from_canonical(cmdline)
+                    .expect("BzImage MachineConfig cmdline must be canonical"),
             }),
         }),
     }
@@ -415,6 +419,15 @@ mod tests {
         assert_eq!(wire.cpuid_table.len(), 2);
         assert_eq!(wire.device_set, vec![1, 4, 7]);
         assert_eq!(wire.skid_margin, 16_384);
+        let Some(proto::boot_spec::Kind::Bzimage(bzimage)) =
+            wire.boot.as_ref().and_then(|boot| boot.kind.as_ref())
+        else {
+            panic!("expected BzImage boot");
+        };
+        assert_eq!(
+            bzimage.cmdline, b"quiet loglevel=4",
+            "wire shape carries extras only, not the forced baseline"
+        );
         let back = machine_config_from_proto(&wire).unwrap();
 
         assert_eq!(
@@ -424,6 +437,63 @@ mod tests {
         assert_eq!(back.cpuid_table, config.cpuid_table);
         assert_eq!(back.device_set, config.device_set);
         assert_eq!(back.resync_slack, dh_vmm::config::DEFAULT_RESYNC_SLACK);
+    }
+
+    #[test]
+    fn bzimage_cmdline_extras_normalize_through_proto() {
+        let mut wire = machine_config_to_proto(&full_machine_config());
+        if let Some(proto::boot_spec::Kind::Bzimage(bzimage)) =
+            wire.boot.as_mut().and_then(|boot| boot.kind.as_mut())
+        {
+            bzimage.cmdline = b"loglevel=7 quiet".to_vec();
+        }
+        let back = machine_config_from_proto(&wire).unwrap();
+        let BootSpec::BzImage { cmdline, .. } = &back.boot else {
+            panic!("expected BzImage boot");
+        };
+        assert_eq!(
+            cmdline,
+            &canonicalize_bzimage_cmdline_extras(b"quiet loglevel=7").unwrap()
+        );
+        let wire_back = machine_config_to_proto(&back);
+        let Some(proto::boot_spec::Kind::Bzimage(bzimage)) =
+            wire_back.boot.as_ref().and_then(|boot| boot.kind.as_ref())
+        else {
+            panic!("expected BzImage boot");
+        };
+        assert_eq!(bzimage.cmdline, b"quiet loglevel=7");
+    }
+
+    #[test]
+    fn bzimage_cmdline_extras_reject_bad_proto_tokens() {
+        let cases = [
+            (
+                b"root=/dev/vda".as_slice(),
+                ConfigError::BzImageCmdlineUnsupportedToken,
+            ),
+            (
+                b"quiet quiet".as_slice(),
+                ConfigError::BzImageCmdlineDuplicateToken,
+            ),
+            (
+                b"console=ttyS0".as_slice(),
+                ConfigError::BzImageCmdlineBaselineOverride,
+            ),
+        ];
+        for (cmdline, expected) in cases {
+            let mut wire = machine_config_to_proto(&full_machine_config());
+            if let Some(proto::boot_spec::Kind::Bzimage(bzimage)) =
+                wire.boot.as_mut().and_then(|boot| boot.kind.as_mut())
+            {
+                bzimage.cmdline = cmdline.to_vec();
+            }
+            assert_eq!(
+                machine_config_from_proto(&wire),
+                Err(MachineConfigWireError::InvalidConfig(expected)),
+                "cmdline {:?}",
+                String::from_utf8_lossy(cmdline)
+            );
+        }
     }
 
     #[test]
@@ -546,7 +616,7 @@ mod tests {
             BootSpec::BzImage {
                 kernel_hash: [0x22; 32],
                 initramfs_hash: [0x33; 32],
-                cmdline: b"console=ttyS0".to_vec(),
+                cmdline: canonicalize_bzimage_cmdline_extras(b"loglevel=4 quiet").unwrap(),
             },
         );
         config.clock = ClockRatio::new(1000, 1).unwrap();

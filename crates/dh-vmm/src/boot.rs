@@ -18,6 +18,8 @@ use vm_memory::{Bytes, GuestAddress};
 
 use crate::kvm::{SlotVm, MMIO_HOLE_BASE};
 
+pub mod linux_bzimage;
+
 const PML4_GPA: u64 = 0x1000;
 const PDPT_GPA: u64 = 0x2000;
 const PD_BASE_GPA: u64 = 0x3000; // four consecutive PD pages
@@ -29,12 +31,15 @@ const LOW_RAM_RESERVED: u64 = 0x8000;
 
 const PAGE_2M: u64 = 2 << 20;
 const GIB: u64 = 1 << 30;
+const LINUX_64BIT_ENTRY_OFFSET: u64 = 0x200;
 /// Cmdline cap: the BootInfo page is one 4 KiB page.
 pub const MAX_CMDLINE: usize = 4096 - 0x20;
 
 #[derive(Debug)]
 pub enum BootError {
     Elf(String),
+    BzImage(String),
+    LinuxLayout(String),
     Mem(String),
     Kvm(String),
     CmdlineTooLong,
@@ -44,6 +49,8 @@ impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BootError::Elf(e) => write!(f, "elf: {e}"),
+            BootError::BzImage(e) => write!(f, "bzImage: {e}"),
+            BootError::LinuxLayout(e) => write!(f, "Linux boot layout: {e}"),
             BootError::Mem(e) => write!(f, "guest memory: {e}"),
             BootError::Kvm(e) => write!(f, "kvm: {e}"),
             BootError::CmdlineTooLong => write!(f, "cmdline exceeds {MAX_CMDLINE} bytes"),
@@ -70,6 +77,33 @@ pub fn load_and_enter(slot: &SlotVm, elf: &[u8], cmdline: &[u8]) -> Result<BootL
         entry,
         bootinfo_gpa: BOOTINFO_GPA,
     })
+}
+
+/// Load a deterministic-subset Linux bzImage + initramfs and program the
+/// 64-bit Linux boot-protocol entry state. This path uses the same identity
+/// page tables and MSR filter posture as the ELF nanokernel loader, but the
+/// handoff page at RSI is Linux `boot_params` instead of DH BootInfo.
+pub fn load_bzimage_and_enter(
+    slot: &SlotVm,
+    bzimage: &[u8],
+    initramfs: &[u8],
+    cmdline: &[u8],
+) -> Result<linux_bzimage::LinuxBootLayout, BootError> {
+    let header =
+        linux_bzimage::parse_bzimage(bzimage, initramfs.len(), cmdline.len(), slot.mem_bytes)
+            .map_err(|e| BootError::BzImage(e.to_string()))?;
+    let plan = linux_bzimage::plan_bzimage_boot(&header, slot.mem_bytes, initramfs.len(), cmdline)
+        .map_err(|e| BootError::LinuxLayout(e.to_string()))?;
+
+    write_page_tables(&slot.guest_mem, slot.mem_bytes)?;
+    write_bzimage_plan(&slot.guest_mem, bzimage, initramfs, &plan)?;
+    crate::msr::apply_default_deny_filter(&slot.vm).map_err(|e| BootError::Kvm(e.0))?;
+    enter_linux_64bit(
+        &slot.vcpu,
+        plan.layout.kernel_image.start + LINUX_64BIT_ENTRY_OFFSET,
+        plan.layout.boot_params.start,
+    )?;
+    Ok(plan.layout)
 }
 
 /// Copy PT_LOAD segments into guest RAM with explicit [filesz, memsz)
@@ -195,6 +229,42 @@ where
         .map_err(|e| BootError::Mem(format!("bootinfo write: {e}")))
 }
 
+fn write_bzimage_plan<M>(
+    mem: &M,
+    bzimage: &[u8],
+    initramfs: &[u8],
+    plan: &linux_bzimage::LinuxBootPlan,
+) -> Result<(), BootError>
+where
+    M: Bytes<GuestAddress, E = vm_memory::GuestMemoryError>,
+{
+    let kernel_image_start = usize::try_from(plan.layout.kernel_image_file_offset)
+        .map_err(|_| BootError::BzImage("kernel image offset exceeds usize".into()))?;
+    let kernel_image_len = usize::try_from(plan.layout.kernel_image.len)
+        .map_err(|_| BootError::BzImage("kernel image length exceeds usize".into()))?;
+    let kernel_image_end = kernel_image_start
+        .checked_add(kernel_image_len)
+        .ok_or_else(|| BootError::BzImage("kernel image range overflows usize".into()))?;
+    let kernel_image = bzimage
+        .get(kernel_image_start..kernel_image_end)
+        .ok_or_else(|| BootError::BzImage("kernel image range exceeds bzImage bytes".into()))?;
+
+    mem.write_slice(kernel_image, GuestAddress(plan.layout.kernel_image.start))
+        .map_err(|e| BootError::Mem(format!("bzImage kernel image copy: {e}")))?;
+    mem.write_slice(
+        &plan.boot_params,
+        GuestAddress(plan.layout.boot_params.start),
+    )
+    .map_err(|e| BootError::Mem(format!("Linux boot_params write: {e}")))?;
+    mem.write_slice(&plan.cmdline_image, GuestAddress(plan.layout.cmdline.start))
+        .map_err(|e| BootError::Mem(format!("Linux cmdline write: {e}")))?;
+    if let Some(range) = plan.layout.initramfs {
+        mem.write_slice(initramfs, GuestAddress(range.start))
+            .map_err(|e| BootError::Mem(format!("initramfs copy: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Direct 64-bit entry (§2.3): CR0/CR3/CR4/EFER + segment caches via
 /// KVM_SET_SREGS (no real-mode phase, no in-memory GDT — KVM honors the
 /// cached descriptors), RIP = e_entry, RSI = &BootInfo, RFLAGS = 2.
@@ -251,6 +321,63 @@ pub fn enter_long_mode(vcpu: &kvm_ioctls::VcpuFd, entry: u64) -> Result<(), Boot
     Ok(())
 }
 
+fn enter_linux_64bit(
+    vcpu: &kvm_ioctls::VcpuFd,
+    entry: u64,
+    boot_params_gpa: u64,
+) -> Result<(), BootError> {
+    let kvm_err = |e: kvm_ioctls::Error| BootError::Kvm(e.to_string());
+    let mut sregs = vcpu.get_sregs().map_err(kvm_err)?;
+
+    let code = kvm_bindings::kvm_segment {
+        base: 0,
+        limit: 0xffff_ffff,
+        selector: 0x10, // Linux __BOOT_CS
+        type_: 0xb,     // execute/read, accessed
+        present: 1,
+        dpl: 0,
+        db: 0,
+        s: 1,
+        l: 1,
+        g: 1,
+        avl: 0,
+        unusable: 0,
+        padding: 0,
+    };
+    let data = kvm_bindings::kvm_segment {
+        selector: 0x18, // Linux __BOOT_DS
+        type_: 0x3,     // read/write, accessed
+        l: 0,
+        db: 1,
+        ..code
+    };
+    sregs.cs = code;
+    sregs.ds = data;
+    sregs.es = data;
+    sregs.fs = data;
+    sregs.gs = data;
+    sregs.ss = data;
+    sregs.cr3 = PML4_GPA;
+    sregs.cr4 = (1 << 5) | (1 << 9) | (1 << 10); // PAE | OSFXSR | OSXMMEXCPT
+    sregs.cr0 = 0x8000_0021; // PG | NE | PE
+    sregs.efer = (1 << 8) | (1 << 10); // LME | LMA
+    vcpu.set_sregs(&sregs).map_err(kvm_err)?;
+
+    let mut regs = vcpu.get_regs().map_err(kvm_err)?;
+    regs.rax = 0;
+    regs.rbx = 0;
+    regs.rcx = 0;
+    regs.rdx = 0;
+    regs.rbp = 0;
+    regs.rdi = 0;
+    regs.rsi = boot_params_gpa;
+    regs.rsp = 0;
+    regs.rip = entry;
+    regs.rflags = 2;
+    vcpu.set_regs(&regs).map_err(kvm_err)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +392,59 @@ mod tests {
         let mut b = [0u8; 8];
         mem.read_slice(&mut b, GuestAddress(gpa)).unwrap();
         u64::from_le_bytes(b)
+    }
+
+    fn synthetic_bzimage(payload: &[u8]) -> Vec<u8> {
+        const SETUP_SECTS_OFF: usize = 0x1f1;
+        const SETUP_HEADER_LEN_OFF: usize = 0x201;
+        const HEADER_MAGIC_OFF: usize = 0x202;
+        const PROTOCOL_VERSION_OFF: usize = 0x206;
+        const LOADFLAGS_OFF: usize = 0x211;
+        const INITRD_ADDR_MAX_OFF: usize = 0x22c;
+        const KERNEL_ALIGNMENT_OFF: usize = 0x230;
+        const RELOCATABLE_KERNEL_OFF: usize = 0x234;
+        const XLOADFLAGS_OFF: usize = 0x236;
+        const CMDLINE_SIZE_OFF: usize = 0x238;
+        const PAYLOAD_OFFSET_OFF: usize = 0x248;
+        const PAYLOAD_LENGTH_OFF: usize = 0x24c;
+        const PREF_ADDRESS_OFF: usize = 0x258;
+        const INIT_SIZE_OFF: usize = 0x260;
+        const SETUP_HEADER_END: usize = 0x268;
+
+        let setup_sects = 4u8;
+        let setup_bytes = (u64::from(setup_sects) + 1) * 512;
+        let payload_offset = 0x400u32;
+        let init_size = 0x40_0000u32;
+        let total = setup_bytes as usize + payload_offset as usize + payload.len();
+        let mut image = vec![0u8; total];
+        image[SETUP_SECTS_OFF] = setup_sects;
+        image[SETUP_HEADER_LEN_OFF] = (SETUP_HEADER_END - HEADER_MAGIC_OFF) as u8;
+        image[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
+        image[0x200..0x202].copy_from_slice(&[0xeb, 0x66]);
+        image[HEADER_MAGIC_OFF..HEADER_MAGIC_OFF + 4].copy_from_slice(b"HdrS");
+        image[PROTOCOL_VERSION_OFF..PROTOCOL_VERSION_OFF + 2]
+            .copy_from_slice(&0x020au16.to_le_bytes());
+        image[LOADFLAGS_OFF] = 0x01; // LOADED_HIGH
+        image[INITRD_ADDR_MAX_OFF..INITRD_ADDR_MAX_OFF + 4]
+            .copy_from_slice(&0x37ff_ffffu32.to_le_bytes());
+        image[KERNEL_ALIGNMENT_OFF..KERNEL_ALIGNMENT_OFF + 4]
+            .copy_from_slice(&0x20_0000u32.to_le_bytes());
+        image[RELOCATABLE_KERNEL_OFF] = 1;
+        image[XLOADFLAGS_OFF..XLOADFLAGS_OFF + 2].copy_from_slice(&0x0001u16.to_le_bytes());
+        image[CMDLINE_SIZE_OFF..CMDLINE_SIZE_OFF + 4]
+            .copy_from_slice(&(crate::config::MAX_CMDLINE as u32).to_le_bytes());
+        image[PAYLOAD_OFFSET_OFF..PAYLOAD_OFFSET_OFF + 4]
+            .copy_from_slice(&payload_offset.to_le_bytes());
+        image[PAYLOAD_LENGTH_OFF..PAYLOAD_LENGTH_OFF + 4]
+            .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        image[PREF_ADDRESS_OFF..PREF_ADDRESS_OFF + 8].copy_from_slice(&0x20_0000u64.to_le_bytes());
+        image[INIT_SIZE_OFF..INIT_SIZE_OFF + 4].copy_from_slice(&init_size.to_le_bytes());
+        let payload_start = setup_bytes as usize + payload_offset as usize;
+        image[setup_bytes as usize..payload_start].fill(0x5a);
+        let entry_byte = setup_bytes as usize + LINUX_64BIT_ENTRY_OFFSET as usize;
+        image[entry_byte] = 0xcc;
+        image[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+        image
     }
 
     #[test]
@@ -315,6 +495,130 @@ mod tests {
             write_bootinfo(&mem, 16 << 20, &vec![b'x'; MAX_CMDLINE + 1]),
             Err(BootError::CmdlineTooLong)
         ));
+    }
+
+    #[test]
+    fn bzimage_plan_writer_copies_linux_kernel_image_and_aux_data() {
+        let payload = vec![0xa5; 0x800];
+        let bzimage = synthetic_bzimage(&payload);
+        let initramfs = b"initramfs-bytes";
+        let cmdline = b"quiet";
+        let header =
+            linux_bzimage::parse_bzimage(&bzimage, initramfs.len(), cmdline.len(), 64 << 20)
+                .unwrap();
+        let plan =
+            linux_bzimage::plan_bzimage_boot(&header, 64 << 20, initramfs.len(), cmdline).unwrap();
+        let mem = ram(64 << 20);
+        write_bzimage_plan(&mem, &bzimage, initramfs, &plan).unwrap();
+
+        let kernel_start = plan.layout.kernel_image_file_offset as usize;
+        let kernel_len = plan.layout.kernel_image.len as usize;
+        let expected_kernel_image = &bzimage[kernel_start..kernel_start + kernel_len];
+        assert_eq!(
+            expected_kernel_image[LINUX_64BIT_ENTRY_OFFSET as usize],
+            0xcc
+        );
+        assert_eq!(
+            &expected_kernel_image
+                [plan.layout.compressed_payload_file_offset as usize - kernel_start..]
+                [..payload.len()],
+            payload
+        );
+
+        let mut got_kernel_image = vec![0u8; kernel_len];
+        mem.read_slice(
+            &mut got_kernel_image,
+            GuestAddress(plan.layout.kernel_image.start),
+        )
+        .unwrap();
+        assert_eq!(got_kernel_image, expected_kernel_image);
+
+        let mut got_payload = vec![0u8; payload.len()];
+        mem.read_slice(
+            &mut got_payload,
+            GuestAddress(
+                linux_bzimage::LINUX_KERNEL_LOAD_GPA
+                    + (plan.layout.compressed_payload_file_offset
+                        - plan.layout.kernel_image_file_offset),
+            ),
+        )
+        .unwrap();
+        assert_eq!(got_payload, payload);
+
+        let mut got_boot_params = [0u8; 0x240];
+        mem.read_slice(
+            &mut got_boot_params,
+            GuestAddress(linux_bzimage::LINUX_BOOT_PARAMS_GPA),
+        )
+        .unwrap();
+        assert_eq!(&got_boot_params[0x202..0x206], b"HdrS");
+        assert_eq!(
+            u32::from_le_bytes(got_boot_params[0x228..0x22c].try_into().unwrap()),
+            linux_bzimage::LINUX_CMDLINE_GPA as u32
+        );
+
+        let mut got_cmdline = [0u8; 6];
+        mem.read_slice(
+            &mut got_cmdline,
+            GuestAddress(linux_bzimage::LINUX_CMDLINE_GPA),
+        )
+        .unwrap();
+        assert_eq!(&got_cmdline, b"quiet\0");
+
+        let initramfs_gpa = plan.layout.initramfs.unwrap().start;
+        let mut got_initramfs = vec![0u8; initramfs.len()];
+        mem.read_slice(&mut got_initramfs, GuestAddress(initramfs_gpa))
+            .unwrap();
+        assert_eq!(got_initramfs, initramfs);
+    }
+
+    #[test]
+    fn bzimage_loader_programs_linux_64bit_entry_state() {
+        if !crate::kvm::kvm_usable() {
+            eprintln!("skipping: /dev/kvm not usable");
+            return;
+        }
+
+        let sys = crate::kvm::KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(64 << 20).unwrap();
+        let payload = vec![0xf4; 0x1000];
+        let bzimage = synthetic_bzimage(&payload);
+        let layout = load_bzimage_and_enter(&slot, &bzimage, b"initramfs", b"quiet").unwrap();
+
+        let regs = slot.vcpu.get_regs().unwrap();
+        assert_eq!(
+            regs.rip,
+            linux_bzimage::LINUX_KERNEL_LOAD_GPA + LINUX_64BIT_ENTRY_OFFSET
+        );
+        assert_eq!(regs.rsi, linux_bzimage::LINUX_BOOT_PARAMS_GPA);
+        assert_eq!(regs.rflags, 2);
+        assert_eq!(regs.rbx, 0);
+        assert_eq!(regs.rbp, 0);
+        assert_eq!(regs.rdi, 0);
+
+        let sregs = slot.vcpu.get_sregs().unwrap();
+        assert_eq!(sregs.cs.selector, 0x10);
+        assert_eq!(sregs.cs.l, 1);
+        assert_eq!(sregs.ds.selector, 0x18);
+        assert_eq!(sregs.ss.selector, 0x18);
+        assert_eq!(sregs.cr3, PML4_GPA);
+        assert_ne!(sregs.cr0 & (1 << 31), 0, "paging enabled");
+        assert_ne!(sregs.cr0 & 1, 0, "protected mode enabled");
+        assert_ne!(sregs.cr4 & (1 << 5), 0, "PAE enabled");
+        assert_ne!(sregs.efer & (1 << 8), 0, "LME enabled");
+        assert_ne!(sregs.efer & (1 << 10), 0, "LMA enabled");
+
+        let mut got_payload = vec![0u8; payload.len()];
+        slot.guest_mem
+            .read_slice(
+                &mut got_payload,
+                GuestAddress(
+                    layout.kernel_image.start
+                        + (layout.compressed_payload_file_offset - layout.kernel_image_file_offset),
+                ),
+            )
+            .unwrap();
+        assert_eq!(got_payload, payload);
     }
 
     #[test]
