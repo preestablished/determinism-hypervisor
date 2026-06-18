@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dh_detclock::counter::InstRetired;
 use kvm_ioctls::VcpuExit;
 
-use crate::agenda::{compile, AgendaError, AgendaInputs, FinalStop, StopKind};
-use crate::boundary::{land_at, Boundary, BoundaryError, Margins};
+use crate::agenda::{AgendaError, AgendaInputs, FinalStop, StopKind, compile};
+use crate::boundary::{Boundary, BoundaryError, Margins, land_at};
 use crate::config::MachineConfig;
 use crate::hash::StateHashChain;
-use crate::inject::{inject_at_boundary, InjectError, Injection};
+use crate::inject::{InjectError, Injection, inject_at_boundary};
 use crate::kvm::SlotVm;
 
 /// §3.4 deferral budget per injection: deterministic and loud when the
@@ -1406,6 +1406,31 @@ mod timer_tests {
             .unwrap()
             .icount,
             10_001
+        );
+    }
+
+    #[test]
+    fn linux_cpu_compat_timer_conversion_is_counter_space_and_deterministic() {
+        let clock = ClockRatio::new(3, 2).unwrap();
+        let arm = TimerArm {
+            deadline_vns: 10,
+            vector: 0x41,
+        };
+        let a = timer_to_injection(arm, clock, 0).unwrap();
+        let b = timer_to_injection(arm, clock, 0).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            ScheduledInjection {
+                icount: 7,
+                vector: 0x41
+            },
+            "ceil(10 * 2 / 3) = 7 guest instructions"
+        );
+        assert_eq!(
+            timer_to_injection(arm, clock, 20).unwrap().icount,
+            21,
+            "expired timers clamp to the next guest-instruction boundary"
         );
     }
 

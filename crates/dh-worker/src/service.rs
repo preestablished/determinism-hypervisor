@@ -1444,6 +1444,7 @@ fn run_verify_replay_on_current_thread(
     let mut slot = sys
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+    let _ = config_hash_for_slot(&config, &slot)?;
     let bus = build_bus(
         &config,
         assets.base_image,
@@ -1837,6 +1838,24 @@ fn new_segment_log(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn config_hash_for_slot(
+    config: &dh_vmm::config::MachineConfig,
+    slot: &dh_vmm::kvm::SlotVm,
+) -> Result<[u8; 32], Status> {
+    if config.cpuid_table != slot.cpuid_table {
+        return Err(Status::invalid_argument(format!(
+            "MachineConfig cpuid_table does not match masked KVM CPUID table installed on vCPU \
+             (got {} leaves, expected {})",
+            config.cpuid_table.len(),
+            slot.cpuid_table.len()
+        )));
+    }
+    config
+        .config_hash()
+        .map_err(|e| Status::invalid_argument(format!("MachineConfig hash: {e:?}")))
+}
+
+#[cfg(target_arch = "x86_64")]
 fn runtime_with_log(
     slot: dh_vmm::kvm::SlotVm,
     bus: dh_devices::MmioBus,
@@ -1847,6 +1866,7 @@ fn runtime_with_log(
     position: crate::runtime::SlotPosition,
     entropy_seed: [u8; 32],
 ) -> Result<SlotRuntime, Status> {
+    let _ = config_hash_for_slot(&config, &slot)?;
     let log = new_segment_log(&config, base_snapshot.as_ref(), entropy_seed)?;
     let mut runtime = SlotRuntime::new(
         slot,
@@ -3126,9 +3146,7 @@ impl HypervisorWorker for WorkerService {
                         assets.base_image,
                         RuntimeVmMem(slot.guest_mem.clone()),
                     )?;
-                    let config_hash = config.config_hash().map_err(|e| {
-                        Status::invalid_argument(format!("MachineConfig hash: {e:?}"))
-                    })?;
+                    let config_hash = config_hash_for_slot(&config, &slot)?;
                     runtime_with_log(
                         slot,
                         bus,
@@ -3191,6 +3209,7 @@ impl HypervisorWorker for WorkerService {
                     let slot = sys
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
+                    let _ = config_hash_for_slot(&config, &slot)?;
                     let mut bus = build_bus(
                         &config,
                         assets.base_image,
@@ -4492,6 +4511,23 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn service_test_cpuid_table() -> Vec<dh_vmm::config::CpuidLeaf> {
+        dh_vmm::kvm::KvmSystem::open()
+            .and_then(|sys| sys.masked_cpuid_table())
+            .unwrap_or_else(|_| {
+                vec![dh_vmm::config::CpuidLeaf {
+                    function: 0,
+                    index: 0,
+                    flags: 0,
+                    eax: 0,
+                    ebx: 0,
+                    ecx: 0,
+                    edx: 0,
+                }]
+            })
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn service_machine_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::MachineConfig {
         service_machine_config_with_mem_epoch_len(
             base_hash,
@@ -4517,6 +4553,7 @@ mod tests {
             },
         );
         config.epoch_len = epoch_len;
+        config.cpuid_table = service_test_cpuid_table();
         config.device_set = vec![
             dh_devices::clock::DEVICE_ID_PV_CLOCK,
             dh_devices::pad::DEVICE_ID_PV_PAD,
@@ -4539,6 +4576,7 @@ mod tests {
                 cmdline: Vec::new(),
             },
         );
+        config.cpuid_table = service_test_cpuid_table();
         config.device_set = vec![
             dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
             dh_devices::clock::DEVICE_ID_PV_CLOCK,
@@ -4585,6 +4623,7 @@ mod tests {
             },
         );
         config.epoch_len = epoch_len;
+        config.cpuid_table = service_test_cpuid_table();
         config.device_set = vec![
             dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
             dh_devices::clock::DEVICE_ID_PV_CLOCK,
@@ -7931,6 +7970,43 @@ mod tests {
                 false
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linux_cpu_compat_config_hash_requires_installed_cpuid_table_live() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let sys = dh_vmm::kvm::KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(2 * 1024 * 1024).unwrap();
+        let mut config = dh_vmm::config::MachineConfig::new(
+            2 * 1024 * 1024,
+            [0x44; 32],
+            dh_vmm::config::BootSpec::Elf {
+                kernel_hash: [0x55; 32],
+                cmdline: Vec::new(),
+            },
+        );
+        config.device_set = vec![
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+
+        let err = config_hash_for_slot(&config, &slot).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("cpuid_table does not match"));
+
+        config.cpuid_table = slot.cpuid_table.clone();
+        let hash = config_hash_for_slot(&config, &slot).unwrap();
+        assert_eq!(hash, config.config_hash().unwrap());
+
+        config.cpuid_table[0].eax ^= 1;
+        let err = config_hash_for_slot(&config, &slot).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("cpuid_table does not match"));
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use dh_detclock::counter::InstRetired;
 use dh_vmm::config::canonicalize_bzimage_cmdline_extras;
 use dh_vmm::kvm::{ExitEvent, KvmSystem};
+use dh_vmm::msr::{DeniedMsrClass, MSR_IA32_APIC_BASE, denied_msr_class};
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
@@ -26,9 +27,6 @@ const TRACE_ICOUNT_LIMIT_ENV: &str = "DH_M9_TRACE_ICOUNT_LIMIT";
 const DEFAULT_TRACE_EXIT_LIMIT: u64 = 4096;
 const DEFAULT_TRACE_ICOUNT_LIMIT: u64 = 1_000_000_000;
 const SMOKE_TRACE_EXIT_LIMIT: u64 = 1;
-const MSR_IA32_APIC_BASE: u32 = 0x1B;
-const MSR_X2APIC_BASE: u32 = 0x800;
-const MSR_X2APIC_END: u32 = 0x8FF;
 
 #[test]
 #[ignore]
@@ -105,6 +103,7 @@ fn linux_entry_smoke() {
             trace_path.is_file(),
             "{TRACE_BOOT_ENV}=1 must produce {TRACE_OUTPUT}"
         );
+        assert_trace_acceptance(&trace);
     }
 }
 
@@ -113,6 +112,31 @@ fn fatal_before_serviceable_exit(trace: &LinuxBootTrace) -> bool {
         && trace.terminal_reason.as_deref().is_some_and(|reason| {
             reason == "shutdown" || reason == "internal_error" || reason.starts_with("fail_entry(")
         })
+}
+
+fn assert_trace_acceptance(trace: &LinuxBootTrace) {
+    assert!(
+        trace.unclassified_denied_msr_indices.is_empty(),
+        "unclassified denied MSRs remain before READY: {:?}",
+        trace.unclassified_denied_msr_indices
+    );
+    assert!(
+        trace.unclassified_mmio_addresses.is_empty(),
+        "unclassified MMIO exits remain before READY: {:?}",
+        trace.unclassified_mmio_addresses
+    );
+    assert!(
+        trace.unclassified_irq_timer_exit_counts.is_empty(),
+        "unclassified IRQ/timer exits remain before READY: {:?}",
+        trace.unclassified_irq_timer_exit_counts
+    );
+    let reason = trace.terminal_reason.as_deref().unwrap_or("unknown");
+    assert!(
+        reason.starts_with("icount_limit_reached(")
+            || reason.starts_with("first_detchannel_")
+            || reason.starts_with("exit_limit_reached("),
+        "trace stopped for unexpected reason: {reason}"
+    );
 }
 
 fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {
@@ -135,7 +159,10 @@ fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {
                 assert_eq!(entry.ecx & (1 << 24), 0, "TSC-deadline");
                 assert_eq!(entry.ecx & (1 << 30), 0, "RDRAND");
             }
-            (7, 0) => assert_eq!(entry.ebx & (1 << 18), 0, "RDSEED"),
+            (7, 0) => {
+                assert_eq!(entry.ebx & (1 << 18), 0, "RDSEED");
+                assert_eq!(entry.edx & (1 << 29), 0, "ARCH_CAPABILITIES");
+            }
             (0x8000_0001, _) => assert_eq!(entry.edx & (1 << 27), 0, "RDTSCP"),
             (0x8000_0007, _) => assert_eq!(entry.edx & (1 << 8), 0, "invariant TSC"),
             _ => {}
@@ -152,6 +179,10 @@ struct LinuxBootTrace {
     denied_wrmsr_indices: BTreeSet<u32>,
     apic_mmio_addresses: BTreeSet<u64>,
     apic_msr_indices: BTreeSet<u32>,
+    linux_cpu_compat_msr_indices: BTreeSet<u32>,
+    unclassified_denied_msr_indices: BTreeSet<u32>,
+    unclassified_mmio_addresses: BTreeSet<u64>,
+    unclassified_irq_timer_exit_counts: BTreeMap<&'static str, u64>,
     irq_window_open_count: u64,
     intr_count: u64,
     ioapic_eoi_vectors: BTreeSet<u8>,
@@ -177,6 +208,8 @@ impl LinuxBootTrace {
     fn observe_mmio(&mut self, gpa: u64) {
         if is_apic_mmio(gpa) {
             self.apic_mmio_addresses.insert(gpa);
+        } else {
+            self.unclassified_mmio_addresses.insert(gpa);
         }
     }
 
@@ -187,9 +220,24 @@ impl LinuxBootTrace {
         } else {
             self.denied_rdmsr_indices.insert(index);
         }
-        if is_apic_msr(index) {
-            self.apic_msr_indices.insert(index);
+        match denied_msr_class(index, write) {
+            DeniedMsrClass::LinuxCpuCompat => {
+                self.linux_cpu_compat_msr_indices.insert(index);
+            }
+            DeniedMsrClass::LapicRequired => {
+                self.apic_msr_indices.insert(index);
+            }
+            DeniedMsrClass::Unclassified => {
+                self.unclassified_denied_msr_indices.insert(index);
+            }
         }
+    }
+
+    fn observe_irq_timer(&mut self, kind: &'static str) {
+        *self
+            .unclassified_irq_timer_exit_counts
+            .entry(kind)
+            .or_insert(0) += 1;
     }
 
     fn observe_detchannel(&mut self, direction: &'static str, port: u16, len: usize) {
@@ -352,10 +400,17 @@ fn prepare_exit_for_trace(trace: &mut LinuxBootTrace, exit: &mut VcpuExit<'_>) {
             data.fill(0);
         }
         VcpuExit::MmioWrite(gpa, _) => trace.observe_mmio(*gpa),
-        VcpuExit::IrqWindowOpen => trace.irq_window_open_count += 1,
-        VcpuExit::Intr => trace.intr_count += 1,
+        VcpuExit::IrqWindowOpen => {
+            trace.irq_window_open_count += 1;
+            trace.observe_irq_timer("irq_window_open");
+        }
+        VcpuExit::Intr => {
+            trace.intr_count += 1;
+            trace.observe_irq_timer("intr");
+        }
         VcpuExit::IoapicEoi(vector) => {
             trace.ioapic_eoi_vectors.insert(*vector);
+            trace.observe_irq_timer("ioapic_eoi");
         }
         _ => {}
     }
@@ -516,10 +571,6 @@ fn is_apic_mmio(gpa: u64) -> bool {
     (base..end).contains(&gpa)
 }
 
-fn is_apic_msr(index: u32) -> bool {
-    index == MSR_IA32_APIC_BASE || (MSR_X2APIC_BASE..=MSR_X2APIC_END).contains(&index)
-}
-
 fn write_trace(trace: &LinuxBootTrace, path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -539,7 +590,7 @@ fn trace_output_path() -> PathBuf {
 fn trace_json(trace: &LinuxBootTrace) -> String {
     let mut out = String::new();
     writeln!(out, "{{").unwrap();
-    writeln!(out, "  \"schema_version\": 1,").unwrap();
+    writeln!(out, "  \"schema_version\": 2,").unwrap();
     writeln!(out, "  \"total_exits\": {},", trace.total_exits).unwrap();
     writeln!(out, "  \"exit_limit\": {},", trace.exit_limit).unwrap();
     writeln!(
@@ -595,6 +646,30 @@ fn trace_json(trace: &LinuxBootTrace) -> String {
         out,
         "  \"apic_msr_indices\": {},",
         json_hex_u32_set(&trace.apic_msr_indices)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  \"linux_cpu_compat_msr_indices\": {},",
+        json_hex_u32_set(&trace.linux_cpu_compat_msr_indices)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  \"unclassified_denied_msr_indices\": {},",
+        json_hex_u32_set(&trace.unclassified_denied_msr_indices)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  \"unclassified_mmio_addresses\": {},",
+        json_hex_u64_set(&trace.unclassified_mmio_addresses)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  \"unclassified_irq_timer_exit_counts\": {},",
+        json_count_map(&trace.unclassified_irq_timer_exit_counts)
     )
     .unwrap();
     writeln!(
@@ -703,6 +778,7 @@ mod trace_tests {
         trace.observe_denied_msr(MSR_IA32_APIC_BASE, false);
         trace.observe_mmio(dh_vmm::boot::linux_bzimage::LINUX_APIC_MMIO_BASE + 0x30);
         trace.irq_window_open_count = 1;
+        trace.observe_irq_timer("irq_window_open");
         trace.observe_detchannel("out", dh_vmm::kvm::PIO_DETCALL_BASE, 4);
 
         let json = trace_json(&trace);
@@ -711,6 +787,10 @@ mod trace_tests {
         assert!(json.contains("\"exit_kind_counts\": {\"x86_rdmsr\": 2}"));
         assert!(json.contains("\"denied_msr_indices\": [\"0x1b\"]"));
         assert!(json.contains("\"apic_mmio_addresses\": [\"0xfee00030\"]"));
+        assert!(json.contains("\"apic_msr_indices\": [\"0x1b\"]"));
+        assert!(json.contains("\"unclassified_denied_msr_indices\": []"));
+        assert!(json.contains("\"unclassified_mmio_addresses\": []"));
+        assert!(json.contains("\"unclassified_irq_timer_exit_counts\": {\"irq_window_open\": 1}"));
         assert!(json.contains("\"lapic_required\": true"));
         assert!(json.contains("\"first_detchannel_status\": {\"reached\": true"));
     }
@@ -730,5 +810,31 @@ mod trace_tests {
             ..LinuxBootTrace::default()
         };
         assert!(!fatal_before_serviceable_exit(&trace));
+    }
+
+    #[test]
+    fn trace_acceptance_rejects_unclassified_surfaces() {
+        let mut trace = LinuxBootTrace {
+            terminal_reason: Some("icount_limit_reached(limit=10, counted=10)".to_string()),
+            ..LinuxBootTrace::default()
+        };
+        assert_trace_acceptance(&trace);
+
+        trace.unclassified_denied_msr_indices.insert(0x10);
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(panic.is_err(), "unclassified MSRs must fail acceptance");
+        trace.unclassified_denied_msr_indices.clear();
+
+        trace.unclassified_mmio_addresses.insert(0xdead_beef);
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(panic.is_err(), "unclassified MMIO must fail acceptance");
+        trace.unclassified_mmio_addresses.clear();
+
+        trace.observe_irq_timer("intr");
+        let panic = std::panic::catch_unwind(|| assert_trace_acceptance(&trace));
+        assert!(
+            panic.is_err(),
+            "unclassified IRQ/timer exits must fail acceptance"
+        );
     }
 }
