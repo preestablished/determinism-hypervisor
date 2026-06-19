@@ -18,7 +18,7 @@ use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_vmm::boundary::{land_at, Boundary, BoundaryError, Margins};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
-use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, Until};
+use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, TimerFired, Until};
 use kvm_ioctls::VcpuExit;
 
 const TEST_NAME: &str = "linux_landing_counting";
@@ -27,6 +27,8 @@ const BASE_SNAPSHOT_REF: [u8; 32] = [0; 32];
 const LANDING_TARGETS: usize = 100;
 const TARGET_FLOOR_AFTER_READY: u64 = 1_000_000;
 const TARGET_STRIDE: u64 = 500_000;
+const TIMER_TARGET_INDEX: usize = 0;
+const TIMER_VECTOR: u8 = 0xF1;
 
 #[derive(Clone, Debug)]
 struct LinuxLandingSetup {
@@ -43,6 +45,14 @@ struct LandingSample {
     rip: u64,
     rcx: u64,
     state_hash: [u8; 32],
+    timer_fired: Option<TimerSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimerSample {
+    vector: u8,
+    armed_deadline_vns: u64,
+    delivered_icount: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,15 +90,38 @@ fn linux_post_ready_landings_are_exact_and_repeatable() -> common::TestResult<()
             "landed icount must equal the target exactly"
         );
     }
+    let timer_sample = first
+        .samples
+        .get(TIMER_TARGET_INDEX)
+        .and_then(|sample| sample.timer_fired.as_ref())
+        .expect("timer landing target must record a timer delivery");
+    assert_eq!(
+        timer_sample.delivered_icount, first.samples[TIMER_TARGET_INDEX].icount,
+        "timer must deliver at the selected landing target"
+    );
+    assert_eq!(
+        timer_sample.vector, TIMER_VECTOR,
+        "timer vector metadata must identify the scheduled IRQ"
+    );
+    assert!(
+        first
+            .samples
+            .iter()
+            .enumerate()
+            .all(|(index, sample)| index == TIMER_TARGET_INDEX || sample.timer_fired.is_none()),
+        "only the selected target should carry timer delivery metadata"
+    );
     assert_eq!(
         targets.first().copied(),
         Some(first.ready_icount + TARGET_FLOOR_AFTER_READY),
         "first target must start after the post-Ready landing warmup floor"
     );
     eprintln!(
-        "M9 Linux landing/counting: ready_icount={} targets={} first_hash={} last_hash={}",
+        "M9 Linux landing/counting: ready_icount={} targets={} timer_vector={} timer_delivered_icount={} first_hash={} last_hash={}",
         first.ready_icount,
         first.samples.len(),
+        timer_sample.vector,
+        timer_sample.delivered_icount,
         common::hex(&first.samples.first().expect("nonempty samples").state_hash),
         common::hex(&first.samples.last().expect("nonempty samples").state_hash)
     );
@@ -215,9 +248,28 @@ fn cold_boot_landings(
         ));
     }
 
-    let samples = land_targets(
-        label, &mut slot, &counter, &rail, &mut chain, setup, &targets,
+    let timer_sample = run_timer_landing_target(
+        label,
+        &mut slot,
+        &counter,
+        &rail,
+        &pause,
+        &mut chain,
+        setup,
+        ready.boundary.icount,
+        targets[TIMER_TARGET_INDEX],
     )?;
+    let mut samples = Vec::with_capacity(LANDING_TARGETS);
+    samples.push(timer_sample);
+    samples.extend(land_targets(
+        label,
+        &mut slot,
+        &counter,
+        &rail,
+        &mut chain,
+        setup,
+        &targets[TIMER_TARGET_INDEX + 1..],
+    )?);
     Ok(LandingRun {
         ready_icount: ready.boundary.icount,
         samples,
@@ -285,6 +337,117 @@ fn run_until_ready(
     Ok(outcome)
 }
 
+fn run_timer_landing_target(
+    label: &str,
+    slot: &mut dh_vmm::kvm::SlotVm,
+    counter: &InstRetired,
+    rail: &RefCell<common::M9DeviceRail>,
+    pause: &AtomicBool,
+    chain: &mut StateHashChain,
+    setup: &LinuxLandingSetup,
+    ready_icount: u64,
+    target: u64,
+) -> common::TestResult<LandingSample> {
+    let deadline_vns = setup
+        .config
+        .clock
+        .vns_from_icount(target)
+        .ok_or_else(|| format!("{label}: timer target {target} overflows vns conversion"))?;
+    let mut on_exit = |exit: VcpuExit<'_>| {
+        let icount = counter
+            .read()
+            .map_err(|e| BoundaryError::Exit(format!("{label}: counter read: {e:?}")))?;
+        common::m9_service_exit_with_detchannel(&mut rail.borrow_mut(), icount, exit)?;
+        Ok(())
+    };
+    let hash_device_sections = || common::m9_runtime_hash_device_sections(rail);
+    let mut segment = Segment {
+        slot,
+        counter,
+        chain,
+        config: &setup.config,
+        start_icount: ready_icount,
+        injections: &[],
+        timer: Some(dh_vmm::runctl::TimerArm {
+            deadline_vns,
+            vector: TIMER_VECTOR,
+        }),
+        pause,
+        sdk_events: None,
+        hash_device_sections: Some(&hash_device_sections),
+    };
+    let budget = target
+        .checked_sub(ready_icount)
+        .ok_or_else(|| format!("{label}: timer target {target} is before Ready {ready_icount}"))?;
+    let outcome = run_segment(
+        &mut segment,
+        Until::IcountBudget(budget),
+        &mut || false,
+        &mut on_exit,
+    )
+    .map_err(|e| format!("{label}: timer landing target {target}: {e}"))?;
+    if outcome.reason != StopReason::BudgetReached {
+        return Err(format!(
+            "{label}: timer landing target {target} stopped {:?}",
+            outcome.reason
+        ));
+    }
+    if outcome.boundary.icount != target {
+        return Err(format!(
+            "{label}: timer landing target {target} landed at {}",
+            outcome.boundary.icount
+        ));
+    }
+    if outcome.injections_delivered != 1 {
+        return Err(format!(
+            "{label}: timer landing target delivered {} injections, expected 1",
+            outcome.injections_delivered
+        ));
+    }
+    let fired = outcome
+        .timer_fired
+        .ok_or_else(|| format!("{label}: timer landing target {target} did not fire"))?;
+    assert_timer_delivery(label, target, deadline_vns, fired)?;
+    Ok(LandingSample {
+        icount: outcome.boundary.icount,
+        rip: outcome.boundary.rip,
+        rcx: outcome.boundary.rcx,
+        state_hash: outcome.state_hash,
+        timer_fired: Some(TimerSample {
+            vector: fired.vector,
+            armed_deadline_vns: fired.armed_deadline_vns,
+            delivered_icount: fired.delivered_icount,
+        }),
+    })
+}
+
+fn assert_timer_delivery(
+    label: &str,
+    target: u64,
+    deadline_vns: u64,
+    fired: TimerFired,
+) -> common::TestResult<()> {
+    if fired.vector != TIMER_VECTOR {
+        return Err(format!(
+            "{label}: timer vector {}, expected {TIMER_VECTOR}",
+            fired.vector
+        ));
+    }
+    if fired.armed_deadline_vns != deadline_vns {
+        return Err(format!(
+            "{label}: timer armed_deadline_vns {}, expected {deadline_vns}",
+            fired.armed_deadline_vns
+        ));
+    }
+    if fired.delivered_icount != target {
+        return Err(format!(
+            "{label}: timer delivered at {}, expected selected target {target}",
+            fired.delivered_icount
+        ));
+    }
+    Ok(())
+}
+
 fn land_targets(
     label: &str,
     slot: &mut dh_vmm::kvm::SlotVm,
@@ -322,6 +485,7 @@ fn land_targets(
             rip: boundary.rip,
             rcx: boundary.rcx,
             state_hash,
+            timer_fired: None,
         });
     }
     Ok(samples)
