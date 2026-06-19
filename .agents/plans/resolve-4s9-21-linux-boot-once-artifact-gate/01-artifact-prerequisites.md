@@ -25,6 +25,12 @@ Path requirements enforced by `crates/dh-worker/tests/common/mod.rs`:
 - `DH_M9_GAME_IMAGE` must be a readable regular file.
 - `DH_M9_IMAGE_CACHE` must be a readable directory.
 
+Operational requirement enforced by the acceptance harness:
+
+- `DH_M9_IMAGE_CACHE` must be writable by the test process. The harness
+  populates this directory with artifact blobs keyed by hash before creating
+  the worker service.
+
 ## Preflight Commands
 
 Run these before the acceptance tests:
@@ -40,6 +46,9 @@ test -f "$DH_M9_INITRAMFS"
 test -f "$DH_M9_BASE_IMAGE"
 test -f "$DH_M9_GAME_IMAGE"
 test -d "$DH_M9_IMAGE_CACHE"
+test -w "$DH_M9_IMAGE_CACHE"
+cache_probe=$(mktemp "$DH_M9_IMAGE_CACHE/.dh-m9-cache-write.XXXXXX")
+rm -f "$cache_probe"
 ```
 
 Expected `DH_M9_ALLOW_SKIP` value for final evidence:
@@ -49,6 +58,16 @@ test "$DH_M9_ALLOW_SKIP" = 0
 ```
 
 Do not use `DH_M9_ALLOW_SKIP=1` for final closure. Skip mode only proves the test harness can skip cleanly when artifacts are absent.
+
+Run an explicit KVM/dirty-ring host preflight before starting the long
+artifact-backed gates:
+
+```bash
+cargo test -p dh-vmm kvm::tests::caps_gate_passes_on_compliant_host -- --nocapture
+```
+
+If this fails, fix host/KVM setup before running the M9 artifact gates. Do not
+patch product code for a missing KVM capability.
 
 ## Code Sources for Prerequisites
 

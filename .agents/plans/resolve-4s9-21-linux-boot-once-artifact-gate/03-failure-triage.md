@@ -10,9 +10,13 @@ Infrastructure or artifact failures usually mention:
 
 - missing `DH_M9_*` environment variables
 - unreadable files or non-directory image cache
+- unwritable image cache or cache population failure
 - KVM unavailable
 - dirty ring unavailable
 - BzImage/initramfs/image hash lookup failure
+- malformed BzImage, initramfs, base image, or game image
+- wrong artifact set, for example a guest/initramfs that never emits guest-sdk Ready EventKind 14
+- boot artifact/config mismatch, including unexpected `MachineConfig.base_image_hash` or pv-blk backing hash
 
 Do not patch product code for those. Fix the host/artifact setup and rerun the same final command.
 
@@ -26,6 +30,12 @@ Product failures usually mention:
 - `Run until Ready` does not stop on guest-sdk Ready EventKind 14
 
 Those require code investigation.
+
+Before treating a failure as a product bug, confirm the artifact set is the
+intended M9 fixture set. At minimum, capture `sha256sum` or `b3sum` output for
+all four artifact files, record the exact paths, and compare them with the
+expected fixture manifest or release notes for the runner environment. A bad
+artifact set can look like a Ready, state-hash, or pv-blk product failure.
 
 ## If BzImage Load Count Increases
 
@@ -100,3 +110,6 @@ If code changes are needed, follow Ralph:
 - apply review fixes if needed
 - no-ff merge to `main`
 - push `main`
+- if host/artifacts cannot be fixed in-session, append notes to `4s9.21` with
+  the exact failing preflight or artifact validation output and keep the bead
+  blocked rather than closing it
