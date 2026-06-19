@@ -7906,6 +7906,135 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn verify_replay_rpc_streams_done_for_bisection_checkpoint_log() {
+        if !runtime_tests_available() {
+            return;
+        }
+        use proto::verify_replay_progress::Msg as VerifyMsg;
+        use proto::verify_replay_request::Log as VerifyLog;
+        use tokio_stream::StreamExt;
+
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let mut config =
+            test_config_with_resources(2, image_cache.path().to_path_buf(), Some(transport));
+        config.bisection_checkpoints = BisectionCheckpointConfig::every_epoch();
+        let svc = WorkerService::new(config).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config_with_mem_epoch_len(
+                        base_hash,
+                        kernel_hash,
+                        2 * 1024 * 1024,
+                        10_000,
+                    )),
+                    entropy_seed: vec![0xBC; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let base_lease = created.lease.unwrap();
+            let base_snapshot = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(base_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .snapshot
+                .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(base_lease),
+            }))
+            .await
+            .unwrap();
+
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(base_snapshot.clone()),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = restored.lease.unwrap();
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::IcountBudget(50_000)),
+                    hard_icount_cap: 0,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(run.icount, 50_000);
+
+            let snap = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let svc_for_log = svc.clone();
+            let input_log_id = snap.input_log_id.clone();
+            let log_bytes = tokio::task::spawn_blocking(move || {
+                stored_input_log_payload(&svc_for_log, input_log_id)
+            })
+            .await
+            .unwrap();
+            assert!(
+                !bisection_checkpoint_aux_records(&log_bytes).is_empty(),
+                "fixture must carry bisection checkpoint evidence"
+            );
+
+            let mut stream = svc
+                .verify_replay(Request::new(proto::VerifyReplayRequest {
+                    base: Some(base_snapshot),
+                    log: Some(VerifyLog::InputLog(log_bytes)),
+                    bisect_on_divergence: Some(true),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut done = None;
+            let mut epoch_ok_count = 0;
+            while let Some(item) = stream.next().await {
+                match item.unwrap().msg.unwrap() {
+                    VerifyMsg::EpochOk(_) => {
+                        assert!(done.is_none(), "EpochOk must precede terminal Done");
+                        epoch_ok_count += 1;
+                    }
+                    VerifyMsg::Done(msg) => done = Some(msg),
+                    VerifyMsg::Divergence(div) => panic!("unexpected divergence: {div:?}"),
+                }
+            }
+            assert!(
+                epoch_ok_count > 0,
+                "VerifyReplay must stream epoch progress before Done"
+            );
+            let done = done.expect("VerifyReplay must stream Done");
+            assert_eq!(done.total_icount, 50_000);
+            assert_eq!(done.end_state_hash.unwrap().hash.len(), 32);
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn verify_replay_rpc_streams_divergence_for_semantically_bad_log() {
         if !runtime_tests_available() {
             return;

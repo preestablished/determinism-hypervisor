@@ -19,9 +19,10 @@
 //!
 //! THE RESEAL HAMMER: replay records through its own rail exactly as
 //! the original run did, so on success the resealed log is BYTE-
-//! IDENTICAL to the input — the strongest equality this layer can
-//! state, subsuming the per-record checks (which exist for granular
-//! divergence reporting, not extra strength).
+//! IDENTICAL to the input, except for diagnostic-only bisection
+//! checkpoint AUX records. Those records are evidence captured during
+//! recording, not replay inputs, so replay may prove equivalence by
+//! matching every non-checkpoint record after sequence renumbering.
 //!
 //! Phase-1 scope, loud where cut: DEV_EVENT records replay through the
 //! generic device-event rail; vectored inputs (a PAD_SET/NET_RX whose
@@ -31,7 +32,7 @@
 
 use dh_detclock::counter::InstRetired;
 use dh_devices::ctx::GuestMem;
-use dh_inputlog::reader::{LogReader, ReadError, RecordBody};
+use dh_inputlog::reader::{Header, LogReader, ReadError, RecordBody};
 use dh_verify::verify::{BisectionDivergence, BisectionEvidence, BisectionMode};
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::MachineConfig;
@@ -327,9 +328,85 @@ pub struct ReplayOutcome {
     pub epoch_hashes_verified: u64,
     pub end_icount: u64,
     pub end_state_hash: [u8; 32],
-    /// The resealed log produced by the replay's own rail — byte-
-    /// identical to the input on success (asserted before returning).
+    /// The resealed log produced by the replay's own rail. On success it is
+    /// byte-identical to the input unless the input carried diagnostic-only
+    /// BISECTION_CHECKPOINT AUX records, which replay verifies by comparing
+    /// the normalized non-checkpoint record stream.
     pub resealed: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ComparableReplayHeader {
+    version: u16,
+    flags_without_has_aux: u32,
+    base_snapshot_id: [u8; 32],
+    end_snapshot_id: [u8; 32],
+    entropy_seed: [u8; 32],
+    machine_config_hash: [u8; 32],
+    clock_num: u32,
+    clock_den: u32,
+    end_icount: u64,
+    end_vns: u64,
+    end_state_hash: [u8; 32],
+    encoder_fingerprint: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ComparableReplayRecord {
+    kind: u8,
+    rflags: u8,
+    icount: u64,
+    boundary_rip: u64,
+    payload: Vec<u8>,
+}
+
+fn comparable_replay_header(header: &Header) -> ComparableReplayHeader {
+    ComparableReplayHeader {
+        version: header.version,
+        flags_without_has_aux: header.flags & !dh_inputlog::dhilog::FLAG_HAS_AUX,
+        base_snapshot_id: header.base_snapshot_id,
+        end_snapshot_id: header.end_snapshot_id,
+        entropy_seed: header.entropy_seed,
+        machine_config_hash: header.machine_config_hash,
+        clock_num: header.clock_num,
+        clock_den: header.clock_den,
+        end_icount: header.end_icount,
+        end_vns: header.end_vns,
+        end_state_hash: header.end_state_hash,
+        encoder_fingerprint: header.encoder_fingerprint,
+    }
+}
+
+fn has_bisection_checkpoint(log: &LogReader<'_>) -> bool {
+    log.records()
+        .any(|rec| matches!(rec.body(), RecordBody::BisectionCheckpoint { .. }))
+}
+
+fn comparable_replay_records(log: &LogReader<'_>) -> Vec<ComparableReplayRecord> {
+    log.records()
+        .filter(|rec| !matches!(rec.body(), RecordBody::BisectionCheckpoint { .. }))
+        .map(|rec| ComparableReplayRecord {
+            kind: rec.kind(),
+            rflags: rec.rflags(),
+            icount: rec.icount(),
+            boundary_rip: rec.boundary_rip(),
+            payload: rec.payload().to_vec(),
+        })
+        .collect()
+}
+
+fn reseal_equivalent_ignoring_bisection_checkpoints(
+    resealed: &[u8],
+    recorded: &LogReader<'_>,
+) -> Result<bool, ReplayError> {
+    let replayed = LogReader::parse(resealed).map_err(ReplayError::Log)?;
+    if !has_bisection_checkpoint(recorded) && !has_bisection_checkpoint(&replayed) {
+        return Ok(false);
+    }
+    Ok(
+        comparable_replay_header(replayed.header()) == comparable_replay_header(recorded.header())
+            && comparable_replay_records(&replayed) == comparable_replay_records(recorded),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1480,7 +1557,8 @@ where
         .into_inner()
         .seal(&outcome_like, header.end_snapshot_id)
         .map_err(|e| ReplayError::Apply(format!("reseal: {e:?}")))?;
-    if resealed != log_bytes {
+    if resealed != log_bytes && !reseal_equivalent_ignoring_bisection_checkpoints(&resealed, &log)?
+    {
         // Find the first differing offset for the report (iteration-88
         // review I2 — an undiffable pair helps nobody).
         let first_diff = resealed
@@ -1523,4 +1601,65 @@ fn stop_reason_from_u8(b: u8) -> Result<StopReason, ReplayError> {
         6 => StopReason::GuestHalted,
         _ => return Err(ReplayError::Apply(format!("unknown END stop_reason {b}"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dh_inputlog::dhilog::{LogWriter, SealParams, SegmentHeader};
+
+    fn header() -> SegmentHeader {
+        SegmentHeader {
+            base_snapshot_id: [0x11; 32],
+            entropy_seed: [0x22; 32],
+            machine_config_hash: [0x33; 32],
+            clock_num: 1,
+            clock_den: 1,
+            encoder_fingerprint: 0,
+        }
+    }
+
+    fn seal_params() -> SealParams {
+        SealParams {
+            end_snapshot_id: [0x44; 32],
+            end_icount: 20,
+            end_vns: 20,
+            end_state_hash: [0x55; 32],
+            stop_reason: 1,
+        }
+    }
+
+    fn log_with_optional_checkpoint(buttons: u32, checkpoint: bool) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        writer.pad_set(10, 0x1010, 0, buttons, 0).unwrap();
+        writer.epoch_hash(20, 0x2020, 2, [0x66; 32]).unwrap();
+        if checkpoint {
+            writer
+                .bisection_checkpoint(20, 0x2020, 20, [0x77; 32], 20)
+                .unwrap();
+        }
+        writer.seal(seal_params()).unwrap()
+    }
+
+    #[test]
+    fn reseal_comparison_ignores_only_bisection_checkpoint_aux_records() {
+        let resealed = log_with_optional_checkpoint(0xA5A5, false);
+        let recorded = log_with_optional_checkpoint(0xA5A5, true);
+        let recorded_reader = LogReader::parse(&recorded).unwrap();
+        assert!(
+            reseal_equivalent_ignoring_bisection_checkpoints(&resealed, &recorded_reader).unwrap()
+        );
+
+        let changed_canonical = log_with_optional_checkpoint(0x5A5A, false);
+        assert!(!reseal_equivalent_ignoring_bisection_checkpoints(
+            &changed_canonical,
+            &recorded_reader
+        )
+        .unwrap());
+
+        let plain_reader = LogReader::parse(&resealed).unwrap();
+        assert!(
+            !reseal_equivalent_ignoring_bisection_checkpoints(&resealed, &plain_reader).unwrap()
+        );
+    }
 }
