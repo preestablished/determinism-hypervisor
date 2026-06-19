@@ -62,6 +62,7 @@ fn cold_fingerprint(timer: Option<TimerArm>) -> Result<String, String> {
         timer,
         pause: &pause,
         sdk_events: None,
+        hash_device_sections: None,
     };
     let out = run_segment(
         &mut seg,

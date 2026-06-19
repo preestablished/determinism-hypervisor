@@ -22,6 +22,9 @@ use dh_devices::pad::PvPad;
 use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER};
 use dh_inputlog::reader::LogReader;
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
+use dh_snapshot::dhsnap::tag;
 use dh_verify::verify::VerifyProgress;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
@@ -36,10 +39,12 @@ use dh_vmm::SlotState;
 use dh_worker::bisection_index::BisectionCheckpointIndex;
 use dh_worker::replay_engine::{replay_segment, ReplayError};
 use dh_worker::runtime::runtime_hash_device_sections;
+use dh_worker::service::boot_observer;
 use dh_worker::snapshot_compare::RegDiff;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use dh_worker::verify_replay::{verify_replay, verify_replay_with_bisection_progress};
 use kvm_ioctls::VcpuExit;
+use tonic::Request;
 use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
@@ -858,4 +863,78 @@ fn lapc_verify_replay_bisection_reports_lapic_reg_diff_on_mutation() {
         }
         other => panic!("wrong event: {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "M9 Linux artifact gate: set DH_M9_* and run with DH_M9_ALLOW_SKIP=0"]
+// Final acceptance command:
+// DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test replay_engine linux_boot_once --release -- --ignored --nocapture
+fn linux_boot_once() {
+    boot_observer::reset();
+    let Some(ready) = common::m9_linux_ready_snapshot("replay_engine::linux_boot_once", 2)
+        .expect("M9 Linux READY snapshot")
+    else {
+        return;
+    };
+    assert_eq!(boot_observer::elf_loads(), 0);
+    assert_eq!(
+        boot_observer::bzimage_loads(),
+        1,
+        "CreateVm is the only Linux boot-loader call before VerifyReplay"
+    );
+
+    let ready_evtc = common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::EVTC)
+        .expect("Ready EVTC section");
+    let ready_blko = common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::BLKO)
+        .expect("Ready BLKO section");
+
+    let rt = tokio::runtime::Runtime::new().expect("test runtime");
+    rt.block_on(async {
+        ready
+            .svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(ready.lease.clone()),
+            }))
+            .await
+            .map_err(|e| format!("destroy original Linux slot: {e}"))?;
+
+        let done = common::verify_replay_done(
+            &ready.svc,
+            ready.initial_snapshot.clone(),
+            ready.ready_snapshot.input_log_id.clone(),
+        )
+        .await?;
+        assert_eq!(
+            boot_observer::bzimage_loads(),
+            1,
+            "VerifyReplay must restore the Linux snapshot without invoking the loader"
+        );
+        assert_eq!(done.total_icount, ready.ready_snapshot.icount);
+        assert_eq!(
+            done.end_state_hash
+                .ok_or_else(|| "VerifyReplay Done returned no end_state_hash".to_string())?
+                .hash,
+            ready.ready_state_hash,
+            "VerifyReplay end hash must match the live Linux READY snapshot"
+        );
+        Ok::<(), String>(())
+    })
+    .expect("VerifyReplay Linux boot-once flow");
+
+    // VerifyReplay must not mutate the source snapshot sections it replays.
+    assert_eq!(
+        common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::EVTC)
+            .expect("Ready EVTC section after replay"),
+        ready_evtc
+    );
+    assert_eq!(
+        common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::BLKO)
+            .expect("Ready BLKO section after replay"),
+        ready_blko
+    );
+    assert_eq!(
+        boot_observer::bzimage_loads(),
+        1,
+        "replay preserves Linux state without a second boot"
+    );
 }

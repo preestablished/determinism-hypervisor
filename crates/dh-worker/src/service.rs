@@ -153,6 +153,37 @@ const EXIT_REASON_LABELS: &[&str] = &[
 type ResponseStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub mod boot_observer {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Process-local diagnostic counters used by ignored Linux lifecycle tests.
+    static ELF_LOADS: AtomicU64 = AtomicU64::new(0);
+    static BZIMAGE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        ELF_LOADS.store(0, Ordering::SeqCst);
+        BZIMAGE_LOADS.store(0, Ordering::SeqCst);
+    }
+
+    pub fn elf_loads() -> u64 {
+        ELF_LOADS.load(Ordering::SeqCst)
+    }
+
+    pub fn bzimage_loads() -> u64 {
+        BZIMAGE_LOADS.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_elf_load() {
+        ELF_LOADS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_bzimage_load() {
+        BZIMAGE_LOADS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub worker_id: String,
@@ -1003,6 +1034,21 @@ fn image_error_to_status(e: ImageResolverError) -> Status {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn resolve_runtime_base_image(
+    image_resolver: &ImageResolver,
+    config: &dh_vmm::config::MachineConfig,
+) -> Result<dh_vmm::blkfile::FileBase, Status> {
+    config
+        .validate()
+        .map_err(ImageResolverError::InvalidConfig)
+        .map_err(image_error_to_status)?;
+    image_resolver
+        .open_base_image(&config.base_image_hash)
+        .map(|(_path, base_image)| base_image)
+        .map_err(image_error_to_status)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn machine_config_error_to_status(e: crate::proto_map::MachineConfigWireError) -> Status {
     Status::invalid_argument(e.to_string())
 }
@@ -1450,9 +1496,7 @@ fn run_verify_replay_on_current_thread(
             Ok::<(), String>(())
         },
     )?;
-    let assets = image_resolver
-        .resolve_create_vm(&config)
-        .map_err(image_error_to_status)?;
+    let base_image = resolve_runtime_base_image(&image_resolver, &config)?;
     let sys = dh_vmm::kvm::KvmSystem::open().map_err(|e| kvm_error_to_status("open KVM", e))?;
     if !sys.dirty_ring {
         return Err(Status::failed_precondition("KVM dirty ring unavailable"));
@@ -1467,14 +1511,7 @@ fn run_verify_replay_on_current_thread(
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
     let _ = config_hash_for_slot(&config, &slot)?;
-    // Match CreateVm's boot initialization before applying snapshot state;
-    // Linux bzImage setup leaves KVM arch state outside plain guest RAM.
-    boot_slot(&slot, assets.boot.clone())?;
-    let bus = build_bus(
-        &config,
-        assets.base_image,
-        RuntimeVmMem(slot.guest_mem.clone()),
-    )?;
+    let bus = build_bus(&config, base_image, RuntimeVmMem(slot.guest_mem.clone()))?;
     let rail = dh_vmm::recording::DeviceRail::new(
         bus,
         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
@@ -2012,12 +2049,18 @@ where
     B: FnOnce(&dh_vmm::kvm::SlotVm, &[u8], &[u8], &[u8]) -> Result<(), Status>,
 {
     match boot {
-        ResolvedBoot::Elf { kernel, cmdline } => load_elf(slot, &kernel, &cmdline),
+        ResolvedBoot::Elf { kernel, cmdline } => {
+            boot_observer::record_elf_load();
+            load_elf(slot, &kernel, &cmdline)
+        }
         ResolvedBoot::BzImage {
             kernel,
             initramfs,
             cmdline,
-        } => load_bzimage(slot, &kernel, &initramfs, &cmdline),
+        } => {
+            boot_observer::record_bzimage_load();
+            load_bzimage(slot, &kernel, &initramfs, &cmdline)
+        }
     }
 }
 
@@ -3345,9 +3388,7 @@ impl HypervisorWorker for WorkerService {
                         crate::restore_engine::recover_machine_config(snapshot_ref.clone(), &store)
                             .map_err(restore_engine_error_to_status)?
                     };
-                    let assets = image_resolver
-                        .resolve_create_vm(&config)
-                        .map_err(image_error_to_status)?;
+                    let base_image = resolve_runtime_base_image(&image_resolver, &config)?;
                     let sys = dh_vmm::kvm::KvmSystem::open()
                         .map_err(|e| kvm_error_to_status("open KVM", e))?;
                     if !sys.dirty_ring {
@@ -3357,14 +3398,8 @@ impl HypervisorWorker for WorkerService {
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
                     let _ = config_hash_for_slot(&config, &slot)?;
-                    // Match CreateVm's boot initialization before applying
-                    // snapshot state to keep bzImage restores equivalent.
-                    boot_slot(&slot, assets.boot.clone())?;
-                    let mut bus = build_bus(
-                        &config,
-                        assets.base_image,
-                        RuntimeVmMem(slot.guest_mem.clone()),
-                    )?;
+                    let mut bus =
+                        build_bus(&config, base_image, RuntimeVmMem(slot.guest_mem.clone()))?;
                     let mut dirty = dh_vmm::dirty::DirtyPageSet::new(slot.mem_bytes);
                     let outcome = {
                         let store = store.lock().map_err(|_| {
@@ -3464,9 +3499,10 @@ impl HypervisorWorker for WorkerService {
                             parent_runtime.boundary_state(parent_runtime.queued_inputs.is_empty());
                         let mut out = Vec::with_capacity(entropy_seeds.len());
                         for seed in entropy_seeds {
-                            let assets = image_resolver
-                                .resolve_create_vm(&parent_runtime.machine_config)
-                                .map_err(image_error_to_status)?;
+                            let base_image = resolve_runtime_base_image(
+                                &image_resolver,
+                                &parent_runtime.machine_config,
+                            )?;
                             let (forked, child_bus) =
                                 crate::fork_engine::fork_slot_with_child_bus_with_lapic(
                                     &sys,
@@ -3482,7 +3518,7 @@ impl HypervisorWorker for WorkerService {
                                     |child| {
                                         build_bus(
                                             &parent_runtime.machine_config,
-                                            assets.base_image,
+                                            base_image,
                                             RuntimeVmMem(child.guest_mem.clone()),
                                         )
                                         .map_err(|e| format!("{}: {}", e.code(), e.message()))
