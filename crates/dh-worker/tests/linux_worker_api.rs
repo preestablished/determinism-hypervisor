@@ -995,7 +995,17 @@ async fn verify_replay_done(
 
 #[test]
 #[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
+fn pvblk_dev_vdb_phase_a_fixture_ready_regions() {
+    run_pvblk_dev_vdb(false);
+}
+
+#[test]
+#[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
 fn pvblk_dev_vdb() {
+    run_pvblk_dev_vdb(true);
+}
+
+fn run_pvblk_dev_vdb(verify_replay: bool) {
     let Some(artifacts) = m9_artifacts().expect("M9 artifacts") else {
         return;
     };
@@ -1116,6 +1126,38 @@ fn pvblk_dev_vdb() {
         assert_ready_ordering(&events, run.icount, ready.region_count)
             .expect("Ready ordering and fixture evidence");
 
+        let region_memory = svc
+            .read_guest_memory(Request::new(proto::ReadGuestMemoryRequest {
+                lease: Some(lease.clone()),
+                ranges: Vec::new(),
+                region_ranges: REQUIRED_M9_EXPECTED_REGIONS
+                    .iter()
+                    .map(|(region, layout_version)| proto::RegionRange {
+                        region: (*region).into(),
+                        layout_version: (*layout_version)
+                            .try_into()
+                            .expect("required M9 layout_version fits u32"),
+                        offset: 0,
+                        len: 16,
+                    })
+                    .collect(),
+            }))
+            .await
+            .expect("ReadGuestMemory expected region_ranges")
+            .into_inner();
+        assert_eq!(region_memory.icount, run.icount);
+        assert_eq!(
+            region_memory.chunks.len(),
+            REQUIRED_M9_EXPECTED_REGIONS.len(),
+            "ReadGuestMemory must return one chunk per expected M9 region"
+        );
+        for ((region, _layout_version), chunk) in REQUIRED_M9_EXPECTED_REGIONS
+            .iter()
+            .zip(region_memory.chunks.iter())
+        {
+            assert_eq!(chunk.len(), 16, "region {region:?} read length");
+        }
+
         let ready_snapshot = svc
             .take_snapshot(Request::new(proto::TakeSnapshotRequest {
                 lease: Some(lease.clone()),
@@ -1174,15 +1216,18 @@ fn pvblk_dev_vdb() {
         .await
         .expect("destroy restored slot");
 
-        let done = verify_replay_done(&svc, initial_snapshot, ready_snapshot.input_log_id.clone())
-            .await
-            .expect("VerifyReplay Done");
-        assert_eq!(done.total_icount, run.icount);
-        assert_eq!(
-            done.end_state_hash.expect("VerifyReplay end hash").hash,
-            ready_state_hash.hash,
-            "live run and replay must end with the same lAPIC+bus-device state hash"
-        );
+        if verify_replay {
+            let done =
+                verify_replay_done(&svc, initial_snapshot, ready_snapshot.input_log_id.clone())
+                    .await
+                    .expect("VerifyReplay Done");
+            assert_eq!(done.total_icount, run.icount);
+            assert_eq!(
+                done.end_state_hash.expect("VerifyReplay end hash").hash,
+                ready_state_hash.hash,
+                "live run and replay must end with the same lAPIC+bus-device state hash"
+            );
+        }
     });
 
     let game_after = file_evidence(&artifacts.game_image)
