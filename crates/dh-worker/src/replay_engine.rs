@@ -309,6 +309,24 @@ fn detchannel_exit_generated_event(device_id: u16, event_type: u16) -> bool {
         )
 }
 
+fn terminal_sdk_finish_tail_matches_recording(
+    finish_reason: StopReason,
+    finish_icount: u64,
+    terminal_event_icount: u64,
+    end_icount: u64,
+    expected_reason: StopReason,
+) -> bool {
+    if finish_reason == StopReason::BudgetReached && finish_icount == end_icount {
+        return true;
+    }
+    // TakeSnapshot seals the input log as BudgetReached. Linux may replay the
+    // terminal detchannel event earlier inside the final epoch and then idle
+    // through HLT before the recorded snapshot boundary.
+    expected_reason == StopReason::BudgetReached
+        && finish_reason == StopReason::GuestHalted
+        && (terminal_event_icount..=end_icount).contains(&finish_icount)
+}
+
 #[derive(Debug)]
 pub enum ReplayError {
     Restore(RestoreError),
@@ -1442,15 +1460,19 @@ where
                 }
                 let finish_tail = run_to(slot, &mut chain, header.end_icount, true, true, false)?;
                 if let Some(finish) = &finish_tail {
-                    if finish.reason != StopReason::BudgetReached
-                        || finish.boundary.icount != header.end_icount
-                    {
+                    if !terminal_sdk_finish_tail_matches_recording(
+                        finish.reason,
+                        finish.boundary.icount,
+                        out.boundary.icount,
+                        header.end_icount,
+                        expected_reason,
+                    ) {
                         return Err(ReplayError::Run(format!(
                             "tail after terminal SDK event stopped {:?} at {} (recording ended {:?} at {})",
                             finish.reason, finish.boundary.icount, expected_reason, header.end_icount
                         )));
                     }
-                    if finish.vns != header.end_vns {
+                    if finish.boundary.icount == header.end_icount && finish.vns != header.end_vns {
                         if bisection_index.is_some() {
                             let divergence = terminal_bisection_divergence(
                                 "end_vns",
@@ -1825,6 +1847,56 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn terminal_sdk_tail_accepts_snapshot_sealed_idle_hlt_after_event() {
+        assert!(terminal_sdk_finish_tail_matches_recording(
+            StopReason::BudgetReached,
+            20,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+        assert!(terminal_sdk_finish_tail_matches_recording(
+            StopReason::GuestHalted,
+            12,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+        assert!(terminal_sdk_finish_tail_matches_recording(
+            StopReason::GuestHalted,
+            18,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+    }
+
+    #[test]
+    fn terminal_sdk_tail_rejects_hlt_before_event_or_non_snapshot_end() {
+        assert!(!terminal_sdk_finish_tail_matches_recording(
+            StopReason::GuestHalted,
+            11,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+        assert!(!terminal_sdk_finish_tail_matches_recording(
+            StopReason::GuestHalted,
+            12,
+            12,
+            20,
+            StopReason::NextSdkEvent,
+        ));
+        assert!(!terminal_sdk_finish_tail_matches_recording(
+            StopReason::Paused,
+            20,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
     }
 
     #[test]

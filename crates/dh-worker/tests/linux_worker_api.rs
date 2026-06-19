@@ -31,6 +31,7 @@ const ALLOW_SKIP_ENV: &str = "DH_M9_ALLOW_SKIP";
 // snapshot stays under snapstore's per-message transport limit.
 const MEM_BYTES: u64 = 128 * 1024 * 1024;
 const READY_HARD_CAP: u64 = 10_000_000_000;
+const FORK_CHILD_BUDGET: u64 = 1_000_000;
 
 type TestResult<T> = Result<T, String>;
 
@@ -482,7 +483,7 @@ fn linux_machine_config(hashes: &CachedHashes, cpuid_table: Vec<CpuidLeaf>) -> M
 fn worker_config(image_cache_dir: PathBuf, snapstore: snapstore_client::Transport) -> WorkerConfig {
     WorkerConfig {
         worker_id: "m9-linux-worker-api".into(),
-        slot_cores: vec![0],
+        slot_cores: vec![0, 1],
         lease_policy: LeasePolicy::default(),
         class: proto::DeterminismClass {
             cpu_model: "m9-test-cpu".into(),
@@ -493,7 +494,7 @@ fn worker_config(image_cache_dir: PathBuf, snapstore: snapstore_client::Transpor
         preflight: PreflightHealth::skipped("m9 Linux worker API acceptance harness"),
         image_cache_dir,
         snapstore: Some(snapstore),
-        bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
+        bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::every_epoch(),
     }
 }
 
@@ -974,7 +975,7 @@ async fn verify_replay_done(
         .verify_replay(Request::new(proto::VerifyReplayRequest {
             base: Some(base),
             log: Some(proto::verify_replay_request::Log::InputLogId(input_log_id)),
-            bisect_on_divergence: Some(false),
+            bisect_on_divergence: Some(true),
         }))
         .await
         .map_err(|e| format!("VerifyReplay: {e}"))?
@@ -1188,6 +1189,62 @@ fn run_pvblk_dev_vdb(verify_replay: bool) {
                 .expect("Ready input log payload");
         assert_no_external_input_before_ready(&log, run.icount)
             .expect("no external host input before Ready");
+
+        let forked = svc
+            .fork(Request::new(proto::ForkRequest {
+                parent: Some(lease.clone()),
+                count: 1,
+                entropy_seeds: Vec::new(),
+            }))
+            .await
+            .expect("Fork Ready parent")
+            .into_inner();
+        assert_eq!(forked.children.len(), 1, "Fork must return one child");
+        let child = forked.children[0].clone();
+        assert_ne!(
+            child.slot_id, lease.slot_id,
+            "Fork child must use a new slot"
+        );
+
+        let child_run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(child.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(FORK_CHILD_BUDGET)),
+                hard_icount_cap: 0,
+                capture: None,
+            }))
+            .await
+            .expect("Run fork child")
+            .into_inner();
+        assert!(
+            child_run.reason == i32::from(proto::StopReason::BudgetReached)
+                || child_run.reason == i32::from(proto::StopReason::GuestHalted),
+            "fork child run stopped with unexpected reason {}",
+            child_run.reason
+        );
+        assert!(
+            child_run.icount > ready_snapshot.icount,
+            "fork child must advance beyond the Ready boundary"
+        );
+
+        let child_snapshot = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(child.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .expect("fork child snapshot")
+            .into_inner();
+        assert_eq!(child_snapshot.machine_config_hash, config_hash.to_vec());
+        assert_eq!(
+            child_snapshot.input_log_id.len(),
+            32,
+            "fork child snapshot must seal a DHILOG segment"
+        );
+        svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(child) }))
+            .await
+            .expect("destroy fork child");
 
         svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
             .await
