@@ -63,6 +63,11 @@ type ReplayDetChannel<M> = dh_devices::detchannel::DetChannelDevice<
     fn() -> detguest_host::LogFaultPlan,
 >;
 
+#[derive(Debug, Default)]
+struct ReplayExitEvents {
+    sdk_streams: Vec<u32>,
+}
+
 fn replay_detchannel_mut<M>(bus: &mut dh_devices::MmioBus) -> Option<&mut ReplayDetChannel<M>>
 where
     M: detguest_host::GuestMem + Clone + Send + 'static,
@@ -79,7 +84,7 @@ fn replay_service_exit<M>(
     rail: &mut DeviceRail<M>,
     icount: u64,
     exit: kvm_ioctls::VcpuExit<'_>,
-) -> Result<(), BoundaryError>
+) -> Result<ReplayExitEvents, BoundaryError>
 where
     M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
 {
@@ -94,16 +99,18 @@ where
         &mut rail.irqs,
     );
 
-    match exit {
+    let sdk_streams = match exit {
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
         {
             rail.serial.pio_write(port, data);
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::IoIn(port, data)
             if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
         {
             rail.serial.pio_read(port, data);
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::MmioRead(gpa, data)
             if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
@@ -111,6 +118,7 @@ where
             rail.lapic
                 .read_mmio(gpa, data)
                 .map_err(|e| BoundaryError::Exit(format!("lapic mmio read {gpa:#x}: {e:?}")))?;
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::MmioWrite(gpa, data)
             if dh_vmm::lapic::LocalApic::contains_mmio(gpa) =>
@@ -118,6 +126,7 @@ where
             rail.lapic
                 .write_mmio(gpa, data)
                 .map_err(|e| BoundaryError::Exit(format!("lapic mmio write {gpa:#x}: {e:?}")))?;
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::X86Rdmsr(msr)
             if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
@@ -135,6 +144,7 @@ where
                     )));
                 }
             }
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::X86Wrmsr(msr)
             if dh_vmm::lapic::LocalApic::is_lapic_msr(msr.index) =>
@@ -149,24 +159,31 @@ where
                     )));
                 }
             }
+            ReplayExitEvents::default()
         }
-        kvm_ioctls::VcpuExit::X86Rdmsr(msr) => match dh_vmm::msr::on_denied_rdmsr(msr.index) {
-            dh_vmm::msr::MsrAction::SupplyValue(value) => {
-                *msr.data = value;
-                *msr.error = 0;
+        kvm_ioctls::VcpuExit::X86Rdmsr(msr) => {
+            match dh_vmm::msr::on_denied_rdmsr(msr.index) {
+                dh_vmm::msr::MsrAction::SupplyValue(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                }
+                dh_vmm::msr::MsrAction::AckWrite | dh_vmm::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
             }
-            dh_vmm::msr::MsrAction::AckWrite | dh_vmm::msr::MsrAction::InjectGp => {
-                *msr.error = 1;
+            ReplayExitEvents::default()
+        }
+        kvm_ioctls::VcpuExit::X86Wrmsr(msr) => {
+            match dh_vmm::msr::on_denied_wrmsr(msr.index) {
+                dh_vmm::msr::MsrAction::SupplyValue(_) | dh_vmm::msr::MsrAction::AckWrite => {
+                    *msr.error = 0;
+                }
+                dh_vmm::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
             }
-        },
-        kvm_ioctls::VcpuExit::X86Wrmsr(msr) => match dh_vmm::msr::on_denied_wrmsr(msr.index) {
-            dh_vmm::msr::MsrAction::SupplyValue(_) | dh_vmm::msr::MsrAction::AckWrite => {
-                *msr.error = 0;
-            }
-            dh_vmm::msr::MsrAction::InjectGp => {
-                *msr.error = 1;
-            }
-        },
+            ReplayExitEvents::default()
+        }
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
         {
@@ -176,12 +193,18 @@ where
             let mut word = [0u8; 4];
             let n = data.len().min(4);
             word[..n].copy_from_slice(&data[..n]);
-            let _events = host
+            let events = host
                 .host_mut()
                 .pio_out(port, u32::from_le_bytes(word), &mut ctx);
             if host.host().metrics.any_anomaly() {
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
+            let sdk_streams: Vec<u32> = events
+                .iter()
+                .filter_map(dh_devices::detchannel::stream_guest_event_payload)
+                .map(|(stream, _payload)| u32::from(stream))
+                .collect();
+            ReplayExitEvents { sdk_streams }
         }
         kvm_ioctls::VcpuExit::IoIn(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
@@ -197,27 +220,63 @@ where
             if host.host().metrics.any_anomaly() {
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
+            ReplayExitEvents {
+                sdk_streams: Vec::new(),
+            }
         }
         kvm_ioctls::VcpuExit::IoIn(_port, data) => {
             data.fill(0);
+            ReplayExitEvents::default()
         }
-        kvm_ioctls::VcpuExit::IoOut(_port, _data) => {}
+        kvm_ioctls::VcpuExit::IoOut(_port, _data) => ReplayExitEvents::default(),
         kvm_ioctls::VcpuExit::MmioRead(gpa, data) => {
             rail.bus
                 .read(gpa, data, &mut ctx)
                 .map_err(|e| BoundaryError::Exit(format!("bus read {gpa:#x}: {e:?}")))?;
+            ReplayExitEvents::default()
         }
         kvm_ioctls::VcpuExit::MmioWrite(gpa, data) => {
             rail.bus
                 .write(gpa, data, &mut ctx)
                 .map_err(|e| BoundaryError::Exit(format!("bus write {gpa:#x}: {e:?}")))?;
+            ReplayExitEvents::default()
         }
         other => {
             return Err(BoundaryError::Exit(format!("unexpected exit: {other:?}")));
         }
-    }
+    };
     if let Some(e) = ctx.log_fault() {
         return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
+    }
+    Ok(sdk_streams)
+}
+
+fn replay_detchannel_drain_at_pause<M>(
+    rail: &mut DeviceRail<M>,
+    icount: u64,
+) -> Result<(), BoundaryError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
+    let mut ctx = dh_devices::DevCtx::new(
+        icount,
+        0,
+        &mut rail.log,
+        &mut rail.mem,
+        &mut rail.entropy,
+        &mut rail.irqs,
+    );
+    let Some(host) = replay_detchannel_mut::<M>(&mut rail.bus) else {
+        return Ok(());
+    };
+    host.host_mut().drain_at_pause(&mut ctx);
+    if host.host().metrics.any_anomaly() {
+        return Err(BoundaryError::Exit("detchannel pause drain anomaly".into()));
+    }
+    if let Some(e) = ctx.log_fault() {
+        return Err(BoundaryError::Exit(format!(
+            "detchannel pause drain log fault: {e:?}"
+        )));
     }
     Ok(())
 }
@@ -599,6 +658,20 @@ where
             _ => None,
         })
         .collect();
+    let terminal_sdk_streams: Vec<u32> = log
+        .aux()
+        .filter_map(|rec| match rec.body() {
+            RecordBody::SdkEvent { stream, .. } if rec.icount() == header.end_icount => {
+                Some(u32::from(stream))
+            }
+            _ => None,
+        })
+        .collect();
+    let terminal_sdk_streams = terminal_sdk_streams
+        .last()
+        .copied()
+        .map(|stream| vec![stream])
+        .unwrap_or_default();
     let terminal_selection = bisection_index.and_then(|index| {
         index.select_for_divergence(BisectionSelectionTarget::TerminalEndState {
             end_icount: header.end_icount,
@@ -641,11 +714,13 @@ where
     let bisection_error = std::cell::RefCell::new(None);
     let pending_bisection = std::cell::RefCell::new(None::<PendingBisectionDivergence>);
     let progress_error = std::cell::RefCell::new(None);
+    let stopped_sdk_streams = std::cell::RefCell::new(Vec::<u32>::new());
     let run_to = |slot: &mut SlotVm,
                   chain: &mut StateHashChain,
                   target: u64,
                   hash_final_stop: bool,
-                  hash_final_epoch: bool|
+                  hash_final_epoch: bool,
+                  sdk_streams: Option<&[u32]>|
      -> Result<Option<dh_vmm::runctl::SegmentOutcome>, ReplayError> {
         let start = counter
             .read()
@@ -656,9 +731,13 @@ where
                  records must be monotone"
             )));
         }
-        if target == start {
+        let sdk_streams = sdk_streams.filter(|streams| !streams.is_empty());
+        let event_stop = sdk_streams.is_some();
+        stopped_sdk_streams.borrow_mut().clear();
+        if target == start && !event_stop {
             return Ok(None);
         }
+        let sdk_event_feed = std::cell::Cell::new(0u64);
         let out = {
             let hash_device_sections = || {
                 let rail_ref = rail.borrow();
@@ -673,12 +752,21 @@ where
                 injections: &[],
                 timer: None,
                 pause: &pause,
-                sdk_events: None,
+                sdk_events: event_stop.then_some(&sdk_event_feed),
                 hash_device_sections: Some(&hash_device_sections),
+            };
+            let until = if event_stop {
+                let hard_cap = target
+                    .checked_sub(start)
+                    .and_then(|budget| budget.checked_add(1_000_000))
+                    .ok_or_else(|| ReplayError::Apply("NextSdkEvent hard cap overflows".into()))?;
+                Until::NextSdkEvent { hard_cap }
+            } else {
+                Until::IcountBudget(target - start)
             };
             run_segment_with_epoch_options(
                 &mut seg,
-                Until::IcountBudget(target - start),
+                until,
                 RunOptions {
                     hash_final_stop,
                     hash_final_epoch,
@@ -689,7 +777,18 @@ where
                     let icount = counter
                         .read()
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
-                    replay_service_exit(&mut rail.borrow_mut(), icount, exit)
+                    let exit_events = replay_service_exit(&mut rail.borrow_mut(), icount, exit)?;
+                    if let Some(want) = sdk_streams {
+                        if exit_events
+                            .sdk_streams
+                            .iter()
+                            .any(|stream| want.contains(stream))
+                        {
+                            stopped_sdk_streams.replace(exit_events.sdk_streams.clone());
+                            sdk_event_feed.set(sdk_event_feed.get() + 1);
+                        }
+                    }
+                    Ok(())
                 },
                 &mut |idx, boundary, value, epoch_slot| {
                     let icount = boundary.icount;
@@ -1099,14 +1198,28 @@ where
                 buttons,
                 frame_hint,
             } => {
-                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
+                let o = run_to(
+                    slot,
+                    &mut chain,
+                    icount,
+                    false,
+                    !epoch_after_canonical,
+                    None,
+                )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_pad_set(icount, rip, port, buttons, frame_hint)
                     .map_err(|e: RecordError| ReplayError::Apply(format!("{e:?}")))?;
             }
             RecordBody::NetRx { frame } => {
-                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
+                let o = run_to(
+                    slot,
+                    &mut chain,
+                    icount,
+                    false,
+                    !epoch_after_canonical,
+                    None,
+                )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_net_rx(icount, rip, frame)
@@ -1123,7 +1236,14 @@ where
                 if detchannel_will_regenerate {
                     continue;
                 }
-                let o = run_to(slot, &mut chain, icount, false, !epoch_after_canonical)?;
+                let o = run_to(
+                    slot,
+                    &mut chain,
+                    icount,
+                    false,
+                    !epoch_after_canonical,
+                    None,
+                )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
                     .apply_dev_event(icount, rip, device_id, event_type, data)
@@ -1156,42 +1276,92 @@ where
     let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
     let verified_before_tail = verified.get();
     let chain_before_tail = chain.clone();
-    let tail = run_to(slot, &mut chain, header.end_icount, true, true)?;
-    if let Some(out) = &tail {
-        // A GuestHalted recording legitimately stops ON its halt at
-        // end_icount; anything else must land the budget exactly. Either
-        // way the boundary must BE end_icount (iteration-88 review I2 —
-        // the halt coincidence is now a pinned contract, not luck).
-        let reason_ok = out.reason == StopReason::BudgetReached
-            || (out.reason == StopReason::GuestHalted
-                && expected_reason == StopReason::GuestHalted);
-        if !reason_ok || out.boundary.icount != header.end_icount {
-            return Err(ReplayError::Run(format!(
-                "tail stopped {:?} at {} (recording ended {:?} at {})",
-                out.reason, out.boundary.icount, expected_reason, header.end_icount
-            )));
-        }
-        // end_vns travels OUTSIDE body_hash (header-only), so the reseal
-        // byte-compare cannot verify it — check the live value here
-        // (iteration-88 review I1/opus2; masked by 1:1 clocks until a5e).
-        if out.vns != header.end_vns {
-            if bisection_index.is_some() {
-                let divergence = terminal_bisection_divergence(
-                    "end_vns",
-                    u64_hash(header.end_vns),
-                    u64_hash(out.vns),
-                )?;
-                return Err(ReplayError::BisectionDivergence(divergence));
+    let terminal_sdk_stream = terminal_sdk_streams.first().copied();
+    let tail = if terminal_sdk_stream.is_some() {
+        loop {
+            let event_tail = run_to(
+                slot,
+                &mut chain,
+                header.end_icount,
+                false,
+                true,
+                Some(&terminal_sdk_streams),
+            )?;
+            let Some(out) = event_tail else {
+                return Err(ReplayError::Run(format!(
+                    "tail did not observe terminal SDK event before recording end at {}",
+                    header.end_icount
+                )));
+            };
+            if out.reason != StopReason::NextSdkEvent || out.boundary.icount != header.end_icount {
+                return Err(ReplayError::Run(format!(
+                    "tail stopped {:?} at {} while waiting for terminal SDK event (recording ended {:?} at {})",
+                    out.reason, out.boundary.icount, expected_reason, header.end_icount
+                )));
             }
-            return Err(ReplayError::Divergence {
-                what: "end_vns",
-                at_icount: header.end_icount,
-                expected: u64_hash(header.end_vns),
-                got: u64_hash(out.vns),
-            });
+            let streams = stopped_sdk_streams.borrow().clone();
+            if terminal_sdk_streams
+                .iter()
+                .any(|want| streams.contains(want))
+            {
+                replay_detchannel_drain_at_pause(&mut rail.borrow_mut(), header.end_icount)
+                    .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+                let device_sections = {
+                    let rail_ref = rail.borrow();
+                    runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                };
+                chain
+                    .push_final_link(slot, &device_sections, header.end_icount, header.end_vns)
+                    .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+                break Some(out);
+            }
+            if out.boundary.icount == header.end_icount {
+                return Err(ReplayError::Run(format!(
+                    "tail reached recording end at {} without terminal SDK stream {:?}",
+                    header.end_icount, terminal_sdk_stream
+                )));
+            }
         }
-    }
-    if tail.is_none()
+    } else {
+        let tail = run_to(slot, &mut chain, header.end_icount, true, true, None)?;
+        if let Some(out) = &tail {
+            // A GuestHalted recording legitimately stops ON its halt at
+            // end_icount; anything else must land the budget exactly. Either
+            // way the boundary must BE end_icount (iteration-88 review I2 —
+            // the halt coincidence is now a pinned contract, not luck).
+            let reason_ok = out.reason == StopReason::BudgetReached
+                || (out.reason == StopReason::GuestHalted
+                    && expected_reason == StopReason::GuestHalted);
+            if !reason_ok || out.boundary.icount != header.end_icount {
+                return Err(ReplayError::Run(format!(
+                    "tail stopped {:?} at {} (recording ended {:?} at {})",
+                    out.reason, out.boundary.icount, expected_reason, header.end_icount
+                )));
+            }
+            // end_vns travels OUTSIDE body_hash (header-only), so the reseal
+            // byte-compare cannot verify it — check the live value here
+            // (iteration-88 review I1/opus2; masked by 1:1 clocks until a5e).
+            if out.vns != header.end_vns {
+                if bisection_index.is_some() {
+                    let divergence = terminal_bisection_divergence(
+                        "end_vns",
+                        u64_hash(header.end_vns),
+                        u64_hash(out.vns),
+                    )?;
+                    return Err(ReplayError::BisectionDivergence(divergence));
+                }
+                return Err(ReplayError::Divergence {
+                    what: "end_vns",
+                    at_icount: header.end_icount,
+                    expected: u64_hash(header.end_vns),
+                    got: u64_hash(out.vns),
+                });
+            }
+        }
+        tail
+    };
+    if terminal_sdk_stream.is_none()
+        && tail.is_none()
         && last_canonical_icount == Some(header.end_icount)
         && last_epoch_icount.get() != Some(header.end_icount)
     {
@@ -1205,6 +1375,7 @@ where
     }
     let mut live_end = chain.value();
     if live_end != header.end_state_hash
+        && terminal_sdk_stream.is_none()
         && expected_reason == StopReason::BudgetReached
         && matches!(
             tail,
@@ -1225,7 +1396,7 @@ where
             .end_icount
             .checked_add(1)
             .ok_or_else(|| ReplayError::Apply("BudgetReached HLT retry overflows".into()))?;
-        let halt_tail = run_to(slot, &mut chain, halt_target, true, true)?;
+        let halt_tail = run_to(slot, &mut chain, halt_target, true, true, None)?;
         if let Some(out) = &halt_tail {
             if out.reason == StopReason::GuestHalted && out.boundary.icount == header.end_icount {
                 if out.vns != header.end_vns {

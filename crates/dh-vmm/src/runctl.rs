@@ -496,7 +496,15 @@ fn run_segment_inner(
     // FrameBudget(0): zero MORE frames — satisfied at the start boundary
     // without entering the guest (mirrors IcountBudget(0) semantics).
     if frame_target == Some(0) {
-        return finish_at_counter(seg, clock, StopReason::BudgetReached, 0, None, 0);
+        return finish_at_counter(
+            seg,
+            clock,
+            StopReason::BudgetReached,
+            0,
+            None,
+            0,
+            options.hash_final_stop,
+        );
     }
 
     // Merge the guest-armed timer (converted per the §4 ceil rule) into
@@ -627,6 +635,7 @@ fn run_segment_inner(
                         delivered,
                         timer_fired,
                         frames_seen,
+                        options.hash_final_stop,
                     )
                 }
                 Err(_) if event_stop => {
@@ -637,6 +646,7 @@ fn run_segment_inner(
                         delivered,
                         timer_fired,
                         frames_seen,
+                        options.hash_final_stop,
                     )
                 }
                 Err(e) => return Err($wrap(e)),
@@ -883,6 +893,7 @@ fn finish_at_counter(
     delivered: u64,
     timer_fired: Option<TimerFired>,
     frames_elapsed: u64,
+    hash_final_stop: bool,
 ) -> Result<SegmentOutcome, RunError> {
     let icount = seg
         .counter
@@ -910,7 +921,7 @@ fn finish_at_counter(
         timer_fired,
         false,
         frames_elapsed,
-        true,
+        hash_final_stop,
     )
 }
 

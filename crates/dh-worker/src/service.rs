@@ -1467,6 +1467,9 @@ fn run_verify_replay_on_current_thread(
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
     let _ = config_hash_for_slot(&config, &slot)?;
+    // Match CreateVm's boot initialization before applying snapshot state;
+    // Linux bzImage setup leaves KVM arch state outside plain guest RAM.
+    boot_slot(&slot, assets.boot.clone())?;
     let bus = build_bus(
         &config,
         assets.base_image,
@@ -3354,6 +3357,9 @@ impl HypervisorWorker for WorkerService {
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
                     let _ = config_hash_for_slot(&config, &slot)?;
+                    // Match CreateVm's boot initialization before applying
+                    // snapshot state to keep bzImage restores equivalent.
+                    boot_slot(&slot, assets.boot.clone())?;
                     let mut bus = build_bus(
                         &config,
                         assets.base_image,

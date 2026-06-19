@@ -1,5 +1,5 @@
 //! M9 Linux worker API acceptance: BzImage boot, deterministic pv-blk as
-//! `/dev/vdb`, detchannel Ready EventKind 14, and snapshot/restore.
+//! `/dev/vdb`, detchannel Ready EventKind 14, snapshot/restore, and replay.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -499,6 +499,34 @@ fn assert_no_external_input_before_ready(log: &[u8], ready_icount: u64) -> TestR
     Ok(())
 }
 
+async fn verify_replay_done(
+    svc: &WorkerService,
+    base: proto::SnapshotRef,
+    input_log_id: Vec<u8>,
+) -> TestResult<proto::VerifyDone> {
+    let mut stream = svc
+        .verify_replay(Request::new(proto::VerifyReplayRequest {
+            base: Some(base),
+            log: Some(proto::verify_replay_request::Log::InputLogId(input_log_id)),
+            bisect_on_divergence: Some(false),
+        }))
+        .await
+        .map_err(|e| format!("VerifyReplay: {e}"))?
+        .into_inner();
+    while let Some(progress) = stream.as_mut().next().await {
+        let progress = progress.map_err(|e| format!("VerifyReplay progress: {e}"))?;
+        match progress.msg {
+            Some(proto::verify_replay_progress::Msg::Done(done)) => return Ok(done),
+            Some(proto::verify_replay_progress::Msg::Divergence(divergence)) => {
+                return Err(format!("VerifyReplay divergence: {divergence:?}"));
+            }
+            Some(proto::verify_replay_progress::Msg::EpochOk(_)) => {}
+            None => return Err("VerifyReplay emitted empty progress message".into()),
+        }
+    }
+    Err("VerifyReplay ended without Done".into())
+}
+
 #[test]
 #[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
 fn pvblk_dev_vdb() {
@@ -674,6 +702,16 @@ fn pvblk_dev_vdb() {
         }))
         .await
         .expect("destroy restored slot");
+
+        let done = verify_replay_done(&svc, initial_snapshot, ready_snapshot.input_log_id.clone())
+            .await
+            .expect("VerifyReplay Done");
+        assert_eq!(done.total_icount, run.icount);
+        assert_eq!(
+            done.end_state_hash.expect("VerifyReplay end hash").hash,
+            ready_state_hash.hash,
+            "live run and replay must end with the same lAPIC+bus-device state hash"
+        );
     });
 
     let game_after = file_evidence(&artifacts.game_image)
