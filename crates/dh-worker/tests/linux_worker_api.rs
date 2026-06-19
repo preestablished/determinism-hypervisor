@@ -641,6 +641,10 @@ fn pvblk_dev_vdb() {
             0,
             "Ready manifest generation must be even/stable"
         );
+        assert!(
+            ready.region_count > 0,
+            "M9 fixture must register expected regions before Ready"
+        );
 
         assert_ready_ordering(&events, run.icount, ready.region_count)
             .expect("Ready ordering and fixture evidence");

@@ -1283,7 +1283,7 @@ where
                 slot,
                 &mut chain,
                 header.end_icount,
-                false,
+                true,
                 true,
                 Some(&terminal_sdk_streams),
             )?;
@@ -1299,19 +1299,28 @@ where
                     out.reason, out.boundary.icount, expected_reason, header.end_icount
                 )));
             }
+            if out.vns != header.end_vns {
+                if bisection_index.is_some() {
+                    let divergence = terminal_bisection_divergence(
+                        "end_vns",
+                        u64_hash(header.end_vns),
+                        u64_hash(out.vns),
+                    )?;
+                    return Err(ReplayError::BisectionDivergence(divergence));
+                }
+                return Err(ReplayError::Divergence {
+                    what: "end_vns",
+                    at_icount: header.end_icount,
+                    expected: u64_hash(header.end_vns),
+                    got: u64_hash(out.vns),
+                });
+            }
             let streams = stopped_sdk_streams.borrow().clone();
             if terminal_sdk_streams
                 .iter()
                 .any(|want| streams.contains(want))
             {
                 replay_detchannel_drain_at_pause(&mut rail.borrow_mut(), header.end_icount)
-                    .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
-                let device_sections = {
-                    let rail_ref = rail.borrow();
-                    runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
-                };
-                chain
-                    .push_final_link(slot, &device_sections, header.end_icount, header.end_vns)
                     .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
                 break Some(out);
             }
