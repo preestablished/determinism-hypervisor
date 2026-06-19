@@ -47,6 +47,7 @@ nanokernel = { path = "../../tests/nanokernel" }
 snapstore-server.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+toml = "0.8"
 tower.workspace = true
 
 # Criterion perf benches (bead 9sb): fork / incremental snapshot /

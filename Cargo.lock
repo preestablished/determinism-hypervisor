@@ -546,6 +546,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower 0.5.3",
  "vm-memory",
