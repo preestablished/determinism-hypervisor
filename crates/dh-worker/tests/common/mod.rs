@@ -5,6 +5,7 @@
 //! at its crate root, so this module never compiles elsewhere.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use dh_devices::clock::PvClock;
@@ -42,6 +43,16 @@ pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [
     DH_M9_GAME_IMAGE,
     DH_M9_IMAGE_CACHE,
 ];
+
+#[allow(dead_code)]
+pub const DH_M9_ALLOW_SKIP: &str = "DH_M9_ALLOW_SKIP";
+#[allow(dead_code)]
+pub const M9_LINUX_MEM_BYTES: u64 = 128 * 1024 * 1024;
+#[allow(dead_code)]
+pub const M9_READY_HARD_CAP: u64 = 10_000_000_000;
+
+#[allow(dead_code)]
+pub type TestResult<T> = Result<T, String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -107,6 +118,380 @@ impl M9LinuxArtifacts {
         require_directory(DH_M9_IMAGE_CACHE, &self.image_cache)?;
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct M9CachedHashes {
+    pub bzimage: [u8; 32],
+    pub initramfs: [u8; 32],
+    pub base_image: [u8; 32],
+    pub game_image: [u8; 32],
+}
+
+#[allow(dead_code)]
+pub struct M9LinuxReady {
+    pub _store_rt: tokio::runtime::Runtime,
+    pub _store_handle: ServerHandle,
+    pub _store_dir: TempDir,
+    pub store: BlockingClient,
+    pub svc: dh_worker::service::WorkerService,
+    pub config_hash: [u8; 32],
+    pub initial_snapshot: dh_proto::v1::SnapshotRef,
+    pub ready_snapshot: dh_proto::v1::TakeSnapshotResponse,
+    pub ready_snapshot_ref: dh_proto::v1::SnapshotRef,
+    pub ready_state_hash: Vec<u8>,
+    pub lease: dh_proto::v1::Lease,
+}
+
+#[allow(dead_code)]
+pub fn m9_allow_skip() -> bool {
+    std::env::var(DH_M9_ALLOW_SKIP).as_deref() == Ok("1")
+}
+
+#[allow(dead_code)]
+pub fn m9_artifacts(test_name: &str) -> TestResult<Option<M9LinuxArtifacts>> {
+    match M9LinuxArtifacts::from_env_required(test_name) {
+        Ok(artifacts) => Ok(Some(artifacts)),
+        Err(e) if m9_allow_skip() => {
+            eprintln!("skipping M9 Linux acceptance {test_name}: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(dead_code)]
+pub fn m9_masked_cpuid_table(
+    test_name: &str,
+) -> TestResult<Option<Vec<dh_vmm::config::CpuidLeaf>>> {
+    match dh_vmm::kvm::KvmSystem::open() {
+        Ok(sys) if sys.dirty_ring => sys
+            .masked_cpuid_table()
+            .map(Some)
+            .map_err(|e| format!("{test_name}: masked CPUID table: {e:?}")),
+        Ok(_) if m9_allow_skip() => {
+            eprintln!("skipping M9 Linux acceptance {test_name}: KVM dirty ring unavailable");
+            Ok(None)
+        }
+        Ok(_) => Err(format!("{test_name}: KVM dirty ring unavailable")),
+        Err(e) if m9_allow_skip() => {
+            eprintln!("skipping M9 Linux acceptance {test_name}: KVM unavailable: {e:?}");
+            Ok(None)
+        }
+        Err(e) => Err(format!("{test_name}: KVM unavailable: {e:?}")),
+    }
+}
+
+#[allow(dead_code)]
+pub fn hash_file(path: &Path) -> TestResult<[u8; 32]> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[allow(dead_code)]
+pub fn ensure_cache_entry(source: &Path, cache_root: &Path) -> TestResult<[u8; 32]> {
+    let hash = hash_file(source)?;
+    let dest = cache_root.join(dh_worker::image_resolver::cache_key(&hash));
+    if dest.exists() {
+        if hash_file(&dest)? == hash {
+            return Ok(hash);
+        }
+        std::fs::remove_file(&dest)
+            .map_err(|e| format!("remove stale cache entry {}: {e}", dest.display()))?;
+    }
+
+    match std::fs::hard_link(source, &dest) {
+        Ok(()) => Ok(hash),
+        Err(_) => {
+            std::fs::copy(source, &dest).map_err(|e| {
+                format!(
+                    "copy {} to image cache {}: {e}",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+            if hash_file(&dest)? != hash {
+                return Err(format!(
+                    "image cache entry {} hash mismatch",
+                    dest.display()
+                ));
+            }
+            Ok(hash)
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn populate_m9_image_cache(artifacts: &M9LinuxArtifacts) -> TestResult<M9CachedHashes> {
+    Ok(M9CachedHashes {
+        bzimage: ensure_cache_entry(&artifacts.bzimage, &artifacts.image_cache)?,
+        initramfs: ensure_cache_entry(&artifacts.initramfs, &artifacts.image_cache)?,
+        base_image: ensure_cache_entry(&artifacts.base_image, &artifacts.image_cache)?,
+        game_image: ensure_cache_entry(&artifacts.game_image, &artifacts.image_cache)?,
+    })
+}
+
+#[allow(dead_code)]
+pub fn m9_linux_machine_config(
+    hashes: &M9CachedHashes,
+    cpuid_table: Vec<dh_vmm::config::CpuidLeaf>,
+) -> dh_vmm::config::MachineConfig {
+    let mut config = dh_vmm::config::MachineConfig::new(
+        M9_LINUX_MEM_BYTES,
+        hashes.game_image,
+        dh_vmm::config::BootSpec::BzImage {
+            kernel_hash: hashes.bzimage,
+            initramfs_hash: hashes.initramfs,
+            cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet")
+                .expect("M9 allows quiet as an append-only cmdline extra"),
+        },
+    );
+    config.cpuid_table = cpuid_table;
+    config.device_set = vec![
+        dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
+        dh_devices::clock::DEVICE_ID_PV_CLOCK,
+        dh_devices::pad::DEVICE_ID_PV_PAD,
+        dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+        dh_devices::blk::DEVICE_ID_PV_BLK,
+        dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+    ];
+    config
+}
+
+#[allow(dead_code)]
+pub fn m9_worker_config(
+    test_name: &str,
+    slots: usize,
+    image_cache_dir: PathBuf,
+    snapstore: snapstore_client::Transport,
+) -> dh_worker::service::WorkerConfig {
+    dh_worker::service::WorkerConfig {
+        worker_id: test_name.into(),
+        slot_cores: (0..slots)
+            .map(|slot| u32::try_from(slot).expect("slot core id fits u32"))
+            .collect(),
+        lease_policy: dh_worker::slot_manager::LeasePolicy::default(),
+        class: dh_proto::v1::DeterminismClass {
+            cpu_model: "m9-test-cpu".into(),
+            microcode: "m9-test-ucode".into(),
+            host_kernel: "m9-test-kernel".into(),
+            vmm_version: "m9-test-vmm".into(),
+        },
+        preflight: dh_worker::service::PreflightHealth::skipped(format!(
+            "{test_name} acceptance harness"
+        )),
+        image_cache_dir,
+        snapstore: Some(snapstore),
+        bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
+    }
+}
+
+#[allow(dead_code)]
+pub fn m9_linux_ready_snapshot(test_name: &str, slots: usize) -> TestResult<Option<M9LinuxReady>> {
+    use dh_proto::v1 as proto;
+    use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
+    use tonic::Request;
+
+    let Some(artifacts) = m9_artifacts(test_name)? else {
+        return Ok(None);
+    };
+    let Some(cpuid_table) = m9_masked_cpuid_table(test_name)? else {
+        return Ok(None);
+    };
+    let hashes = populate_m9_image_cache(&artifacts)?;
+    let config = m9_linux_machine_config(&hashes, cpuid_table);
+    let config_hash = config
+        .config_hash()
+        .map_err(|e| format!("MachineConfig hash: {e:?}"))?;
+
+    let store_dir = TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+    let store_sock = "snapstore.sock";
+    let (_store_rt, _store_handle, store) =
+        spawn_store_at(store_dir.path().to_path_buf(), store_sock);
+    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
+    let svc = dh_worker::service::WorkerService::new(m9_worker_config(
+        test_name,
+        slots,
+        artifacts.image_cache,
+        snapstore,
+    ))
+    .map_err(|e| format!("WorkerService::new: {e:?}"))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+
+    let (lease, initial_snapshot, ready_snapshot) = rt.block_on(async {
+        let created = svc
+            .create_vm(Request::new(proto::CreateVmRequest {
+                config: Some(dh_worker::proto_map::machine_config_to_proto(&config)),
+                entropy_seed: vec![0x9A; 32],
+            }))
+            .await
+            .map_err(|e| format!("CreateVm BzImage: {e}"))?
+            .into_inner();
+        let lease = created
+            .lease
+            .ok_or_else(|| "CreateVm returned no lease".to_string())?;
+        if created.icount != 0 {
+            return Err(format!("CreateVm icount {}, expected 0", created.icount));
+        }
+
+        let initial = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("initial TakeSnapshot: {e}"))?
+            .into_inner();
+        let initial_snapshot = initial
+            .snapshot
+            .ok_or_else(|| "initial TakeSnapshot returned no snapshot".to_string())?;
+
+        let run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::NextSdkEvent(
+                    proto::NextSdkEvent {
+                        stream: Some(detguest_wire::record::EventKind::Ready as u32),
+                    },
+                )),
+                hard_icount_cap: M9_READY_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run until Ready: {e}"))?
+            .into_inner();
+        if run.reason != i32::from(proto::StopReason::NextSdkEvent) {
+            return Err(format!(
+                "Run stopped with reason {}, expected NextSdkEvent",
+                run.reason
+            ));
+        }
+        if run.sdk_event.as_ref().map(|event| event.stream)
+            != Some(detguest_wire::record::EventKind::Ready as u32)
+        {
+            return Err("RunResponse.sdk_event was not Ready".into());
+        }
+
+        let ready_snapshot = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Ready TakeSnapshot: {e}"))?
+            .into_inner();
+        Ok::<_, String>((lease, initial_snapshot, ready_snapshot))
+    })?;
+
+    let ready_snapshot_ref = ready_snapshot
+        .snapshot
+        .clone()
+        .ok_or_else(|| "Ready TakeSnapshot returned no snapshot".to_string())?;
+    let ready_state_hash = ready_snapshot
+        .state_hash
+        .as_ref()
+        .ok_or_else(|| "Ready TakeSnapshot returned no state_hash".to_string())?
+        .hash
+        .clone();
+    if ready_snapshot.machine_config_hash != config_hash.to_vec() {
+        return Err("Ready TakeSnapshot machine_config_hash mismatch".into());
+    }
+
+    Ok(Some(M9LinuxReady {
+        _store_rt,
+        _store_handle,
+        _store_dir: store_dir,
+        store,
+        svc,
+        config_hash,
+        initial_snapshot,
+        ready_snapshot,
+        ready_snapshot_ref,
+        ready_state_hash,
+        lease,
+    }))
+}
+
+#[allow(dead_code)]
+pub fn snapshot_section(
+    store: &BlockingClient,
+    snapshot: &dh_proto::v1::SnapshotRef,
+    tag: [u8; 4],
+) -> TestResult<Vec<u8>> {
+    let hash: [u8; 32] = snapshot
+        .hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| "snapshot ref must be 32 bytes".to_string())?;
+    let container = store
+        .get_snapshot(snapstore_types::SnapshotRef::from_bytes(hash))
+        .map_err(|e| format!("get_snapshot: {e}"))?;
+    let manifest =
+        snapstore_manifest::Manifest::decode(&container).map_err(|e| format!("manifest: {e}"))?;
+    let dhsnap = dh_snapshot::dhsnap::Container::parse(&manifest.device_blob.bytes)
+        .map_err(|e| format!("DHSNAP parse: {e:?}"))?;
+    dhsnap
+        .get(tag)
+        .map(|section| section.contents.to_vec())
+        .ok_or_else(|| {
+            format!(
+                "snapshot missing DHSNAP section {}",
+                std::str::from_utf8(&tag).unwrap_or("????")
+            )
+        })
+}
+
+#[allow(dead_code)]
+pub async fn verify_replay_done(
+    svc: &dh_worker::service::WorkerService,
+    base: dh_proto::v1::SnapshotRef,
+    input_log_id: Vec<u8>,
+) -> TestResult<dh_proto::v1::VerifyDone> {
+    use dh_proto::v1 as proto;
+    use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
+    use tokio_stream::StreamExt;
+    use tonic::Request;
+
+    let mut stream = svc
+        .verify_replay(Request::new(proto::VerifyReplayRequest {
+            base: Some(base),
+            log: Some(proto::verify_replay_request::Log::InputLogId(input_log_id)),
+            bisect_on_divergence: Some(false),
+        }))
+        .await
+        .map_err(|e| format!("VerifyReplay: {e}"))?
+        .into_inner();
+    while let Some(progress) = stream.as_mut().next().await {
+        let progress = progress.map_err(|e| format!("VerifyReplay progress: {e}"))?;
+        match progress.msg {
+            Some(proto::verify_replay_progress::Msg::Done(done)) => return Ok(done),
+            Some(proto::verify_replay_progress::Msg::Divergence(divergence)) => {
+                return Err(format!("VerifyReplay divergence: {divergence:?}"));
+            }
+            Some(proto::verify_replay_progress::Msg::EpochOk(_)) => {}
+            None => return Err("VerifyReplay emitted empty progress message".into()),
+        }
+    }
+    Err("VerifyReplay ended without Done".into())
 }
 
 #[allow(dead_code)]

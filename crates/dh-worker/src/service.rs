@@ -153,6 +153,35 @@ const EXIT_REASON_LABELS: &[&str] = &[
 type ResponseStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+#[cfg(target_arch = "x86_64")]
+pub mod boot_observer {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ELF_LOADS: AtomicU64 = AtomicU64::new(0);
+    static BZIMAGE_LOADS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        ELF_LOADS.store(0, Ordering::SeqCst);
+        BZIMAGE_LOADS.store(0, Ordering::SeqCst);
+    }
+
+    pub fn elf_loads() -> u64 {
+        ELF_LOADS.load(Ordering::SeqCst)
+    }
+
+    pub fn bzimage_loads() -> u64 {
+        BZIMAGE_LOADS.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn record_elf_load() {
+        ELF_LOADS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_bzimage_load() {
+        BZIMAGE_LOADS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub worker_id: String,
@@ -1467,9 +1496,6 @@ fn run_verify_replay_on_current_thread(
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
     let _ = config_hash_for_slot(&config, &slot)?;
-    // Match CreateVm's boot initialization before applying snapshot state;
-    // Linux bzImage setup leaves KVM arch state outside plain guest RAM.
-    boot_slot(&slot, assets.boot.clone())?;
     let bus = build_bus(
         &config,
         assets.base_image,
@@ -2012,12 +2038,18 @@ where
     B: FnOnce(&dh_vmm::kvm::SlotVm, &[u8], &[u8], &[u8]) -> Result<(), Status>,
 {
     match boot {
-        ResolvedBoot::Elf { kernel, cmdline } => load_elf(slot, &kernel, &cmdline),
+        ResolvedBoot::Elf { kernel, cmdline } => {
+            boot_observer::record_elf_load();
+            load_elf(slot, &kernel, &cmdline)
+        }
         ResolvedBoot::BzImage {
             kernel,
             initramfs,
             cmdline,
-        } => load_bzimage(slot, &kernel, &initramfs, &cmdline),
+        } => {
+            boot_observer::record_bzimage_load();
+            load_bzimage(slot, &kernel, &initramfs, &cmdline)
+        }
     }
 }
 
@@ -3357,9 +3389,6 @@ impl HypervisorWorker for WorkerService {
                         .create_slot_vm(config.mem_bytes)
                         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
                     let _ = config_hash_for_slot(&config, &slot)?;
-                    // Match CreateVm's boot initialization before applying
-                    // snapshot state to keep bzImage restores equivalent.
-                    boot_slot(&slot, assets.boot.clone())?;
                     let mut bus = build_bus(
                         &config,
                         assets.base_image,

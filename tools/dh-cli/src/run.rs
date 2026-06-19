@@ -70,6 +70,7 @@ pub fn run(
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         const SERIAL_END: u16 = SERIAL_PIO_BASE + SERIAL_PIO_LEN;
         let mut on_exit = |exit: VcpuExit| match exit {

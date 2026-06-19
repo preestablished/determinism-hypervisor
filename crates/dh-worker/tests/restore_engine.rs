@@ -20,17 +20,22 @@ use dh_devices::detchannel::DetChannelDevice;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::{DevCtx, EntropySource, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 use dh_snapshot::dhsnap::{tag, Container, ContainerWriter};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::{enable_dirty_logging, DirtyPageSet, DirtyRing, PAGE_SIZE};
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem};
 use dh_vmm::{vcpu_state, SlotState};
+use dh_worker::proto_map::machine_config_from_proto;
 use dh_worker::restore_engine::{recover_machine_config, restore_snapshot, RestoreError};
+use dh_worker::service::boot_observer;
 use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;
+use tonic::Request;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages
@@ -866,5 +871,191 @@ fn mis_shaped_containers_are_rejected_loudly() {
     assert!(
         matches!(&err, RestoreError::Codec(m) if m.contains("VCPU")),
         "{err:?}"
+    );
+}
+
+#[test]
+#[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
+fn linux_boot_once() {
+    boot_observer::reset();
+    let Some(ready) = common::m9_linux_ready_snapshot("restore_engine::linux_boot_once", 2)
+        .expect("M9 Linux READY snapshot")
+    else {
+        return;
+    };
+    assert_eq!(boot_observer::elf_loads(), 0);
+    assert_eq!(
+        boot_observer::bzimage_loads(),
+        1,
+        "CreateVm is the only Linux boot-loader call before restore/fork"
+    );
+
+    let ready_evtc = common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::EVTC)
+        .expect("Ready EVTC section");
+    let ready_blko = common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::BLKO)
+        .expect("Ready BLKO section");
+
+    let rt = tokio::runtime::Runtime::new().expect("test runtime");
+    let (restored_snapshot, child_snapshot) = rt
+        .block_on(async {
+            ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(ready.lease.clone()),
+                }))
+                .await
+                .map_err(|e| format!("destroy original Linux slot: {e}"))?;
+
+            let restored = ready
+                .svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(ready.ready_snapshot_ref.clone()),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .map_err(|e| format!("RestoreSnapshot READY: {e}"))?
+                .into_inner();
+            assert_eq!(
+                boot_observer::bzimage_loads(),
+                1,
+                "RestoreSnapshot must not invoke the Linux loader"
+            );
+            let restored_config = restored
+                .config
+                .as_ref()
+                .ok_or_else(|| "RestoreSnapshot returned no config".to_string())?;
+            let restored_config_hash = machine_config_from_proto(restored_config)
+                .map_err(|e| format!("restored MachineConfig decode: {e}"))?
+                .config_hash()
+                .map_err(|e| format!("restored MachineConfig hash: {e:?}"))?;
+            assert_eq!(restored_config_hash, ready.config_hash);
+            assert_eq!(
+                restored
+                    .state_hash
+                    .as_ref()
+                    .ok_or_else(|| "RestoreSnapshot returned no state_hash".to_string())?
+                    .hash,
+                ready.ready_state_hash
+            );
+            let restored_lease = restored
+                .lease
+                .ok_or_else(|| "RestoreSnapshot returned no lease".to_string())?;
+
+            let restored_snapshot = ready
+                .svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(restored_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("TakeSnapshot restored READY: {e}"))?
+                .into_inner();
+            assert_eq!(
+                restored_snapshot.machine_config_hash,
+                ready.ready_snapshot.machine_config_hash
+            );
+            assert_eq!(
+                restored_snapshot
+                    .state_hash
+                    .as_ref()
+                    .ok_or_else(|| "restored snapshot returned no state_hash".to_string())?
+                    .hash,
+                ready.ready_state_hash
+            );
+
+            let forked = ready
+                .svc
+                .fork(Request::new(proto::ForkRequest {
+                    parent: Some(restored_lease.clone()),
+                    count: 1,
+                    entropy_seeds: Vec::new(),
+                }))
+                .await
+                .map_err(|e| format!("Fork restored READY: {e}"))?
+                .into_inner();
+            assert_eq!(
+                boot_observer::bzimage_loads(),
+                1,
+                "Fork must not invoke the Linux loader"
+            );
+            let child_lease = forked
+                .children
+                .first()
+                .cloned()
+                .ok_or_else(|| "Fork returned no child".to_string())?;
+            let child_snapshot = ready
+                .svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(child_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("TakeSnapshot fork child READY: {e}"))?
+                .into_inner();
+            assert_eq!(
+                child_snapshot.machine_config_hash,
+                ready.ready_snapshot.machine_config_hash
+            );
+            assert_eq!(
+                child_snapshot
+                    .state_hash
+                    .as_ref()
+                    .ok_or_else(|| "child snapshot returned no state_hash".to_string())?
+                    .hash,
+                ready.ready_state_hash
+            );
+
+            ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(child_lease),
+                }))
+                .await
+                .map_err(|e| format!("destroy fork child: {e}"))?;
+            ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(restored_lease),
+                }))
+                .await
+                .map_err(|e| format!("destroy restored parent: {e}"))?;
+
+            Ok::<_, String>((restored_snapshot, child_snapshot))
+        })
+        .expect("restore/fork Linux boot-once flow");
+
+    let restored_ref = restored_snapshot
+        .snapshot
+        .as_ref()
+        .expect("restored snapshot ref");
+    assert_eq!(
+        common::snapshot_section(&ready.store, restored_ref, tag::EVTC)
+            .expect("restored EVTC section"),
+        ready_evtc
+    );
+    assert_eq!(
+        common::snapshot_section(&ready.store, restored_ref, tag::BLKO)
+            .expect("restored BLKO section"),
+        ready_blko
+    );
+
+    let child_ref = child_snapshot
+        .snapshot
+        .as_ref()
+        .expect("child snapshot ref");
+    assert_eq!(
+        common::snapshot_section(&ready.store, child_ref, tag::EVTC).expect("child EVTC section"),
+        ready_evtc
+    );
+    assert_eq!(
+        common::snapshot_section(&ready.store, child_ref, tag::BLKO).expect("child BLKO section"),
+        ready_blko
+    );
+    assert_eq!(
+        boot_observer::bzimage_loads(),
+        1,
+        "restore and fork preserve Linux state without a second boot"
     );
 }
