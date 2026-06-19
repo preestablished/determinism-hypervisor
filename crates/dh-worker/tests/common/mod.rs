@@ -135,6 +135,7 @@ fn require_directory(env_name: &str, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn kvm_available() -> bool {
     std::fs::OpenOptions::new()
         .read(true)

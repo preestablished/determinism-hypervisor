@@ -33,15 +33,15 @@ use dh_detclock::counter::InstRetired;
 use dh_devices::ctx::GuestMem;
 use dh_inputlog::reader::{LogReader, ReadError, RecordBody};
 use dh_verify::verify::{BisectionDivergence, BisectionEvidence, BisectionMode};
-use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::MachineConfig;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
 use dh_vmm::recording::{DeviceRail, RecordError};
 use dh_vmm::runctl::{
-    RunError, RunOptions, Segment, StopReason, Until, run_segment_with_epoch_options,
+    run_segment_with_epoch_options, RunError, RunOptions, Segment, StopReason, Until,
 };
+use dh_vmm::SlotState;
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 use std::sync::atomic::AtomicBool;
@@ -50,7 +50,8 @@ use crate::bisection_index::{
     BisectionCheckpointIndex, BisectionDivergenceSite, BisectionSelectionTarget,
     IndexedBisectionCheckpoint, RecordPosition, SelectedBisectionCheckpoint,
 };
-use crate::restore_engine::{RestoreError, restore_snapshot};
+use crate::restore_engine::{restore_snapshot, RestoreError};
+use crate::runtime::runtime_hash_device_sections;
 
 /// The structured divergence captured by the epoch sink:
 /// `(what, at_icount, expected, got)`.
@@ -638,7 +639,10 @@ where
             return Ok(None);
         }
         let out = {
-            let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+            let hash_device_sections = || {
+                let rail_ref = rail.borrow();
+                runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+            };
             let mut seg = Segment {
                 slot,
                 counter,
@@ -903,7 +907,10 @@ where
                         .clock
                         .vns_from_icount($icount)
                         .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
-                    let device_sections = dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+                    let device_sections = {
+                        let rail_ref = rail.borrow();
+                        runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                    };
                     $chain
                         .push_final_link($slot, &device_sections, $icount, vns)
                         .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
@@ -1171,7 +1178,10 @@ where
             .clock
             .vns_from_icount(header.end_icount)
             .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
-        let device_sections = dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+        let device_sections = {
+            let rail_ref = rail.borrow();
+            runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+        };
         chain
             .push_final_link(slot, &device_sections, header.end_icount, vns)
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;

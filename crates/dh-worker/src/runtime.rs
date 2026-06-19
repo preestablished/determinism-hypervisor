@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +373,16 @@ pub struct DrainedGuestEvent {
     pub icount: u64,
     pub vns: u64,
     pub payload: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn runtime_hash_device_sections(
+    bus: &dh_devices::MmioBus,
+    lapic: &dh_vmm::lapic::LocalApic,
+) -> Vec<u8> {
+    let mut bytes = dh_vmm::hash::lapic_section(lapic);
+    bytes.extend_from_slice(&dh_vmm::hash::device_sections(bus));
+    bytes
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

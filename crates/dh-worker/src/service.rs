@@ -17,10 +17,11 @@ use crate::proto_map::{
 use crate::replay_engine::ReplayError;
 #[cfg(target_arch = "x86_64")]
 use crate::runtime::{
-    DrainedGuestEvent, QueuedInput, QueuedInputAt, QueuedInputKind, RuntimeActorError,
-    RuntimeError, RuntimeThreadState, SlotActor, SlotRuntime, WorkerRuntimeTable,
+    runtime_hash_device_sections, DrainedGuestEvent, QueuedInput, QueuedInputAt, QueuedInputKind,
+    RuntimeActorError, RuntimeError, RuntimeThreadState, SlotActor, SlotRuntime,
+    WorkerRuntimeTable,
 };
-use crate::slot_manager::{Lease, LeasePolicy, SlotError, SlotManager, parse_core_list};
+use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
 #[cfg(target_arch = "x86_64")]
@@ -1197,24 +1198,49 @@ fn segment_vns_from_icount(
 
 #[cfg(target_arch = "x86_64")]
 fn hard_icount_cap(raw: u64) -> u64 {
-    if raw == 0 { 10_000_000_000 } else { raw }
+    if raw == 0 {
+        10_000_000_000
+    } else {
+        raw
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn until_from_run_request(req: &proto::RunRequest) -> Result<dh_vmm::runctl::Until, Status> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunUntil {
+    until: dh_vmm::runctl::Until,
+    sdk_event_filter: Option<Option<u32>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn until_from_run_request(req: &proto::RunRequest) -> Result<RunUntil, Status> {
     use proto::run_request::Until as WireUntil;
     match req
         .until
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("RunRequest.until is required"))?
     {
-        WireUntil::IcountBudget(budget) => Ok(dh_vmm::runctl::Until::IcountBudget(*budget)),
-        WireUntil::VnsBudget(budget) => Ok(dh_vmm::runctl::Until::VnsBudget(*budget)),
-        WireUntil::FrameBudget(frames) => Ok(dh_vmm::runctl::Until::FrameBudget {
-            frames: u64::from(*frames),
-            hard_cap: hard_icount_cap(req.hard_icount_cap),
+        WireUntil::IcountBudget(budget) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::IcountBudget(*budget),
+            sdk_event_filter: None,
         }),
-        WireUntil::NextSdkEvent(_) => Err(unimplemented_status("Run next_sdk_event")),
+        WireUntil::VnsBudget(budget) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::VnsBudget(*budget),
+            sdk_event_filter: None,
+        }),
+        WireUntil::FrameBudget(frames) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::FrameBudget {
+                frames: u64::from(*frames),
+                hard_cap: hard_icount_cap(req.hard_icount_cap),
+            },
+            sdk_event_filter: None,
+        }),
+        WireUntil::NextSdkEvent(filter) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::NextSdkEvent {
+                hard_cap: hard_icount_cap(req.hard_icount_cap),
+            },
+            sdk_event_filter: Some(filter.stream),
+        }),
         WireUntil::Goal(_) => Err(unimplemented_status("Run goal")),
     }
 }
@@ -1959,9 +1985,13 @@ fn boot_slot(slot: &dh_vmm::kvm::SlotVm, boot: ResolvedBoot) -> Result<(), Statu
                 .map(|_| ())
                 .map_err(|e| Status::failed_precondition(format!("ELF boot: {e}")))
         }
-        ResolvedBoot::BzImage { .. } => Err(Status::unimplemented(
-            "BzImage boot is in the wire schema, but dh-vmm currently only boots ELF images",
-        )),
+        ResolvedBoot::BzImage {
+            kernel,
+            initramfs,
+            cmdline,
+        } => dh_vmm::boot::load_bzimage_and_enter(slot, &kernel, &initramfs, &cmdline)
+            .map(|_| ())
+            .map_err(|e| Status::failed_precondition(format!("BzImage boot: {e}"))),
     }
 }
 
@@ -2042,6 +2072,21 @@ fn append_guest_events_with_retention_cap(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn sdk_event_matches(filter: Option<u32>, event: &DrainedGuestEvent) -> bool {
+    filter.map_or(true, |stream| event.stream == stream)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn drained_guest_event_to_proto(event: DrainedGuestEvent) -> proto::GuestEvent {
+    proto::GuestEvent {
+        stream: event.stream,
+        icount: event.icount,
+        vns: event.vns,
+        payload: event.payload,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn trim_guest_events_to_retention_cap(events: &mut Vec<DrainedGuestEvent>) {
     let overflow = events
         .len()
@@ -2062,12 +2107,7 @@ fn select_stream_guest_events(
     let mut retained = Vec::new();
     for event in guest_events.drain(..) {
         if want_all || stream_filter.contains(&event.stream) {
-            selected.push(proto::GuestEvent {
-                stream: event.stream,
-                icount: event.icount,
-                vns: event.vns,
-                payload: event.payload,
-            });
+            selected.push(drained_guest_event_to_proto(event));
         } else {
             retained.push(event);
         }
@@ -3480,7 +3520,7 @@ impl HypervisorWorker for WorkerService {
             let request = request.into_inner();
             let capture = request.capture.clone();
             let lease = lease_from_proto(request.lease.clone())?;
-            let until = until_from_run_request(&request)?;
+            let run_until = until_from_run_request(&request)?;
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let metrics = self.inner.metrics.clone();
@@ -3502,6 +3542,7 @@ impl HypervisorWorker for WorkerService {
                     let start_cumulative_epoch = runtime.position.epoch_index;
                     let start_segment_vns =
                         segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
+                    let sdk_event_filter = run_until.sdk_event_filter;
                     let epoch_len = runtime.machine_config.epoch_len.max(1);
                     let start_segment_epoch = start_segment_icount / epoch_len;
                     if bisection_checkpoints.enabled {
@@ -3555,7 +3596,13 @@ impl HypervisorWorker for WorkerService {
                             QueuedInputAt::Icount(_) => None,
                         })
                         .collect();
-                    let (run_result, consumed_input_orders, drained_guest_events, rail) = {
+                    let (
+                        run_result,
+                        consumed_input_orders,
+                        drained_guest_events,
+                        first_matching_sdk_event,
+                        rail,
+                    ) = {
                         let mut rail_inner = dh_vmm::recording::DeviceRail::new(
                             bus,
                             entropy,
@@ -3566,6 +3613,8 @@ impl HypervisorWorker for WorkerService {
                         let rail = std::cell::RefCell::new(rail_inner);
                         let mut consumed_input_orders = Vec::new();
                         let mut drained_guest_events = Vec::new();
+                        let sdk_event_feed = std::cell::Cell::new(0u64);
+                        let mut first_matching_sdk_event: Option<DrainedGuestEvent> = None;
                         let counter_ref = counter;
                         let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
                             metrics.record_exit(lease.slot_id, vcpu_exit_reason_label(&exit));
@@ -3585,6 +3634,16 @@ impl HypervisorWorker for WorkerService {
                                 event_icount,
                                 exit,
                             )?;
+                            if let Some(filter) = sdk_event_filter {
+                                for event in &events {
+                                    if sdk_event_matches(filter, event) {
+                                        sdk_event_feed.set(sdk_event_feed.get() + 1);
+                                        if first_matching_sdk_event.is_none() {
+                                            first_matching_sdk_event = Some(event.clone());
+                                        }
+                                    }
+                                }
+                            }
                             drained_guest_events.extend(events);
                             Ok(())
                         };
@@ -3722,8 +3781,10 @@ impl HypervisorWorker for WorkerService {
                                 }
                                 Ok(())
                         };
-                        let hash_device_sections =
-                            || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+                        let hash_device_sections = || {
+                            let rail_ref = rail.borrow();
+                            runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                        };
                         let run_result = {
                             let mut segment = dh_vmm::runctl::Segment {
                                 slot: &mut runtime.slot,
@@ -3734,12 +3795,12 @@ impl HypervisorWorker for WorkerService {
                                 injections: &[],
                                 timer: None,
                                 pause: pause.as_ref(),
-                                sdk_events: None,
+                                sdk_events: sdk_event_filter.map(|_| &sdk_event_feed),
                                 hash_device_sections: Some(&hash_device_sections),
                             };
                             dh_vmm::runctl::run_segment_with_scheduled_inputs_frames_and_epochs(
                                 &mut segment,
-                                until,
+                                run_until.until,
                                 &scheduled_input_icounts,
                                 &scheduled_frame_inputs,
                                 runtime.position.frame_counter,
@@ -3753,6 +3814,7 @@ impl HypervisorWorker for WorkerService {
                             run_result,
                             consumed_input_orders,
                             drained_guest_events,
+                            first_matching_sdk_event,
                             rail.into_inner(),
                         )
                     };
@@ -3827,7 +3889,13 @@ impl HypervisorWorker for WorkerService {
                                     hash: outcome.state_hash.to_vec(),
                                 }),
                                 frames_elapsed: outcome.frames_elapsed,
-                                sdk_event: None,
+                                sdk_event: if outcome.reason
+                                    == dh_vmm::runctl::StopReason::NextSdkEvent
+                                {
+                                    first_matching_sdk_event.map(drained_guest_event_to_proto)
+                                } else {
+                                    None
+                                },
                                 feature_bytes: capture.feature_bytes,
                                 fb_lz4: capture.fb_lz4,
                                 fb_info: capture.fb_info,
@@ -4611,6 +4679,60 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn synthetic_bzimage(payload: &[u8]) -> Vec<u8> {
+        const SETUP_SECTS_OFF: usize = 0x1f1;
+        const SETUP_HEADER_LEN_OFF: usize = 0x201;
+        const HEADER_MAGIC_OFF: usize = 0x202;
+        const PROTOCOL_VERSION_OFF: usize = 0x206;
+        const LOADFLAGS_OFF: usize = 0x211;
+        const INITRD_ADDR_MAX_OFF: usize = 0x22c;
+        const KERNEL_ALIGNMENT_OFF: usize = 0x230;
+        const RELOCATABLE_KERNEL_OFF: usize = 0x234;
+        const XLOADFLAGS_OFF: usize = 0x236;
+        const CMDLINE_SIZE_OFF: usize = 0x238;
+        const PAYLOAD_OFFSET_OFF: usize = 0x248;
+        const PAYLOAD_LENGTH_OFF: usize = 0x24c;
+        const PREF_ADDRESS_OFF: usize = 0x258;
+        const INIT_SIZE_OFF: usize = 0x260;
+        const SETUP_HEADER_END: usize = 0x268;
+        const LINUX_64BIT_ENTRY_OFFSET: usize = 0x200;
+
+        let setup_sects = 4u8;
+        let setup_bytes = (u64::from(setup_sects) + 1) * 512;
+        let payload_offset = 0x400u32;
+        let init_size = 0x40_0000u32;
+        let total = setup_bytes as usize + payload_offset as usize + payload.len();
+        let mut image = vec![0u8; total];
+        image[SETUP_SECTS_OFF] = setup_sects;
+        image[SETUP_HEADER_LEN_OFF] = (SETUP_HEADER_END - HEADER_MAGIC_OFF) as u8;
+        image[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
+        image[0x200..0x202].copy_from_slice(&[0xeb, 0x66]);
+        image[HEADER_MAGIC_OFF..HEADER_MAGIC_OFF + 4].copy_from_slice(b"HdrS");
+        image[PROTOCOL_VERSION_OFF..PROTOCOL_VERSION_OFF + 2]
+            .copy_from_slice(&0x020au16.to_le_bytes());
+        image[LOADFLAGS_OFF] = 0x01;
+        image[INITRD_ADDR_MAX_OFF..INITRD_ADDR_MAX_OFF + 4]
+            .copy_from_slice(&0x37ff_ffffu32.to_le_bytes());
+        image[KERNEL_ALIGNMENT_OFF..KERNEL_ALIGNMENT_OFF + 4]
+            .copy_from_slice(&0x20_0000u32.to_le_bytes());
+        image[RELOCATABLE_KERNEL_OFF] = 1;
+        image[XLOADFLAGS_OFF..XLOADFLAGS_OFF + 2].copy_from_slice(&0x0001u16.to_le_bytes());
+        image[CMDLINE_SIZE_OFF..CMDLINE_SIZE_OFF + 4]
+            .copy_from_slice(&(dh_vmm::config::MAX_CMDLINE as u32).to_le_bytes());
+        image[PAYLOAD_OFFSET_OFF..PAYLOAD_OFFSET_OFF + 4]
+            .copy_from_slice(&payload_offset.to_le_bytes());
+        image[PAYLOAD_LENGTH_OFF..PAYLOAD_LENGTH_OFF + 4]
+            .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        image[PREF_ADDRESS_OFF..PREF_ADDRESS_OFF + 8].copy_from_slice(&0x20_0000u64.to_le_bytes());
+        image[INIT_SIZE_OFF..INIT_SIZE_OFF + 4].copy_from_slice(&init_size.to_le_bytes());
+        let payload_start = setup_bytes as usize + payload_offset as usize;
+        image[setup_bytes as usize..payload_start].fill(0x5a);
+        image[setup_bytes as usize + LINUX_64BIT_ENTRY_OFFSET] = 0xcc;
+        image[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+        image
+    }
+
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn image_resolver_errors_map_to_create_vm_status_codes() {
         let path = PathBuf::from("/cache/blob");
@@ -4737,6 +4859,34 @@ mod tests {
             dh_vmm::config::BootSpec::Elf {
                 kernel_hash,
                 cmdline: Vec::new(),
+            },
+        );
+        config.cpuid_table = service_test_cpuid_table();
+        config.device_set = vec![
+            dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
+            dh_devices::clock::DEVICE_ID_PV_CLOCK,
+            dh_devices::pad::DEVICE_ID_PV_PAD,
+            dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+            dh_devices::blk::DEVICE_ID_PV_BLK,
+            dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+        ];
+        machine_config_to_proto(&config)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn bzimage_service_machine_config(
+        base_hash: [u8; 32],
+        kernel_hash: [u8; 32],
+        initramfs_hash: [u8; 32],
+    ) -> proto::MachineConfig {
+        let mut config = dh_vmm::config::MachineConfig::new(
+            64 * 1024 * 1024,
+            base_hash,
+            dh_vmm::config::BootSpec::BzImage {
+                kernel_hash,
+                initramfs_hash,
+                cmdline: dh_vmm::config::canonicalize_bzimage_cmdline_extras(b"quiet")
+                    .expect("allowed BzImage cmdline extra"),
             },
         );
         config.cpuid_table = service_test_cpuid_table();
@@ -6089,6 +6239,69 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn create_vm_accepts_bzimage_boot_through_linux_loader() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash =
+            write_cache_blob(image_cache.path(), &synthetic_bzimage(&vec![0xf4; 0x1000]));
+        let initramfs_hash = write_cache_blob(image_cache.path(), b"initramfs");
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let config = bzimage_service_machine_config(base_hash, kernel_hash, initramfs_hash);
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(config),
+                    entropy_seed: vec![0xB7; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            assert_eq!(created.icount, 0);
+            let expected_base_hash = base_hash;
+            svc.runtime_table()
+                .with(lease.slot_id, |actor| {
+                    actor
+                        .with_runtime(move |runtime| {
+                            assert_eq!(runtime.machine_config.base_image_hash, expected_base_hash);
+                            assert!(matches!(
+                                &runtime.machine_config.boot,
+                                dh_vmm::config::BootSpec::BzImage { .. }
+                            ));
+                            let devices: Vec<(u64, u16)> = runtime
+                                .bus
+                                .devices()
+                                .map(|(base, dev)| (base, dev.device_id()))
+                                .collect();
+                            assert!(devices.contains(&(
+                                DETCHANNEL_MMIO_BASE,
+                                dh_devices::detchannel::DEVICE_ID_DETCHANNEL
+                            )));
+                            assert!(
+                                devices.contains(&(0xD000_4000, dh_devices::blk::DEVICE_ID_PV_BLK))
+                            );
+                        })
+                        .unwrap()
+                })
+                .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn bisection_checkpoint_capture_preserves_runtime_lineage_and_log_surfaces() {
         if !runtime_tests_available() {
             return;
@@ -6758,6 +6971,95 @@ mod tests {
                 saw_beacon = true;
             }
             assert!(saw_beacon, "device exercise should emit one Beacon event");
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn run_next_sdk_event_returns_matching_guest_event_and_keeps_stream_backlog() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::device_exercise_elf());
+        let svc = WorkerService::new(test_config_with_resources(
+            1,
+            image_cache.path().to_path_buf(),
+            None,
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use tokio_stream::StreamExt;
+
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(device_exercise_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xA8; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+            let beacon = detguest_wire::record::EventKind::Beacon as u32;
+            let run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(lease.clone()),
+                    until: Some(proto::run_request::Until::NextSdkEvent(
+                        proto::NextSdkEvent {
+                            stream: Some(beacon),
+                        },
+                    )),
+                    hard_icount_cap: 10_000_000,
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                run.reason,
+                proto_stop_reason(dh_vmm::runctl::StopReason::NextSdkEvent)
+            );
+            let sdk_event = run.sdk_event.as_ref().expect("matching SDK event");
+            assert_eq!(sdk_event.stream, beacon);
+            assert!(sdk_event.icount > 0);
+            assert_eq!(sdk_event.icount, run.icount);
+            assert_eq!(sdk_event.payload.len(), 8);
+            assert_eq!(
+                u32::from_le_bytes(sdk_event.payload[0..4].try_into().unwrap()),
+                nanokernel::DEVICE_EXERCISE_BEACON_ID
+            );
+            assert_eq!(
+                svc.runtime_table()
+                    .with(lease.slot_id, |actor| actor
+                        .with_runtime(|runtime| runtime.guest_events.len())
+                        .unwrap())
+                    .unwrap(),
+                1,
+                "RunResponse.sdk_event must not consume StreamGuestEvents backlog"
+            );
+
+            let mut stream = svc
+                .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+                    lease: Some(lease.clone()),
+                    streams: vec![beacon],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let streamed = stream
+                .as_mut()
+                .next()
+                .await
+                .expect("one streamed event")
+                .unwrap();
+            assert_eq!(&streamed, sdk_event);
+            assert!(stream.as_mut().next().await.is_none());
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
         });
     }
 

@@ -47,25 +47,26 @@ mod common;
 use std::sync::atomic::AtomicBool;
 use std::{collections::BTreeMap, fs, path::Path};
 
-use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
+use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
-use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
+use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
-use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::PAGE_SIZE;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
-use dh_vmm::runctl::{Segment, SegmentOutcome, StopReason, Until, run_segment_with_epochs};
+use dh_vmm::runctl::{run_segment_with_epochs, Segment, SegmentOutcome, StopReason, Until};
 use dh_vmm::vt::ClockRatio;
+use dh_vmm::SlotState;
 use dh_worker::replay_engine::replay_segment;
+use dh_worker::runtime::runtime_hash_device_sections;
 use dh_worker::snapshot_engine::{
-    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, PageSource, take_snapshot,
+    take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
 use kvm_ioctls::VcpuExit;
 use snapstore_manifest::{DeviceBlob, Manifest};
@@ -465,7 +466,10 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, seconds: u64) -> 
                 timer: None,
                 pause: &pause,
                 sdk_events: None,
-                hash_device_sections: Some(&|| dh_vmm::hash::lapic_section(&rail.borrow().lapic)),
+                hash_device_sections: Some(&|| {
+                    let rail_ref = rail.borrow();
+                    runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                }),
             };
             let counter_ref = &counter;
             run_segment_with_epochs(

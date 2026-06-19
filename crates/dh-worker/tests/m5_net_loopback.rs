@@ -11,25 +11,26 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
+use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
-use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
-use dh_devices::net::{PV_NET_BASE, PvNet, REG_TX_DOORBELL};
+use dh_devices::net::{PvNet, PV_NET_BASE, REG_TX_DOORBELL};
+use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
-use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
 use dh_vmm::runctl::{
-    RunOptions, Segment, SegmentOutcome, StopReason, Until, run_segment_with_epoch_options,
-    run_segment_with_epochs,
+    run_segment_with_epoch_options, run_segment_with_epochs, RunOptions, Segment, SegmentOutcome,
+    StopReason, Until,
 };
-use dh_worker::replay_engine::{ReplayOutcome, replay_segment};
-use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
+use dh_vmm::SlotState;
+use dh_worker::replay_engine::{replay_segment, ReplayOutcome};
+use dh_worker::runtime::runtime_hash_device_sections;
+use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
 use snapstore_types::SnapshotRef;
 use vm_memory::{Bytes, GuestAddress};
@@ -145,7 +146,10 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
             timer: None,
             pause: &pause,
             sdk_events: None,
-            hash_device_sections: Some(&|| dh_vmm::hash::lapic_section(&rail.borrow().lapic)),
+            hash_device_sections: Some(&|| {
+                let rail_ref = rail.borrow();
+                runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+            }),
         };
         let counter_ref = &counter;
         run_segment_with_epoch_options(
@@ -234,7 +238,10 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient) -> Recording {
             timer: None,
             pause: &pause,
             sdk_events: None,
-            hash_device_sections: Some(&|| dh_vmm::hash::lapic_section(&rail.borrow().lapic)),
+            hash_device_sections: Some(&|| {
+                let rail_ref = rail.borrow();
+                runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+            }),
         };
         let counter_ref = &counter;
         run_segment_with_epochs(

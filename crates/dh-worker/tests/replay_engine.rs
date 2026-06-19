@@ -15,28 +15,29 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{VmMem, gettid, kvm_available, spawn_store_blocking};
+use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
-use dh_devices::MmioBus;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_inputlog::dhilog::{DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER, LogWriter, SegmentHeader};
+use dh_devices::MmioBus;
+use dh_inputlog::dhilog::{LogWriter, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_PIO_ANSWER};
 use dh_inputlog::reader::LogReader;
 use dh_verify::verify::VerifyProgress;
-use dh_vmm::SlotState;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
 use dh_vmm::recording::DeviceRail;
 use dh_vmm::runctl::{
-    Segment, SegmentOutcome, StopReason, Until, run_segment_with_epochs,
-    run_segment_with_scheduled_inputs_frames_and_epochs,
+    run_segment_with_epochs, run_segment_with_scheduled_inputs_frames_and_epochs, Segment,
+    SegmentOutcome, StopReason, Until,
 };
+use dh_vmm::SlotState;
 use dh_worker::bisection_index::BisectionCheckpointIndex;
-use dh_worker::replay_engine::{ReplayError, replay_segment};
+use dh_worker::replay_engine::{replay_segment, ReplayError};
+use dh_worker::runtime::runtime_hash_device_sections;
 use dh_worker::snapshot_compare::RegDiff;
-use dh_worker::snapshot_engine::{BoundaryState, PageSource, take_snapshot};
+use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use dh_worker::verify_replay::{verify_replay, verify_replay_with_bisection_progress};
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
@@ -160,7 +161,10 @@ fn record(store: &snapstore_client::blocking::SnapstoreClient, opts: RecordOptio
     let run_one = |slot: &mut SlotVm, chain: &mut StateHashChain| -> SegmentOutcome {
         let start = counter.read().unwrap();
         let out = {
-            let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+            let hash_device_sections = || {
+                let rail_ref = rail.borrow();
+                runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+            };
             let mut seg = Segment {
                 slot,
                 counter: &counter,
@@ -381,7 +385,10 @@ fn replay_does_not_hash_intermediate_canonical_record_landings() {
     let pause = AtomicBool::new(false);
     let scheduled_inputs = [40_000, cfg.epoch_len, QUANTUM];
     let out = {
-        let hash_device_sections = || dh_vmm::hash::lapic_section(&rail.borrow().lapic);
+        let hash_device_sections = || {
+            let rail_ref = rail.borrow();
+            runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+        };
         let mut seg = Segment {
             slot: &mut slot,
             counter: &counter,
