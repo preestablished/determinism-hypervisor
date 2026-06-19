@@ -244,10 +244,19 @@ pub fn hash_file(path: &Path) -> TestResult<[u8; 32]> {
 }
 
 #[allow(dead_code)]
+pub fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+#[allow(dead_code)]
+pub fn m9_cache_entry(cache_root: &Path, hash: &[u8; 32]) -> PathBuf {
+    cache_root.join(hex(hash))
+}
+
+#[allow(dead_code)]
 pub fn ensure_cache_entry(source: &Path, cache_root: &Path) -> TestResult<[u8; 32]> {
     let hash = hash_file(source)?;
-    let key = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let dest = cache_root.join(key);
+    let dest = m9_cache_entry(cache_root, &hash);
     if dest.exists() {
         if hash_file(&dest)? == hash {
             return Ok(hash);
@@ -471,6 +480,9 @@ pub fn m9_service_exit_with_detchannel(
             if host.host().metrics.any_anomaly() {
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
+            if let Some(e) = ctx.log_fault() {
+                return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
+            }
             drained_guest_events(events, icount)
         }
         VcpuExit::IoIn(port, data)
@@ -494,6 +506,9 @@ pub fn m9_service_exit_with_detchannel(
             data[..n].copy_from_slice(&bytes[..n]);
             if host.host().metrics.any_anomaly() {
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
+            }
+            if let Some(e) = ctx.log_fault() {
+                return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
             }
             Ok(Vec::new())
         }

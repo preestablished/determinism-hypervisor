@@ -9,6 +9,7 @@
 mod common;
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
@@ -39,9 +40,9 @@ struct ReadyIdentity {
 }
 
 struct LinuxReadySetup {
-    artifacts: common::M9LinuxArtifacts,
     bzimage: Vec<u8>,
     initramfs: Vec<u8>,
+    game_image: PathBuf,
     config: MachineConfig,
     machine_config_hash: [u8; 32],
 }
@@ -62,6 +63,9 @@ fn linux_boot_to_ready_identity_is_deterministic() -> common::TestResult<()> {
         common::hash_file(&artifacts.base_image)?,
         "DH_M9_BASE_IMAGE must be readable fixture context"
     );
+    let bzimage_path = common::m9_cache_entry(&artifacts.image_cache, &hashes.bzimage);
+    let initramfs_path = common::m9_cache_entry(&artifacts.image_cache, &hashes.initramfs);
+    let game_image_path = common::m9_cache_entry(&artifacts.image_cache, &hashes.game_image);
     let config = common::m9_linux_machine_config(
         &hashes,
         sys.masked_cpuid_table()
@@ -70,12 +74,32 @@ fn linux_boot_to_ready_identity_is_deterministic() -> common::TestResult<()> {
     let machine_config_hash = config
         .config_hash()
         .map_err(|e| format!("{TEST_NAME}: MachineConfig hash: {e:?}"))?;
+    let bzimage = std::fs::read(&bzimage_path)
+        .map_err(|e| format!("read cached BzImage {}: {e}", bzimage_path.display()))?;
+    if common::hash_bytes(&bzimage) != hashes.bzimage {
+        return Err(format!(
+            "cached BzImage {} no longer matches MachineConfig hash",
+            bzimage_path.display()
+        ));
+    }
+    let initramfs = std::fs::read(&initramfs_path)
+        .map_err(|e| format!("read cached initramfs {}: {e}", initramfs_path.display()))?;
+    if common::hash_bytes(&initramfs) != hashes.initramfs {
+        return Err(format!(
+            "cached initramfs {} no longer matches MachineConfig hash",
+            initramfs_path.display()
+        ));
+    }
+    if common::hash_file(&game_image_path)? != hashes.game_image {
+        return Err(format!(
+            "cached game image {} no longer matches MachineConfig hash",
+            game_image_path.display()
+        ));
+    }
     let setup = LinuxReadySetup {
-        bzimage: std::fs::read(&artifacts.bzimage)
-            .map_err(|e| format!("read {}: {e}", artifacts.bzimage.display()))?,
-        initramfs: std::fs::read(&artifacts.initramfs)
-            .map_err(|e| format!("read {}: {e}", artifacts.initramfs.display()))?,
-        artifacts,
+        bzimage,
+        initramfs,
+        game_image: game_image_path,
         config,
         machine_config_hash,
     };
@@ -131,7 +155,7 @@ fn cold_boot_to_ready(
         .map_err(|e| format!("{label}: enable counter: {e:?}"))?;
 
     let mem = common::M9VmMem(slot.guest_mem.clone());
-    let base_image = dh_vmm::blkfile::FileBase::open(&setup.artifacts.game_image)
+    let base_image = dh_vmm::blkfile::FileBase::open(&setup.game_image)
         .map_err(|e| format!("{label}: open DH_M9_GAME_IMAGE: {e}"))?;
     let bus = common::m9_linux_bus(&setup.config, base_image, mem.clone())?;
     let log = LogWriter::new(SegmentHeader {
@@ -199,6 +223,12 @@ fn cold_boot_to_ready(
     let ready_event = ready_event
         .into_inner()
         .ok_or_else(|| format!("{label}: NextSdkEvent stop had no Ready event"))?;
+    if sdk_event_feed.get() != 1 {
+        return Err(format!(
+            "{label}: expected exactly one Ready event before stop, saw {}",
+            sdk_event_feed.get()
+        ));
+    }
     if ready_event.icount != outcome.boundary.icount {
         return Err(format!(
             "{label}: Ready event icount {} != run boundary {}",
