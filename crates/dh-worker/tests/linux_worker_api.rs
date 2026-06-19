@@ -34,6 +34,9 @@ const READY_HARD_CAP: u64 = 10_000_000_000;
 
 type TestResult<T> = Result<T, String>;
 
+const REQUIRED_M9_EXPECTED_REGIONS: &[(&str, i64)] =
+    &[("wram", 1), ("framebuffer", 1), ("meta", 1)];
+
 #[derive(Clone, Debug)]
 struct CachedHashes {
     bzimage: [u8; 32],
@@ -301,6 +304,21 @@ fn assert_initramfs_boot_contract(initramfs: &Path) -> TestResult<()> {
             ));
         }
     }
+    for (name, layout_version) in REQUIRED_M9_EXPECTED_REGIONS {
+        let found = expected_regions.iter().any(|region| {
+            region.as_table().and_then(|table| {
+                Some((
+                    table.get("name")?.as_str()?,
+                    table.get("layout_version")?.as_integer()?,
+                ))
+            }) == Some((*name, *layout_version))
+        });
+        if !found {
+            return Err(format!(
+                "boot.toml must list expected_region {name:?} with layout_version {layout_version}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -367,6 +385,14 @@ game_dev = "/dev/vdb"
 [[expected_region]]
 name = "wram"
 layout_version = 1
+
+[[expected_region]]
+name = "framebuffer"
+layout_version = 1
+
+[[expected_region]]
+name = "meta"
+layout_version = 1
 "#;
     let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::fs::write(tmp.path(), test_newc_with_boot_toml(boot_toml)).map_err(|e| e.to_string())?;
@@ -394,6 +420,39 @@ exec = "/opt/autostart-trivial"
         err.contains("[unit.control]"),
         "unexpected contract error: {err}"
     );
+    Ok(())
+}
+
+#[test]
+fn initramfs_contract_rejects_refwork_manifest_missing_required_region() -> TestResult<()> {
+    let boot_toml = r#"
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/usr/bin/refwork-harness"
+
+[unit.control]
+protocol = "refwork-ctl"
+proto_version = 1
+game_dev = "/dev/vdb"
+
+[[expected_region]]
+name = "wram"
+layout_version = 1
+
+[[expected_region]]
+name = "framebuffer"
+layout_version = 1
+"#;
+    let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    std::fs::write(tmp.path(), test_newc_with_boot_toml(boot_toml)).map_err(|e| e.to_string())?;
+
+    let err = assert_initramfs_boot_contract(tmp.path()).expect_err("missing meta rejected");
+    assert!(err.contains("\"meta\""), "unexpected contract error: {err}");
     Ok(())
 }
 

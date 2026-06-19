@@ -55,6 +55,21 @@ these environment variables:
 | `DH_M9_GAME_IMAGE` | Regular file: read-only game image exposed in-guest as `/dev/vdb` |
 | `DH_M9_IMAGE_CACHE` | Existing directory: worker image cache keyed by lowercase BLAKE3 hex |
 
+`DH_M9_INITRAMFS` must be the reference-workload guest image, not the M2
+smoke/autostart image. Its baked `/etc/detguest/boot.toml` is part of the
+artifact contract and must declare:
+
+- `boot_toml_version = 1`
+- `[autostart] unit = <reference-workload unit id>`
+- the autostart unit's `[unit.control]` with
+  `protocol = "refwork-ctl"`, `proto_version = 1`, and
+  `game_dev = "/dev/vdb"`
+- `[[expected_region]]` entries for `wram`, `framebuffer`, and `meta`, each
+  with `layout_version = 1`
+
+The worker M9 acceptance preflights this manifest before creating KVM so a
+smoke initramfs fails as an artifact error rather than as a replay mismatch.
+
 Recommended staging layout on the `kvm-intel` box:
 
 ```bash
