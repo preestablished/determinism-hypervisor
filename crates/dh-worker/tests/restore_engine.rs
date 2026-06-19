@@ -875,7 +875,9 @@ fn mis_shaped_containers_are_rejected_loudly() {
 }
 
 #[test]
-#[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
+#[ignore = "M9 Linux artifact gate: set DH_M9_* and run with DH_M9_ALLOW_SKIP=0"]
+// Final acceptance command:
+// DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test restore_engine linux_boot_once --release -- --ignored --nocapture
 fn linux_boot_once() {
     boot_observer::reset();
     let Some(ready) = common::m9_linux_ready_snapshot("restore_engine::linux_boot_once", 2)
@@ -1030,6 +1032,8 @@ fn linux_boot_once() {
         .snapshot
         .as_ref()
         .expect("restored snapshot ref");
+    // Restored and forked READY snapshots must preserve the source event and
+    // block sections byte-for-byte.
     assert_eq!(
         common::snapshot_section(&ready.store, restored_ref, tag::EVTC)
             .expect("restored EVTC section"),

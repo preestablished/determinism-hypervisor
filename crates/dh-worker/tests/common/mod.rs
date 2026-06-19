@@ -5,7 +5,7 @@
 //! at its crate root, so this module never compiles elsewhere.
 
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use dh_devices::clock::PvClock;
@@ -204,31 +204,76 @@ pub fn hash_file(path: &Path) -> TestResult<[u8; 32]> {
 #[allow(dead_code)]
 pub fn ensure_cache_entry(source: &Path, cache_root: &Path) -> TestResult<[u8; 32]> {
     let hash = hash_file(source)?;
-    let dest = cache_root.join(dh_worker::image_resolver::cache_key(&hash));
+    let key = dh_worker::image_resolver::cache_key(&hash);
+    let dest = cache_root.join(&key);
     if dest.exists() {
         if hash_file(&dest)? == hash {
             return Ok(hash);
         }
-        std::fs::remove_file(&dest)
-            .map_err(|e| format!("remove stale cache entry {}: {e}", dest.display()))?;
+        return Err(format!(
+            "existing image cache entry {} does not match key {}",
+            dest.display(),
+            key
+        ));
     }
 
     match std::fs::hard_link(source, &dest) {
         Ok(()) => Ok(hash),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            if hash_file(&dest)? == hash {
+                Ok(hash)
+            } else {
+                Err(format!(
+                    "concurrent image cache entry {} does not match key {}",
+                    dest.display(),
+                    key
+                ))
+            }
+        }
         Err(_) => {
-            std::fs::copy(source, &dest).map_err(|e| {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let tmp = cache_root.join(format!("{}.{}.{}.tmp", key, std::process::id(), nonce));
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::copy(source, &tmp).map_err(|e| {
                 format!(
-                    "copy {} to image cache {}: {e}",
+                    "copy {} to temporary image cache entry {}: {e}",
                     source.display(),
-                    dest.display()
+                    tmp.display()
                 )
             })?;
-            if hash_file(&dest)? != hash {
+            if hash_file(&tmp)? != hash {
+                let _ = std::fs::remove_file(&tmp);
                 return Err(format!(
-                    "image cache entry {} hash mismatch",
-                    dest.display()
+                    "temporary image cache entry {} hash mismatch",
+                    tmp.display()
                 ));
             }
+            let publish = match std::fs::hard_link(&tmp, &dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if hash_file(&dest)? == hash {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "concurrent image cache entry {} does not match key {}",
+                            dest.display(),
+                            key
+                        ))
+                    }
+                }
+                Err(e) => Err(format!(
+                    "publish temporary image cache entry {} to {}: {e}",
+                    tmp.display(),
+                    dest.display()
+                )),
+            };
+            let cleanup = std::fs::remove_file(&tmp)
+                .map_err(|e| format!("remove temporary image cache entry {}: {e}", tmp.display()));
+            publish?;
+            cleanup?;
             Ok(hash)
         }
     }

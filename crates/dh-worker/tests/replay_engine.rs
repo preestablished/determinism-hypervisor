@@ -866,7 +866,9 @@ fn lapc_verify_replay_bisection_reports_lapic_reg_diff_on_mutation() {
 }
 
 #[test]
-#[ignore = "M9 Linux artifact gate: requires DH_M9_* artifacts and KVM"]
+#[ignore = "M9 Linux artifact gate: set DH_M9_* and run with DH_M9_ALLOW_SKIP=0"]
+// Final acceptance command:
+// DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test replay_engine linux_boot_once --release -- --ignored --nocapture
 fn linux_boot_once() {
     boot_observer::reset();
     let Some(ready) = common::m9_linux_ready_snapshot("replay_engine::linux_boot_once", 2)
@@ -919,6 +921,7 @@ fn linux_boot_once() {
     })
     .expect("VerifyReplay Linux boot-once flow");
 
+    // VerifyReplay must not mutate the source snapshot sections it replays.
     assert_eq!(
         common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::EVTC)
             .expect("Ready EVTC section after replay"),
