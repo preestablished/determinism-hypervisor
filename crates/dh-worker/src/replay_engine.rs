@@ -150,6 +150,23 @@ where
                 }
             }
         }
+        kvm_ioctls::VcpuExit::X86Rdmsr(msr) => match dh_vmm::msr::on_denied_rdmsr(msr.index) {
+            dh_vmm::msr::MsrAction::SupplyValue(value) => {
+                *msr.data = value;
+                *msr.error = 0;
+            }
+            dh_vmm::msr::MsrAction::AckWrite | dh_vmm::msr::MsrAction::InjectGp => {
+                *msr.error = 1;
+            }
+        },
+        kvm_ioctls::VcpuExit::X86Wrmsr(msr) => match dh_vmm::msr::on_denied_wrmsr(msr.index) {
+            dh_vmm::msr::MsrAction::SupplyValue(_) | dh_vmm::msr::MsrAction::AckWrite => {
+                *msr.error = 0;
+            }
+            dh_vmm::msr::MsrAction::InjectGp => {
+                *msr.error = 1;
+            }
+        },
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
         {
@@ -181,6 +198,10 @@ where
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
         }
+        kvm_ioctls::VcpuExit::IoIn(_port, data) => {
+            data.fill(0);
+        }
+        kvm_ioctls::VcpuExit::IoOut(_port, _data) => {}
         kvm_ioctls::VcpuExit::MmioRead(gpa, data) => {
             rail.bus
                 .read(gpa, data, &mut ctx)
@@ -1174,16 +1195,12 @@ where
         && last_canonical_icount == Some(header.end_icount)
         && last_epoch_icount.get() != Some(header.end_icount)
     {
-        let vns = machine_config
-            .clock
-            .vns_from_icount(header.end_icount)
-            .ok_or_else(|| ReplayError::Run("vns/icount conversion overflow".into()))?;
         let device_sections = {
             let rail_ref = rail.borrow();
             runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
         };
         chain
-            .push_final_link(slot, &device_sections, header.end_icount, vns)
+            .push_final_link(slot, &device_sections, header.end_icount, header.end_vns)
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
     }
     let mut live_end = chain.value();

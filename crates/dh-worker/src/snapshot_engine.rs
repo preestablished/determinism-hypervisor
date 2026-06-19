@@ -32,11 +32,11 @@
 //! into ENTR v2 instead of being framed alone.
 
 use dh_snapshot::dhsnap::{
-    ContainerWriter, EntrSection, EntrSectionV2, LapcSection, TimeSection, tag,
+    tag, ContainerWriter, EntrSection, EntrSectionV2, LapcSection, TimeSection,
 };
-use dh_vmm::dirty::{DirtyPageSet, DirtyRing, PAGE_SIZE, harvest_at_boundary};
+use dh_vmm::dirty::{harvest_at_boundary, DirtyPageSet, DirtyRing, PAGE_SIZE};
 use dh_vmm::kvm::SlotVm;
-use dh_vmm::{SlotState, vcpu_state};
+use dh_vmm::{vcpu_state, SlotState};
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;
@@ -166,7 +166,8 @@ pub fn take_snapshot_with_lapic(
         } => {
             harvest_at_boundary(ring, &slot.vm, dirty)
                 .map_err(|e| EngineError::Kvm(format!("harvest: {e:?}")))?;
-            let indices: Vec<u64> = dirty.iter().collect();
+            let mut indices: Vec<u64> = dirty.iter().collect();
+            include_device_guest_ram_pages(bus, total_pages, &mut indices)?;
             (indices, Some(parent), Some(dirty))
         }
     };
@@ -284,6 +285,38 @@ fn read_pages(slot: &SlotVm, page_indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>
         pages.push((*idx, buf));
     }
     Ok(pages)
+}
+
+fn include_device_guest_ram_pages(
+    bus: &dh_devices::MmioBus,
+    total_pages: u64,
+    page_indices: &mut Vec<u64>,
+) -> Result<(), EngineError> {
+    for (_base, dev) in bus.devices() {
+        for (gpa, len) in dev.guest_ram_snapshot_ranges() {
+            if len == 0 {
+                continue;
+            }
+            let end = gpa.checked_add(len).ok_or_else(|| {
+                EngineError::Codec(format!(
+                    "device {:#06x} snapshot guest RAM range overflows: {gpa:#x}+{len:#x}",
+                    dev.device_id()
+                ))
+            })?;
+            let first_page = gpa / PAGE_SIZE;
+            let end_page = end.div_ceil(PAGE_SIZE);
+            if end_page > total_pages {
+                return Err(EngineError::Codec(format!(
+                    "device {:#06x} snapshot guest RAM range {gpa:#x}..{end:#x} exceeds guest RAM",
+                    dev.device_id()
+                )));
+            }
+            page_indices.extend(first_page..end_page);
+        }
+    }
+    page_indices.sort_unstable();
+    page_indices.dedup();
+    Ok(())
 }
 
 fn put_snapshot_from_pages(

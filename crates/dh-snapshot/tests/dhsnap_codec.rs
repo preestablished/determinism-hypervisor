@@ -148,12 +148,10 @@ fn empty_container_is_just_header() {
 fn known_tags_table_is_complete_and_unique() {
     assert_eq!(KNOWN_TAGS.len(), 11);
     for (i, a) in KNOWN_TAGS.iter().enumerate() {
-        assert!(
-            std::str::from_utf8(a)
-                .unwrap()
-                .chars()
-                .all(|c| c.is_ascii_uppercase())
-        );
+        assert!(std::str::from_utf8(a)
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_uppercase()));
         for b in &KNOWN_TAGS[i + 1..] {
             assert_ne!(a, b, "duplicate tag in KNOWN_TAGS");
         }
@@ -196,7 +194,7 @@ fn golden_bytes_minimal_container() {
     expect.extend_from_slice(&84u64.to_le_bytes()); // vns
     expect.extend_from_slice(&1u64.to_le_bytes()); // epoch_index
     expect.extend_from_slice(&[0xAB; 32]); // hash_chain
-    // 56 % 8 == 0: no alignment padding.
+                                           // 56 % 8 == 0: no alignment padding.
 
     let mut w = ContainerWriter::new();
     w.push_section(

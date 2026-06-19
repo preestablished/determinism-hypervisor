@@ -6,20 +6,20 @@
 mod common;
 
 use common::{kvm_available, spawn_store_blocking, test_bus};
-use dh_devices::MmioBus;
 use dh_devices::clock::PvClock;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
-use dh_snapshot::dhsnap::{Container, EntrSectionV2, LapcSection, TimeSection, tag};
+use dh_devices::MmioBus;
+use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, LapcSection, TimeSection};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::{
-    DirtyPageSet, DirtyRing, PAGE_SIZE, enable_dirty_logging, harvest_at_boundary,
+    enable_dirty_logging, harvest_at_boundary, DirtyPageSet, DirtyRing, PAGE_SIZE,
 };
-use dh_vmm::kvm::{ExitEvent, KvmSystem, SlotVm, classify_exit};
-use dh_vmm::{SlotState, vcpu_state};
+use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem, SlotVm};
+use dh_vmm::{vcpu_state, SlotState};
 use dh_worker::snapshot_engine::{
-    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, EngineError, PageSource,
-    capture_bisection_checkpoint_snapshot, take_snapshot,
+    capture_bisection_checkpoint_snapshot, take_snapshot, BoundaryState, EngineError, PageSource,
+    DEVICE_BLOB_FORMAT_DHSNAP,
 };
 
 const MEM: u64 = 2 * 1024 * 1024; // 512 pages

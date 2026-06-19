@@ -20,7 +20,7 @@
 //! The chain VALUE (not just the last link) is the state hash exchanged
 //! with other services: comparing chains compares execution histories.
 
-use kvm_bindings::{Msrs, kvm_msr_entry, kvm_segment};
+use kvm_bindings::{kvm_msr_entry, kvm_segment, Msrs};
 use kvm_ioctls::VcpuFd;
 use vm_memory::{Bytes, GuestAddress};
 
@@ -403,7 +403,8 @@ mod tests {
         let a = canonical_vcpu_blob(&slot.vcpu, 0).unwrap();
         let mut xsave = slot.vcpu.get_xsave().unwrap();
         xsave.region[6] = 0x7F80; // flip a rounding-control-relevant bit set
-        xsave.region[128] |= 0b10; // XSTATE_BV.SSE: the area is live, not init
+                                  // XSTATE_BV.SSE: the area is live, not init.
+        xsave.region[128] |= 0b10;
         // SAFETY: plain kvm_xsave (no FAM tail in the 0.24 binding); the
         // struct came from GET_XSAVE on this same vCPU.
         #[allow(unsafe_code)]
@@ -606,9 +607,9 @@ mod lapic_section_tests {
 #[cfg(test)]
 mod device_section_tests {
     use super::*;
-    use dh_devices::MmioBus;
     use dh_devices::blk::{BaseIoError, BlockBase, PvBlk};
     use dh_devices::pad::PvPad;
+    use dh_devices::MmioBus;
 
     struct ZeroBase;
     impl BlockBase for ZeroBase {

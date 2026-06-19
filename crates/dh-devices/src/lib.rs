@@ -55,6 +55,14 @@ pub trait DetDevice: Send {
     /// Append this device's section contents (versioned by
     /// `section_version`). Must be a pure function of device state.
     fn snapshot(&self, out: &mut Vec<u8>);
+    /// Guest RAM ranges that are part of this device's durable state even
+    /// when KVM's dirty ring does not report them. This is for shared
+    /// guest/host device memory such as detchannel rings, where host-side
+    /// pause-boundary mutations are logged but not KVM-dirtied. Ranges are
+    /// byte ranges in GPA space; the snapshot engine rounds to 4 KiB pages.
+    fn guest_ram_snapshot_ranges(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
     fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError>;
     /// Restore-engine downcast seam (ARCH §8.3). A device whose restore
     /// needs engine-supplied state that is NOT in its own DHSNAP section

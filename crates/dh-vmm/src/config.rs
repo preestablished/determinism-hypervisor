@@ -89,7 +89,7 @@ pub const DEFAULT_RESYNC_SLACK: u32 = 1024;
 pub const MAX_CMDLINE: usize = 4096;
 pub const MAX_CPUID_LEAVES: usize = 4096;
 pub const MAX_DEVICES: usize = 256;
-pub const BZIMAGE_FORCED_CMDLINE: &[u8] = b"console=ttyS0 nokaslr norandmaps random.trust_cpu=off tsc=unstable clocksource=dh-pvclock nohz=off highres=off init=/init";
+pub const BZIMAGE_FORCED_CMDLINE: &[u8] = b"console=ttyS0 nokaslr norandmaps random.trust_cpu=off random.trust_bootloader=on page_alloc.shuffle=0 notsc tsc=unstable clocksource=jiffies vdso=0 lpj=4096 noapictimer default_hugepagesz=2M hugepagesz=2M hugepages=1 init=/init";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BzImageCmdlineExtras {
@@ -201,10 +201,17 @@ fn is_forced_bzimage_baseline_key(token: &[u8]) -> bool {
             | b"nokaslr"
             | b"norandmaps"
             | b"random.trust_cpu"
+            | b"random.trust_bootloader"
+            | b"page_alloc.shuffle"
+            | b"notsc"
             | b"tsc"
             | b"clocksource"
-            | b"nohz"
-            | b"highres"
+            | b"vdso"
+            | b"lpj"
+            | b"noapictimer"
+            | b"default_hugepagesz"
+            | b"hugepagesz"
+            | b"hugepages"
             | b"init"
     )
 }
@@ -797,6 +804,34 @@ mod tests {
         );
         assert_eq!(
             canonicalize_bzimage_cmdline_extras(b"nokaslr"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"lpj=1"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"noapictimer"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"hugepages=2"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"random.trust_bootloader=off"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"page_alloc.shuffle=1"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"notsc"),
+            Err(ConfigError::BzImageCmdlineBaselineOverride)
+        );
+        assert_eq!(
+            canonicalize_bzimage_cmdline_extras(b"vdso=1"),
             Err(ConfigError::BzImageCmdlineBaselineOverride)
         );
         assert_eq!(

@@ -24,6 +24,7 @@ const L1_ECX_AVX: u32 = 1 << 28; // AVX: unusable with CR4.OSXSAVE off
 const L1_ECX_F16C: u32 = 1 << 29; // AVX family
 
 // Leaf 1 EDX
+const L1_EDX_TSC: u32 = 1 << 4; // RDTSC: host-clocked raw cycle counter
 const L1_EDX_TM: u32 = 1 << 29; // thermal monitor: package-thermal behavior
 const L1_EDX_ACPI: u32 = 1 << 22; // thermal/throttle MSRs
 
@@ -78,7 +79,7 @@ pub fn mask_in_place(cpuid: &mut CpuId) {
                     | L1_ECX_OSXSAVE
                     | L1_ECX_AVX
                     | L1_ECX_F16C);
-                e.edx &= !(L1_EDX_TM | L1_EDX_ACPI);
+                e.edx &= !(L1_EDX_TSC | L1_EDX_TM | L1_EDX_ACPI);
                 // EBX[31:24] is the initial APIC ID: which HOST LP the
                 // ioctl ran on. It flipped the masked-table hash between
                 // runs of the same binary (iteration-48 review, live).
@@ -217,6 +218,7 @@ mod tests {
                     assert_eq!(e.ecx & L1_ECX_X2APIC, 0, "x2APIC");
                     assert_eq!(e.ecx & L1_ECX_MONITOR, 0, "MONITOR");
                     assert_eq!(e.ecx & L1_ECX_PDCM, 0, "PDCM");
+                    assert_eq!(e.edx & L1_EDX_TSC, 0, "TSC");
                     assert_eq!(
                         e.ecx
                             & (L1_ECX_FMA
@@ -310,6 +312,7 @@ mod tests {
                     assert_eq!(e.ecx & L1_ECX_TSC_DEADLINE, 0, "TSC_DEADLINE");
                     assert_eq!(e.ecx & L1_ECX_X2APIC, 0, "x2APIC");
                     assert_eq!(e.ecx & L1_ECX_PDCM, 0, "PDCM");
+                    assert_eq!(e.edx & L1_EDX_TSC, 0, "TSC");
                 }
                 (7, 0) => {
                     assert_eq!(e.ebx & L7_EBX_RDSEED, 0, "RDSEED");

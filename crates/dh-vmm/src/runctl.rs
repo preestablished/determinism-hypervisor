@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dh_detclock::counter::InstRetired;
 use kvm_ioctls::VcpuExit;
 
-use crate::agenda::{AgendaError, AgendaInputs, FinalStop, StopKind, compile};
-use crate::boundary::{Boundary, BoundaryError, Margins, land_at};
+use crate::agenda::{compile, AgendaError, AgendaInputs, FinalStop, StopKind};
+use crate::boundary::{land_at, Boundary, BoundaryError, Margins};
 use crate::config::MachineConfig;
 use crate::hash::StateHashChain;
-use crate::inject::{InjectError, Injection, inject_at_boundary};
+use crate::inject::{inject_at_boundary, InjectError, Injection};
 use crate::kvm::SlotVm;
 
 /// §3.4 deferral budget per injection: deterministic and loud when the
@@ -448,6 +448,11 @@ fn run_segment_inner(
             seg.start_icount
         )));
     }
+    let start_vns = clock
+        .vns_from_icount(seg.start_icount)
+        .ok_or(RunError::ClockOverflow)?;
+    crate::tsc::set_tsc_value_with_offset(&seg.slot.vcpu, start_vns)
+        .map_err(|e| RunError::Kvm(format!("set segment-start TSC: {e:?}")))?;
 
     let (final_stop, goal_poll_period) = match until {
         Until::IcountBudget(b) => (FinalStop::IcountBudget(b), None),

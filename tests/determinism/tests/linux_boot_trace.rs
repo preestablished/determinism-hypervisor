@@ -11,10 +11,11 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use dh_detclock::counter::InstRetired;
+use dh_devices::DebugSerial;
 use dh_vmm::config::canonicalize_bzimage_cmdline_extras;
 use dh_vmm::kvm::{ExitEvent, KvmSystem};
 use dh_vmm::lapic::{LapicError, LocalApic};
-use dh_vmm::msr::{DeniedMsrClass, MSR_IA32_APIC_BASE, denied_msr_class};
+use dh_vmm::msr::{denied_msr_class, DeniedMsrClass, MSR_IA32_APIC_BASE};
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::VcpuExit;
 use vm_memory::{Bytes, GuestAddress};
@@ -156,6 +157,7 @@ fn assert_masked_cpuid_surface(slot: &dh_vmm::kvm::SlotVm) {
     for entry in cpuid.as_slice() {
         match (entry.function, entry.index) {
             (1, _) => {
+                assert_eq!(entry.edx & (1 << 4), 0, "TSC");
                 assert_eq!(entry.ecx & (1 << 21), 0, "x2APIC");
                 assert_eq!(entry.ecx & (1 << 24), 0, "TSC-deadline");
                 assert_eq!(entry.ecx & (1 << 30), 0, "RDRAND");
@@ -192,6 +194,10 @@ struct LinuxBootTrace {
     exit_limit: u64,
     icount_limit: Option<u64>,
     final_icount: Option<u64>,
+    final_rip: Option<u64>,
+    final_rsp: Option<u64>,
+    serial_output_len: usize,
+    serial_output_tail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +270,21 @@ impl LinuxBootTrace {
     }
 }
 
+fn record_serial_output(trace: &mut LinuxBootTrace, serial: &mut DebugSerial) {
+    const SERIAL_TAIL_LIMIT: usize = 4096;
+    let bytes = serial.take_output();
+    trace.serial_output_len += bytes.len();
+    let start = bytes.len().saturating_sub(SERIAL_TAIL_LIMIT);
+    trace.serial_output_tail = String::from_utf8_lossy(&bytes[start..]).into_owned();
+}
+
+fn record_final_regs(trace: &mut LinuxBootTrace, vcpu: &kvm_ioctls::VcpuFd) {
+    if let Ok(regs) = vcpu.get_regs() {
+        trace.final_rip = Some(regs.rip);
+        trace.final_rsp = Some(regs.rsp);
+    }
+}
+
 fn trace_linux_boot(
     slot: &mut dh_vmm::kvm::SlotVm,
     exit_limit: u64,
@@ -282,14 +303,17 @@ fn trace_linux_boot(
             exit_limit,
             icount_limit,
             LocalApic::new(),
+            DebugSerial::new(),
         );
     }
 
     let mut lapic = LocalApic::new();
+    let mut serial = DebugSerial::new();
     for _ in 0..exit_limit {
         let mut exit = match slot.vcpu.run() {
             Ok(exit) => exit,
             Err(e) => {
+                record_serial_output(&mut trace, &mut serial);
                 trace.terminal_reason = Some(format!("kvm_run_error: {e}"));
                 return trace;
             }
@@ -300,10 +324,14 @@ fn trace_linux_boot(
         match service_lapic_exit_for_trace(&mut trace, &mut lapic, &mut exit) {
             TraceExitService::Handled => continue,
             TraceExitService::Terminal(reason) => {
+                record_serial_output(&mut trace, &mut serial);
                 trace.terminal_reason = Some(reason);
                 return trace;
             }
             TraceExitService::Unhandled => {}
+        }
+        if service_serial_exit_for_trace(&mut serial, &mut exit) {
+            continue;
         }
         prepare_exit_for_trace(&mut trace, &mut exit);
         let terminal = terminal_reason(&exit);
@@ -311,15 +339,18 @@ fn trace_linux_boot(
         observe_classified_event(&mut trace, &event);
 
         if let Some(reason) = terminal_after_classification(&event) {
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(reason);
             return trace;
         }
         if let Some(reason) = terminal {
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(reason);
             return trace;
         }
     }
 
+    record_serial_output(&mut trace, &mut serial);
     trace.terminal_reason = Some(format!("exit_limit_reached({exit_limit})"));
     trace
 }
@@ -330,6 +361,7 @@ fn trace_linux_boot_with_icount(
     exit_limit: u64,
     icount_limit: u64,
     mut lapic: LocalApic,
+    mut serial: DebugSerial,
 ) -> LinuxBootTrace {
     if let Err(e) = dh_vmm::run::install_kick_handler() {
         trace.terminal_reason = Some(format!("icount_setup_failed: install kick handler: {e}"));
@@ -362,6 +394,8 @@ fn trace_linux_boot_with_icount(
         let counted = counter.read().expect("read instruction counter");
         trace.final_icount = Some(counted);
         if counted >= icount_limit {
+            record_final_regs(&mut trace, &guard);
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(format!(
                 "icount_limit_reached(limit={icount_limit}, counted={counted})"
             ));
@@ -369,6 +403,7 @@ fn trace_linux_boot_with_icount(
         }
 
         if let Err(e) = counter.arm_period(icount_limit - counted) {
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(format!("icount_setup_failed: arm period: {e:?}"));
             return trace;
         }
@@ -379,6 +414,8 @@ fn trace_linux_boot_with_icount(
                 let counted = counter.read().expect("read instruction counter after kick");
                 trace.final_icount = Some(counted);
                 if counted >= icount_limit {
+                    record_final_regs(&mut trace, &guard);
+                    record_serial_output(&mut trace, &mut serial);
                     trace.terminal_reason = Some(format!(
                         "icount_limit_reached(limit={icount_limit}, counted={counted})"
                     ));
@@ -387,6 +424,7 @@ fn trace_linux_boot_with_icount(
                 continue;
             }
             Err(e) => {
+                record_serial_output(&mut trace, &mut serial);
                 trace.terminal_reason = Some(format!("kvm_run_error: {e}"));
                 return trace;
             }
@@ -398,10 +436,14 @@ fn trace_linux_boot_with_icount(
             TraceExitService::Handled => continue,
             TraceExitService::Terminal(reason) => {
                 trace.final_icount = counter.read().ok();
+                record_serial_output(&mut trace, &mut serial);
                 trace.terminal_reason = Some(reason);
                 return trace;
             }
             TraceExitService::Unhandled => {}
+        }
+        if service_serial_exit_for_trace(&mut serial, &mut exit) {
+            continue;
         }
         prepare_exit_for_trace(&mut trace, &mut exit);
         let terminal = terminal_reason(&exit);
@@ -410,17 +452,21 @@ fn trace_linux_boot_with_icount(
 
         if let Some(reason) = terminal_after_classification(&event) {
             trace.final_icount = counter.read().ok();
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(reason);
             return trace;
         }
         if let Some(reason) = terminal {
             trace.final_icount = counter.read().ok();
+            record_serial_output(&mut trace, &mut serial);
             trace.terminal_reason = Some(reason);
             return trace;
         }
     }
 
     trace.final_icount = counter.read().ok();
+    record_final_regs(&mut trace, &guard);
+    record_serial_output(&mut trace, &mut serial);
     trace.terminal_reason = Some(format!("exit_limit_reached({exit_limit})"));
     trace
 }
@@ -485,6 +531,20 @@ fn service_lapic_exit_for_trace(
 
 fn lapic_error(context: &'static str, error: LapicError) -> String {
     format!("lapic_{context}_error({error:?})")
+}
+
+fn service_serial_exit_for_trace(serial: &mut DebugSerial, exit: &mut VcpuExit<'_>) -> bool {
+    match exit {
+        VcpuExit::IoOut(port, data) if is_serial_port(*port) => {
+            serial.pio_write(*port, data);
+            true
+        }
+        VcpuExit::IoIn(port, data) if is_serial_port(*port) => {
+            serial.pio_read(*port, data);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn prepare_exit_for_trace(trace: &mut LinuxBootTrace, exit: &mut VcpuExit<'_>) {
@@ -703,6 +763,18 @@ fn trace_json(trace: &LinuxBootTrace) -> String {
     .unwrap();
     writeln!(
         out,
+        "  \"final_rip\": {},",
+        json_optional_hex_u64(trace.final_rip)
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  \"final_rsp\": {},",
+        json_optional_hex_u64(trace.final_rsp)
+    )
+    .unwrap();
+    writeln!(
+        out,
         "  \"terminal_reason\": {},",
         json_string(trace.terminal_reason.as_deref().unwrap_or("unknown"))
     )
@@ -776,6 +848,13 @@ fn trace_json(trace: &LinuxBootTrace) -> String {
         json_u8_set(&trace.ioapic_eoi_vectors)
     )
     .unwrap();
+    writeln!(out, "  \"serial_output_len\": {},", trace.serial_output_len).unwrap();
+    writeln!(
+        out,
+        "  \"serial_output_tail\": {},",
+        json_string(&trace.serial_output_tail)
+    )
+    .unwrap();
     writeln!(
         out,
         "  \"first_detchannel_status\": {}",
@@ -789,6 +868,12 @@ fn trace_json(trace: &LinuxBootTrace) -> String {
 fn json_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_optional_hex_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| json_string(&format!("{value:#x}")))
         .unwrap_or_else(|| "null".to_string())
 }
 

@@ -341,10 +341,11 @@ impl LocalApic {
                 }
             }
             REG_LVT_TIMER => {
-                if value & LVT_MASKED == 0 {
-                    return Err(LapicError::UnsupportedTimer { offset: off, value });
-                }
-                self.lvt_timer = value;
+                // Linux programs the local-APIC timer before userspace. We keep
+                // the surface deterministic by accepting the register writes but
+                // persisting a masked, never-firing timer. No host-clocked source
+                // is introduced; guest-visible time remains pv-clock owned.
+                self.lvt_timer = value | LVT_MASKED;
             }
             REG_LVT_THERMAL => self.lvt_thermal = value,
             REG_LVT_PERF => self.lvt_perf = value,
@@ -352,9 +353,6 @@ impl LocalApic {
             REG_LVT_LINT1 => self.lvt_lint1 = value,
             REG_LVT_ERROR => self.lvt_error = value,
             REG_TIMER_INITIAL => {
-                if value != 0 {
-                    return Err(LapicError::UnsupportedTimer { offset: off, value });
-                }
                 self.timer_initial = 0;
             }
             REG_TIMER_DIVIDE => self.timer_divide = value,
@@ -473,22 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn linux_lapic_rejects_timers_and_x2apic_without_host_time() {
+    fn linux_lapic_accepts_timer_programming_without_host_time() {
         let mut apic = LocalApic::new();
-        assert_eq!(
-            write4(&mut apic, REG_LVT_TIMER, 0x40),
-            Err(LapicError::UnsupportedTimer {
-                offset: REG_LVT_TIMER,
-                value: 0x40
-            })
-        );
-        assert_eq!(
-            write4(&mut apic, REG_TIMER_INITIAL, 1),
-            Err(LapicError::UnsupportedTimer {
-                offset: REG_TIMER_INITIAL,
-                value: 1
-            })
-        );
+        write4(&mut apic, REG_LVT_TIMER, 0x40).unwrap();
+        assert_eq!(read4(&apic, REG_LVT_TIMER), LVT_MASKED | 0x40);
+        write4(&mut apic, REG_TIMER_INITIAL, 1).unwrap();
+        assert_eq!(read4(&apic, REG_TIMER_INITIAL), 0);
+        assert_eq!(read4(&apic, REG_TIMER_CURRENT), 0);
         write4(&mut apic, REG_LVT_TIMER, LVT_MASKED | 0x40).unwrap();
         assert_eq!(
             apic.write_msr(MSR_IA32_APIC_BASE, RESET_APIC_BASE_MSR | APIC_BASE_X2APIC),

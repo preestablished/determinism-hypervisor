@@ -82,6 +82,7 @@ fn run_counting() -> Result<(Vec<u8>, u64, u64), String> {
             timer: None,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         let counter_ref = &counter;
         let mut on_exit = |exit: VcpuExit| match exit {

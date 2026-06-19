@@ -196,6 +196,14 @@ where
         self.host.snapshot(out);
     }
 
+    fn guest_ram_snapshot_ranges(&self) -> Vec<(u64, u64)> {
+        self.host
+            .channel_gpa()
+            .map(|gpa| (gpa, u64::from(CHANNEL_SIZE_PAGES) * 4096))
+            .into_iter()
+            .collect()
+    }
+
     fn restore(&mut self, bytes: &[u8], sec_version: u16) -> Result<(), RestoreError> {
         DetChannelHost::<M, P>::validate_evtc_section(bytes, sec_version)?;
         let plan = (self.restore_plan)();

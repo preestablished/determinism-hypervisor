@@ -79,6 +79,15 @@ const E820_ENTRY_SIZE: usize = 20;
 const E820_TABLE_CAP: usize = 128;
 const E820_RAM: u32 = 1;
 const E820_RESERVED: u32 = 2;
+const SETUP_DATA_HEADER_LEN: usize = 16;
+const SETUP_RNG_SEED_TYPE: u32 = 9;
+const SETUP_RNG_SEED_OFF: usize = 0x0d00;
+const SETUP_RNG_SEED: [u8; 64] = [
+    0x64, 0x68, 0x2d, 0x6d, 0x39, 0x2d, 0x72, 0x6e, 0x67, 0x2d, 0x73, 0x65, 0x65, 0x64, 0x2d, 0x76,
+    0x31, 0x00, 0x4b, 0x9d, 0x23, 0x41, 0x8c, 0xf0, 0x17, 0xa6, 0x5e, 0x31, 0xc2, 0xdd, 0x88, 0x10,
+    0xfa, 0x67, 0x04, 0x29, 0xb3, 0x5c, 0x91, 0xee, 0x70, 0x12, 0x44, 0xab, 0xcd, 0x09, 0x57, 0x26,
+    0xe8, 0x3a, 0x95, 0x6b, 0x11, 0xd4, 0x20, 0x7f, 0x03, 0xbe, 0x49, 0xa1, 0x5d, 0x72, 0xc6, 0x18,
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BzImageLayout {
@@ -712,7 +721,21 @@ fn build_boot_params(
     );
     put_u16(&mut page, XLOADFLAGS_OFF, header.xloadflags);
     put_u32(&mut page, CMDLINE_SIZE_OFF, header.cmdline_size);
+    put_u64(
+        &mut page,
+        SETUP_DATA_OFF,
+        LINUX_BOOT_PARAMS_GPA + SETUP_RNG_SEED_OFF as u64,
+    );
     put_u64(&mut page, PREF_ADDRESS_OFF, header.pref_address);
+    put_u64(&mut page, SETUP_RNG_SEED_OFF, 0);
+    put_u32(&mut page, SETUP_RNG_SEED_OFF + 8, SETUP_RNG_SEED_TYPE);
+    put_u32(
+        &mut page,
+        SETUP_RNG_SEED_OFF + 12,
+        SETUP_RNG_SEED.len() as u32,
+    );
+    let seed_start = SETUP_RNG_SEED_OFF + SETUP_DATA_HEADER_LEN;
+    page[seed_start..seed_start + SETUP_RNG_SEED.len()].copy_from_slice(&SETUP_RNG_SEED);
 
     for (index, entry) in layout.e820_entries.iter().enumerate() {
         let at = ZERO_PAGE_E820_TABLE_OFF + index * E820_ENTRY_SIZE;
@@ -1226,7 +1249,22 @@ mod tests {
         assert_eq!(page[RELOCATABLE_KERNEL_OFF], 1);
         assert_eq!(u16_at(page, XLOADFLAGS_OFF), XLF_KERNEL_64);
         assert_eq!(u32_at(page, CMDLINE_SIZE_OFF), config::MAX_CMDLINE as u32);
+        assert_eq!(
+            u64_at(page, SETUP_DATA_OFF),
+            LINUX_BOOT_PARAMS_GPA + SETUP_RNG_SEED_OFF as u64
+        );
         assert_eq!(u64_at(page, PREF_ADDRESS_OFF), 0x20_0000);
+        assert_eq!(u64_at(page, SETUP_RNG_SEED_OFF), 0);
+        assert_eq!(u32_at(page, SETUP_RNG_SEED_OFF + 8), SETUP_RNG_SEED_TYPE);
+        assert_eq!(
+            u32_at(page, SETUP_RNG_SEED_OFF + 12),
+            SETUP_RNG_SEED.len() as u32
+        );
+        assert_eq!(
+            &page[SETUP_RNG_SEED_OFF + SETUP_DATA_HEADER_LEN
+                ..SETUP_RNG_SEED_OFF + SETUP_DATA_HEADER_LEN + SETUP_RNG_SEED.len()],
+            &SETUP_RNG_SEED
+        );
         assert_eq!(u32_at(page, INIT_SIZE_OFF), header.init_size as u32);
         assert_eq!(plan.layout.cmdline_len, 5);
         assert_eq!(plan.cmdline_image, b"quiet\0");
@@ -1244,10 +1282,13 @@ mod tests {
         let mut scrubbed = plan.boot_params;
         let setup_header_end = SETUP_SECTS_OFF + header.setup_header.len();
         let e820_end = ZERO_PAGE_E820_TABLE_OFF + plan.layout.e820_entries.len() * E820_ENTRY_SIZE;
+        let setup_seed_end = SETUP_RNG_SEED_OFF + SETUP_DATA_HEADER_LEN + SETUP_RNG_SEED.len();
         for range in [
             ZERO_PAGE_E820_COUNT_OFF..ZERO_PAGE_E820_COUNT_OFF + 1,
             SETUP_SECTS_OFF..setup_header_end,
+            SETUP_DATA_OFF..SETUP_DATA_OFF + 8,
             ZERO_PAGE_E820_TABLE_OFF..e820_end,
+            SETUP_RNG_SEED_OFF..setup_seed_end,
         ] {
             scrubbed[range].fill(0);
         }

@@ -5,7 +5,7 @@
 //! diagnostic payloads later VerifyReplay bisection code can attach to a
 //! refined divergence.
 
-use dh_snapshot::dhsnap::{Container, LapcSection, tag};
+use dh_snapshot::dhsnap::{tag, Container, LapcSection};
 use dh_vmm::lapic::LocalApic;
 use dh_vmm::vcpu_state::{self, VcpuState};
 use serde::{Deserialize, Serialize};
@@ -371,7 +371,7 @@ fn tag_name(tag: [u8; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dh_snapshot::dhsnap::{ContainerWriter, tag};
+    use dh_snapshot::dhsnap::{tag, ContainerWriter};
     use dh_vmm::vcpu_state::{RESTORE_MSR_LIST, VCPU_SECTION_VERSION, XSAVE_AREA_LEN};
     use kvm_bindings::kvm_msr_entry;
     use snapstore_manifest::{DeviceBlob, Manifest, ManifestEntry};

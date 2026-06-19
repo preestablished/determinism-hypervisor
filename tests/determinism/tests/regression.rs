@@ -84,6 +84,7 @@ fn cold_run(budget: u64) -> (u64, u64, u64, u64, [u8; 32]) {
         timer: None,
         pause: &pause,
         sdk_events: None,
+        hash_device_sections: None,
     };
     let out = run_segment(
         &mut seg,

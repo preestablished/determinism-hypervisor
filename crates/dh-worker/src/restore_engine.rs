@@ -41,14 +41,14 @@
 //! section's 2 (the 6yl version-domain split).
 
 use dh_detclock::counter::InstRetired;
-use dh_devices::clock::{DEVICE_ID_PV_CLOCK, PvClock};
-use dh_devices::entropy::{DEVICE_ID_PV_ENTROPY, DetEntropy, EntropyState};
-use dh_snapshot::dhsnap::{Container, EntrSectionV2, LapcSection, TimeSection, tag};
+use dh_devices::clock::{PvClock, DEVICE_ID_PV_CLOCK};
+use dh_devices::entropy::{DetEntropy, EntropyState, DEVICE_ID_PV_ENTROPY};
+use dh_snapshot::dhsnap::{tag, Container, EntrSectionV2, LapcSection, TimeSection};
 use dh_vmm::config::MachineConfig;
 use dh_vmm::dirty::{DirtyPageSet, PAGE_SIZE};
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::SlotVm;
-use dh_vmm::{SlotState, vcpu_state};
+use dh_vmm::{vcpu_state, SlotState};
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 use vm_memory::{Bytes, GuestAddress};

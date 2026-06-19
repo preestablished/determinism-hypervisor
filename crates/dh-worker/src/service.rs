@@ -1890,6 +1890,8 @@ fn runtime_with_log(
     entropy_seed: [u8; 32],
 ) -> Result<SlotRuntime, Status> {
     let _ = config_hash_for_slot(&config, &slot)?;
+    dh_vmm::dirty::enable_dirty_logging(&slot)
+        .map_err(|e| kvm_error_to_status("enable dirty logging", e))?;
     let log = new_segment_log(&config, base_snapshot.as_ref(), entropy_seed)?;
     let mut runtime = SlotRuntime::new(
         slot,
@@ -1979,19 +1981,40 @@ fn build_bus(
 
 #[cfg(target_arch = "x86_64")]
 fn boot_slot(slot: &dh_vmm::kvm::SlotVm, boot: ResolvedBoot) -> Result<(), Status> {
-    match boot {
-        ResolvedBoot::Elf { kernel, cmdline } => {
-            dh_vmm::boot::load_and_enter(slot, &kernel, &cmdline)
+    boot_slot_with_loaders(
+        slot,
+        boot,
+        |slot, kernel, cmdline| {
+            dh_vmm::boot::load_and_enter(slot, kernel, cmdline)
                 .map(|_| ())
                 .map_err(|e| Status::failed_precondition(format!("ELF boot: {e}")))
-        }
+        },
+        |slot, kernel, initramfs, cmdline| {
+            dh_vmm::boot::load_bzimage_and_enter(slot, kernel, initramfs, cmdline)
+                .map(|_| ())
+                .map_err(|e| Status::failed_precondition(format!("BzImage boot: {e}")))
+        },
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn boot_slot_with_loaders<E, B>(
+    slot: &dh_vmm::kvm::SlotVm,
+    boot: ResolvedBoot,
+    load_elf: E,
+    load_bzimage: B,
+) -> Result<(), Status>
+where
+    E: FnOnce(&dh_vmm::kvm::SlotVm, &[u8], &[u8]) -> Result<(), Status>,
+    B: FnOnce(&dh_vmm::kvm::SlotVm, &[u8], &[u8], &[u8]) -> Result<(), Status>,
+{
+    match boot {
+        ResolvedBoot::Elf { kernel, cmdline } => load_elf(slot, &kernel, &cmdline),
         ResolvedBoot::BzImage {
             kernel,
             initramfs,
             cmdline,
-        } => dh_vmm::boot::load_bzimage_and_enter(slot, &kernel, &initramfs, &cmdline)
-            .map(|_| ())
-            .map_err(|e| Status::failed_precondition(format!("BzImage boot: {e}"))),
+        } => load_bzimage(slot, &kernel, &initramfs, &cmdline),
     }
 }
 
@@ -2199,6 +2222,29 @@ fn service_exit_with_detchannel(
                 }
             }
         }
+        kvm_ioctls::VcpuExit::X86Rdmsr(msr) => {
+            match dh_vmm::msr::on_denied_rdmsr(msr.index) {
+                dh_vmm::msr::MsrAction::SupplyValue(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                }
+                dh_vmm::msr::MsrAction::AckWrite | dh_vmm::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
+            }
+            Vec::new()
+        }
+        kvm_ioctls::VcpuExit::X86Wrmsr(msr) => {
+            match dh_vmm::msr::on_denied_wrmsr(msr.index) {
+                dh_vmm::msr::MsrAction::SupplyValue(_) | dh_vmm::msr::MsrAction::AckWrite => {
+                    *msr.error = 0;
+                }
+                dh_vmm::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
+            }
+            Vec::new()
+        }
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
         {
@@ -2240,6 +2286,11 @@ fn service_exit_with_detchannel(
             }
             Vec::new()
         }
+        kvm_ioctls::VcpuExit::IoIn(_port, data) => {
+            data.fill(0);
+            Vec::new()
+        }
+        kvm_ioctls::VcpuExit::IoOut(_port, _data) => Vec::new(),
         kvm_ioctls::VcpuExit::MmioRead(gpa, data) => {
             rail.bus.read(gpa, data, &mut ctx).map_err(|e| {
                 dh_vmm::boundary::BoundaryError::Exit(format!("bus read {gpa:#x}: {e:?}"))
@@ -3032,8 +3083,8 @@ impl WorkerService {
         // publication/removal so SlotManager and WorkerRuntimeTable stay
         // transactionally aligned.
         build_runtimes: impl FnOnce(&WorkerRuntimeTable, &[Lease]) -> Result<Vec<SlotRuntime>, Status>
-        + Send
-        + 'static,
+            + Send
+            + 'static,
     ) -> Result<Vec<Lease>, Status> {
         let manager = self.inner.manager.clone();
         let runtimes = self.inner.runtimes.clone();
@@ -4513,8 +4564,8 @@ impl HypervisorWorker for WorkerService {
         &self,
         _request: Request<proto::WatchSlotsRequest>,
     ) -> Result<Response<Self::WatchSlotsStream>, Status> {
-        use tokio_stream::StreamExt;
         use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+        use tokio_stream::StreamExt;
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(self.inner.manager.subscribe())
             .map(|event| match event {
@@ -4669,6 +4720,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:?}").contains("UnsupportedIcr"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linux_worker_service_applies_denied_msr_policy() {
+        let mut rail = service_test_rail();
+
+        let mut read_error = 99u8;
+        let mut read_data = u64::MAX;
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::X86Rdmsr(kvm_ioctls::ReadMsrExit {
+                error: &mut read_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: dh_vmm::msr::MSR_IA32_MISC_ENABLE,
+                data: &mut read_data,
+            }),
+        )
+        .unwrap();
+        assert_eq!(read_error, 0);
+        assert_eq!(read_data, 0);
+
+        let mut denied_write_error = 0u8;
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::X86Wrmsr(kvm_ioctls::WriteMsrExit {
+                error: &mut denied_write_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: dh_vmm::msr::MSR_IA32_TSC,
+                data: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(denied_write_error, 1);
+
+        let mut acked_write_error = 99u8;
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::X86Wrmsr(kvm_ioctls::WriteMsrExit {
+                error: &mut acked_write_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: dh_vmm::msr::MSR_IA32_BIOS_SIGN_ID,
+                data: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(acked_write_error, 0);
+
+        let mut ignored_in = [0xAA, 0xBB];
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::IoIn(0x61, &mut ignored_in),
+        )
+        .unwrap();
+        assert_eq!(ignored_in, [0, 0]);
+
+        let ignored_out = [0xCC];
+        service_exit_with_detchannel(
+            &mut rail,
+            0,
+            0,
+            kvm_ioctls::VcpuExit::IoOut(0xD3, &ignored_out),
+        )
+        .unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -6235,6 +6358,42 @@ mod tests {
                 Some(snapshot.hash.try_into().unwrap())
             );
         });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn boot_slot_routes_bzimage_to_linux_loader_once() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let sys = dh_vmm::kvm::KvmSystem::open().unwrap();
+        let slot = sys.create_slot_vm(64 * 1024 * 1024).unwrap();
+        let elf_calls = std::cell::Cell::new(0u32);
+        let bzimage_calls = std::cell::Cell::new(0u32);
+
+        boot_slot_with_loaders(
+            &slot,
+            crate::image_resolver::ResolvedBoot::BzImage {
+                kernel: b"kernel".to_vec(),
+                initramfs: b"initramfs".to_vec(),
+                cmdline: b"cmdline".to_vec(),
+            },
+            |_, _, _| {
+                elf_calls.set(elf_calls.get() + 1);
+                Ok(())
+            },
+            |_, kernel, initramfs, cmdline| {
+                bzimage_calls.set(bzimage_calls.get() + 1);
+                assert_eq!(kernel, b"kernel");
+                assert_eq!(initramfs, b"initramfs");
+                assert_eq!(cmdline, b"cmdline");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(elf_calls.get(), 0);
+        assert_eq!(bzimage_calls.get(), 1);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -8370,10 +8529,9 @@ mod tests {
         assert_eq!(div.rip_actual, 0x401004);
         assert_eq!(div.reg_diff, vec![0xA1, 0xB2]);
         assert_eq!(div.diff_page_idx, vec![17, 19]);
-        assert!(
-            div.suspected_cause
-                .contains("evidence_mode=replay-vs-recorded")
-        );
+        assert!(div
+            .suspected_cause
+            .contains("evidence_mode=replay-vs-recorded"));
         assert!(div.suspected_cause.contains("expected_checkpoint_ref="));
         assert!(div.suspected_cause.contains("actual_probe_ref="));
     }
@@ -8617,13 +8775,13 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(a_info.0, a_info.1.0);
-        assert_eq!(b_info.0, b_info.1.0);
+        assert_eq!(a_info.0, a_info.1 .0);
+        assert_eq!(b_info.0, b_info.1 .0);
         assert_ne!(a_info.0, b_info.0);
-        assert!(a_info.1.1);
-        assert!(b_info.1.1);
-        assert_eq!(a_info.1.2, 0);
-        assert_eq!(b_info.1.2, 0);
+        assert!(a_info.1 .1);
+        assert!(b_info.1 .1);
+        assert_eq!(a_info.1 .2, 0);
+        assert_eq!(b_info.1 .2, 0);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -9011,11 +9169,9 @@ mod tests {
             .into_inner()
             .slots;
         assert_eq!(slots.len(), 2);
-        assert!(
-            slots
-                .iter()
-                .all(|slot| slot.state == i32::from(proto::SlotState::Empty))
-        );
+        assert!(slots
+            .iter()
+            .all(|slot| slot.state == i32::from(proto::SlotState::Empty)));
 
         handle.abort();
     }

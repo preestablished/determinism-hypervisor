@@ -24,8 +24,8 @@
 
 use dh_devices::clock::PvClock;
 use dh_devices::entropy::DetEntropy;
-use dh_devices::net::{DEVICE_ID_PV_NET, NetRxError, PvNet};
-use dh_devices::pad::{DEVICE_ID_PV_PAD, PadError, PvPad};
+use dh_devices::net::{NetRxError, PvNet, DEVICE_ID_PV_NET};
+use dh_devices::pad::{PadError, PvPad, DEVICE_ID_PV_PAD};
 use dh_devices::{DebugSerial, DevCtx, GuestMem, IrqRequest, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SealParams, WriteError};
 use kvm_ioctls::VcpuExit;
@@ -157,6 +157,27 @@ impl<M: GuestMem> DeviceRail<M> {
                     }
                 }
             }
+            VcpuExit::X86Rdmsr(msr) => match crate::msr::on_denied_rdmsr(msr.index) {
+                crate::msr::MsrAction::SupplyValue(value) => {
+                    *msr.data = value;
+                    *msr.error = 0;
+                }
+                crate::msr::MsrAction::AckWrite | crate::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
+            },
+            VcpuExit::X86Wrmsr(msr) => match crate::msr::on_denied_wrmsr(msr.index) {
+                crate::msr::MsrAction::SupplyValue(_) | crate::msr::MsrAction::AckWrite => {
+                    *msr.error = 0;
+                }
+                crate::msr::MsrAction::InjectGp => {
+                    *msr.error = 1;
+                }
+            },
+            VcpuExit::IoIn(_port, data) => {
+                data.fill(0);
+            }
+            VcpuExit::IoOut(_port, _data) => {}
             VcpuExit::MmioRead(gpa, data) => {
                 self.bus
                     .read(gpa, data, &mut ctx)
@@ -450,13 +471,78 @@ mod tests {
         assert_eq!(u32::from_le_bytes(tpr_back), 0x44);
 
         let unmasked_timer = 0x40u32.to_le_bytes();
-        let err = rail
-            .service_exit(
-                0,
-                VcpuExit::MmioWrite(crate::lapic::XAPIC_MMIO_BASE + 0x320, &unmasked_timer),
-            )
-            .unwrap_err();
-        assert!(format!("{err:?}").contains("UnsupportedTimer"));
+        rail.service_exit(
+            0,
+            VcpuExit::MmioWrite(crate::lapic::XAPIC_MMIO_BASE + 0x320, &unmasked_timer),
+        )
+        .unwrap();
+        let mut timer_back = [0u8; 4];
+        rail.service_exit(
+            0,
+            VcpuExit::MmioRead(crate::lapic::XAPIC_MMIO_BASE + 0x320, &mut timer_back),
+        )
+        .unwrap();
+        assert_eq!(u32::from_le_bytes(timer_back), (1 << 16) | 0x40);
+    }
+
+    #[test]
+    fn device_rail_applies_denied_msr_policy() {
+        let mut rail = DeviceRail::new(
+            MmioBus::new(),
+            DetEntropy::from_seed([7; 32]),
+            LogWriter::new(header()),
+            VecGuestMem(vec![0u8; 64]),
+        );
+
+        let mut read_error = 99u8;
+        let mut read_data = u64::MAX;
+        rail.service_exit(
+            0,
+            VcpuExit::X86Rdmsr(kvm_ioctls::ReadMsrExit {
+                error: &mut read_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: crate::msr::MSR_IA32_MISC_ENABLE,
+                data: &mut read_data,
+            }),
+        )
+        .unwrap();
+        assert_eq!(read_error, 0);
+        assert_eq!(read_data, 0);
+
+        let mut denied_write_error = 0u8;
+        rail.service_exit(
+            0,
+            VcpuExit::X86Wrmsr(kvm_ioctls::WriteMsrExit {
+                error: &mut denied_write_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: crate::msr::MSR_IA32_TSC,
+                data: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(denied_write_error, 1);
+
+        let mut acked_write_error = 99u8;
+        rail.service_exit(
+            0,
+            VcpuExit::X86Wrmsr(kvm_ioctls::WriteMsrExit {
+                error: &mut acked_write_error,
+                reason: kvm_ioctls::MsrExitReason::Filter,
+                index: crate::msr::MSR_IA32_BIOS_SIGN_ID,
+                data: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(acked_write_error, 0);
+
+        let mut ignored_in = [0xAA, 0xBB];
+        rail.service_exit(0, VcpuExit::IoIn(0x61, &mut ignored_in))
+            .unwrap();
+        assert_eq!(ignored_in, [0, 0]);
+
+        let ignored_out = [0xCC];
+        rail.service_exit(0, VcpuExit::IoOut(0xD3, &ignored_out))
+            .unwrap();
     }
 
     #[test]
@@ -716,7 +802,7 @@ mod live_tests {
     use crate::hash::StateHashChain;
     use crate::kvm::KvmSystem;
     use crate::run::install_kick_handler;
-    use crate::runctl::{Segment, Until, run_segment};
+    use crate::runctl::{run_segment, Segment, Until};
     use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
     use dh_inputlog::dhilog::SegmentHeader;
     use dh_inputlog::reader::{LogReader, RecordBody};

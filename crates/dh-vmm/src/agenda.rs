@@ -484,8 +484,7 @@ mod tests {
 
             // Every in-window scheduled input appears exactly once, at its icount.
             for (idx, &at) in scheduled_inputs.iter().enumerate() {
-                let hits: Vec<&StopPoint> =
-                    a.iter().filter(|p| p.inputs.contains(&idx)).collect();
+                let hits: Vec<&StopPoint> = a.iter().filter(|p| p.inputs.contains(&idx)).collect();
                 if at > start && at <= last.icount {
                     assert_eq!(hits.len(), 1);
                     assert_eq!(hits[0].icount, at);

@@ -78,6 +78,13 @@ pub fn set_tsc_offset(vcpu: &VcpuFd, offset: i64) -> Result<(), KvmError> {
     Ok(())
 }
 
+/// Set the current guest-visible TSC value by rebasing the hardware TSC
+/// offset against the host TSC observed immediately before the ioctl.
+pub fn set_tsc_value_with_offset(vcpu: &VcpuFd, value: u64) -> Result<(), KvmError> {
+    let host_tsc = rdtsc();
+    set_tsc_offset(vcpu, value.wrapping_sub(host_tsc) as i64)
+}
+
 /// Read the current guest-TSC offset back (verification + diagnostics).
 pub fn get_tsc_offset(vcpu: &VcpuFd) -> Result<i64, KvmError> {
     let mut raw = 0u64;
@@ -93,6 +100,14 @@ pub fn get_tsc_offset(vcpu: &VcpuFd) -> Result<i64, KvmError> {
         )));
     }
     Ok(raw as i64)
+}
+
+fn rdtsc() -> u64 {
+    // Safe intrinsic on x86_64.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
 }
 
 /// Mechanism 1: write an absolute guest-TSC VALUE via KVM_SET_MSRS —

@@ -28,7 +28,7 @@ use vmm_sys_util::ioctl_iow_nr;
 
 use dh_detclock::counter::InstRetired;
 
-use crate::boundary::{Boundary, BoundaryError, Margins, land_at};
+use crate::boundary::{land_at, Boundary, BoundaryError, Margins};
 
 // kvm-ioctls 0.24 does not wrap KVM_INTERRUPT (userspace-irqchip vector
 // queue); raw ioctl per the msr.rs pattern.

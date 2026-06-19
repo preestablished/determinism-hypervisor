@@ -7,12 +7,12 @@
 
 mod common;
 
-use common::{CLOCK_BASE, VmMem, kvm_available, spawn_store_blocking, test_bus};
+use common::{kvm_available, spawn_store_blocking, test_bus, VmMem, CLOCK_BASE};
 use detguest_host::LogFaultPlan;
 use detguest_wire::header::{
-    CHANNEL_SIZE, CHANNEL_SIZE_PAGES, ChannelHeader, OFF_MANIFEST, OFF_RESERVED,
+    ChannelHeader, CHANNEL_SIZE, CHANNEL_SIZE_PAGES, OFF_MANIFEST, OFF_RESERVED,
 };
-use detguest_wire::manifest::{MANIFEST_TOTAL_SIZE, init_manifest};
+use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
 use detguest_wire::ports::{PORT_INIT_GO, PORT_INIT_HI, PORT_INIT_LO};
 use dh_devices::clock::{REG_TIMER_DEADLINE, REG_VNS};
 use dh_devices::ctx::VecGuestMem;
@@ -20,14 +20,14 @@ use dh_devices::detchannel::DetChannelDevice;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::{DevCtx, EntropySource, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
-use dh_snapshot::dhsnap::{Container, ContainerWriter, tag};
+use dh_snapshot::dhsnap::{tag, Container, ContainerWriter};
 use dh_vmm::config::{BootSpec, MachineConfig};
-use dh_vmm::dirty::{DirtyPageSet, DirtyRing, PAGE_SIZE, enable_dirty_logging};
-use dh_vmm::kvm::{ExitEvent, KvmSystem, classify_exit};
-use dh_vmm::{SlotState, vcpu_state};
-use dh_worker::restore_engine::{RestoreError, recover_machine_config, restore_snapshot};
+use dh_vmm::dirty::{enable_dirty_logging, DirtyPageSet, DirtyRing, PAGE_SIZE};
+use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem};
+use dh_vmm::{vcpu_state, SlotState};
+use dh_worker::restore_engine::{recover_machine_config, restore_snapshot, RestoreError};
 use dh_worker::snapshot_engine::{
-    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, PageSource, take_snapshot,
+    take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;

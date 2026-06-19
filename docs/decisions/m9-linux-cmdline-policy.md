@@ -18,7 +18,7 @@ builds Linux boot params.
 The forced M9 Linux baseline command line is exactly these bytes:
 
 ```text
-console=ttyS0 nokaslr norandmaps random.trust_cpu=off tsc=unstable clocksource=dh-pvclock nohz=off highres=off init=/init
+console=ttyS0 nokaslr norandmaps random.trust_cpu=off random.trust_bootloader=on page_alloc.shuffle=0 notsc tsc=unstable clocksource=jiffies vdso=0 lpj=4096 noapictimer default_hugepagesz=2M hugepagesz=2M hugepages=1 init=/init
 ```
 
 `BzImageBoot.cmdline` is interpreted as append-only extras, not as a complete
@@ -52,6 +52,17 @@ bytes.
 
 The proto surface remains compact: callers can request quiet boot or a specific
 kernel loglevel without taking ownership of deterministic baseline controls.
+The forced random and allocator controls keep Linux from consuming
+host-provided entropy or shuffling page allocation order before DH supplies
+deterministic devices. The loader supplies a fixed `SETUP_RNG_SEED` setup_data
+node, so `random.trust_bootloader=on` credits deterministic bootloader entropy
+rather than host entropy. The forced `notsc`, `tsc=unstable`,
+`clocksource=jiffies`, and `vdso=0` tokens keep raw host-clock TSC out of Linux
+time and entropy paths. The forced `lpj=4096` and `noapictimer` tokens avoid
+Linux early boot loops that would otherwise wait for host-time timer progress
+before the deterministic M9 device contract is established. The forced HugeTLB
+reservation gives the guest agent its fixed 2 MiB detchannel allocation without
+relying on runtime hugepage availability.
 
 Any future extra must be added to this decision or a superseding decision before
 it is accepted by `proto_map` or included in `MachineConfig` hashing.

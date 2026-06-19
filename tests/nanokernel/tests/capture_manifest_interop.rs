@@ -12,8 +12,7 @@
 use detguest_host::{Channel, GuestMem, MockGuestMem};
 use detguest_wire::header::OFF_MANIFEST;
 use detguest_wire::manifest::{
-    Extent, RegionEntry, MANIFEST_MAGIC, MANIFEST_VERSION, REGION_CAPACITY,
-    REGION_FLAG_FRAMEBUFFER,
+    Extent, RegionEntry, MANIFEST_MAGIC, MANIFEST_VERSION, REGION_CAPACITY, REGION_FLAG_FRAMEBUFFER,
 };
 use nanokernel::{
     CAPTURE_FIXTURE_CHANNEL_GPA, CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION, CAPTURE_FIXTURE_FB_BYTES,
@@ -168,8 +167,7 @@ fn bumped_layout_version_is_visible_to_resolve() {
     let region = ch.read_manifest().unwrap().resolve("framebuffer").unwrap();
     assert_eq!(region.layout_version, 2);
     assert_ne!(
-        region.layout_version,
-        CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+        region.layout_version, CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
         "the bump must be distinguishable from the default"
     );
 }

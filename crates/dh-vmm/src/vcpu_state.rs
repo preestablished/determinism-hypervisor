@@ -185,17 +185,8 @@ pub fn restore(slot: &SlotVm, st: &VcpuState, vns: u64) -> Result<(), KvmError> 
     }
 
     // IA32_TSC ← vns via the TSC_OFFSET attribute (tsc-alignment.md).
-    let host_tsc = rdtsc();
-    crate::tsc::set_tsc_offset(vcpu, vns.wrapping_sub(host_tsc) as i64)?;
+    crate::tsc::set_tsc_value_with_offset(vcpu, vns)?;
     Ok(())
-}
-
-fn rdtsc() -> u64 {
-    // Safe intrinsic on x86_64.
-    #[allow(unsafe_code)]
-    unsafe {
-        core::arch::x86_64::_rdtsc()
-    }
 }
 
 // ---- DHSNAP `VCPU` section codec (API.md §4 table order) ---------------------

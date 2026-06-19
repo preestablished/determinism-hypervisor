@@ -6,7 +6,7 @@
 //! DISABLE_EXITS) is enforced by construction — this module simply never
 //! creates them, and the smoke test asserts a fresh VM has no irqchip.
 
-use kvm_bindings::{KVM_API_VERSION, kvm_userspace_memory_region};
+use kvm_bindings::{kvm_userspace_memory_region, KVM_API_VERSION};
 use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
 

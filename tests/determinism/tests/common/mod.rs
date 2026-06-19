@@ -200,6 +200,7 @@ impl Rig {
             timer,
             pause: &pause,
             sdk_events: None,
+            hash_device_sections: None,
         };
         run_segment(
             &mut seg,

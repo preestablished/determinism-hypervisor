@@ -16,8 +16,8 @@
 //! time), and every 64-bit kernel writes it on context switch (swapgs).
 
 use kvm_bindings::{
-    KVM_MSR_FILTER_DEFAULT_DENY, KVM_MSR_FILTER_READ, KVM_MSR_FILTER_WRITE, kvm_msr_filter,
-    kvm_msr_filter_range,
+    kvm_msr_filter, kvm_msr_filter_range, KVM_MSR_FILTER_DEFAULT_DENY, KVM_MSR_FILTER_READ,
+    KVM_MSR_FILTER_WRITE,
 };
 use kvm_ioctls::VmFd;
 use std::os::fd::AsRawFd;
@@ -28,14 +28,19 @@ use vmm_sys_util::ioctl_iow_nr;
 pub const MSR_SPEC_CTRL: u32 = 0x48;
 pub const MSR_IA32_TSC: u32 = 0x10;
 pub const MSR_IA32_PLATFORM_ID: u32 = 0x17;
+pub const MSR_SMI_COUNT: u32 = 0x34;
+pub const MSR_IA32_FEATURE_CONTROL: u32 = 0x3A;
 pub const MSR_IA32_APIC_BASE: u32 = 0x1B;
 pub const MSR_IA32_BIOS_SIGN_ID: u32 = 0x8B;
+pub const MSR_IA32_PLATFORM_INFO: u32 = 0xCE;
 pub const MSR_IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+pub const MSR_IA32_MISC_FEATURES_ENABLES: u32 = 0x140;
 pub const MSR_SYSENTER_CS: u32 = 0x174;
 pub const MSR_SYSENTER_ESP: u32 = 0x175;
 pub const MSR_SYSENTER_EIP: u32 = 0x176;
 pub const MSR_PAT: u32 = 0x277;
 pub const MSR_IA32_MISC_ENABLE: u32 = 0x1A0;
+pub const MSR_PPERF: u32 = 0x64E;
 pub const MSR_X2APIC_BASE: u32 = 0x800;
 pub const MSR_X2APIC_END: u32 = 0x8FF;
 pub const MSR_EFER: u32 = 0xC000_0080;
@@ -138,10 +143,17 @@ pub fn denied_msr_class(index: u32, write: bool) -> DeniedMsrClass {
     }
     match (index, write) {
         (MSR_IA32_PLATFORM_ID, false)
+        | (MSR_SMI_COUNT, false)
+        | (MSR_IA32_FEATURE_CONTROL, false)
+        | (MSR_IA32_FEATURE_CONTROL, true)
         | (MSR_IA32_BIOS_SIGN_ID, false)
         | (MSR_IA32_BIOS_SIGN_ID, true)
+        | (MSR_IA32_PLATFORM_INFO, false)
         | (MSR_IA32_ARCH_CAPABILITIES, false)
-        | (MSR_IA32_MISC_ENABLE, false) => DeniedMsrClass::LinuxCpuCompat,
+        | (MSR_IA32_MISC_FEATURES_ENABLES, false)
+        | (MSR_IA32_MISC_FEATURES_ENABLES, true)
+        | (MSR_IA32_MISC_ENABLE, false)
+        | (MSR_PPERF, false) => DeniedMsrClass::LinuxCpuCompat,
         _ => DeniedMsrClass::Unclassified,
     }
 }
@@ -187,6 +199,10 @@ mod tests {
             DeniedMsrClass::LinuxCpuCompat
         );
         assert_eq!(
+            denied_msr_class(MSR_SMI_COUNT, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
             denied_msr_class(MSR_IA32_BIOS_SIGN_ID, false),
             DeniedMsrClass::LinuxCpuCompat
         );
@@ -195,11 +211,27 @@ mod tests {
             DeniedMsrClass::LinuxCpuCompat
         );
         assert_eq!(
+            denied_msr_class(MSR_IA32_FEATURE_CONTROL, true),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_IA32_PLATFORM_INFO, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
             denied_msr_class(MSR_IA32_ARCH_CAPABILITIES, false),
             DeniedMsrClass::LinuxCpuCompat
         );
         assert_eq!(
+            denied_msr_class(MSR_IA32_MISC_FEATURES_ENABLES, true),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
             denied_msr_class(MSR_IA32_MISC_ENABLE, false),
+            DeniedMsrClass::LinuxCpuCompat
+        );
+        assert_eq!(
+            denied_msr_class(MSR_PPERF, false),
             DeniedMsrClass::LinuxCpuCompat
         );
         assert_eq!(

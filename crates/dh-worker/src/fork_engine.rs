@@ -30,12 +30,12 @@
 
 use dh_detclock::counter::InstRetired;
 use dh_devices::entropy::DetEntropy;
-use dh_vmm::SlotState;
 use dh_vmm::hash::StateHashChain;
 use dh_vmm::kvm::{KvmSystem, SlotVm};
+use dh_vmm::SlotState;
 
-use crate::restore_engine::{RestoreError, apply_dhsnap};
-use crate::snapshot_engine::{BoundaryState, EngineError, build_dhsnap_with_lapic};
+use crate::restore_engine::{apply_dhsnap, RestoreError};
+use crate::snapshot_engine::{build_dhsnap_with_lapic, BoundaryState, EngineError};
 
 #[derive(Debug)]
 pub enum ForkError {

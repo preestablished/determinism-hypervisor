@@ -5,16 +5,16 @@ mod common;
 
 use common::{kvm_available, spawn_store_blocking, test_bus};
 use dh_devices::entropy::DetEntropy;
-use dh_snapshot::dhsnap::{Container, ContainerWriter, LapcSection, tag};
-use dh_vmm::SlotState;
+use dh_snapshot::dhsnap::{tag, Container, ContainerWriter, LapcSection};
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::kvm::KvmSystem;
 use dh_vmm::lapic::{LocalApic, XAPIC_MMIO_BASE};
+use dh_vmm::SlotState;
 use dh_worker::fork_engine::fork_slot_with_lapic;
-use dh_worker::restore_engine::{RestoreError, restore_snapshot};
+use dh_worker::restore_engine::{restore_snapshot, RestoreError};
 use dh_worker::snapshot_compare::compare_snapshots;
 use dh_worker::snapshot_engine::{
-    BoundaryState, DEVICE_BLOB_FORMAT_DHSNAP, PageSource, take_snapshot_with_lapic,
+    take_snapshot_with_lapic, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
 use snapstore_manifest::DeviceBlob;
 use snapstore_types::SnapshotRef;
