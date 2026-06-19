@@ -105,6 +105,15 @@ const DETERMINISM_CLASS_LOCK: &str = concat!(
     "/../../ci/determinism-class.lock"
 );
 
+#[test]
+#[ignore = "M9 Linux acceptance guard: fails on the linux filter until real Linux corpus coverage exists"]
+fn linux_m5_record_replay_requires_real_linux_corpus() {
+    common::reject_unimplemented_m9_linux_gate(
+        "m5_record_replay::linux_m5_record_replay_requires_real_linux_corpus",
+        "Linux M5 corpus replay must use a Linux root snapshot and deterministic post-READY input script with nonzero EPOCH_HASH verification and matching END state hash.",
+    );
+}
+
 fn hex(b: &[u8; 32]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

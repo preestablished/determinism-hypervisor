@@ -165,10 +165,15 @@ pub fn m9_artifacts(test_name: &str) -> TestResult<Option<M9LinuxArtifacts>> {
 
 #[allow(dead_code)]
 pub fn reject_unimplemented_m9_linux_gate(test_name: &str, required_evidence: &str) {
-    match std::env::var(DH_M9_GUEST) {
-        Ok(value) if value == "linux" => panic!(
-            "{test_name} selected {DH_M9_GUEST}=linux, but no real Linux implementation exists yet. Required evidence: {required_evidence}. Do not count a zero-test or guard-only run as M9 Linux acceptance."
-        ),
+    let guest = std::env::var(DH_M9_GUEST);
+    let linux_env = guest.as_deref() == Ok("linux");
+    let linux_filter = std::env::args().any(|arg| arg == "linux");
+    if linux_env || linux_filter {
+        panic!(
+            "{test_name} selected Linux evidence, but no real Linux implementation exists yet. Required evidence: {required_evidence}. Do not count a zero-test or guard-only run as M9 Linux acceptance."
+        );
+    }
+    match guest {
         Ok(value) => {
             eprintln!(
                 "skipping {test_name} Linux guard because {DH_M9_GUEST}={value:?}, not \"linux\""

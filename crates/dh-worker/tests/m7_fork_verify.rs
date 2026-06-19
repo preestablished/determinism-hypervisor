@@ -66,6 +66,7 @@ const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
 const SLOT_CORES_ENV: &str = "DH_M7_ACCEPT_SLOT_CORES";
 const ALLOW_SKIP_ENV: &str = "DH_M7_ACCEPT_ALLOW_SKIP";
 const CROSS_CHECKS_ENV: &str = "DH_M7_CROSS_CHECKS";
+const GUEST_ENV: &str = "DH_M7_ACCEPT_GUEST";
 
 type TestResult<T> = Result<T, String>;
 
@@ -76,6 +77,14 @@ struct ChildRecord {
     snapshot: proto::SnapshotRef,
     state_hash: [u8; 32],
     input_log_id: Vec<u8>,
+}
+
+fn reject_unimplemented_linux_m7_acceptance(test_name: &str) {
+    if std::env::var(GUEST_ENV).as_deref() == Ok("linux") {
+        panic!(
+            "{test_name} selected {GUEST_ENV}=linux, but m7_fork_verify still has only the nanokernel pad_echo fixture wired. Do not count this command as Linux M7 evidence until it boots the M9 Linux fixture and proves 1000/1000 VerifyDone with zero Divergence."
+        );
+    }
 }
 
 fn arr32(bytes: &[u8], what: &str) -> [u8; 32] {
@@ -728,8 +737,17 @@ fn cross_check_indices_cover_the_1000_job_universe() {
 }
 
 #[test]
+#[ignore = "M9 Linux acceptance guard: fails when DH_M7_ACCEPT_GUEST=linux until real Linux M7 coverage exists"]
+fn linux_m7_acceptance_requires_real_linux_fixture() {
+    reject_unimplemented_linux_m7_acceptance(
+        "m7_fork_verify::linux_m7_acceptance_requires_real_linux_fixture",
+    );
+}
+
+#[test]
 #[ignore = "M7 acceptance gate: 1000 forked children; run with --release -- --ignored --nocapture"]
 fn m7_accept_1000_seeded_forks_verify_replay_all() {
+    reject_unimplemented_linux_m7_acceptance("m7_accept_1000_seeded_forks_verify_replay_all");
     let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
         return;
     };
@@ -822,6 +840,9 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
 #[test]
 #[ignore = "M7 acceptance gate: cross-slot same-seed reruns; run with --release -- --ignored --nocapture"]
 fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
+    reject_unimplemented_linux_m7_acceptance(
+        "m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs",
+    );
     let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
         return;
     };
