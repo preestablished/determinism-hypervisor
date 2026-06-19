@@ -605,10 +605,14 @@ fn parse_elf_until(
 
 fn linux_ready_json(r: &crate::linux::LinuxReadyReport) -> String {
     format!(
-        "{{\"reason\":\"{}\",\"event_kind\":{},\"ready_payload_len\":{},\"icount\":{},\"vns\":{},\"state_hash\":\"{}\",\"config_hash\":\"{}\",\"game_image_hash\":\"{}\",\"base_image_hash\":\"{}\"}}",
+        "{{\"reason\":\"{}\",\"event_kind\":{},\"ready_payload_len\":{},\"ready_unit\":{},\"ready_region_count\":{},\"ready_manifest_generation\":{},\"ready_payload_digest\":\"{}\",\"icount\":{},\"vns\":{},\"state_hash\":\"{}\",\"config_hash\":\"{}\",\"game_image_hash\":\"{}\",\"base_image_hash\":\"{}\"}}",
         r.reason,
         r.ready_event_kind,
         r.ready_payload_len,
+        r.ready_unit,
+        r.ready_region_count,
+        r.ready_manifest_generation,
+        r.ready_payload_digest,
         r.icount,
         r.vns,
         r.state_hash,

@@ -47,6 +47,10 @@ pub struct LinuxGuestPaths {
 pub struct LinuxReadyReport {
     pub ready_event_kind: u16,
     pub ready_payload_len: usize,
+    pub ready_unit: u32,
+    pub ready_region_count: u32,
+    pub ready_manifest_generation: u64,
+    pub ready_payload_digest: String,
     pub reason: &'static str,
     pub icount: u64,
     pub vns: u64,
@@ -56,6 +60,14 @@ pub struct LinuxReadyReport {
     pub initramfs_hash: String,
     pub base_image_hash: String,
     pub game_image_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadyPayload {
+    pub unit: u32,
+    pub region_count: u32,
+    pub manifest_generation: u64,
+    pub digest: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -189,7 +201,7 @@ pub fn run_to_ready(
         RuntimeVmMem(slot.guest_mem.clone()),
     ));
     let ready_feed = Cell::new(0u64);
-    let mut ready_event: Option<(u16, usize)> = None;
+    let mut ready_event: Option<ReadyPayload> = None;
 
     let outcome = {
         let hash_device_sections = || {
@@ -206,10 +218,9 @@ pub fn run_to_ready(
                     dh_devices::detchannel::stream_guest_event_payload(event)
                 {
                     if kind == READY_EVENT_KIND {
+                        let ready = parse_ready_payload(&payload)?;
                         ready_feed.set(ready_feed.get() + 1);
-                        if ready_event.is_none() {
-                            ready_event = Some((kind, payload.len()));
-                        }
+                        ready_event.get_or_insert(ready);
                     }
                 }
             }
@@ -241,7 +252,7 @@ pub fn run_to_ready(
     };
     counter.disable().map_err(|e| format!("{e:?}"))?;
 
-    let (ready_event_kind, ready_payload_len) = ready_event
+    let ready = ready_event
         .ok_or_else(|| format!("run stopped without Ready EventKind {READY_EVENT_KIND}"))?;
     if outcome.reason != StopReason::NextSdkEvent {
         return Err(format!(
@@ -251,8 +262,12 @@ pub fn run_to_ready(
     }
 
     Ok(LinuxReadyReport {
-        ready_event_kind,
-        ready_payload_len,
+        ready_event_kind: READY_EVENT_KIND,
+        ready_payload_len: READY_PAYLOAD_LEN,
+        ready_unit: ready.unit,
+        ready_region_count: ready.region_count,
+        ready_manifest_generation: ready.manifest_generation,
+        ready_payload_digest: hex(&ready.digest),
         reason: "next_sdk_event",
         icount: outcome.boundary.icount,
         vns: outcome.vns,
@@ -268,8 +283,12 @@ pub fn run_to_ready(
 pub fn ready_fingerprint(paths: &LinuxGuestPaths, hard_cap: u64) -> Result<String, String> {
     let r = run_to_ready(paths, hard_cap, false)?;
     Ok(format!(
-        "ready_event_kind={} icount={} vns={} state_hash={} config_hash={} game_image_hash={} base_image_hash={}",
+        "ready_event_kind={} ready_unit={} ready_region_count={} ready_manifest_generation={} ready_payload_digest={} icount={} vns={} state_hash={} config_hash={} game_image_hash={} base_image_hash={}",
         r.ready_event_kind,
+        r.ready_unit,
+        r.ready_region_count,
+        r.ready_manifest_generation,
+        r.ready_payload_digest,
         r.icount,
         r.vns,
         r.state_hash,
@@ -312,6 +331,35 @@ fn linux_cmdline(paths: &LinuxGuestPaths) -> Result<Vec<u8>, String> {
     };
     dh_vmm::config::canonicalize_bzimage_cmdline_extras(extras.as_bytes())
         .map_err(|e| format!("BzImage cmdline extras: {e:?}"))
+}
+
+const READY_PAYLOAD_LEN: usize = 16;
+
+pub fn parse_ready_payload(payload: &[u8]) -> Result<ReadyPayload, BoundaryError> {
+    if payload.len() != READY_PAYLOAD_LEN {
+        return Err(BoundaryError::Exit(format!(
+            "Ready payload must be {READY_PAYLOAD_LEN} bytes, got {}",
+            payload.len()
+        )));
+    }
+    let ready = ReadyPayload {
+        unit: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        region_count: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+        manifest_generation: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+        digest: hash_bytes(payload),
+    };
+    if ready.region_count == 0 {
+        return Err(BoundaryError::Exit(
+            "Ready payload region_count must be nonzero".into(),
+        ));
+    }
+    if ready.manifest_generation % 2 != 0 {
+        return Err(BoundaryError::Exit(format!(
+            "Ready payload manifest_generation {} is odd",
+            ready.manifest_generation
+        )));
+    }
+    Ok(ready)
 }
 
 fn build_linux_bus(
@@ -463,4 +511,34 @@ fn linux_hash_device_sections(
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_payload(unit: u32, region_count: u32, manifest_generation: u64) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&unit.to_le_bytes());
+        out[4..8].copy_from_slice(&region_count.to_le_bytes());
+        out[8..16].copy_from_slice(&manifest_generation.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn ready_payload_parser_pins_shape_and_fields() {
+        let payload = ready_payload(7, 3, 8);
+        let parsed = parse_ready_payload(&payload).expect("valid Ready payload");
+        assert_eq!(parsed.unit, 7);
+        assert_eq!(parsed.region_count, 3);
+        assert_eq!(parsed.manifest_generation, 8);
+        assert_eq!(parsed.digest, hash_bytes(&payload));
+    }
+
+    #[test]
+    fn ready_payload_parser_rejects_malformed_ready() {
+        assert!(parse_ready_payload(&ready_payload(7, 0, 8)).is_err());
+        assert!(parse_ready_payload(&ready_payload(7, 3, 9)).is_err());
+        assert!(parse_ready_payload(&ready_payload(7, 3, 8)[..15]).is_err());
+    }
 }
