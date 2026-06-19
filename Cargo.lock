@@ -423,8 +423,12 @@ version = "0.1.0"
 name = "dh-cli"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "detguest-host",
+ "detguest-wire",
  "dh-detclock",
  "dh-devices",
+ "dh-inputlog",
  "dh-proto",
  "dh-verify",
  "dh-vmm",

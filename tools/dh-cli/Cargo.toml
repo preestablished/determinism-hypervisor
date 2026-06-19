@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
+detguest-host.workspace = true
+detguest-wire.workspace = true
 dh-detclock.workspace = true
 dh-devices.workspace = true
+dh-inputlog.workspace = true
 dh-proto.workspace = true
 dh-verify.workspace = true
 dh-vmm.workspace = true

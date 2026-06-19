@@ -17,6 +17,8 @@ pub mod cpuid;
 #[cfg(target_arch = "x86_64")]
 pub mod gate;
 #[cfg(target_arch = "x86_64")]
+pub mod linux;
+#[cfg(target_arch = "x86_64")]
 pub mod ops;
 #[cfg(target_arch = "x86_64")]
 pub mod run;
