@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -540,6 +540,45 @@ fn event_pos(
     events.iter().position(|event| event.stream == kind as u32)
 }
 
+fn payload_u32(payload: &[u8], offset: usize, what: &str) -> TestResult<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| format!("{what} offset overflow"))?;
+    let bytes = payload
+        .get(offset..end)
+        .ok_or_else(|| format!("{what} payload too short: {} bytes", payload.len()))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn name_intern_payload(payload: &[u8]) -> TestResult<(u32, String)> {
+    if payload.len() < 4 {
+        return Err(format!(
+            "NameIntern payload too short: {} bytes",
+            payload.len()
+        ));
+    }
+    let name_id = payload_u32(payload, 0, "NameIntern.name_id")?;
+    let name = std::str::from_utf8(&payload[4..])
+        .map_err(|e| format!("NameIntern.name is not UTF-8: {e}"))?
+        .to_owned();
+    Ok((name_id, name))
+}
+
+fn region_register_payload(payload: &[u8]) -> TestResult<(u32, u32, u32, u32)> {
+    if payload.len() != 16 {
+        return Err(format!(
+            "RegionRegister payload must be 16 bytes, got {}",
+            payload.len()
+        ));
+    }
+    Ok((
+        payload_u32(payload, 0, "RegionRegister.region_id")?,
+        payload_u32(payload, 4, "RegionRegister.name_id")?,
+        payload_u32(payload, 8, "RegionRegister.layout_version")?,
+        payload_u32(payload, 12, "RegionRegister.manifest_generation")?,
+    ))
+}
+
 fn payload_preview(payload: &[u8]) -> String {
     payload
         .iter()
@@ -591,15 +630,42 @@ fn assert_ready_ordering(
             "guest event order invalid: hello={hello}, ready={ready}"
         ));
     }
-    if region_count > 0 {
-        let region = event_pos(events, detguest_wire::record::EventKind::RegionRegister)
-            .ok_or_else(|| {
-                "guest events did not contain RegionRegister before Ready".to_string()
+    if region_count < REQUIRED_M9_EXPECTED_REGIONS.len() as u32 {
+        return Err(format!(
+            "Ready region_count {region_count} is smaller than required M9 regions {}",
+            REQUIRED_M9_EXPECTED_REGIONS.len()
+        ));
+    }
+    let mut names = BTreeMap::<u32, String>::new();
+    let mut registered = BTreeMap::<String, u32>::new();
+    for (idx, event) in events.iter().enumerate().take(ready) {
+        if event.stream == detguest_wire::record::EventKind::NameIntern as u32 {
+            let (name_id, name) = name_intern_payload(&event.payload)?;
+            names.insert(name_id, name);
+        } else if event.stream == detguest_wire::record::EventKind::RegionRegister as u32 {
+            let (_region_id, name_id, layout_version, _generation) =
+                region_register_payload(&event.payload)?;
+            let name = names.get(&name_id).ok_or_else(|| {
+                format!(
+                    "RegionRegister before Ready at event {idx} referenced unknown name_id {name_id}"
+                )
             })?;
-        if region >= ready {
-            return Err(format!(
-                "guest event order invalid: region={region}, ready={ready}"
-            ));
+            registered.insert(name.clone(), layout_version);
+        }
+    }
+    for (name, layout_version) in REQUIRED_M9_EXPECTED_REGIONS {
+        match registered.get(*name) {
+            Some(got) if i64::from(*got) == *layout_version => {}
+            Some(got) => {
+                return Err(format!(
+                    "RegionRegister for {name:?} had layout_version {got}, expected {layout_version}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "guest events did not contain RegionRegister for required region {name:?} before Ready"
+                ));
+            }
         }
     }
     if events[ready].icount != ready_icount {
@@ -608,17 +674,91 @@ fn assert_ready_ordering(
             events[ready].icount
         ));
     }
-    if region_count > 0
-        && !events.iter().any(|event| {
-            event
-                .payload
-                .windows(b"/dev/vdb".len())
-                .any(|w| w == b"/dev/vdb")
-        })
-    {
-        return Err("fixture did not expose LoadGame/dev_path evidence containing /dev/vdb".into());
-    }
     Ok(())
+}
+
+#[cfg(test)]
+fn test_event(
+    kind: detguest_wire::record::EventKind,
+    icount: u64,
+    payload: Vec<u8>,
+) -> proto::GuestEvent {
+    proto::GuestEvent {
+        stream: kind as u32,
+        icount,
+        vns: icount,
+        payload,
+    }
+}
+
+#[cfg(test)]
+fn name_intern_event(icount: u64, name_id: u32, name: &str) -> proto::GuestEvent {
+    let mut payload = name_id.to_le_bytes().to_vec();
+    payload.extend_from_slice(name.as_bytes());
+    test_event(
+        detguest_wire::record::EventKind::NameIntern,
+        icount,
+        payload,
+    )
+}
+
+#[cfg(test)]
+fn region_register_event(
+    icount: u64,
+    region_id: u32,
+    name_id: u32,
+    layout_version: u32,
+) -> proto::GuestEvent {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&region_id.to_le_bytes());
+    payload.extend_from_slice(&name_id.to_le_bytes());
+    payload.extend_from_slice(&layout_version.to_le_bytes());
+    payload.extend_from_slice(&2u32.to_le_bytes());
+    test_event(
+        detguest_wire::record::EventKind::RegionRegister,
+        icount,
+        payload,
+    )
+}
+
+#[cfg(test)]
+fn ready_event(icount: u64, region_count: u32) -> proto::GuestEvent {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&region_count.to_le_bytes());
+    payload.extend_from_slice(&2u64.to_le_bytes());
+    test_event(detguest_wire::record::EventKind::Ready, icount, payload)
+}
+
+#[test]
+fn ready_ordering_requires_named_expected_regions_before_ready() -> TestResult<()> {
+    let events = vec![
+        test_event(detguest_wire::record::EventKind::Hello, 1, vec![1; 12]),
+        name_intern_event(2, 10, "wram"),
+        region_register_event(3, 0, 10, 1),
+        name_intern_event(4, 11, "framebuffer"),
+        region_register_event(5, 1, 11, 1),
+        name_intern_event(6, 12, "meta"),
+        region_register_event(7, 2, 12, 1),
+        ready_event(8, 3),
+    ];
+
+    assert_ready_ordering(&events, 8, 3)
+}
+
+#[test]
+fn ready_ordering_rejects_missing_required_region_event() {
+    let events = vec![
+        test_event(detguest_wire::record::EventKind::Hello, 1, vec![1; 12]),
+        name_intern_event(2, 10, "wram"),
+        region_register_event(3, 0, 10, 1),
+        name_intern_event(4, 11, "framebuffer"),
+        region_register_event(5, 1, 11, 1),
+        ready_event(6, 3),
+    ];
+
+    let err = assert_ready_ordering(&events, 6, 3).expect_err("missing meta rejected");
+    assert!(err.contains("\"meta\""), "unexpected error: {err}");
 }
 
 fn snapshot_tags(
