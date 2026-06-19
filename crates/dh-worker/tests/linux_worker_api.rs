@@ -551,14 +551,27 @@ fn payload_u32(payload: &[u8], offset: usize, what: &str) -> TestResult<u32> {
 }
 
 fn name_intern_payload(payload: &[u8]) -> TestResult<(u32, String)> {
-    if payload.len() < 4 {
+    if payload.len() < 8 {
         return Err(format!(
             "NameIntern payload too short: {} bytes",
             payload.len()
         ));
     }
     let name_id = payload_u32(payload, 0, "NameIntern.name_id")?;
-    let name = std::str::from_utf8(&payload[4..])
+    let name_len = u16::from_le_bytes(payload[4..6].try_into().unwrap()) as usize;
+    let name_end = 8usize
+        .checked_add(name_len)
+        .ok_or_else(|| "NameIntern.name_len overflow".to_string())?;
+    let name_bytes = payload.get(8..name_end).ok_or_else(|| {
+        format!(
+            "NameIntern.name_len {name_len} exceeds payload {}",
+            payload.len()
+        )
+    })?;
+    if payload[name_end..].iter().any(|&b| b != 0) {
+        return Err("NameIntern payload padding must be zero".into());
+    }
+    let name = std::str::from_utf8(name_bytes)
         .map_err(|e| format!("NameIntern.name is not UTF-8: {e}"))?
         .to_owned();
     Ok((name_id, name))
@@ -693,8 +706,10 @@ fn test_event(
 
 #[cfg(test)]
 fn name_intern_event(icount: u64, name_id: u32, name: &str) -> proto::GuestEvent {
-    let mut payload = name_id.to_le_bytes().to_vec();
-    payload.extend_from_slice(name.as_bytes());
+    let payload = canonical_payload(&detguest_wire::events::EventPayload::NameIntern {
+        name_id,
+        name: name.as_bytes(),
+    });
     test_event(
         detguest_wire::record::EventKind::NameIntern,
         icount,
@@ -709,11 +724,14 @@ fn region_register_event(
     name_id: u32,
     layout_version: u32,
 ) -> proto::GuestEvent {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&region_id.to_le_bytes());
-    payload.extend_from_slice(&name_id.to_le_bytes());
-    payload.extend_from_slice(&layout_version.to_le_bytes());
-    payload.extend_from_slice(&2u32.to_le_bytes());
+    let payload = canonical_payload(&detguest_wire::events::EventPayload::RegionRegister(
+        detguest_wire::events::RegionEvent {
+            region_id,
+            name_id,
+            layout_version,
+            manifest_generation: 2,
+        },
+    ));
     test_event(
         detguest_wire::record::EventKind::RegionRegister,
         icount,
@@ -723,11 +741,19 @@ fn region_register_event(
 
 #[cfg(test)]
 fn ready_event(icount: u64, region_count: u32) -> proto::GuestEvent {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    payload.extend_from_slice(&region_count.to_le_bytes());
-    payload.extend_from_slice(&2u64.to_le_bytes());
+    let payload = canonical_payload(&detguest_wire::events::EventPayload::Ready {
+        unit: 0,
+        region_count,
+        manifest_generation: 2,
+    });
     test_event(detguest_wire::record::EventKind::Ready, icount, payload)
+}
+
+#[cfg(test)]
+fn canonical_payload(ev: &detguest_wire::events::EventPayload<'_>) -> Vec<u8> {
+    let mut buf = vec![0u8; detguest_wire::record::MAX_RECORD_LEN];
+    let n = detguest_wire::events::encode_event(&mut buf, 0, 0, 0, ev).unwrap();
+    buf[detguest_wire::record::RECORD_HEADER_LEN..n].to_vec()
 }
 
 #[test]
