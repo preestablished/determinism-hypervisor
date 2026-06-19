@@ -33,3 +33,4 @@ snapstore-manifest.workspace = true
 snapstore-server.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+toml = "0.8"

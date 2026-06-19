@@ -2,6 +2,7 @@
 //! segment at a time, read the timer-guest ISR table.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -79,6 +80,18 @@ pub struct M9CachedHashes {
     pub initramfs: [u8; 32],
     pub base_image: [u8; 32],
     pub game_image: [u8; 32],
+}
+
+#[allow(dead_code)]
+pub const REQUIRED_M9_EXPECTED_REGIONS: &[(&str, i64)] =
+    &[("wram", 1), ("framebuffer", 1), ("meta", 1)];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct M9InitramfsContract {
+    pub autostart_unit: i64,
+    pub exec_path: String,
+    pub expected_regions: BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +259,221 @@ pub fn hash_file(path: &Path) -> TestResult<[u8; 32]> {
 #[allow(dead_code)]
 pub fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+#[allow(dead_code)]
+pub fn parse_m9_boot_toml_contract(boot_toml: &str) -> TestResult<M9InitramfsContract> {
+    let manifest: toml::Value = boot_toml
+        .parse()
+        .map_err(|e| format!("parse initramfs boot.toml: {e}"))?;
+    let root = toml_table(&manifest, "boot.toml root")?;
+    if root
+        .get("boot_toml_version")
+        .and_then(|value| value.as_integer())
+        != Some(1)
+    {
+        return Err("boot.toml must set boot_toml_version = 1".into());
+    }
+
+    let autostart_unit = root
+        .get("autostart")
+        .and_then(|value| value.as_table())
+        .and_then(|table| table.get("unit"))
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "boot.toml must autostart the reference workload unit".to_string())?;
+    let units = toml_array(root, "unit")?;
+    let unit = units
+        .iter()
+        .filter_map(|value| value.as_table())
+        .find(|table| table.get("id").and_then(|value| value.as_integer()) == Some(autostart_unit))
+        .ok_or_else(|| format!("boot.toml autostart unit {autostart_unit} has no [[unit]]"))?;
+    let exec_path = unit
+        .get("exec")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("boot.toml autostart unit {autostart_unit} must set exec"))?;
+    if matches!(exec_path, "/opt/autostart-trivial" | "/opt/print-lines") {
+        return Err(format!(
+            "initramfs boot.toml is the M2 smoke manifest, not the M9 reference-workload contract: autostart exec={exec_path:?}"
+        ));
+    }
+
+    let control = unit
+        .get("control")
+        .and_then(|value| value.as_table())
+        .ok_or_else(|| "autostart unit must declare [unit.control]".to_string())?;
+    if control.get("protocol").and_then(|value| value.as_str()) != Some("refwork-ctl") {
+        return Err("autostart unit.control must use protocol = \"refwork-ctl\"".into());
+    }
+    if control
+        .get("proto_version")
+        .and_then(|value| value.as_integer())
+        != Some(1)
+    {
+        return Err("autostart unit.control must use proto_version = 1".into());
+    }
+    if control.get("game_dev").and_then(|value| value.as_str()) != Some("/dev/vdb") {
+        return Err("autostart unit.control must set game_dev = \"/dev/vdb\"".into());
+    }
+
+    let expected_region_tables = toml_array(root, "expected_region")?;
+    if expected_region_tables.is_empty() {
+        return Err("boot.toml must list expected regions for the Ready gate".into());
+    }
+    let mut expected_regions = BTreeMap::new();
+    for (idx, region) in expected_region_tables.iter().enumerate() {
+        let region = region
+            .as_table()
+            .ok_or_else(|| format!("expected_region[{idx}] must be a table"))?;
+        let name = region
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("expected_region[{idx}] must name a region"))?;
+        if name.is_empty() {
+            return Err(format!("expected_region[{idx}] has an empty name"));
+        }
+        let layout_version = region
+            .get("layout_version")
+            .and_then(|value| value.as_integer())
+            .filter(|version| *version > 0)
+            .ok_or_else(|| {
+                format!("expected_region[{idx}] ({name}) must pin a positive layout_version")
+            })?;
+        if expected_regions
+            .insert(name.to_string(), layout_version)
+            .is_some()
+        {
+            return Err(format!("duplicate expected_region name {name:?}"));
+        }
+    }
+
+    for (name, layout_version) in REQUIRED_M9_EXPECTED_REGIONS {
+        if expected_regions.get(*name) != Some(layout_version) {
+            return Err(format!(
+                "boot.toml must list expected_region {name:?} with layout_version {layout_version}"
+            ));
+        }
+    }
+
+    Ok(M9InitramfsContract {
+        autostart_unit,
+        exec_path: exec_path.to_string(),
+        expected_regions,
+    })
+}
+
+#[allow(dead_code)]
+pub fn assert_m9_initramfs_contract(initramfs: &Path) -> TestResult<M9InitramfsContract> {
+    let archive = std::fs::read(initramfs)
+        .map_err(|e| format!("read initramfs {}: {e}", initramfs.display()))?;
+    let boot_toml = initramfs_entry(&archive, "etc/detguest/boot.toml")?;
+    let boot_toml = std::str::from_utf8(boot_toml.data)
+        .map_err(|e| format!("boot.toml in {} is not UTF-8: {e}", initramfs.display()))?;
+    let contract = parse_m9_boot_toml_contract(boot_toml)?;
+
+    initramfs_entry(&archive, "init")?;
+    let agent = initramfs_entry(&archive, "sbin/detguest-agent")?;
+    if !agent.is_executable() {
+        return Err("initramfs sbin/detguest-agent must be executable".into());
+    }
+
+    let exec_entry = initramfs_entry(&archive, &contract.exec_path)?;
+    if !exec_entry.is_executable() {
+        return Err(format!(
+            "initramfs autostart exec {} must be executable",
+            contract.exec_path
+        ));
+    }
+
+    Ok(contract)
+}
+
+fn toml_table<'a>(
+    value: &'a toml::Value,
+    name: &str,
+) -> TestResult<&'a toml::map::Map<String, toml::Value>> {
+    value
+        .as_table()
+        .ok_or_else(|| format!("{name} must be a TOML table"))
+}
+
+fn toml_array<'a>(table: &'a toml::Table, key: &str) -> TestResult<&'a Vec<toml::Value>> {
+    table
+        .get(key)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("boot.toml missing array [[{key}]]"))
+}
+
+struct InitramfsEntry<'a> {
+    mode: u32,
+    data: &'a [u8],
+}
+
+impl InitramfsEntry<'_> {
+    fn is_executable(&self) -> bool {
+        let kind = self.mode & 0o170000;
+        matches!(kind, 0o100000 | 0o120000) && self.mode & 0o111 != 0
+    }
+}
+
+fn initramfs_entry<'a>(archive: &'a [u8], needle: &str) -> TestResult<InitramfsEntry<'a>> {
+    const HEADER_LEN: usize = 110;
+    let needle = normalize_cpio_path(needle);
+    let mut offset = 0usize;
+    while offset
+        .checked_add(HEADER_LEN)
+        .is_some_and(|end| end <= archive.len())
+    {
+        let header = &archive[offset..offset + HEADER_LEN];
+        if &header[..6] != b"070701" {
+            return Err(format!(
+                "unsupported initramfs cpio magic at offset {offset}"
+            ));
+        }
+        let mode = parse_newc_hex(&header[14..22])? as u32;
+        let file_size = parse_newc_hex(&header[54..62])?;
+        let name_size = parse_newc_hex(&header[94..102])?;
+        offset += HEADER_LEN;
+
+        let name_end = offset
+            .checked_add(name_size)
+            .ok_or_else(|| "newc filename offset overflow".to_string())?;
+        if name_size == 0 || name_end > archive.len() {
+            return Err("truncated initramfs cpio filename".into());
+        }
+        let raw_name = &archive[offset..name_end - 1];
+        let name = std::str::from_utf8(raw_name).map_err(|e| format!("newc filename utf8: {e}"))?;
+        let data_start = align4(name_end).ok_or_else(|| "newc data offset overflow".to_string())?;
+        let data_end = data_start
+            .checked_add(file_size)
+            .ok_or_else(|| "newc file size overflow".to_string())?;
+        if data_end > archive.len() {
+            return Err(format!("truncated initramfs cpio entry {name:?}"));
+        }
+        if name == "TRAILER!!!" {
+            break;
+        }
+        if normalize_cpio_path(name) == needle {
+            return Ok(InitramfsEntry {
+                mode,
+                data: &archive[data_start..data_end],
+            });
+        }
+        offset = align4(data_end).ok_or_else(|| "newc next offset overflow".to_string())?;
+    }
+    Err(format!("initramfs missing {needle}"))
+}
+
+fn normalize_cpio_path(path: &str) -> &str {
+    path.trim_start_matches("./").trim_start_matches('/')
+}
+
+fn align4(n: usize) -> Option<usize> {
+    n.checked_add(3).map(|v| v & !3)
+}
+
+fn parse_newc_hex(field: &[u8]) -> TestResult<usize> {
+    let text = std::str::from_utf8(field).map_err(|e| format!("newc header utf8: {e}"))?;
+    usize::from_str_radix(text, 16).map_err(|e| format!("newc header hex {text:?}: {e}"))
 }
 
 #[allow(dead_code)]
@@ -697,5 +925,60 @@ mod tests {
             artifacts.image_cache,
             PathBuf::from("/tmp/DH_M9_IMAGE_CACHE")
         );
+    }
+
+    #[test]
+    fn m9_boot_contract_parser_accepts_reference_manifest() {
+        let boot_toml = r#"
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/opt/m9-refwork-contract"
+
+[unit.control]
+protocol = "refwork-ctl"
+proto_version = 1
+game_dev = "/dev/vdb"
+
+[[expected_region]]
+name = "wram"
+layout_version = 1
+
+[[expected_region]]
+name = "framebuffer"
+layout_version = 1
+
+[[expected_region]]
+name = "meta"
+layout_version = 1
+"#;
+
+        let contract = parse_m9_boot_toml_contract(boot_toml).unwrap();
+        assert_eq!(contract.autostart_unit, 0);
+        assert_eq!(contract.exec_path, "/opt/m9-refwork-contract");
+        assert_eq!(contract.expected_regions["wram"], 1);
+        assert_eq!(contract.expected_regions["framebuffer"], 1);
+        assert_eq!(contract.expected_regions["meta"], 1);
+    }
+
+    #[test]
+    fn m9_boot_contract_parser_rejects_smoke_manifest() {
+        let boot_toml = r#"
+boot_toml_version = 1
+
+[autostart]
+unit = 0
+
+[[unit]]
+id = 0
+exec = "/opt/autostart-trivial"
+"#;
+
+        let err = parse_m9_boot_toml_contract(boot_toml).unwrap_err();
+        assert!(err.contains("M2 smoke manifest"), "unexpected error: {err}");
     }
 }

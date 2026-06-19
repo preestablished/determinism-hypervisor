@@ -67,8 +67,14 @@ artifact contract and must declare:
 - `[[expected_region]]` entries for `wram`, `framebuffer`, and `meta`, each
   with `layout_version = 1`
 
-The worker M9 acceptance preflights this manifest before creating KVM so a
-smoke initramfs fails as an artifact error rather than as a replay mismatch.
+The host-only fixture probe and worker M9 acceptance both preflight this
+manifest before creating KVM so a smoke initramfs fails as an artifact error
+rather than as a replay mismatch:
+
+```bash
+DH_M9_ALLOW_SKIP=0 \
+cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture
+```
 
 Recommended staging layout on the `kvm-intel` box:
 

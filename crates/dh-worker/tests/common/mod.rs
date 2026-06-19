@@ -34,6 +34,8 @@ pub const DH_M9_BASE_IMAGE: &str = "DH_M9_BASE_IMAGE";
 pub const DH_M9_GAME_IMAGE: &str = "DH_M9_GAME_IMAGE";
 #[allow(dead_code)]
 pub const DH_M9_IMAGE_CACHE: &str = "DH_M9_IMAGE_CACHE";
+#[allow(dead_code)]
+pub const DH_M9_GUEST: &str = "DH_M9_GUEST";
 
 #[allow(dead_code)]
 pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [
@@ -158,6 +160,23 @@ pub fn m9_artifacts(test_name: &str) -> TestResult<Option<M9LinuxArtifacts>> {
             Ok(None)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[allow(dead_code)]
+pub fn reject_unimplemented_m9_linux_gate(test_name: &str, required_evidence: &str) {
+    match std::env::var(DH_M9_GUEST) {
+        Ok(value) if value == "linux" => panic!(
+            "{test_name} selected {DH_M9_GUEST}=linux, but no real Linux implementation exists yet. Required evidence: {required_evidence}. Do not count a zero-test or guard-only run as M9 Linux acceptance."
+        ),
+        Ok(value) => {
+            eprintln!(
+                "skipping {test_name} Linux guard because {DH_M9_GUEST}={value:?}, not \"linux\""
+            );
+        }
+        Err(_) => {
+            eprintln!("skipping {test_name} Linux guard because {DH_M9_GUEST} is not set");
+        }
     }
 }
 

@@ -41,6 +41,15 @@ const AFTER_RESTORE_FRAMES: u64 = 2;
 const FRAME_HARD_CAP: u64 = 50_000_000;
 const AT_FRAME_TARGET: u32 = 2;
 
+#[test]
+#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux frame coverage exists"]
+fn linux_m5_frame_scheduling_requires_real_frame_marks() {
+    common::reject_unimplemented_m9_linux_gate(
+        "m5_frame_scheduling::linux_m5_frame_scheduling_requires_real_frame_marks",
+        "Linux frame scheduling must observe real post-READY pv-pad FRAME_MARK records in the worker-recorded segment.",
+    );
+}
+
 fn config() -> MachineConfig {
     MachineConfig::new(
         MEM,

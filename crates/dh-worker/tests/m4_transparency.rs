@@ -70,6 +70,15 @@ const FULL: u64 = 200_000_000;
 /// capacity, so no leg ever reaches the guest's completion HLT.
 const ITERS_CMDLINE: &[u8] = b"30000000";
 
+#[test]
+#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux coverage exists"]
+fn linux_m4_transparency_requires_real_linux_fixture() {
+    common::reject_unimplemented_m9_linux_gate(
+        "m4_transparency::linux_m4_transparency_requires_real_linux_fixture",
+        "Linux snapshot transparency must boot the M9 fixture, run post-READY work, and compare restored/forked state hashes without falling back to nanokernel.",
+    );
+}
+
 fn config(cmdline: &[u8]) -> MachineConfig {
     MachineConfig::new(
         MEM,

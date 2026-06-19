@@ -406,6 +406,7 @@ dependencies = [
  "snapstore-server",
  "tempfile",
  "tokio",
+ "toml",
  "vm-memory",
 ]
 

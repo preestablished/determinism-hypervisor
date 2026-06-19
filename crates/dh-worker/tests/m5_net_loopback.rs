@@ -40,6 +40,15 @@ const HARD_CAP: u64 = 1_000_000;
 const EPOCH_LEN: u64 = 64;
 const NET_TX_DOORBELL_GPA: u64 = PV_NET_BASE + REG_TX_DOORBELL;
 
+#[test]
+#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux IO coverage exists"]
+fn linux_m5_io_loopback_requires_guest_driven_linux_io() {
+    common::reject_unimplemented_m9_linux_gate(
+        "m5_net_loopback::linux_m5_io_loopback_requires_guest_driven_linux_io",
+        "Linux IO regression coverage must use guest-driven pv-net or pv-blk IO in the same worker segment that record/replay verifies.",
+    );
+}
+
 fn config() -> MachineConfig {
     let mut c = MachineConfig::new(
         MEM,
