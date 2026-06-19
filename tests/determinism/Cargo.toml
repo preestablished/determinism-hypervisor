@@ -18,6 +18,7 @@ dh-vmm.workspace = true
 [target.'cfg(target_arch = "x86_64")'.dev-dependencies]
 blake3.workspace = true
 detguest-host.workspace = true
+detguest-wire.workspace = true
 dh-devices.workspace = true
 dh-inputlog.workspace = true
 kvm-bindings = "0.14.0"
