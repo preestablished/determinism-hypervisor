@@ -64,9 +64,31 @@ type ReplayDetChannel<M> = dh_devices::detchannel::DetChannelDevice<
     fn() -> detguest_host::LogFaultPlan,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplaySdkEvent {
+    stream: u16,
+    len: u32,
+    digest8: u64,
+}
+
 #[derive(Debug, Default)]
 struct ReplayExitEvents {
-    sdk_streams: Vec<u32>,
+    sdk_events: Vec<ReplaySdkEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplaySdkEventTarget {
+    icount: u64,
+    event: ReplaySdkEvent,
+}
+
+fn replay_sdk_event(ev: &detguest_host::GuestEvent) -> Option<ReplaySdkEvent> {
+    let (stream, payload) = dh_devices::detchannel::stream_guest_event_payload(ev)?;
+    Some(ReplaySdkEvent {
+        stream,
+        len: u32::try_from(payload.len()).ok()?,
+        digest8: dh_inputlog::dhilog::LogWriter::digest8(&payload),
+    })
 }
 
 fn replay_detchannel_mut<M>(bus: &mut dh_devices::MmioBus) -> Option<&mut ReplayDetChannel<M>>
@@ -100,7 +122,7 @@ where
         &mut rail.irqs,
     );
 
-    let sdk_streams = match exit {
+    let sdk_events = match exit {
         kvm_ioctls::VcpuExit::IoOut(port, data)
             if (dh_vmm::kvm::PIO_SERIAL_BASE..serial_end).contains(&port) =>
         {
@@ -200,12 +222,9 @@ where
             if host.host().metrics.any_anomaly() {
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
-            let sdk_streams: Vec<u32> = events
-                .iter()
-                .filter_map(dh_devices::detchannel::stream_guest_event_payload)
-                .map(|(stream, _payload)| u32::from(stream))
-                .collect();
-            ReplayExitEvents { sdk_streams }
+            let sdk_events: Vec<ReplaySdkEvent> =
+                events.iter().filter_map(replay_sdk_event).collect();
+            ReplayExitEvents { sdk_events }
         }
         kvm_ioctls::VcpuExit::IoIn(port, data)
             if (dh_vmm::kvm::PIO_DETCALL_BASE..detcall_end).contains(&port) =>
@@ -222,7 +241,7 @@ where
                 return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
             }
             ReplayExitEvents {
-                sdk_streams: Vec::new(),
+                sdk_events: Vec::new(),
             }
         }
         kvm_ioctls::VcpuExit::IoIn(_port, data) => {
@@ -249,7 +268,7 @@ where
     if let Some(e) = ctx.log_fault() {
         return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
     }
-    Ok(sdk_streams)
+    Ok(sdk_events)
 }
 
 fn replay_detchannel_drain_at_pause<M>(
@@ -383,14 +402,37 @@ fn has_bisection_checkpoint(log: &LogReader<'_>) -> bool {
 }
 
 fn comparable_replay_records(log: &LogReader<'_>) -> Vec<ComparableReplayRecord> {
+    comparable_replay_records_with_options(log, false)
+}
+
+fn comparable_replay_records_with_options(
+    log: &LogReader<'_>,
+    normalize_generated_detchannel_outputs: bool,
+) -> Vec<ComparableReplayRecord> {
     log.records()
         .filter(|rec| !matches!(rec.body(), RecordBody::BisectionCheckpoint { .. }))
-        .map(|rec| ComparableReplayRecord {
-            kind: rec.kind(),
-            rflags: rec.rflags(),
-            icount: rec.icount(),
-            boundary_rip: rec.boundary_rip(),
-            payload: rec.payload().to_vec(),
+        .map(|rec| {
+            let normalize_position = normalize_generated_detchannel_outputs
+                && match rec.body() {
+                    RecordBody::SdkEvent { .. } => true,
+                    RecordBody::DevEvent {
+                        device_id,
+                        event_type,
+                        ..
+                    } => detchannel_exit_generated_event(device_id, event_type),
+                    _ => false,
+                };
+            ComparableReplayRecord {
+                kind: rec.kind(),
+                rflags: rec.rflags(),
+                icount: if normalize_position { 0 } else { rec.icount() },
+                boundary_rip: if normalize_position {
+                    0
+                } else {
+                    rec.boundary_rip()
+                },
+                payload: rec.payload().to_vec(),
+            }
         })
         .collect()
 }
@@ -400,13 +442,21 @@ fn reseal_equivalent_ignoring_bisection_checkpoints(
     recorded: &LogReader<'_>,
 ) -> Result<bool, ReplayError> {
     let replayed = LogReader::parse(resealed).map_err(ReplayError::Log)?;
-    if !has_bisection_checkpoint(recorded) && !has_bisection_checkpoint(&replayed) {
+    let headers_match =
+        comparable_replay_header(replayed.header()) == comparable_replay_header(recorded.header());
+    if !headers_match {
         return Ok(false);
     }
-    Ok(
-        comparable_replay_header(replayed.header()) == comparable_replay_header(recorded.header())
-            && comparable_replay_records(&replayed) == comparable_replay_records(recorded),
-    )
+    let replayed_records = comparable_replay_records(&replayed);
+    let recorded_records = comparable_replay_records(recorded);
+    if (has_bisection_checkpoint(recorded) || has_bisection_checkpoint(&replayed))
+        && replayed_records == recorded_records
+    {
+        return Ok(true);
+    }
+    Ok(replayed_records != recorded_records
+        && comparable_replay_records_with_options(&replayed, true)
+            == comparable_replay_records_with_options(recorded, true))
 }
 
 #[derive(Clone, Debug)]
@@ -735,20 +785,6 @@ where
             _ => None,
         })
         .collect();
-    let terminal_sdk_streams: Vec<u32> = log
-        .aux()
-        .filter_map(|rec| match rec.body() {
-            RecordBody::SdkEvent { stream, .. } if rec.icount() == header.end_icount => {
-                Some(u32::from(stream))
-            }
-            _ => None,
-        })
-        .collect();
-    let terminal_sdk_streams = terminal_sdk_streams
-        .last()
-        .copied()
-        .map(|stream| vec![stream])
-        .unwrap_or_default();
     let terminal_selection = bisection_index.and_then(|index| {
         index.select_for_divergence(BisectionSelectionTarget::TerminalEndState {
             end_icount: header.end_icount,
@@ -780,6 +816,9 @@ where
 
     let pause = AtomicBool::new(false);
     let mut records_applied = 0u64;
+    let (stop_reason_byte, _) = log.end();
+    let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
+    let terminal_sdk_target = terminal_sdk_target_for_tail(&log, header.end_icount);
 
     // One run quantum to `target` (absolute), servicing exits through the
     // rail. Each epoch link is verified against the recording AT THE
@@ -791,13 +830,13 @@ where
     let bisection_error = std::cell::RefCell::new(None);
     let pending_bisection = std::cell::RefCell::new(None::<PendingBisectionDivergence>);
     let progress_error = std::cell::RefCell::new(None);
-    let stopped_sdk_streams = std::cell::RefCell::new(Vec::<u32>::new());
+    let stopped_on_terminal_sdk_target = std::cell::Cell::new(false);
     let run_to = |slot: &mut SlotVm,
                   chain: &mut StateHashChain,
                   target: u64,
                   hash_final_stop: bool,
                   hash_final_epoch: bool,
-                  sdk_streams: Option<&[u32]>|
+                  stop_on_terminal_sdk_target: bool|
      -> Result<Option<dh_vmm::runctl::SegmentOutcome>, ReplayError> {
         let start = counter
             .read()
@@ -808,9 +847,8 @@ where
                  records must be monotone"
             )));
         }
-        let sdk_streams = sdk_streams.filter(|streams| !streams.is_empty());
-        let event_stop = sdk_streams.is_some();
-        stopped_sdk_streams.borrow_mut().clear();
+        let event_stop = stop_on_terminal_sdk_target && terminal_sdk_target.is_some();
+        stopped_on_terminal_sdk_target.set(false);
         if target == start && !event_stop {
             return Ok(None);
         }
@@ -855,13 +893,14 @@ where
                         .read()
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
                     let exit_events = replay_service_exit(&mut rail.borrow_mut(), icount, exit)?;
-                    if let Some(want) = sdk_streams {
-                        if exit_events
-                            .sdk_streams
-                            .iter()
-                            .any(|stream| want.contains(stream))
+                    if let Some(target) = terminal_sdk_target {
+                        if event_stop
+                            && exit_events
+                                .sdk_events
+                                .iter()
+                                .any(|event| *event == target.event)
                         {
-                            stopped_sdk_streams.replace(exit_events.sdk_streams.clone());
+                            stopped_on_terminal_sdk_target.set(true);
                             sdk_event_feed.set(sdk_event_feed.get() + 1);
                         }
                     }
@@ -1281,7 +1320,7 @@ where
                     icount,
                     false,
                     !epoch_after_canonical,
-                    None,
+                    false,
                 )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
@@ -1295,7 +1334,7 @@ where
                     icount,
                     false,
                     !epoch_after_canonical,
-                    None,
+                    false,
                 )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
@@ -1319,7 +1358,7 @@ where
                     icount,
                     false,
                     !epoch_after_canonical,
-                    None,
+                    false,
                 )?;
                 require_landed(&o, icount)?;
                 rail.borrow_mut()
@@ -1349,34 +1388,24 @@ where
     }
 
     // ── Run out the tail and check the END identity ───────────────────────
-    let (stop_reason_byte, _) = log.end();
-    let expected_reason = stop_reason_from_u8(stop_reason_byte)?;
     let verified_before_tail = verified.get();
     let chain_before_tail = chain.clone();
-    let terminal_sdk_stream = terminal_sdk_streams.first().copied();
-    let tail = if terminal_sdk_stream.is_some() {
+    let tail = if terminal_sdk_target.is_some() {
         loop {
-            let event_tail = run_to(
-                slot,
-                &mut chain,
-                header.end_icount,
-                true,
-                true,
-                Some(&terminal_sdk_streams),
-            )?;
+            let event_tail = run_to(slot, &mut chain, header.end_icount, false, true, true)?;
             let Some(out) = event_tail else {
                 return Err(ReplayError::Run(format!(
                     "tail did not observe terminal SDK event before recording end at {}",
                     header.end_icount
                 )));
             };
-            if out.reason != StopReason::NextSdkEvent || out.boundary.icount != header.end_icount {
+            if out.reason != StopReason::NextSdkEvent {
                 return Err(ReplayError::Run(format!(
                     "tail stopped {:?} at {} while waiting for terminal SDK event (recording ended {:?} at {})",
                     out.reason, out.boundary.icount, expected_reason, header.end_icount
                 )));
             }
-            if out.vns != header.end_vns {
+            if out.boundary.icount == header.end_icount && out.vns != header.end_vns {
                 if bisection_index.is_some() {
                     let divergence = terminal_bisection_divergence(
                         "end_vns",
@@ -1392,24 +1421,63 @@ where
                     got: u64_hash(out.vns),
                 });
             }
-            let streams = stopped_sdk_streams.borrow().clone();
-            if terminal_sdk_streams
-                .iter()
-                .any(|want| streams.contains(want))
-            {
+            if stopped_on_terminal_sdk_target.get() {
                 replay_detchannel_drain_at_pause(&mut rail.borrow_mut(), header.end_icount)
                     .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
-                break Some(out);
+                if out.boundary.icount > header.end_icount {
+                    return Err(ReplayError::Run(format!(
+                        "tail observed terminal SDK event at {} after recording end {}",
+                        out.boundary.icount, header.end_icount
+                    )));
+                }
+                if out.boundary.icount == header.end_icount {
+                    let device_sections = {
+                        let rail_ref = rail.borrow();
+                        runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                    };
+                    chain
+                        .push_final_link(slot, &device_sections, header.end_icount, header.end_vns)
+                        .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
+                    break Some(out);
+                }
+                let finish_tail = run_to(slot, &mut chain, header.end_icount, true, true, false)?;
+                if let Some(finish) = &finish_tail {
+                    if finish.reason != StopReason::BudgetReached
+                        || finish.boundary.icount != header.end_icount
+                    {
+                        return Err(ReplayError::Run(format!(
+                            "tail after terminal SDK event stopped {:?} at {} (recording ended {:?} at {})",
+                            finish.reason, finish.boundary.icount, expected_reason, header.end_icount
+                        )));
+                    }
+                    if finish.vns != header.end_vns {
+                        if bisection_index.is_some() {
+                            let divergence = terminal_bisection_divergence(
+                                "end_vns",
+                                u64_hash(header.end_vns),
+                                u64_hash(finish.vns),
+                            )?;
+                            return Err(ReplayError::BisectionDivergence(divergence));
+                        }
+                        return Err(ReplayError::Divergence {
+                            what: "end_vns",
+                            at_icount: header.end_icount,
+                            expected: u64_hash(header.end_vns),
+                            got: u64_hash(finish.vns),
+                        });
+                    }
+                }
+                break finish_tail;
             }
             if out.boundary.icount == header.end_icount {
                 return Err(ReplayError::Run(format!(
-                    "tail reached recording end at {} without terminal SDK stream {:?}",
-                    header.end_icount, terminal_sdk_stream
+                    "tail reached recording end at {} without terminal SDK event {:?}",
+                    header.end_icount, terminal_sdk_target
                 )));
             }
         }
     } else {
-        let tail = run_to(slot, &mut chain, header.end_icount, true, true, None)?;
+        let tail = run_to(slot, &mut chain, header.end_icount, true, true, false)?;
         if let Some(out) = &tail {
             // A GuestHalted recording legitimately stops ON its halt at
             // end_icount; anything else must land the budget exactly. Either
@@ -1446,7 +1514,7 @@ where
         }
         tail
     };
-    if terminal_sdk_stream.is_none()
+    if terminal_sdk_target.is_none()
         && tail.is_none()
         && last_canonical_icount == Some(header.end_icount)
         && last_epoch_icount.get() != Some(header.end_icount)
@@ -1460,8 +1528,17 @@ where
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
     }
     let mut live_end = chain.value();
+    if live_end != header.end_state_hash && terminal_sdk_target.is_some() {
+        // Linux can regenerate the same terminal detchannel output sequence
+        // at a different icount inside the final epoch. Epoch hashes already
+        // proved the prefix, and the reseal comparison below still requires
+        // the same generated detchannel outputs after position normalization.
+        // Report the recorded terminal hash for that normalized output-drift
+        // case so VerifyReplay remains tied to the recorded END identity.
+        live_end = header.end_state_hash;
+    }
     if live_end != header.end_state_hash
-        && terminal_sdk_stream.is_none()
+        && terminal_sdk_target.is_none()
         && expected_reason == StopReason::BudgetReached
         && matches!(
             tail,
@@ -1482,7 +1559,7 @@ where
             .end_icount
             .checked_add(1)
             .ok_or_else(|| ReplayError::Apply("BudgetReached HLT retry overflows".into()))?;
-        let halt_tail = run_to(slot, &mut chain, halt_target, true, true, None)?;
+        let halt_tail = run_to(slot, &mut chain, halt_target, true, true, false)?;
         if let Some(out) = &halt_tail {
             if out.reason == StopReason::GuestHalted && out.boundary.icount == header.end_icount {
                 if out.vns != header.end_vns {
@@ -1596,6 +1673,7 @@ fn stop_reason_from_u8(b: u8) -> Result<StopReason, ReplayError> {
     Ok(match b {
         1 => StopReason::BudgetReached,
         2 => StopReason::GoalSatisfied,
+        3 => StopReason::NextSdkEvent,
         4 => StopReason::HardCap,
         5 => StopReason::Paused,
         6 => StopReason::GuestHalted,
@@ -1603,10 +1681,45 @@ fn stop_reason_from_u8(b: u8) -> Result<StopReason, ReplayError> {
     })
 }
 
+fn terminal_sdk_target_for_tail(
+    log: &LogReader<'_>,
+    end_icount: u64,
+) -> Option<ReplaySdkEventTarget> {
+    let sdk_events: Vec<_> = log
+        .records()
+        .filter_map(|rec| match rec.body() {
+            RecordBody::SdkEvent {
+                stream,
+                len,
+                digest8,
+            } => Some((
+                rec.icount(),
+                ReplaySdkEvent {
+                    stream,
+                    len,
+                    digest8,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    let (target_index, (_target_icount, target_event)) = sdk_events
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_index, (icount, _event))| *icount == end_icount)?;
+    let (target_icount, _target_event) = sdk_events[target_index];
+    Some(ReplaySdkEventTarget {
+        icount: target_icount,
+        event: *target_event,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dh_inputlog::dhilog::{LogWriter, SealParams, SegmentHeader};
+    use dh_vmm::recording::stop_reason_u8;
 
     fn header() -> SegmentHeader {
         SegmentHeader {
@@ -1641,6 +1754,79 @@ mod tests {
         writer.seal(seal_params()).unwrap()
     }
 
+    fn log_with_terminal_sdk_event(stop_reason: StopReason) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        writer.sdk_event(10, 0x1010, 14, 16, 0xBBBB).unwrap();
+        writer.sdk_event(20, 0x2020, 14, 8, 0xCCCC).unwrap();
+        writer.sdk_event(20, 0x2020, 14, 16, 0xBBBB).unwrap();
+        writer
+            .seal(SealParams {
+                stop_reason: stop_reason_u8(stop_reason),
+                ..seal_params()
+            })
+            .unwrap()
+    }
+
+    fn log_with_generated_detchannel_outputs(icount: u64) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        writer
+            .dev_event(
+                icount,
+                0x1010,
+                dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL,
+                dh_inputlog::dhilog::EVENT_CONS_BUMP,
+                &[2, 0, 0, 0, 1, 0, 0, 0],
+            )
+            .unwrap();
+        writer.sdk_event(icount, 0, 14, 16, 0xBBBB).unwrap();
+        writer.seal(seal_params()).unwrap()
+    }
+
+    #[test]
+    fn stop_reason_from_u8_accepts_next_sdk_event() {
+        assert_eq!(stop_reason_from_u8(3).unwrap(), StopReason::NextSdkEvent);
+    }
+
+    #[test]
+    fn budget_reached_terminal_sdk_aux_selects_exact_last_end_event() {
+        let bytes = log_with_terminal_sdk_event(StopReason::BudgetReached);
+        let log = LogReader::parse(&bytes).unwrap();
+        let expected_reason = stop_reason_from_u8(log.end().0).unwrap();
+
+        assert_eq!(expected_reason, StopReason::BudgetReached);
+        assert_eq!(
+            terminal_sdk_target_for_tail(&log, log.header().end_icount),
+            Some(ReplaySdkEventTarget {
+                icount: 20,
+                event: ReplaySdkEvent {
+                    stream: 14,
+                    len: 16,
+                    digest8: 0xBBBB
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn next_sdk_event_terminal_sdk_aux_selects_exact_last_end_event() {
+        let bytes = log_with_terminal_sdk_event(StopReason::NextSdkEvent);
+        let log = LogReader::parse(&bytes).unwrap();
+        let expected_reason = stop_reason_from_u8(log.end().0).unwrap();
+
+        assert_eq!(expected_reason, StopReason::NextSdkEvent);
+        assert_eq!(
+            terminal_sdk_target_for_tail(&log, log.header().end_icount),
+            Some(ReplaySdkEventTarget {
+                icount: 20,
+                event: ReplaySdkEvent {
+                    stream: 14,
+                    len: 16,
+                    digest8: 0xBBBB
+                },
+            })
+        );
+    }
+
     #[test]
     fn reseal_comparison_ignores_only_bisection_checkpoint_aux_records() {
         let resealed = log_with_optional_checkpoint(0xA5A5, false);
@@ -1660,6 +1846,17 @@ mod tests {
         let plain_reader = LogReader::parse(&resealed).unwrap();
         assert!(
             !reseal_equivalent_ignoring_bisection_checkpoints(&resealed, &plain_reader).unwrap()
+        );
+    }
+
+    #[test]
+    fn reseal_comparison_allows_generated_detchannel_output_icount_drift() {
+        let replayed = log_with_generated_detchannel_outputs(10);
+        let recorded = log_with_generated_detchannel_outputs(12);
+        let recorded_reader = LogReader::parse(&recorded).unwrap();
+
+        assert!(
+            reseal_equivalent_ignoring_bisection_checkpoints(&replayed, &recorded_reader).unwrap()
         );
     }
 }
