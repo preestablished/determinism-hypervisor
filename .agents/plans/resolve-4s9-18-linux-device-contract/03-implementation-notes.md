@@ -36,10 +36,13 @@ Implementation shape:
 - Split `until_from_run_request` into a small result struct if needed:
   - `until: dh_vmm::runctl::Until`
   - `sdk_event_filter: Option<Option<u32>>`
+- Map the actual proto variant `proto::run_request::Until::NextSdkEvent(proto::NextSdkEvent { stream })`.
 - For `RunRequest.next_sdk_event.stream`:
   - absent means any SDK event.
   - present means exact detchannel EventKind.
   - `hard_icount_cap == 0` still maps to the worker default cap.
+- Allocate a run-local `std::cell::Cell<u64>` as the `Segment.sdk_events` feed only for this mode.
+- Allocate a run-local `Option<DrainedGuestEvent>` for the first matching event.
 - Add a local matcher:
 
 ```rust
@@ -53,6 +56,7 @@ fn sdk_event_matches(filter: Option<u32>, event: &DrainedGuestEvent) -> bool {
   - for matching events, increment the `Cell<u64>` feed.
   - store the first matching event for `RunResponse.sdk_event`.
   - append all drained events to the runtime retention list after run completes.
+- Set `RunResponse.sdk_event` only when `outcome.reason == dh_vmm::runctl::StopReason::NextSdkEvent`.
 
 Important: `runctl::Until::NextSdkEvent` stops when the feed rises during that segment. Do not poll `runtime.guest_events`; the run-control feed must be driven synchronously from the doorbell exit that drained the matching event.
 
@@ -80,7 +84,7 @@ Files:
 - `crates/dh-worker/src/service.rs`
 - `crates/dh-worker/src/replay_engine.rs`
 
-Add or reuse a small helper with exactly one byte order:
+Add or reuse a small helper with exactly one state-hash byte order:
 
 ```rust
 fn runtime_hash_device_sections(
@@ -100,21 +104,23 @@ Rationale:
 - snapshot capture already writes bus device sections.
 - replay already restores bus device sections.
 - `4s9.18` requires pv-blk overlay and detchannel state to participate in snapshot/hash/replay proof.
+- DHSNAP and state-hash bytes are intentionally not identical: DHSNAP writes canonical tag order and folds pv-entropy regs into `ENTR`; `hash::device_sections` frames bus devices in bus/base order for hash coverage.
+- In replay, update all current lapic-only hash sites, including the run-gap helper, the `verify_current_epoch!` path, and the final same-icount tail path.
 
 ## MachineConfig Device Set
 
-The Linux worker API test should request only deterministic M9 surfaces needed before Ready:
+The Linux worker API test should request only deterministic M9 surfaces needed before Ready, sorted by numeric device id because `MachineConfig::validate` requires sorted unique `device_set` values:
 
-- `DEVICE_ID_DETCHANNEL`
-- `DEVICE_ID_PV_CLOCK`
-- `DEVICE_ID_PV_PAD`
-- `DEVICE_ID_PV_ENTROPY`
-- `DEVICE_ID_PV_BLK`
-- `DEVICE_ID_DEBUG_SERIAL`
+- `DEVICE_ID_DETCHANNEL` (`0x0001`)
+- `DEVICE_ID_PV_CLOCK` (`0x0002`)
+- `DEVICE_ID_PV_PAD` (`0x0003`)
+- `DEVICE_ID_PV_ENTROPY` (`0x0004`)
+- `DEVICE_ID_PV_BLK` (`0x0005`)
+- `DEVICE_ID_DEBUG_SERIAL` (`0x0006`)
 
 Do not add virtio-blk. Do not make serial a readiness condition.
 
-If device order affects bus registration or hash bytes, make the test use the same canonical order as production M9 configs.
+The test `cpuid_table` must match the masked KVM CPUID table installed on the slot so `MachineConfig` hashing and live vCPU state agree.
 
 ## Artifact Cache Population
 
@@ -129,6 +135,8 @@ Expected env vars:
 - `DH_M9_IMAGE_CACHE`
 
 The test may create hardlinks or copies inside `DH_M9_IMAGE_CACHE`, but it must not mutate the source artifact files. Use noninteractive file operations.
+
+Current worker schema has one pv-blk backing hash: `MachineConfig.base_image_hash`. For this bead, set `base_image_hash` to the BLAKE3 of `DH_M9_GAME_IMAGE` and register that file in the image cache as the pv-blk backing exposed to the Linux fixture as `/dev/vdb`. If `DH_M9_BASE_IMAGE` must also be attached separately, file and complete a prerequisite schema/device bead before claiming `4s9.18` acceptance.
 
 ## Fixture Evidence
 

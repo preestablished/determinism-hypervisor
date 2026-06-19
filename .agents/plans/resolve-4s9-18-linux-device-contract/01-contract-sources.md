@@ -14,6 +14,7 @@ Guest SDK:
   - section 3.1: EventKind table, including `Ready` kind 14.
   - section 3.2: `Ready` payload is `unit u32`, `region_count u32`, `manifest_generation u64`.
   - section 7: boot manifest uses `[unit.control] game_dev = "/dev/vdb"` and expected regions such as `wram`, `framebuffer`, and `meta`.
+  - drift note: upstream text still describes `game_dev` as a virtio-blk game-image device in places. Local M9 decision `docs/decisions/m9-linux-ready-and-block-device.md` overrides that transport to the existing deterministic pv-blk device.
 - `/home/infra-admin/.agents/projects/determinism/docs/guest-sdk/INTEGRATION.md`
   - the agent reads `boot.toml`, uses `game_dev`, drives `Hello -> LoadGame -> Start`, and emits ring-A Ready only after expected regions are registered.
 

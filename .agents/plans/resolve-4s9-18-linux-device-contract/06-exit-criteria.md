@@ -9,8 +9,9 @@
 - `RunRequest.next_sdk_event` works through the public worker API.
 - `RunResponse.sdk_event` is populated when the stop reason is `NEXT_SDK_EVENT`.
 - Runtime guest-event retention still allows `StreamGuestEvents` to inspect ordering after a run.
-- The state-hash preimage used by live run and replay includes deterministic lAPIC plus bus device sections.
+- The state-hash preimage used by live run and replay covers deterministic lAPIC plus bus device sections.
 - pv-blk remains the selected M9 block transport at `0xD000_4000`.
+- `MachineConfig.base_image_hash` is the BLAKE3 of `DH_M9_GAME_IMAGE` unless a prerequisite multi-disk schema/device bead has landed.
 - No deterministic virtio-blk implementation is introduced for M9.
 - Serial output is not used as a readiness condition.
 
@@ -39,22 +40,27 @@ For hash-sensitive changes, run the relevant worker suite at least three consecu
 The `linux_worker_api::pvblk_dev_vdb` test output must establish:
 
 - Ready is EventKind 14 on detchannel.
-- Ready occurs after CHANNEL_INIT, Hello, `LoadGame{dev_path="/dev/vdb"}`, `Start{}`, and expected region registration.
-- No host-injected input lands before Ready.
+- CHANNEL_INIT success is proven through `EVTC` attach state or equivalent logged attach evidence; Hello, `LoadGame{dev_path="/dev/vdb"}`, `Start{}`, expected region registration, and Ready occur in order.
+- No external host-injected input lands before Ready: no ring-C/ring-I pushes, no `PAD_SET`, and no scheduled `DeviceEvent` or `NetRx`.
 - The Linux fixture reaches the selected game image through `/dev/vdb`.
-- The host base image file is unchanged.
-- pv-blk overlay and detchannel attachment state survive snapshot/restore and replay.
+- The source `DH_M9_GAME_IMAGE` file is unchanged.
+- pv-blk registers/overlay, EVTC host attach/producer-seq state, and the guest-RAM channel page survive snapshot/restore and replay.
 - Live run and replay produce matching state hashes.
-- The fixture cannot use host entropy or host wall-clock time as a pre-Ready input.
+- Canonical cmdline, CPUID masking, fixture evidence, and replay/hash equality show no supported host entropy or host wall-clock path is used as a pre-Ready input. Raw bypasses such as `RDTSC`/`RDRAND` remain guest-contract violations to catch through verification.
 
 ## Session Close
 
 Follow repository session close rules:
 
 ```bash
+bd create --title="<follow-up>" --description="<remaining work>" --type=task --priority=P1  # for any unresolved follow-up
+bd update determinism-hypervisor-4s9.18 --append-notes "Acceptance evidence: <commands and result summary>"
+bd close determinism-hypervisor-4s9.18 --reason "Accepted: <primary command evidence>"
+bd close determinism-hypervisor-4s9.20 --reason "Accepted: BzImage CreateVm seam landed"  # if completed in the same implementation session
+bd ready
 git status
 git add <changed files>
-git commit -m "Plan resolution for Linux device contract"
+git commit -m "<implementation-specific message>"
 git pull --rebase
 bd dolt push
 git push

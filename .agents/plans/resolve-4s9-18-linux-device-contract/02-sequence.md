@@ -40,10 +40,10 @@ This makes Ready EventKind 14 observable through the public worker API instead o
 
 ## 4. Include Bus Device State In Run And Replay Hashes
 
-The snapshot engine already serializes bus devices, and `dh_vmm::hash::device_sections(&bus)` already produces canonical bus-device preimage bytes. The worker run and replay paths should use the same state shape:
+The snapshot engine already serializes bus devices, and `dh_vmm::hash::device_sections(&bus)` already produces canonical bus-device preimage bytes for the state hash. DHSNAP and the state hash do not use identical bytes: DHSNAP writes canonical tag order and folds pv-entropy regs into `ENTR`, while `hash::device_sections` frames bus devices in bus/base order. The worker run and replay paths should have the same deterministic state coverage:
 
 - Build a combined hash preimage from `lapic_section(&lapic)` followed by `device_sections(&bus)`.
-- Use that same helper in `crates/dh-worker/src/service.rs` and `crates/dh-worker/src/replay_engine.rs`.
+- Use that same helper in `crates/dh-worker/src/service.rs` and every lapic-only hash site in `crates/dh-worker/src/replay_engine.rs`.
 - Keep ordering identical in run and replay.
 
 This is required for the `4s9.18` acceptance phrase "snapshot/hash/replay" to be meaningful for pv-blk overlay and detchannel attachment state.
@@ -55,7 +55,9 @@ Create `crates/dh-worker/tests/linux_worker_api.rs` as an ignored, artifact-gate
 The target should:
 
 - Use `M9LinuxArtifacts::from_env_required("linux_worker_api")`.
-- Populate `DH_M9_IMAGE_CACHE` with BLAKE3-keyed entries for bzImage, initramfs, base image, and game image using the existing resolver cache key scheme.
+- Populate `DH_M9_IMAGE_CACHE` with BLAKE3-keyed entries for the artifacts using the existing resolver cache key scheme.
+- Set `MachineConfig.base_image_hash` to the BLAKE3 of `DH_M9_GAME_IMAGE`, because current worker schema has one pv-blk backing file and that backing is the Linux-visible `/dev/vdb` game image for this bead.
+- Treat `DH_M9_BASE_IMAGE` as fixture context unless a prerequisite multi-disk/root-vs-game schema bead lands before `4s9.18`.
 - Build a `MachineConfig` with `BootSpec::BzImage` and the selected M9 device set.
 - Use the public worker API: `CreateVm`, `Run`, `StreamGuestEvents`, `TakeSnapshot`, `RestoreSnapshot`, and `VerifyReplay`.
 
@@ -67,11 +69,12 @@ It should prove:
 
 - `CreateVm` succeeds with BzImage boot and selected deterministic device set.
 - `Run(next_sdk_event stream=14)` stops at guest-sdk Ready, not serial output.
-- The event stream contains CHANNEL_INIT/Hello before Ready and no host-injected input before Ready.
+- Detchannel `EVTC` or equivalent logged attach evidence proves CHANNEL_INIT succeeded; streamed guest events contain Hello, expected region registration evidence, and Ready in order.
+- No external host-injected input lands before Ready: no ring-C/ring-I pushes, no `PAD_SET`, and no scheduled `DeviceEvent` or `NetRx` before the Ready event.
 - The Linux fixture's Ready implies the control leg reached `LoadGame{dev_path="/dev/vdb"}` and `Start{}` with expected regions registered.
-- The host base image bytes and mtime do not change.
-- pv-blk overlay and detchannel state survive snapshot/restore and replay with stable state hashes.
-- The fixture cannot observe host time or host entropy surfaces.
+- The source `DH_M9_GAME_IMAGE` bytes and mtime do not change.
+- pv-blk overlay/register state, EVTC host attach/producer-seq state, and the guest-RAM channel page survive snapshot/restore and replay with stable state hashes.
+- Canonical cmdline and CPUID masking remove supported host time/entropy surfaces; replay/hash equality and fixture evidence catch guest-contract violations such as raw host entropy/time use.
 
 If the current Linux fixture does not expose enough evidence for `/dev/vdb`, host-time, or host-entropy assertions, stop and update the fixture contract rather than weakening the worker test.
 

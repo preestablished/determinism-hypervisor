@@ -18,10 +18,11 @@ There is already a deterministic pv-blk model at MMIO base `0xD000_4000`, and th
 
 - Linux boot is `bzImage + initramfs` through the deterministic Linux boot loader already present in `dh-vmm`.
 - The game image path is the existing deterministic pv-blk device at `0xD000_4000`; the Linux guest fixture maps that device to `/dev/vdb`.
-- The base image is immutable host input. Writes, if the fixture exercises them, must be overlay-only and must not mutate the base file.
+- Current worker schema has one pv-blk backing file through `MachineConfig.base_image_hash`. For this bead, `/dev/vdb` is backed by `DH_M9_GAME_IMAGE`; if `DH_M9_BASE_IMAGE` must also be attached as a separate disk/root image, file and complete a prerequisite multi-disk/schema bead first.
+- The selected pv-blk backing file is immutable host input. Writes, if the fixture exercises them, must be overlay-only or rejected by the guest read-only path and must not mutate the source file.
 - The accepted READY point is guest-sdk EventKind 14 `Ready{unit, region_count, manifest_generation}` on detchannel.
 - Serial output is diagnostic only. It cannot satisfy M9 READY.
-- No host-injected input may land before the Ready event is drained.
+- No external host-injected input may land before the Ready event is drained.
 - Snapshot, state hash, and replay must include deterministic device state relevant to pv-blk and detchannel.
 
 ## Plan Files
