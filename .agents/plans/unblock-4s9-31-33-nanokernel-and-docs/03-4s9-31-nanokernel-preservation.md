@@ -60,8 +60,8 @@ Do not set `DH_M7_ACCEPT_GUEST=linux` for this nanokernel preservation smoke.
 Before and after any doc edits, check that nanokernel fixture paths are unchanged:
 
 ```bash
-git diff -- tests/nanokernel crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s
-git status --short -- tests/nanokernel crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s
+git diff --exit-code -- tests/nanokernel crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s
+test -z "$(git status --porcelain=v1 -- tests/nanokernel crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s)"
 ```
 
 Expected result: no changes.
@@ -69,6 +69,8 @@ Expected result: no changes.
 ## Documentation Updates
 
 Update `docs/phase-1-exit-gate.md` and `docs/phase-2-exit-gate.md` with a dated post-M9 nanokernel preservation section.
+
+Keep this scoped to `4s9.31`: add only a dated nanokernel-preservation addendum. Do not publish Linux exit-gate evidence, update the full Phase 1/Phase 2 Linux gate tables, or claim `4s9.32` acceptance from this bead. If a doc already has a broader section reserved for `4s9.32`, point to the new nanokernel addendum rather than folding Linux evidence into `4s9.31`.
 
 Include:
 
@@ -89,6 +91,6 @@ Do not rewrite old evidence sections as if they were fresh. Add a new dated sect
 Close `4s9.31` only when:
 
 - all required evidence commands pass or any omitted long command is explicitly justified by the bead owner;
-- docs contain fresh nanokernel preservation evidence;
+- docs contain fresh nanokernel preservation evidence only, without claiming the downstream `4s9.32` Linux-plus-nanokernel exit-gate update;
 - fixture integrity checks show no nanokernel fixture/corpus changes;
 - `git diff --check` and `cargo fmt --check` pass if any Markdown or Rust files changed.

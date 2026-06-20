@@ -31,7 +31,7 @@ bd comment determinism-hypervisor-4s9.31 "Starting post-M9 nanokernel preservati
 bd update determinism-hypervisor-4s9.31 --claim
 ```
 
-If `bd update --claim` refuses while status is `BLOCKED`, use the explicit `--status open` path above. `bd update --help` confirms `--status` and `--claim` are supported.
+If `bd update --claim` refuses while status is `BLOCKED`, stop long enough to make an explicit owner/operator decision: either move the stale-blocked issue to `open` with `bd update --status open`, or leave it blocked and record why in a comment. Do not silently bypass a real unresolved blocker. `bd update --help` confirms `--status` and `--claim` are supported.
 
 ## Unblock And Claim 4s9.33
 
@@ -50,6 +50,8 @@ Same fallback applies if manual status changes are not desired:
 bd comment determinism-hypervisor-4s9.33 "Starting Linux gate command and runner classification docs now that all listed dependencies are closed."
 bd update determinism-hypervisor-4s9.33 --claim
 ```
+
+Again, if `--claim` refuses while the issue is `BLOCKED`, make an explicit owner/operator decision before using `bd update --status open`. This is appropriate only because the current listed dependencies are closed; it is not a general license to override blocked work.
 
 ## Ordering
 

@@ -18,11 +18,15 @@ Adjust staged files to the actual diff. Do not stage unrelated working-tree chan
 
 ## Close 4s9.31
 
-After the evidence and docs are committed:
+Before recording final evidence, rebase so the commit SHA in Beads is the SHA that will be pushed:
 
 ```bash
+git pull --rebase
 commit_sha=$(git rev-parse HEAD)
-bd comment determinism-hypervisor-4s9.31 "<paste evidence from 05-validation-and-evidence.md, including commit $commit_sha>"
+echo "Evidence commit: $commit_sha"
+bd comment determinism-hypervisor-4s9.31 --stdin <<'EOF'
+<paste evidence from 05-validation-and-evidence.md, including the evidence commit printed above>
+EOF
 bd close determinism-hypervisor-4s9.31 --reason="Post-M9 nanokernel preservation evidence published"
 ```
 
@@ -37,11 +41,15 @@ Do not start `4s9.32` unless the user asks.
 
 ## Close 4s9.33
 
-After docs/workflow classification is committed:
+Before recording final evidence, rebase so the commit SHA in Beads is the SHA that will be pushed:
 
 ```bash
+git pull --rebase
 commit_sha=$(git rev-parse HEAD)
-bd comment determinism-hypervisor-4s9.33 "<paste evidence from 05-validation-and-evidence.md, including commit $commit_sha>"
+echo "Evidence commit: $commit_sha"
+bd comment determinism-hypervisor-4s9.33 --stdin <<'EOF'
+<paste evidence from 05-validation-and-evidence.md, including the evidence commit printed above>
+EOF
 bd close determinism-hypervisor-4s9.33 --reason="Linux gate commands, runner requirements, and CI/nightly classification documented"
 ```
 
@@ -61,11 +69,27 @@ AGENTS.md requires pushed code and Beads state before ending the work session:
 
 ```bash
 git status --short --branch
+git stash list
+bd ready
+commit_sha=${commit_sha:-$(git rev-parse HEAD)}
 git pull --rebase
+post_pull_sha=$(git rev-parse HEAD)
+test "$post_pull_sha" = "$commit_sha" || {
+  echo "HEAD changed after evidence comment; add a correction Beads comment with $post_pull_sha before pushing"
+  exit 1
+}
 bd dolt push
 git push
 git status
 ```
+
+Before `bd dolt push`, file follow-up issues for any remaining work discovered during validation:
+
+```bash
+bd create --title="<short follow-up>" --description="<why this remains and what needs doing>" --type=task --priority=2
+```
+
+If temporary stashes or local-only branches were created, clear or explicitly hand them off before the final status check. Prune remote branches only when they are known to be stale and unrelated to active work; do not delete branches speculatively.
 
 Final `git status` must say:
 

@@ -72,6 +72,16 @@ Linux gate docs and runner classification complete.
 
 Commit: <sha>
 
+Producer evidence reviewed:
+- 4s9.22: <CLI Linux evidence summary>
+- 4s9.24: <Phase 1 Linux gate evidence summary>
+- 4s9.25: <Linux timer/IRQ evidence summary>
+- 4s9.26: <Linux landing/counting evidence summary>
+- 4s9.27: <Linux M5 corpus evidence summary>
+- 4s9.28: <Linux M4/M5 frame/net evidence summary>
+- 4s9.29: <Linux M7 full/cross-slot/nightly evidence summary>
+- 4s9.30: <Linux worker API evidence summary>
+
 Docs:
 - docs/ops/test-partitioning.md lists Linux M9 artifact env vars, fixture contract, Phase 1 Linux gate, landing/counting, timer/IRQ if present, M4/M5 frame/net regressions, M5 corpus, Linux M7 nightly/full/cross-slot, and nanokernel/default M7 commands.
 - docs/ops/github-runner.md records M9 artifact staging, image-cache requirement, slot-core/taskset requirement, and nightly/operator split.

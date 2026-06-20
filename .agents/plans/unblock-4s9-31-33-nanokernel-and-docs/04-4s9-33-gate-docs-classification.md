@@ -27,6 +27,21 @@ Do not promote full Linux M9 acceptance commands to required CI unless runtime a
 
 ## Commands And Env Vars To Ensure Are Documented
 
+Before editing command tables, audit the producer bead evidence and current test targets:
+
+```bash
+bd show determinism-hypervisor-4s9.22
+bd show determinism-hypervisor-4s9.24
+bd show determinism-hypervisor-4s9.25
+bd show determinism-hypervisor-4s9.26
+bd show determinism-hypervisor-4s9.27
+bd show determinism-hypervisor-4s9.28
+bd show determinism-hypervisor-4s9.29
+bd show determinism-hypervisor-4s9.30
+```
+
+Use these records to cite passing no-skip Linux evidence in the `4s9.33` close comment. Do not rely only on the three direct dependencies listed on `4s9.33`; the docs classify the whole M9 gate surface.
+
 `docs/ops/test-partitioning.md` should include exact command rows for:
 
 - Linux fixture contract:
@@ -34,6 +49,13 @@ Do not promote full Linux M9 acceptance commands to required CI unless runtime a
   ```bash
   DH_M9_ALLOW_SKIP=0 \
   cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture
+  ```
+
+- Linux boot-to-READY identity:
+
+  ```bash
+  DH_M9_ALLOW_SKIP=0 \
+  cargo test -p determinism-tests --test linux_ready --release -- --ignored --nocapture
   ```
 
 - Linux Phase 1 CLI gate:
@@ -61,9 +83,22 @@ Do not promote full Linux M9 acceptance commands to required CI unless runtime a
   cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture
   ```
 
-- Linux M4/M5 frame/net regressions. Inspect exact current test names before documenting. Likely files:
-  - `crates/dh-worker/tests/m5_frame_scheduling.rs`
-  - `crates/dh-worker/tests/m5_net_loopback.rs`
+- Linux M4/M5 frame/net regressions:
+
+  ```bash
+  DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux \
+  cargo test -p dh-worker --test m4_transparency --release linux -- --ignored --nocapture
+  ```
+
+  ```bash
+  DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux \
+  cargo test -p dh-worker --test m5_frame_scheduling --release linux -- --ignored --nocapture
+  ```
+
+  ```bash
+  DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux \
+  cargo test -p dh-worker --test m5_net_loopback --release linux -- --ignored --nocapture
+  ```
 
 - Linux M5 corpus reverify:
 
@@ -72,6 +107,13 @@ Do not promote full Linux M9 acceptance commands to required CI unless runtime a
   cargo test -p dh-worker --test m5_record_replay --release \
     linux_m5_record_replay_post_ready_corpus_reverifies \
     -- --ignored --nocapture
+  ```
+
+- Linux worker API:
+
+  ```bash
+  DH_M9_ALLOW_SKIP=0 \
+  cargo test -p dh-worker --test linux_worker_api --release -- --ignored --nocapture
   ```
 
 - Linux M7 nightly 100-child canary and full M7 operator commands, preserving the rows added by `4s9.29`.
@@ -121,6 +163,7 @@ If the workflows already satisfy a requirement, leave them unchanged and documen
 
 Close `4s9.33` only when:
 
+- producer bead evidence for `4s9.22` through `4s9.30` has been reviewed and the close comment cites the no-skip evidence backing the documented Linux commands;
 - docs and workflow classification are consistent;
 - exact Linux commands and env vars are documented;
 - runner requirements include artifact staging and slot affinity;
