@@ -11,13 +11,16 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{gettid, kvm_available, spawn_store_blocking, TestResult, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::net::{PvNet, PV_NET_BASE, REG_TX_DOORBELL};
 use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
+use dh_snapshot::dhsnap::tag;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -33,20 +36,146 @@ use dh_worker::runtime::runtime_hash_device_sections;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
 use snapstore_types::SnapshotRef;
+use tonic::Request;
 use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
 const HARD_CAP: u64 = 1_000_000;
 const EPOCH_LEN: u64 = 64;
 const NET_TX_DOORBELL_GPA: u64 = PV_NET_BASE + REG_TX_DOORBELL;
+const LINUX_IO_FRAMES: u32 = 1;
+const LINUX_FRAME_HARD_CAP: u64 = 50_000_000;
+const META_IO_MAGIC_OFF: u64 = 32;
+const META_IO_PROOF_LEN: u64 = 24;
+const BLKO_DIRTY_COUNT_OFF: usize = 32;
 
 #[test]
-#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux IO coverage exists"]
-fn linux_m5_io_loopback_requires_guest_driven_linux_io() {
-    common::reject_unimplemented_m9_linux_gate(
-        "m5_net_loopback::linux_m5_io_loopback_requires_guest_driven_linux_io",
-        "Linux IO regression coverage must use guest-driven pv-net or pv-blk IO in the same worker segment that record/replay verifies.",
+#[ignore = "M9 Linux acceptance: requires KVM dirty-ring support and staged DH_M9_* artifacts"]
+fn linux_pvblk_io_loopback_records_and_replays() -> TestResult<()> {
+    let Some(ready) =
+        common::m9_linux_ready_snapshot("m5_net_loopback::linux_pvblk_io_loopback", 2)?
+    else {
+        return Ok(());
+    };
+    let ready_blko = common::snapshot_section(&ready.store, &ready.ready_snapshot_ref, tag::BLKO)?;
+    assert_eq!(
+        blko_dirty_clusters(&ready_blko)?,
+        0,
+        "READY snapshot should not have pv-blk overlay writes before Start"
     );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    let (run, io_snapshot, meta_proof, verify_done) = rt.block_on(async {
+        let run = ready
+            .svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(ready.lease.clone()),
+                until: Some(proto::run_request::Until::FrameBudget(LINUX_IO_FRAMES)),
+                hard_icount_cap: LINUX_FRAME_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run Linux pv-blk IO frame: {e}"))?
+            .into_inner();
+        if run.reason != i32::from(proto::StopReason::BudgetReached) {
+            return Err(format!(
+                "Linux pv-blk IO run stopped with {}, expected BudgetReached",
+                run.reason
+            ));
+        }
+        if run.frames_elapsed != u64::from(LINUX_IO_FRAMES) {
+            return Err(format!(
+                "Linux pv-blk IO run frames_elapsed {}, expected {LINUX_IO_FRAMES}",
+                run.frames_elapsed
+            ));
+        }
+
+        let meta = ready
+            .svc
+            .read_guest_memory(Request::new(proto::ReadGuestMemoryRequest {
+                lease: Some(ready.lease.clone()),
+                ranges: Vec::new(),
+                region_ranges: vec![proto::RegionRange {
+                    region: "meta".into(),
+                    layout_version: 1,
+                    offset: META_IO_MAGIC_OFF,
+                    len: META_IO_PROOF_LEN,
+                }],
+            }))
+            .await
+            .map_err(|e| format!("ReadGuestMemory meta IO proof: {e}"))?
+            .into_inner();
+        let meta_proof = meta
+            .chunks
+            .first()
+            .cloned()
+            .ok_or_else(|| "ReadGuestMemory returned no meta IO proof chunk".to_string())?;
+
+        let io_snapshot = ready
+            .svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(ready.lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot Linux pv-blk IO segment: {e}"))?
+            .into_inner();
+        let verify_done = common::verify_replay_done(
+            &ready.svc,
+            ready.ready_snapshot_ref.clone(),
+            io_snapshot.input_log_id.clone(),
+        )
+        .await?;
+
+        let _ = ready
+            .svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(ready.lease.clone()),
+            }))
+            .await;
+
+        Ok::<_, String>((run, io_snapshot, meta_proof, verify_done))
+    })?;
+
+    let checksum = assert_meta_io_proof(&meta_proof)?;
+    let io_ref = io_snapshot
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| "Linux pv-blk IO snapshot returned no snapshot ref".to_string())?;
+    let io_blko = common::snapshot_section(&ready.store, io_ref, tag::BLKO)?;
+    assert_ne!(
+        ready_blko, io_blko,
+        "guest-driven pv-blk write must change the BLKO snapshot section"
+    );
+    assert!(
+        blko_dirty_clusters(&io_blko)? > 0,
+        "Linux pv-blk IO snapshot must contain dirty overlay clusters"
+    );
+    let live_end_hash = io_snapshot
+        .state_hash
+        .as_ref()
+        .ok_or_else(|| "Linux pv-blk IO snapshot returned no state hash".to_string())?;
+    assert_eq!(
+        verify_done
+            .end_state_hash
+            .ok_or_else(|| "VerifyReplay returned no end state hash".to_string())?
+            .hash,
+        live_end_hash.hash,
+        "VerifyReplay must reproduce the guest-driven pv-blk IO segment end hash"
+    );
+
+    eprintln!(
+        "linux-pvblk-io run_icount={} frame_counter={} checksum={checksum:#x} blko_dirty_clusters={}",
+        run.icount,
+        io_snapshot.frame_counter,
+        blko_dirty_clusters(&io_blko)?
+    );
+
+    Ok(())
 }
 
 fn config() -> MachineConfig {
@@ -72,6 +201,34 @@ fn net_bus() -> MmioBus {
     bus.register(0xD000_3000, Box::new(PvEntropy::new()))
         .unwrap();
     bus
+}
+
+fn blko_dirty_clusters(section: &[u8]) -> TestResult<u32> {
+    let bytes = section
+        .get(BLKO_DIRTY_COUNT_OFF..BLKO_DIRTY_COUNT_OFF + 4)
+        .ok_or_else(|| format!("BLKO section too short: {} bytes", section.len()))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn assert_meta_io_proof(bytes: &[u8]) -> TestResult<u64> {
+    if bytes.len() != META_IO_PROOF_LEN as usize {
+        return Err(format!(
+            "meta IO proof length {}, expected {META_IO_PROOF_LEN}",
+            bytes.len()
+        ));
+    }
+    if &bytes[..8] != b"PVBLKIO1" {
+        return Err(format!("meta IO proof missing magic: {:?}", &bytes[..8]));
+    }
+    let frame = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if frame != 0 {
+        return Err(format!("meta IO proof frame {frame}, expected 0"));
+    }
+    let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if checksum == 0 {
+        return Err("meta IO proof checksum must be nonzero".into());
+    }
+    Ok(checksum)
 }
 
 fn header_for(snap: &SnapshotRef, cfg_hash: [u8; 32]) -> SegmentHeader {
