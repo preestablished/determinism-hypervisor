@@ -51,6 +51,8 @@ use std::sync::atomic::AtomicBool;
 use common::{gettid, kvm_available, spawn_store_blocking, test_bus};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::DetEntropy;
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -59,8 +61,11 @@ use dh_vmm::runctl::{run_segment, ScheduledInjection, Segment, SegmentOutcome, S
 use dh_vmm::SlotState;
 use dh_worker::fork_engine::fork_slot;
 use dh_worker::restore_engine::restore_snapshot;
+use dh_worker::snapshot_compare::compare_snapshots;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use kvm_ioctls::VcpuExit;
+use snapstore_types::SnapshotRef as StoreSnapshotRef;
+use tonic::Request;
 use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
@@ -69,14 +74,305 @@ const FULL: u64 = 200_000_000;
 /// Landing-loop iterations: 8 instructions each; 30M iters = 2.4e8
 /// capacity, so no leg ever reaches the guest's completion HLT.
 const ITERS_CMDLINE: &[u8] = b"30000000";
+const LINUX_POST_READY_FIRST_BUDGET: u64 = 1_000_000;
+const LINUX_POST_READY_SECOND_BUDGET: u64 = 1_000_000;
 
 #[test]
-#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux coverage exists"]
-fn linux_m4_transparency_requires_real_linux_fixture() {
-    common::reject_unimplemented_m9_linux_gate(
-        "m4_transparency::linux_m4_transparency_requires_real_linux_fixture",
-        "Linux snapshot transparency must boot the M9 fixture, run post-READY work, and compare restored/forked state hashes without falling back to nanokernel.",
+#[ignore = "M9 Linux artifact gate: set DH_M9_* and DH_M9_GUEST=linux"]
+fn linux_m4_post_ready_snapshot_restore_and_fork_are_transparent() {
+    const TEST_NAME: &str =
+        "m4_transparency::linux_m4_post_ready_snapshot_restore_and_fork_are_transparent";
+
+    let Some(ready) = common::m9_linux_ready_snapshot(TEST_NAME, 4).expect("M9 Linux Ready") else {
+        return;
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    rt.block_on(async {
+        let mid_run = worker_run_budget(
+            &ready.svc,
+            &ready.lease,
+            LINUX_POST_READY_FIRST_BUDGET,
+            ready.ready_snapshot.icount,
+            "control first post-Ready segment",
+        )
+        .await;
+        let mid_snapshot = worker_take_snapshot(&ready.svc, &ready.lease, "mid post-Ready").await;
+        assert_eq!(
+            mid_snapshot.icount, mid_run.icount,
+            "mid snapshot must be taken at the first post-Ready boundary"
+        );
+        assert_eq!(
+            state_hash_bytes(mid_snapshot.state_hash.as_ref(), "mid snapshot"),
+            state_hash_bytes(mid_run.state_hash.as_ref(), "mid run"),
+            "snapshot at the mid boundary must preserve the run state hash"
+        );
+        eprintln!(
+            "linux-m4 mid icount={} vns={} frame_counter={} hash={}",
+            mid_snapshot.icount,
+            mid_snapshot.vns,
+            mid_snapshot.frame_counter,
+            hex_vec(&state_hash_bytes(mid_snapshot.state_hash.as_ref(), "mid snapshot"))
+        );
+
+        let control_run = worker_run_budget(
+            &ready.svc,
+            &ready.lease,
+            LINUX_POST_READY_SECOND_BUDGET,
+            mid_snapshot.icount,
+            "control second post-Ready segment",
+        )
+        .await;
+        let control_snapshot =
+            worker_take_snapshot(&ready.svc, &ready.lease, "control final").await;
+        assert_eq!(
+            control_snapshot.icount, control_run.icount,
+            "control final snapshot must match the run boundary"
+        );
+        let control_hash = state_hash_bytes(control_snapshot.state_hash.as_ref(), "control final");
+        assert_eq!(
+            control_hash,
+            state_hash_bytes(control_run.state_hash.as_ref(), "control final run"),
+            "control snapshot state hash must match the run response"
+        );
+        eprintln!(
+            "linux-m4 control icount={} vns={} frames={} frame_counter={} hash={}",
+            control_snapshot.icount,
+            control_snapshot.vns,
+            control_run.frames_elapsed,
+            control_snapshot.frame_counter,
+            hex_vec(&control_hash)
+        );
+        worker_destroy(&ready.svc, ready.lease.clone(), "control").await;
+
+        let mid_ref = mid_snapshot
+            .snapshot
+            .clone()
+            .expect("mid post-Ready snapshot ref");
+        let restored = ready
+            .svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(mid_ref.clone()),
+                entropy_seed: Vec::new(),
+            }))
+            .await
+            .expect("RestoreSnapshot mid post-Ready")
+            .into_inner();
+        assert_eq!(
+            state_hash_bytes(restored.state_hash.as_ref(), "restored mid"),
+            state_hash_bytes(mid_snapshot.state_hash.as_ref(), "mid snapshot"),
+            "restore must preserve the post-Ready mid-boundary state hash"
+        );
+        let restored_lease = restored.lease.clone().expect("restored lease");
+        eprintln!(
+            "linux-m4 restored-mid frame_counter={} hash={}",
+            restored.frame_counter,
+            hex_vec(&state_hash_bytes(restored.state_hash.as_ref(), "restored mid"))
+        );
+        let restored_run = worker_run_budget(
+            &ready.svc,
+            &restored_lease,
+            LINUX_POST_READY_SECOND_BUDGET,
+            mid_snapshot.icount,
+            "restored second post-Ready segment",
+        )
+        .await;
+        let restored_snapshot =
+            worker_take_snapshot(&ready.svc, &restored_lease, "restored final").await;
+        assert_eq!(
+            restored_run.icount, control_run.icount,
+            "restored leg must land at the same cumulative icount"
+        );
+        eprintln!(
+            "linux-m4 restored icount={} vns={} frames={} frame_counter={} hash={}",
+            restored_snapshot.icount,
+            restored_snapshot.vns,
+            restored_run.frames_elapsed,
+            restored_snapshot.frame_counter,
+            hex_vec(&state_hash_bytes(
+                restored_snapshot.state_hash.as_ref(),
+                "restored final"
+            ))
+        );
+        let control_snapshot_ref =
+            store_snapshot_ref(control_snapshot.snapshot.as_ref(), "control final");
+        let restored_snapshot_ref =
+            store_snapshot_ref(restored_snapshot.snapshot.as_ref(), "restored final");
+        let comparison = std::thread::scope(|scope| {
+            scope
+                .spawn(|| compare_snapshots(&ready.store, control_snapshot_ref, restored_snapshot_ref))
+                .join()
+                .expect("snapshot comparison thread")
+        })
+        .expect("compare control/restored final snapshots");
+        eprintln!(
+            "linux-m4 snapshot diff rip_expected={:#x} rip_actual={:#x} reg_diffs={} diff_pages={:?}",
+            comparison.rip_expected,
+            comparison.rip_actual,
+            comparison.reg_diffs.len(),
+            comparison.diff_page_idx
+        );
+        for diff in comparison.reg_diffs.iter().take(8) {
+            eprintln!(
+                "linux-m4 reg_diff {} expected={} actual={}",
+                diff.name,
+                hex_vec(&diff.expected),
+                hex_vec(&diff.actual)
+            );
+        }
+        assert_eq!(
+            state_hash_bytes(restored_snapshot.state_hash.as_ref(), "restored final"),
+            control_hash,
+            "snapshot/restore detour must be invisible to the Linux post-Ready state hash"
+        );
+        worker_destroy(&ready.svc, restored_lease, "restored").await;
+
+        let fork_parent = ready
+            .svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(mid_ref),
+                entropy_seed: Vec::new(),
+            }))
+            .await
+            .expect("RestoreSnapshot fork parent")
+            .into_inner()
+            .lease
+            .expect("fork parent lease");
+        let forked = ready
+            .svc
+            .fork(Request::new(proto::ForkRequest {
+                parent: Some(fork_parent.clone()),
+                count: 2,
+                entropy_seeds: Vec::new(),
+            }))
+            .await
+            .expect("Fork post-Ready parent")
+            .into_inner();
+        assert_eq!(forked.children.len(), 2, "fork must return two children");
+
+        let mut child_hashes = Vec::new();
+        for (index, child) in forked.children.iter().enumerate() {
+            let label = format!("fork child {index} second post-Ready segment");
+            let child_run = worker_run_budget(
+                &ready.svc,
+                child,
+                LINUX_POST_READY_SECOND_BUDGET,
+                mid_snapshot.icount,
+                &label,
+            )
+            .await;
+            assert_eq!(
+                child_run.icount, control_run.icount,
+                "{label} must land at the same cumulative icount"
+            );
+            let child_snapshot =
+                worker_take_snapshot(&ready.svc, child, &format!("fork child {index} final")).await;
+            child_hashes.push(state_hash_bytes(
+                child_snapshot.state_hash.as_ref(),
+                &format!("fork child {index} final"),
+            ));
+        }
+        assert_eq!(child_hashes[0], control_hash, "fork child 0 final hash");
+        assert_eq!(child_hashes[1], control_hash, "fork child 1 final hash");
+
+        for (index, child) in forked.children.into_iter().enumerate() {
+            worker_destroy(&ready.svc, child, &format!("fork child {index}")).await;
+        }
+        worker_destroy(&ready.svc, fork_parent, "fork parent").await;
+    });
+}
+
+async fn worker_run_budget(
+    svc: &dh_worker::service::WorkerService,
+    lease: &proto::Lease,
+    budget: u64,
+    expected_start_icount: u64,
+    label: &str,
+) -> proto::RunResponse {
+    let run = svc
+        .run(Request::new(proto::RunRequest {
+            lease: Some(lease.clone()),
+            until: Some(proto::run_request::Until::IcountBudget(budget)),
+            hard_icount_cap: 0,
+            capture: None,
+        }))
+        .await
+        .unwrap_or_else(|e| panic!("{label}: Run: {e}"))
+        .into_inner();
+    assert_eq!(
+        run.reason,
+        i32::from(proto::StopReason::BudgetReached),
+        "{label}: run stopped with reason {}",
+        run.reason
     );
+    assert_eq!(
+        run.icount,
+        expected_start_icount + budget,
+        "{label}: run must land exactly on the requested post-Ready budget"
+    );
+    run
+}
+
+async fn worker_take_snapshot(
+    svc: &dh_worker::service::WorkerService,
+    lease: &proto::Lease,
+    label: &str,
+) -> proto::TakeSnapshotResponse {
+    let snapshot = svc
+        .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+            lease: Some(lease.clone()),
+            seal_input_log: Some(true),
+            capture: None,
+        }))
+        .await
+        .unwrap_or_else(|e| panic!("{label}: TakeSnapshot: {e}"))
+        .into_inner();
+    assert!(
+        snapshot
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.hash.len() == 32),
+        "{label}: snapshot ref must be present"
+    );
+    assert_eq!(
+        snapshot.input_log_id.len(),
+        32,
+        "{label}: TakeSnapshot must seal a DHILOG segment"
+    );
+    snapshot
+}
+
+async fn worker_destroy(svc: &dh_worker::service::WorkerService, lease: proto::Lease, label: &str) {
+    svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+        .await
+        .unwrap_or_else(|e| panic!("{label}: DestroyVm: {e}"));
+}
+
+fn state_hash_bytes(hash: Option<&proto::StateHash>, label: &str) -> Vec<u8> {
+    let bytes = hash
+        .unwrap_or_else(|| panic!("{label}: missing state_hash"))
+        .hash
+        .clone();
+    assert_eq!(bytes.len(), 32, "{label}: state_hash length");
+    bytes
+}
+
+fn hex_vec(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn store_snapshot_ref(snapshot: Option<&proto::SnapshotRef>, label: &str) -> StoreSnapshotRef {
+    let bytes: [u8; 32] = snapshot
+        .unwrap_or_else(|| panic!("{label}: missing snapshot ref"))
+        .hash
+        .as_slice()
+        .try_into()
+        .unwrap_or_else(|_| panic!("{label}: snapshot ref must be 32 bytes"));
+    StoreSnapshotRef::from_bytes(bytes)
 }
 
 fn config(cmdline: &[u8]) -> MachineConfig {

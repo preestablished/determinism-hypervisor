@@ -180,7 +180,8 @@ pub fn canonical_vcpu_blob(vcpu: &VcpuFd, vns: u64) -> Result<Vec<u8>, KvmError>
         move |e: kvm_ioctls::Error| KvmError::Open(format!("{what}: {e}"))
     };
     let regs = vcpu.get_regs().map_err(kvm_err("KVM_GET_REGS"))?;
-    let sregs = vcpu.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+    let mut sregs = vcpu.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+    crate::vcpu_state::canonicalize_sregs(&mut sregs);
     let fpu = vcpu.get_fpu().map_err(kvm_err("KVM_GET_FPU"))?;
     let events = vcpu
         .get_vcpu_events()

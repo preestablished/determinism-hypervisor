@@ -2080,6 +2080,25 @@ fn frame_counter_from_bus(bus: &mut dh_devices::MmioBus) -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn reseed_pv_clock_vns_base(bus: &mut dh_devices::MmioBus, vns: u64) -> Result<(), Status> {
+    for (_base, dev) in bus.devices_mut() {
+        if dev.device_id() == dh_devices::clock::DEVICE_ID_PV_CLOCK {
+            let Some(clock) = dev
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<dh_devices::clock::PvClock>())
+            else {
+                return Err(Status::internal(
+                    "pv-clock device does not downcast to PvClock",
+                ));
+            };
+            clock.set_vns_base(vns);
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 fn runtime_detchannel_mut(bus: &mut dh_devices::MmioBus) -> Option<&mut RuntimeDetChannel> {
     bus.devices_mut().find_map(|(_base, dev)| {
         if dev.device_id() != dh_devices::detchannel::DEVICE_ID_DETCHANNEL {
@@ -4178,6 +4197,38 @@ impl HypervisorWorker for WorkerService {
                                     e,
                                 )
                             })?;
+                    if let Err(e) = reseed_pv_clock_vns_base(&mut runtime.bus, boundary.vns) {
+                        return Err(fault_runtime_after_snapshot_loss(
+                            manager.as_ref(),
+                            runtime,
+                            lease.slot_id,
+                            "TakeSnapshot could not reseed pv-clock",
+                            e,
+                        ));
+                    }
+                    let counter_reset = match runtime.counter.as_ref() {
+                        Some(counter) => counter.reset(),
+                        None => {
+                            return Err(fault_runtime_after_snapshot_loss(
+                                manager.as_ref(),
+                                runtime,
+                                lease.slot_id,
+                                "TakeSnapshot could not reset segment counter",
+                                Status::failed_precondition(
+                                    "slot actor has no InstRetired counter",
+                                ),
+                            ));
+                        }
+                    };
+                    if let Err(e) = counter_reset {
+                        return Err(fault_runtime_after_snapshot_loss(
+                            manager.as_ref(),
+                            runtime,
+                            lease.slot_id,
+                            "TakeSnapshot could not reset segment counter",
+                            Status::data_loss(format!("counter reset: {e:?}")),
+                        ));
+                    }
                     if let Err(e) = manager
                         .set_position(
                             &lease,

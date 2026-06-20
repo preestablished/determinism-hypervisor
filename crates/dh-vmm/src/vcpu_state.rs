@@ -32,7 +32,8 @@ use crate::msr::{
     MSR_TSC_AUX,
 };
 use kvm_bindings::{
-    kvm_debugregs, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, Msrs,
+    kvm_debugregs, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs, kvm_vcpu_events,
+    kvm_xcrs, Msrs,
 };
 
 /// §8.1 MSR capture list for the restore codec — same set and order as
@@ -84,6 +85,33 @@ fn kvm_err(what: &'static str) -> impl Fn(kvm_ioctls::Error) -> KvmError {
     move |e| KvmError::Open(format!("{what}: {e}"))
 }
 
+pub fn canonicalize_unusable_segment(seg: &mut kvm_segment) {
+    if seg.unusable == 0 {
+        return;
+    }
+    let selector = seg.selector;
+    *seg = kvm_segment {
+        selector,
+        unusable: 1,
+        ..Default::default()
+    };
+}
+
+pub fn canonicalize_sregs(sregs: &mut kvm_sregs) {
+    for segment in [
+        &mut sregs.cs,
+        &mut sregs.ds,
+        &mut sregs.es,
+        &mut sregs.fs,
+        &mut sregs.gs,
+        &mut sregs.ss,
+        &mut sregs.tr,
+        &mut sregs.ldt,
+    ] {
+        canonicalize_unusable_segment(segment);
+    }
+}
+
 /// Capture the full state set from a vCPU stopped at a boundary.
 pub fn capture(slot: &SlotVm) -> Result<VcpuState, KvmError> {
     let vcpu = &slot.vcpu;
@@ -121,10 +149,12 @@ pub fn capture(slot: &SlotVm) -> Result<VcpuState, KvmError> {
             RESTORE_MSR_LIST[n]
         )));
     }
+    let mut sregs = vcpu.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+    canonicalize_sregs(&mut sregs);
 
     Ok(VcpuState {
         regs: vcpu.get_regs().map_err(kvm_err("KVM_GET_REGS"))?,
-        sregs: vcpu.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?,
+        sregs,
         fpu: vcpu.get_fpu().map_err(kvm_err("KVM_GET_FPU"))?,
         xsave,
         xcrs: vcpu.get_xcrs().map_err(kvm_err("KVM_GET_XCRS"))?,
@@ -395,6 +425,45 @@ mod tests {
         assert_eq!(std::mem::size_of::<kvm_xcrs>(), 392);
         assert_eq!(std::mem::size_of::<kvm_vcpu_events>(), 64);
         assert_eq!(std::mem::size_of::<kvm_debugregs>(), 128);
+    }
+
+    #[test]
+    fn unusable_segment_canonicalization_ignores_hidden_descriptor_noise() {
+        let mut noisy = kvm_segment {
+            base: 0xDEAD_BEEF,
+            limit: 0xFFFF,
+            selector: 0x33,
+            type_: 3,
+            present: 1,
+            dpl: 3,
+            db: 1,
+            s: 1,
+            l: 1,
+            g: 1,
+            avl: 1,
+            unusable: 7,
+            padding: 0xAA,
+        };
+        let mut quiet = kvm_segment {
+            selector: 0x33,
+            unusable: 1,
+            ..Default::default()
+        };
+        canonicalize_unusable_segment(&mut noisy);
+        canonicalize_unusable_segment(&mut quiet);
+        assert_eq!(noisy, quiet);
+        assert_eq!(noisy.selector, 0x33, "selector remains guest-visible");
+        assert_eq!(noisy.unusable, 1, "unusable is normalized to a boolean");
+
+        let mut usable = kvm_segment {
+            selector: 0x10,
+            present: 1,
+            type_: 11,
+            ..Default::default()
+        };
+        let before = usable;
+        canonicalize_unusable_segment(&mut usable);
+        assert_eq!(usable, before, "usable segments are not rewritten");
     }
 
     #[test]
