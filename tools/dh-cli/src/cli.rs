@@ -276,12 +276,13 @@ fn gate_cmd(args: &[String]) {
                 print!("{}", report.artifact());
                 if report.passed() {
                     println!(
-                        "M9 LINUX READY GATE: PASS ({} runs, Ready EventKind {})",
+                        "M9 LINUX PHASE-1 GATE: PASS ({} runs, Ready EventKind {}, post-Ready budget {})",
                         parsed.runs,
-                        crate::linux::READY_EVENT_KIND
+                        crate::linux::READY_EVENT_KIND,
+                        crate::linux::DEFAULT_POST_READY_BUDGET
                     );
                 } else {
-                    eprintln!("M9 LINUX READY GATE: FAIL");
+                    eprintln!("M9 LINUX PHASE-1 GATE: FAIL");
                     std::process::exit(1);
                 }
             }

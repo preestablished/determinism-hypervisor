@@ -99,7 +99,11 @@ pub fn run_linux_gate(
     runs: usize,
     paths: &crate::linux::LinuxGuestPaths,
 ) -> Result<GateReport, String> {
-    zero_divergence("linux-ready", runs, |_| {
-        crate::linux::ready_fingerprint(paths, crate::linux::DEFAULT_READY_HARD_CAP)
+    zero_divergence("linux-phase1", runs, |_| {
+        crate::linux::phase1_fingerprint(
+            paths,
+            crate::linux::DEFAULT_READY_HARD_CAP,
+            crate::linux::DEFAULT_POST_READY_BUDGET,
+        )
     })
 }

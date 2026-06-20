@@ -20,6 +20,7 @@ use kvm_ioctls::VcpuExit;
 
 pub const DEFAULT_LINUX_MEM_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_READY_HARD_CAP: u64 = 10_000_000_000;
+pub const DEFAULT_POST_READY_BUDGET: u64 = 2_000_000;
 pub const READY_EVENT_KIND: u16 = detguest_wire::record::EventKind::Ready as u16;
 
 const DETCHANNEL_MMIO_BASE: u64 = 0xD000_3000;
@@ -60,6 +61,20 @@ pub struct LinuxReadyReport {
     pub initramfs_hash: String,
     pub base_image_hash: String,
     pub game_image_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinuxPostReadyReport {
+    pub budget: u64,
+    pub icount: u64,
+    pub vns: u64,
+    pub state_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinuxPhase1Report {
+    pub ready: LinuxReadyReport,
+    pub post_ready: LinuxPostReadyReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +137,28 @@ pub fn run_to_ready(
     hard_cap: u64,
     paranoid_hash: bool,
 ) -> Result<LinuxReadyReport, String> {
+    Ok(run_linux(paths, hard_cap, paranoid_hash, None)?.0)
+}
+
+pub fn run_phase1(
+    paths: &LinuxGuestPaths,
+    hard_cap: u64,
+    post_ready_budget: u64,
+    paranoid_hash: bool,
+) -> Result<LinuxPhase1Report, String> {
+    let (ready, post_ready) = run_linux(paths, hard_cap, paranoid_hash, Some(post_ready_budget))?;
+    Ok(LinuxPhase1Report {
+        ready,
+        post_ready: post_ready.expect("post_ready_budget requested a post-Ready report"),
+    })
+}
+
+fn run_linux(
+    paths: &LinuxGuestPaths,
+    hard_cap: u64,
+    paranoid_hash: bool,
+    post_ready_budget: Option<u64>,
+) -> Result<(LinuxReadyReport, Option<LinuxPostReadyReport>), String> {
     dh_vmm::run::install_kick_handler().map_err(|e| format!("kick handler: {e}"))?;
 
     let bzimage = read_file(&paths.bzimage)?;
@@ -250,8 +287,6 @@ pub fn run_to_ready(
         )
         .map_err(|e| format!("{e}"))?
     };
-    counter.disable().map_err(|e| format!("{e:?}"))?;
-
     let ready = ready_event
         .ok_or_else(|| format!("run stopped without Ready EventKind {READY_EVENT_KIND}"))?;
     if outcome.reason != StopReason::NextSdkEvent {
@@ -261,7 +296,7 @@ pub fn run_to_ready(
         ));
     }
 
-    Ok(LinuxReadyReport {
+    let ready_report = LinuxReadyReport {
         ready_event_kind: READY_EVENT_KIND,
         ready_payload_len: READY_PAYLOAD_LEN,
         ready_unit: ready.unit,
@@ -277,7 +312,73 @@ pub fn run_to_ready(
         initramfs_hash: hex(&initramfs_hash),
         base_image_hash: hex(&base_image_hash),
         game_image_hash: hex(&game_image_hash),
-    })
+    };
+
+    let post_ready = match post_ready_budget {
+        Some(budget) => {
+            let start_icount = outcome.boundary.icount;
+            let post_outcome = {
+                let hash_device_sections = || {
+                    let rail_ref = rail.borrow();
+                    linux_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+                };
+                let mut on_exit = |exit: VcpuExit<'_>| {
+                    let icount = counter
+                        .read()
+                        .map_err(|e| BoundaryError::Exit(format!("counter read: {e:?}")))?;
+                    service_linux_exit(&mut rail.borrow_mut(), icount, exit)?;
+                    Ok(())
+                };
+                let mut segment = Segment {
+                    slot: &mut slot,
+                    counter: &counter,
+                    chain: &mut chain,
+                    config: &config,
+                    start_icount,
+                    injections: &[],
+                    timer: None,
+                    pause: &pause,
+                    sdk_events: None,
+                    hash_device_sections: Some(&hash_device_sections),
+                };
+                run_segment_with_options(
+                    &mut segment,
+                    Until::IcountBudget(budget),
+                    RunOptions {
+                        paranoid_hash,
+                        ..RunOptions::default()
+                    },
+                    &mut || false,
+                    &mut on_exit,
+                )
+                .map_err(|e| format!("post-Ready budget: {e}"))?
+            };
+            if post_outcome.reason != StopReason::BudgetReached {
+                return Err(format!(
+                    "post-Ready budget stopped with {:?}, expected BudgetReached",
+                    post_outcome.reason
+                ));
+            }
+            if post_outcome.boundary.icount != start_icount + budget {
+                return Err(format!(
+                    "post-Ready budget stopped at {}, expected {}",
+                    post_outcome.boundary.icount,
+                    start_icount + budget
+                ));
+            }
+            Some(LinuxPostReadyReport {
+                budget,
+                icount: post_outcome.boundary.icount,
+                vns: post_outcome.vns,
+                state_hash: hex(&post_outcome.state_hash),
+            })
+        }
+        None => None,
+    };
+
+    counter.disable().map_err(|e| format!("{e:?}"))?;
+
+    Ok((ready_report, post_ready))
 }
 
 pub fn ready_fingerprint(paths: &LinuxGuestPaths, hard_cap: u64) -> Result<String, String> {
@@ -295,6 +396,32 @@ pub fn ready_fingerprint(paths: &LinuxGuestPaths, hard_cap: u64) -> Result<Strin
         r.config_hash,
         r.game_image_hash,
         r.base_image_hash
+    ))
+}
+
+pub fn phase1_fingerprint(
+    paths: &LinuxGuestPaths,
+    hard_cap: u64,
+    post_ready_budget: u64,
+) -> Result<String, String> {
+    let r = run_phase1(paths, hard_cap, post_ready_budget, false)?;
+    Ok(format!(
+        "ready_event_kind={} ready_unit={} ready_region_count={} ready_manifest_generation={} ready_payload_digest={} ready_icount={} ready_vns={} ready_state_hash={} config_hash={} game_image_hash={} base_image_hash={} post_ready_budget={} post_ready_icount={} post_ready_vns={} post_ready_state_hash={}",
+        r.ready.ready_event_kind,
+        r.ready.ready_unit,
+        r.ready.ready_region_count,
+        r.ready.ready_manifest_generation,
+        r.ready.ready_payload_digest,
+        r.ready.icount,
+        r.ready.vns,
+        r.ready.state_hash,
+        r.ready.config_hash,
+        r.ready.game_image_hash,
+        r.ready.base_image_hash,
+        r.post_ready.budget,
+        r.post_ready.icount,
+        r.post_ready.vns,
+        r.post_ready.state_hash
     ))
 }
 
