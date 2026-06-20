@@ -81,6 +81,29 @@ Final M9 acceptance evidence must not set `*_ALLOW_SKIP=1`. Missing artifacts
 are gate failures, not skips. Keep staged artifact directories outside the repo
 so large bzImage/initramfs/disk images cannot be committed accidentally.
 
+The scheduled Linux gate is the `m7-linux-fork-verify-100` nightly canary in
+`.github/workflows/nightly-drift.yaml`. It uses the concrete runner paths:
+
+```bash
+/home/infra-admin/.cache/dh-m9/reference-workload/bzImage
+/home/infra-admin/.cache/dh-m9/reference-workload/initramfs.cpio
+/home/infra-admin/.cache/dh-m9/reference-workload/base.img
+/home/infra-admin/.cache/dh-m9/reference-workload/game.img
+/home/infra-admin/.cache/dh-m9/image-cache
+```
+
+That job preflights `/dev/kvm`, `nasm`, every artifact path, the writable
+`DH_M9_IMAGE_CACHE`, and slot affinity. It then runs the Linux M7 canary with
+`DH_M7_ACCEPT_GUEST=linux`, `DH_M7_ACCEPT_JOBS=100`,
+`DH_M7_ACCEPT_SLOT_CORES=2-5`, `DH_M7_ACCEPT_ALLOW_SKIP=0`,
+`DH_M9_ALLOW_SKIP=0`, and `taskset -c "$DH_M7_ACCEPT_SLOT_CORES"`.
+
+Full M9 acceptance, the full Linux M7 1000-child gate, and Linux M7 cross-slot
+rerun determinism are operator-run commands. They require deliberate exclusive
+host scheduling and are intentionally not required CI. The existing
+nanokernel/default `m7-fork-verify-100` nightly canary remains live beside the
+Linux canary.
+
 ## Tool provisioning (beyond the base Rust toolchain)
 
 Tools the milestone jobs (M5 fuzz / M6 smoke / M7 soak — IMPLEMENTATION-PLAN)
@@ -138,7 +161,9 @@ Notes:
   `kvm-intel` runner with `DH_M7_ACCEPT_SLOT_CORES=2-5`, matching this
   box's isolated slot-core set. The full 1000-child acceptance command
   remains operator-run because it is the phase exit gate rather than the
-  nightly tripwire.
+  nightly tripwire. The Linux M7 nightly canary also runs 100 children with
+  the staged M9 artifacts and the same default slot-core set; full Linux
+  acceptance and cross-slot evidence remain operator-run.
 - **`grpcurl --version` prints `dev build <no version set>`** when installed
   via `go install` (release binaries get the version stamped via ldflags;
   go install does not). Verify the real version with
@@ -223,7 +248,10 @@ TOKEN=$(gh api -X POST repos/preestablished/determinism-hypervisor/actions/runne
   the next push), so cancelling superseded runs is safe and keeps the box
   from queueing stale work. `nightly-drift.yaml` — the measurement-flavored
   workflow — uses `cancel-in-progress: false`: never kill a drift/canary
-  run in flight.
+  run in flight. A long operator dispatch on the same single `kvm-intel`
+  runner, including full Linux M9 or M7 acceptance, can delay the nightly
+  drift/canary jobs; that is a scheduling cost, not a reason to promote those
+  commands to required CI.
 - The three other runners on this box serve other repos on the housekeeping
   cores; their jobs can add noise to perf gates. Perf-gate flakiness →
   schedule the nightly when the box is quiet before touching margins.

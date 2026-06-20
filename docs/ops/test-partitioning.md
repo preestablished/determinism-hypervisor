@@ -101,6 +101,47 @@ building `MachineConfig`: BLAKE3-hash each staged file and copy/link it to
 inputs; the image-cache entries are the bytes the worker resolves for
 `CreateVm`.
 
+## M9 Linux gate classification
+
+Linux artifact gates are not required CI. They depend on staged `DH_M9_*`
+artifacts, live KVM, and deliberate scheduling on the `kvm-intel` host. The
+100-child Linux M7 canary is the only scheduled Linux artifact gate in
+`nightly-drift.yaml`; the full M9 evidence commands remain operator-run.
+
+Every command in this section requires the staging block above, plus
+`DH_M9_ALLOW_SKIP=0`. Commands using the worker service also require the
+`DH_M9_IMAGE_CACHE` directory to exist and contain the artifact cache entries.
+
+| Gate | Classification | Command |
+|---|---|---|
+| Linux fixture contract | Operator-run preflight | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture` |
+| Linux boot-to-READY identity | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_ready --release -- --ignored --nocapture` |
+| Linux Phase 1 CLI gate | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo run -p dh-cli -- gate --linux --runs 100 --bzimage "$DH_M9_BZIMAGE" --initramfs "$DH_M9_INITRAMFS" --base-image "$DH_M9_BASE_IMAGE" --game-image "$DH_M9_GAME_IMAGE"` |
+| Linux landing/counting | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_landing_counting --release -- --ignored --nocapture` |
+| Linux timer/IRQ determinism | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture` |
+| Linux M4 snapshot/restore/fork transparency | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m4_transparency --release linux -- --ignored --nocapture` |
+| Linux M5 frame scheduling | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_frame_scheduling --release linux -- --ignored --nocapture` |
+| Linux M5 guest-driven pv-blk loopback | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_net_loopback --release linux -- --ignored --nocapture` |
+| Linux M5 corpus reverify | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test m5_record_replay --release linux_m5_record_replay_post_ready_corpus_reverifies -- --ignored --nocapture` |
+| Linux worker API | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test linux_worker_api --release -- --ignored --nocapture` |
+| Linux M7 nightly canary | Nightly | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` |
+| Linux M7 full fork/VerifyReplay | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` |
+| Linux M7 cross-slot rerun determinism | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` |
+
+Producer evidence reviewed for this classification:
+
+| Bead | Evidence summary |
+|---|---|
+| `4s9.22` | `dh-cli` Linux boot/run/gate entry points accepted with artifact-backed Linux gate runs; default `dh-cli gate` remained nanokernel. |
+| `4s9.23` | `linux_ready` accepted with no-skip artifact-backed cold boot identity evidence. |
+| `4s9.24` | Linux Phase 1 CLI gate accepted with `--runs 100`, identical READY identity, config hash, and post-READY budget hash. |
+| `4s9.25` | `linux_timer_determinism` accepted across 100 cold Linux cases with identical delivered icount list, vector/source metadata, and final state hash. |
+| `4s9.26` | `linux_landing_counting` accepted with 100 exact post-READY targets, identical tuples across cold boots, and timer-adjacent metadata. |
+| `4s9.27` | Linux M5 post-READY record/replay corpus accepted; `linux_m5_record_replay_post_ready_corpus_reverifies` replaced the guard and passed with nonzero epoch verification. |
+| `4s9.28` | Linux M4/M5 worker regressions accepted: M4 transparency, frame-budget/frame marks, and guest-driven pv-blk loopback all passed with no-skip staged artifacts. |
+| `4s9.29` | Linux M7 full 1000-child acceptance and cross-slot rerun passed under `taskset -c 2-5`; nightly Linux 100-child canary was added while preserving the nanokernel canary. |
+| `4s9.30` | Linux worker API accepted for CreateVm, Run-to-Ready, StreamGuestEvents, Snapshot, Restore, Fork, child Run, and VerifyReplay. |
+
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 
 These self-skip elsewhere; on the box they run for real:
@@ -117,13 +158,13 @@ These self-skip elsewhere; on the box they run for real:
 | M1 device-surface acceptance | `cargo test -p determinism-tests --test m1_acceptance` | <1s |
 | Phase-1 gate (one command) | `cargo run -p dh-cli -- gate [--runs N]` | ~32s at 100 runs |
 | M6 grpcurl + metrics smoke | [`docs/ops/m6-grpcurl-metrics-smoke.md`](./m6-grpcurl-metrics-smoke.md) | operator-run |
-| M9 Linux acceptance gates | Export `DH_M9_BZIMAGE`, `DH_M9_INITRAMFS`, `DH_M9_BASE_IMAGE`, `DH_M9_GAME_IMAGE`, and `DH_M9_IMAGE_CACHE` as above, then run the M9-specific test commands introduced by the implementation beads | operator-run; no `*_ALLOW_SKIP=1` for final gates |
+| M9 Linux acceptance gates | Export `DH_M9_BZIMAGE`, `DH_M9_INITRAMFS`, `DH_M9_BASE_IMAGE`, `DH_M9_GAME_IMAGE`, and `DH_M9_IMAGE_CACHE` as above, then run the exact commands in [M9 Linux gate classification](#m9-linux-gate-classification) | operator-run; no `*_ALLOW_SKIP=1` for final gates |
 | M7 nightly fork/VerifyReplay canary, nanokernel/default | `DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | scheduled in `nightly-drift.yaml`; preserves `pad_echo` coverage |
-| M7 nightly fork/VerifyReplay canary, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` | scheduled in `nightly-drift.yaml`; boots M9 Linux to READY once and verifies 100 fork children |
+| M7 nightly fork/VerifyReplay canary, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` | scheduled in `nightly-drift.yaml`; boots M9 Linux to READY once and verifies 100 fork children |
 | M7 fork/VerifyReplay acceptance, nanokernel/default | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture` | long; `pad_echo` path |
-| M7 fork/VerifyReplay acceptance, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | primary Linux M7 gate; 1000 fork children, zero Divergence, matching `VerifyReplay.Done.end_state_hash`; run under `taskset -c 2-5` if the invoking shell has narrower affinity |
+| M7 fork/VerifyReplay acceptance, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | primary Linux M7 gate; 1000 fork children, zero Divergence, matching `VerifyReplay.Done.end_state_hash` |
 | M7 cross-slot rerun determinism, nanokernel/default | `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | operator-run; 10 sampled jobs across all child slots |
-| M7 cross-slot rerun determinism, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | operator-run; same-seed snapshot refs, state hashes, input log ids, DHILOG payloads, frame marks, and meta checks must match across sampled slots |
+| M7 cross-slot rerun determinism, Linux | Export the `DH_M9_*` artifact variables above, then run `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | operator-run; same-seed snapshot refs, state hashes, input log ids, DHILOG payloads, frame marks, and meta checks must match across sampled slots |
 | M7 throughput soak under housekeeping load | `DH_M7_SOAK_SLOT_CORES=2-5 DH_M7_SOAK_HOUSEKEEPING_CORES=0-1 DH_M7_SOAK_SECONDS=1800 ci/m7-throughput-soak.sh` | minimum 30 min |
 
 `DH_M7_SOAK_SECONDS` is a minimum measured wall-clock window; the soak can run

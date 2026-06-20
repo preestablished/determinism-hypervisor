@@ -46,6 +46,31 @@ host:
 | `plain-landing` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000b4`, `vns=2000000`, state hash `64eecca97eed5c9a3f75c14d76bc6d6a810242ad31366ba84fe4168d72ec6b6a`, `timer=None` |
 | `timer-event` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000ea`, `vns=2000000`, state hash `25ec9e0e8cf4389caeb7b6c7714c2f647cea49a089289d1c52d82c98f993fc88`, `timer=Some(1234567)` |
 
+## M9 post-Linux nanokernel preservation (2026-06-20)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`; `bash
+ci/check-determinism-class.sh` reported all 7 lock keys matched. `/dev/kvm`
+was present and rw, `nasm` was `/usr/bin/nasm`, and `taskset -c 2-5` reported
+`Cpus_allowed_list: 2-5`.
+
+This is a post-M9 preservation addendum only. It proves the original
+nanokernel Phase 1 gate and its supporting tests still run after the Linux
+guest path landed; it does not publish the downstream Linux-plus-nanokernel
+exit-gate rollup tracked by `determinism-hypervisor-4s9.32`.
+
+| Command | Evidence |
+|---|---|
+| `cargo test --workspace` | PASS. The workspace suite included the live Phase 1 KVM tests, nanokernel crate tests, worker snapshot/fork/replay tests, and the checked-in `pad_echo_6s` corpus reverify. Linux artifact acceptance tests remained ignored in the ordinary workspace run. |
+| `cargo run -p dh-cli -- gate --runs 100` | PASS: `PHASE-1 DETERMINISM GATE: PASS (100 runs each)`. The command did not pass `--linux`, so `tools/dh-cli/src/gate.rs` used `BootSpec::Elf` with `nanokernel::landing_loop_elf()` for `plain-landing` and `nanokernel::timer_guest_elf()` for `timer-event`. |
+| `plain-landing` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000b4`, `vns=2000000`, state hash `64eecca97eed5c9a3f75c14d76bc6d6a810242ad31366ba84fe4168d72ec6b6a`, `timer=None`. |
+| `timer-event` sub-gate | 100/100 identical: `icount=2000000`, `rip=0x1000ea`, `vns=2000000`, state hash `02bb7b547cff16219356bc26c6b782af07eb72c2e08331a995aef16e52c85113`, `timer=Some(1234567)`. |
+| `cargo test -p determinism-tests --test regression --test timer_determinism --test if0_deferral --test landing_precision --test counting_semantics --test counting_smoke --test m1_acceptance` | PASS. `counting_semantics` 2/2, `counting_smoke` 1/1, `if0_deferral` 5/5, `landing_precision` 2/2, `m1_acceptance` 1/1, `regression` 2/2, `timer_determinism` 5/5. |
+
+Fixture preservation checks before the documentation edits showed no changes
+under `tests/nanokernel/**` or
+`crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s/**`.
+
 ## Known refinements baked into the gate (not exceptions)
 
 - §3.1 exit-instruction retirement is the MEASURED rule (retire zero,

@@ -134,6 +134,34 @@ rerun or re-recorded on this host:
 | M7 cross-slot rerun acceptance | Target discovered and ignored by default. Operator command remains `DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture`. |
 | M4 perf telemetry | Still ignored by default: `m4_perf_gates_p50_128mib ... ignored`, command `cargo test -p dh-worker --test perf_gates --release -- --ignored --nocapture`. |
 
+## M9 post-Linux nanokernel preservation (2026-06-20)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`; `bash
+ci/check-determinism-class.sh` reported all 7 lock keys matched. `/dev/kvm`
+was present and rw, `nasm` was `/usr/bin/nasm`, and `taskset -c 2-5` reported
+`Cpus_allowed_list: 2-5`.
+
+This addendum is limited to preserving the pre-existing nanokernel M5/M7
+coverage after M9 Linux work. It does not claim the downstream
+Linux-plus-nanokernel Phase 2 evidence rollup tracked by
+`determinism-hypervisor-4s9.32`.
+
+| Command | Evidence |
+|---|---|
+| `cargo test --workspace` | PASS. The run included worker restore/fork/replay tests, nanokernel fixture drift tests, and the checked-in `pad_echo_6s` corpus reverify. |
+| `cargo test -p dh-worker --test m5_record_replay record_replay_corpus_pad_echo_6s_reverifies -- --nocapture` | PASS: `record_replay_corpus_pad_echo_6s_reverifies ... ok`. |
+| `cargo test -p dh-worker --test m7_fork_verify -- --nocapture` | PASS: non-ignored helper tests 3/3; the full acceptance and cross-slot M7 gates remained ignored and discoverable. |
+| `DH_M7_ACCEPT_JOBS=2 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` | PASS: `M7 fork/verify done: verified=2 divergence=0 unique_hashes=2`. `DH_M7_ACCEPT_GUEST` was unset, so the harness used the default nanokernel `pad_echo` fixture. |
+
+M7 nanokernel operator commands remain documented in
+[`docs/ops/test-partitioning.md`](ops/test-partitioning.md): the full
+1000-child acceptance, the 100-child nightly canary, and the cross-slot rerun
+determinism command are still separate nanokernel/default rows. Fixture
+preservation checks before the documentation edits showed no changes under
+`tests/nanokernel/**` or
+`crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s/**`.
+
 ## Known refinements baked into the gate
 
 - Snapshot and restore perf numbers are storage telemetry on the
