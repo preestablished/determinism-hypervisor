@@ -29,3 +29,12 @@ Full review notes:
 ## Remaining Judgment
 
 The plan still leaves one implementation tradeoff to the coding agent: whether to validate the Linux `PVBLKIO1` meta proof for every one of the 1000 children or for a bounded subset plus all cross-slot children. That is intentional because per-child guest-memory reads may affect runtime. The non-negotiable Linux evidence remains frame marks, epoch hashes, lineage, zero `Divergence`, and matching `VerifyReplay.Done.end_state_hash` for every child.
+
+## Fresh Review Follow-Up
+
+Two fresh subagent reviews were run after the initial plan was committed. I agree with the concrete findings and incorporated them:
+
+- The unfiltered full Linux M7 acceptance command now includes `--test-threads=1`, and the plan explicitly requires full acceptance and targeted cross-slot evidence to run sequentially on the reference host.
+- The nightly Linux canary instructions now say to duplicate the existing M7 job's repository checkout, sibling dependency checkout, Rust toolchain, KVM, and `nasm` setup before adding the Linux-specific environment and command.
+- The closeout runbook now includes `git add`, `git commit`, exact commit SHA capture, and a Beads evidence comment before `bd close`.
+- The existing explicit-core helper guidance was already source-compatible with current M9 helper users; keep that compatibility when implementing.

@@ -291,6 +291,12 @@ Recommended shape:
 
 - keep the existing `m7-fork-verify-100` job as nanokernel/default coverage;
 - add `m7-linux-fork-verify-100`;
+- copy the existing M7 job setup rather than writing a shorter cargo-only job:
+  - checkout this repository at `path: repo`;
+  - checkout sibling path dependencies at `control-plane`, `guest-sdk`, and `snapshot-store`;
+  - install the stable Rust toolchain;
+  - preflight `/dev/kvm` read/write access;
+  - preflight `nasm`;
 - set:
 
   ```yaml
@@ -306,6 +312,7 @@ Recommended shape:
   DH_M9_IMAGE_CACHE: /home/infra-admin/.cache/dh-m9/image-cache
   ```
 
+- create or verify `DH_M9_IMAGE_CACHE` before running cargo;
 - preflight `/dev/kvm`, `nasm`, and the five artifact paths before running cargo;
 - run only the full 100-child Linux acceptance test in the nightly canary, not the cross-slot test, unless runtime measurements show both fit comfortably.
 - add `m7-linux-fork-verify-100` to `alert-on-failure.needs`;

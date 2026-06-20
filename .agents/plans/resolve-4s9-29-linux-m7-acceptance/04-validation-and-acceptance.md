@@ -150,7 +150,7 @@ DH_M7_ACCEPT_JOBS=1000 \
 DH_M7_CROSS_CHECKS=10 \
 DH_M7_ACCEPT_ALLOW_SKIP=0 \
 cargo test -p dh-worker --test m7_fork_verify --release \
-  -- --ignored --nocapture
+  -- --ignored --nocapture --test-threads=1
 ```
 
 Required result:
@@ -176,6 +176,8 @@ cargo test -p dh-worker --test m7_fork_verify --release \
   m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs \
   -- --ignored --nocapture
 ```
+
+Run the unfiltered full acceptance and the targeted full cross-slot evidence sequentially. Do not run M7 acceptance commands in parallel on the reference host: both allocate from `DH_M7_ACCEPT_SLOT_CORES=2-5`, and the runner assumes exclusive slot cores during determinism gates.
 
 ## Nightly Canary Validation
 

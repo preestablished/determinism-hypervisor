@@ -67,15 +67,24 @@ After implementation and validation:
 git status --short --branch
 cargo fmt --check
 git diff --check
+git add crates/dh-worker/tests/m7_fork_verify.rs \
+  crates/dh-worker/tests/common/mod.rs \
+  .github/workflows/nightly-drift.yaml \
+  docs/ops/test-partitioning.md
+git commit -m "Add Linux M7 fork VerifyReplay acceptance"
+commit_sha=$(git rev-parse HEAD)
 bd show determinism-hypervisor-4s9.29
+bd comment determinism-hypervisor-4s9.29 "<paste close evidence here, including commit $commit_sha, host, artifact hashes, 1000/1000 VerifyReplay Done, zero Divergence, cross-slot result, nightly change, and docs change>"
 bd close determinism-hypervisor-4s9.29
 git pull --rebase
 bd dolt push
 git push
-git status --short --branch
+git status
 ```
 
 `git status` must show the branch up to date with origin before handoff.
+
+If the final implementation touches additional files, include them in the `git add` step. The important ordering is: validate, commit code/docs, record evidence on the bead with the exact commit SHA, close the bead, push Beads, then push git.
 
 ## Downstream Handoff
 
