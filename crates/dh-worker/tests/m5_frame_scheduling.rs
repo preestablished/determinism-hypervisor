@@ -17,7 +17,7 @@ mod common;
 
 use std::sync::atomic::AtomicBool;
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{gettid, kvm_available, spawn_store_blocking, TestResult, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::ctx::VecGuestMem;
 use dh_devices::entropy::{DetEntropy, PvEntropy};
@@ -25,6 +25,8 @@ use dh_devices::pad::{PvPad, PV_PAD_BASE, REG_FRAME_COUNTER};
 use dh_devices::{DevCtx, MmioBus};
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::hash::StateHashChain;
@@ -34,6 +36,8 @@ use dh_vmm::runctl::{run_segment, Segment, SegmentOutcome, StopReason, Until};
 use dh_vmm::SlotState;
 use dh_worker::restore_engine::restore_snapshot;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
+use snapstore_manifest::input_log::InputLogContainer;
+use tonic::Request;
 
 const MEM: u64 = 16 << 20;
 const FIRST_FRAMES: u64 = 3;
@@ -42,12 +46,160 @@ const FRAME_HARD_CAP: u64 = 50_000_000;
 const AT_FRAME_TARGET: u32 = 2;
 
 #[test]
-#[ignore = "M9 Linux acceptance guard: fails when DH_M9_GUEST=linux until real Linux frame coverage exists"]
-fn linux_m5_frame_scheduling_requires_real_frame_marks() {
-    common::reject_unimplemented_m9_linux_gate(
-        "m5_frame_scheduling::linux_m5_frame_scheduling_requires_real_frame_marks",
-        "Linux frame scheduling must observe real post-READY pv-pad FRAME_MARK records in the worker-recorded segment.",
+#[ignore = "M9 Linux acceptance: requires KVM dirty-ring support and staged DH_M9_* artifacts"]
+fn linux_m5_frame_budget_records_post_ready_frame_marks() -> TestResult<()> {
+    let Some(ready) = common::m9_linux_ready_snapshot(
+        "m5_frame_scheduling::linux_m5_frame_budget_records_post_ready_frame_marks",
+        2,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let start_frame = ready.ready_snapshot.frame_counter;
+    let first_expected = expected_frame_table(start_frame, FIRST_FRAMES)?;
+    let first_end = *first_expected
+        .last()
+        .ok_or_else(|| "first expected frame table is empty".to_string())?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    let (first_run, first_snapshot, restored_frame_counter, second_run, second_snapshot) = rt
+        .block_on(async {
+            let first_run = ready
+                .svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(ready.lease.clone()),
+                    until: Some(proto::run_request::Until::FrameBudget(FIRST_FRAMES as u32)),
+                    hard_icount_cap: FRAME_HARD_CAP,
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("Run first Linux frame budget: {e}"))?
+                .into_inner();
+            assert_worker_frame_budget(&first_run, FIRST_FRAMES, "first Linux run")?;
+
+            let first_snapshot = ready
+                .svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(ready.lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("TakeSnapshot first Linux frame budget: {e}"))?
+                .into_inner();
+            let first_ref = first_snapshot
+                .snapshot
+                .clone()
+                .ok_or_else(|| "first frame snapshot returned no snapshot ref".to_string())?;
+
+            let restored = ready
+                .svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(first_ref),
+                    entropy_seed: Vec::new(),
+                }))
+                .await
+                .map_err(|e| format!("RestoreSnapshot first frame boundary: {e}"))?
+                .into_inner();
+            let restored_frame_counter = restored.frame_counter;
+            let restored_lease = restored
+                .lease
+                .ok_or_else(|| "RestoreSnapshot returned no lease".to_string())?;
+
+            let second_run = ready
+                .svc
+                .run(Request::new(proto::RunRequest {
+                    lease: Some(restored_lease.clone()),
+                    until: Some(proto::run_request::Until::FrameBudget(
+                        AFTER_RESTORE_FRAMES as u32,
+                    )),
+                    hard_icount_cap: FRAME_HARD_CAP,
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("Run restored Linux frame budget: {e}"))?
+                .into_inner();
+            assert_worker_frame_budget(&second_run, AFTER_RESTORE_FRAMES, "restored Linux run")?;
+
+            let second_snapshot = ready
+                .svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(restored_lease.clone()),
+                    seal_input_log: Some(true),
+                    capture: None,
+                }))
+                .await
+                .map_err(|e| format!("TakeSnapshot restored Linux frame budget: {e}"))?
+                .into_inner();
+
+            let _ = ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(restored_lease),
+                }))
+                .await;
+            let _ = ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(ready.lease.clone()),
+                }))
+                .await;
+
+            Ok::<_, String>((
+                first_run,
+                first_snapshot,
+                restored_frame_counter,
+                second_run,
+                second_snapshot,
+            ))
+        })?;
+
+    assert_eq!(
+        first_snapshot.frame_counter, first_end,
+        "first Linux frame-budget snapshot must persist the absolute pv-pad counter"
     );
+    assert_eq!(
+        restored_frame_counter, first_end,
+        "RestoreSnapshot must report the PADD-restored absolute frame counter"
+    );
+    let first_log = input_log_payload(&ready.store, &first_snapshot.input_log_id)?;
+    let first_marks = frame_marks(&first_log);
+    assert_strict_frame_table(&first_marks, &first_expected);
+    assert!(
+        resolve_at_frame(&first_marks, first_end).is_some(),
+        "first segment frame table must resolve the final absolute frame"
+    );
+
+    let second_expected = expected_frame_table(first_end, AFTER_RESTORE_FRAMES)?;
+    let second_end = *second_expected
+        .last()
+        .ok_or_else(|| "second expected frame table is empty".to_string())?;
+    assert_eq!(
+        second_snapshot.frame_counter, second_end,
+        "restored Linux frame-budget snapshot must continue the absolute pv-pad counter"
+    );
+    let second_log = input_log_payload(&ready.store, &second_snapshot.input_log_id)?;
+    let second_marks = frame_marks(&second_log);
+    assert_strict_frame_table(&second_marks, &second_expected);
+    assert!(
+        resolve_at_frame(&second_marks, AFTER_RESTORE_FRAMES as u32).is_none(),
+        "restored frame table must use absolute frame numbers, not segment-relative values"
+    );
+
+    eprintln!(
+        "linux-m5 frames start={} first_icount={} first_frames={:?} restored_icount={} restored_frames={:?}",
+        start_frame,
+        first_run.icount,
+        first_marks,
+        second_run.icount,
+        second_marks
+    );
+
+    Ok(())
 }
 
 fn config() -> MachineConfig {
@@ -182,6 +334,50 @@ fn assert_strict_frame_table(marks: &[(u64, u32)], expected_frames: &[u32]) {
         marks.windows(2).all(|w| w[0].0 < w[1].0),
         "FRAME_MARK icounts must be strictly increasing: {marks:?}"
     );
+}
+
+fn expected_frame_table(start_frame: u32, frames: u64) -> TestResult<Vec<u32>> {
+    let frames =
+        u32::try_from(frames).map_err(|_| format!("frame count {frames} does not fit u32"))?;
+    let end = start_frame
+        .checked_add(frames)
+        .ok_or_else(|| format!("frame range overflows u32: start={start_frame} count={frames}"))?;
+    Ok((start_frame + 1..=end).collect())
+}
+
+fn assert_worker_frame_budget(
+    run: &proto::RunResponse,
+    expected_frames: u64,
+    label: &str,
+) -> TestResult<()> {
+    if run.reason != i32::from(proto::StopReason::BudgetReached) {
+        return Err(format!(
+            "{label} stopped with reason {}, expected BudgetReached",
+            run.reason
+        ));
+    }
+    if run.frames_elapsed != expected_frames {
+        return Err(format!(
+            "{label} frames_elapsed {}, expected {expected_frames}",
+            run.frames_elapsed
+        ));
+    }
+    Ok(())
+}
+
+fn input_log_payload(
+    store: &snapstore_client::blocking::SnapstoreClient,
+    input_log_id: &[u8],
+) -> TestResult<Vec<u8>> {
+    let id: [u8; 32] = input_log_id
+        .try_into()
+        .map_err(|_| "input log id must be 32 bytes".to_string())?;
+    let container = store
+        .get_input_log(snapstore_types::LogId::from_bytes(id))
+        .map_err(|e| format!("get_input_log: {e}"))?;
+    let decoded = InputLogContainer::decode(&container)
+        .map_err(|e| format!("input log container decode: {e}"))?;
+    Ok(decoded.payload().to_vec())
 }
 
 #[test]
