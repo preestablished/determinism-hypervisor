@@ -1,28 +1,24 @@
-//! M7 ACCEPT (bead cw2): root snapshot, 1000 seeded fork children,
-//! one guest-second random pad burst per child, then VerifyReplay every
+//! M7 ACCEPT: root snapshot, seeded fork children, and VerifyReplay for every
 //! child log with zero Divergence and matching end_state_hash.
 //!
-//! DHILOG v1 does not persist a byte-concatenated fork-tree artifact in
-//! this repo. The splice contract is a validated sequence of independently
-//! replayable edges, so this harness validates each child segment as the
-//! single-edge lineage `(root_snapshot -> child_snapshot)` and then verifies
-//! that edge through the worker VerifyReplay RPC path.
+//! The default guest mode is the original nanokernel `pad_echo` fixture. Set
+//! `DH_M7_ACCEPT_GUEST=linux` to run the M9 Linux READY fixture instead:
 //!
-//! HARDWARE-GATED: ignored by default; the acceptance command is:
+//!   DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux \
+//!   DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_JOBS=1000 \
+//!     cargo test -p dh-worker --test m7_fork_verify --release \
+//!       -- --ignored --nocapture --test-threads=1
 //!
-//!   cargo test -p dh-worker --test m7_fork_verify --release \
-//!     -- --ignored --nocapture
-//!
-//! Defaults are 1000 jobs and slot cores 2-65 (64 slots: one root parent
-//! plus 63 children per batch). Developer smoke on small machines may set:
+//! Developer smoke on small machines may set:
 //!
 //!   DH_M7_ACCEPT_JOBS=2 DH_M7_ACCEPT_SLOT_CORES=0-1 \
 //!     cargo test -p dh-worker --test m7_fork_verify -- --ignored --nocapture
 //!
-//! The cross-slot acceptance gate samples the same 1000-job universe, forking
-//! same-seed children across every available child slot and requiring identical
-//! refs:
+//! The cross-slot acceptance gate samples the same job universe, forking
+//! same-seed children across every available child slot and requiring
+//! byte-identical refs/logs:
 //!
+//!   DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux \
 //!   DH_M7_ACCEPT_SLOT_CORES=2-5 cargo test -p dh-worker \
 //!     --test m7_fork_verify --release \
 //!     m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs \
@@ -62,6 +58,11 @@ const CLOCK_NUM: u32 = 10_000;
 const VNS_PER_SECOND: u64 = 1_000_000_000;
 const RUN_BUDGET: u64 = 100_000;
 const BURST_EVENTS: usize = 8;
+const M9_LINUX_CHILD_FRAMES: u32 = 5;
+const M9_LINUX_CHILD_HARD_CAP: u64 = 5_000_000;
+const M9_LINUX_CHILD_EPOCH_LEN: u64 = 745_000;
+const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
+const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
 const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
 const SLOT_CORES_ENV: &str = "DH_M7_ACCEPT_SLOT_CORES";
 const ALLOW_SKIP_ENV: &str = "DH_M7_ACCEPT_ALLOW_SKIP";
@@ -70,6 +71,25 @@ const GUEST_ENV: &str = "DH_M7_ACCEPT_GUEST";
 
 type TestResult<T> = Result<T, String>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptanceGuest {
+    Nanokernel,
+    Linux,
+}
+
+impl AcceptanceGuest {
+    fn configured() -> Self {
+        match std::env::var(GUEST_ENV) {
+            Ok(value) if value == "linux" => Self::Linux,
+            Ok(value) if value == "nanokernel" => Self::Nanokernel,
+            Ok(value) => {
+                panic!("{GUEST_ENV} must be unset, \"nanokernel\", or \"linux\"; got {value:?}")
+            }
+            Err(_) => Self::Nanokernel,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ChildRecord {
     index: usize,
@@ -77,13 +97,218 @@ struct ChildRecord {
     snapshot: proto::SnapshotRef,
     state_hash: [u8; 32],
     input_log_id: Vec<u8>,
+    segment_end_icount: u64,
+    segment_end_vns: u64,
+    cumulative_icount: u64,
+    cumulative_vns: u64,
+    frames_elapsed: u64,
+    frame_counter: u32,
+    meta_pvblk_checksum: Option<u64>,
 }
 
-fn reject_unimplemented_linux_m7_acceptance(test_name: &str) {
-    if std::env::var(GUEST_ENV).as_deref() == Ok("linux") {
-        panic!(
-            "{test_name} selected {GUEST_ENV}=linux, but m7_fork_verify still has only the nanokernel pad_echo fixture wired. Do not count this command as Linux M7 evidence until it boots the M9 Linux fixture and proves 1000/1000 VerifyDone with zero Divergence."
-        );
+#[derive(Clone, Debug)]
+struct ParsedChildLog {
+    dhilog_blake3: String,
+    base_snapshot_id: [u8; 32],
+    end_snapshot_id: [u8; 32],
+    machine_config_hash: [u8; 32],
+    record_count: u64,
+    canonical_count: u64,
+    end_icount: u64,
+    end_vns: u64,
+    end_state_hash: [u8; 32],
+    has_epoch_hashes: bool,
+    epoch_hashes: Vec<(u64, u64, [u8; 32])>,
+    frame_marks: Vec<(u64, u32)>,
+}
+
+enum AcceptanceHarness {
+    Nanokernel {
+        svc: WorkerService,
+        store: snapstore_client::blocking::SnapstoreClient,
+        root_lease: proto::Lease,
+        root_snapshot: proto::SnapshotRef,
+        machine_config_hash: [u8; 32],
+        root_cumulative_icount: u64,
+        root_cumulative_vns: u64,
+        root_frame_counter: u32,
+        _store_rt: tokio::runtime::Runtime,
+        _store_handle: snapstore_server::build_server::ServerHandle,
+        _store_dir: tempfile::TempDir,
+        _image_cache: tempfile::TempDir,
+    },
+    Linux {
+        ready: common::M9LinuxReady,
+        root_cumulative_icount: u64,
+        root_cumulative_vns: u64,
+        root_frame_counter: u32,
+    },
+}
+
+impl AcceptanceHarness {
+    fn new(
+        guest: AcceptanceGuest,
+        test_name: &str,
+        slot_cores: Vec<u32>,
+    ) -> TestResult<Option<Self>> {
+        match guest {
+            AcceptanceGuest::Nanokernel => Self::new_nanokernel(slot_cores).map(Some),
+            AcceptanceGuest::Linux => Self::new_linux(test_name, slot_cores),
+        }
+    }
+
+    fn new_nanokernel(slot_cores: Vec<u32>) -> TestResult<Self> {
+        let image_cache = tempfile::TempDir::new().map_err(|e| format!("image cache: {e}"))?;
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::pad_echo_elf());
+        let cpuid_table = dh_vmm::kvm::KvmSystem::open()
+            .map_err(|e| format!("KVM open for masked CPUID table: {e:?}"))?
+            .masked_cpuid_table()
+            .map_err(|e| format!("masked CPUID table: {e:?}"))?;
+        let (config, machine_config_hash) = pad_echo_config(base_hash, kernel_hash, cpuid_table);
+
+        let store_dir = tempfile::TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+        let store_sock = "snapstore.sock";
+        let (_store_rt, _store_handle, store) =
+            common::spawn_store_at(store_dir.path().to_path_buf(), store_sock);
+        let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
+        let svc = WorkerService::new(worker_config(
+            slot_cores,
+            image_cache.path().to_path_buf(),
+            snapstore,
+        ))
+        .map_err(|e| format!("WorkerService::new: {e:?}"))?;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("test runtime: {e}"))?;
+        let (root_lease, root_snapshot_response) =
+            rt.block_on(async { create_root(&svc, config).await })?;
+        let root_snapshot = root_snapshot_response
+            .snapshot
+            .clone()
+            .ok_or_else(|| "root TakeSnapshot returned no snapshot ref".to_string())?;
+
+        Ok(Self::Nanokernel {
+            svc,
+            store,
+            root_lease,
+            root_snapshot,
+            machine_config_hash,
+            root_cumulative_icount: root_snapshot_response.icount,
+            root_cumulative_vns: root_snapshot_response.vns,
+            root_frame_counter: root_snapshot_response.frame_counter,
+            _store_rt,
+            _store_handle,
+            _store_dir: store_dir,
+            _image_cache: image_cache,
+        })
+    }
+
+    fn new_linux(test_name: &str, slot_cores: Vec<u32>) -> TestResult<Option<Self>> {
+        let Some(ready) = common::m9_linux_ready_snapshot_with_slot_cores_and_config(
+            test_name,
+            slot_cores,
+            |config| {
+                config.epoch_len = M9_LINUX_CHILD_EPOCH_LEN;
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::Linux {
+            root_cumulative_icount: ready.ready_snapshot.icount,
+            root_cumulative_vns: ready.ready_snapshot.vns,
+            root_frame_counter: ready.ready_snapshot.frame_counter,
+            ready,
+        }))
+    }
+
+    fn guest(&self) -> AcceptanceGuest {
+        match self {
+            Self::Nanokernel { .. } => AcceptanceGuest::Nanokernel,
+            Self::Linux { .. } => AcceptanceGuest::Linux,
+        }
+    }
+
+    fn svc(&self) -> &WorkerService {
+        match self {
+            Self::Nanokernel { svc, .. } => svc,
+            Self::Linux { ready, .. } => &ready.svc,
+        }
+    }
+
+    fn store(&self) -> &snapstore_client::blocking::SnapstoreClient {
+        match self {
+            Self::Nanokernel { store, .. } => store,
+            Self::Linux { ready, .. } => &ready.store,
+        }
+    }
+
+    fn root_lease(&self) -> &proto::Lease {
+        match self {
+            Self::Nanokernel { root_lease, .. } => root_lease,
+            Self::Linux { ready, .. } => &ready.lease,
+        }
+    }
+
+    fn root_snapshot(&self) -> &proto::SnapshotRef {
+        match self {
+            Self::Nanokernel { root_snapshot, .. } => root_snapshot,
+            Self::Linux { ready, .. } => &ready.ready_snapshot_ref,
+        }
+    }
+
+    fn machine_config_hash(&self) -> [u8; 32] {
+        match self {
+            Self::Nanokernel {
+                machine_config_hash,
+                ..
+            } => *machine_config_hash,
+            Self::Linux { ready, .. } => ready.config_hash,
+        }
+    }
+
+    fn root_cumulative_icount(&self) -> u64 {
+        match self {
+            Self::Nanokernel {
+                root_cumulative_icount,
+                ..
+            }
+            | Self::Linux {
+                root_cumulative_icount,
+                ..
+            } => *root_cumulative_icount,
+        }
+    }
+
+    fn root_cumulative_vns(&self) -> u64 {
+        match self {
+            Self::Nanokernel {
+                root_cumulative_vns,
+                ..
+            }
+            | Self::Linux {
+                root_cumulative_vns,
+                ..
+            } => *root_cumulative_vns,
+        }
+    }
+
+    fn root_frame_counter(&self) -> u32 {
+        match self {
+            Self::Nanokernel {
+                root_frame_counter, ..
+            }
+            | Self::Linux {
+                root_frame_counter, ..
+            } => *root_frame_counter,
+        }
+    }
+
+    async fn destroy_root(&self) {
+        destroy_best_effort(self.svc(), Some(self.root_lease().clone())).await;
     }
 }
 
@@ -91,6 +316,14 @@ fn arr32(bytes: &[u8], what: &str) -> [u8; 32] {
     bytes
         .try_into()
         .unwrap_or_else(|_| panic!("{what} must be 32 bytes, got {}", bytes.len()))
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes)
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn write_cache_blob(root: &Path, bytes: &[u8]) -> [u8; 32] {
@@ -156,7 +389,11 @@ fn expected_pad_records(index: usize) -> Vec<(u64, u8, u32)> {
         .collect()
 }
 
-fn pad_echo_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::MachineConfig {
+fn pad_echo_machine_config(
+    base_hash: [u8; 32],
+    kernel_hash: [u8; 32],
+    cpuid_table: Vec<dh_vmm::config::CpuidLeaf>,
+) -> MachineConfig {
     let mut config = MachineConfig::new(
         MEM,
         base_hash,
@@ -165,6 +402,7 @@ fn pad_echo_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::Machine
             cmdline: Vec::new(),
         },
     );
+    config.cpuid_table = cpuid_table;
     config.epoch_len = RUN_BUDGET;
     config.clock = ClockRatio::new(CLOCK_NUM, 1).expect("nonzero clock ratio");
     config.device_set = vec![
@@ -173,7 +411,17 @@ fn pad_echo_config(base_hash: [u8; 32], kernel_hash: [u8; 32]) -> proto::Machine
         dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
         dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
     ];
-    machine_config_to_proto(&config)
+    config
+}
+
+fn pad_echo_config(
+    base_hash: [u8; 32],
+    kernel_hash: [u8; 32],
+    cpuid_table: Vec<dh_vmm::config::CpuidLeaf>,
+) -> (proto::MachineConfig, [u8; 32]) {
+    let config = pad_echo_machine_config(base_hash, kernel_hash, cpuid_table);
+    let config_hash = config.config_hash().expect("pad_echo machine config hash");
+    (machine_config_to_proto(&config), config_hash)
 }
 
 fn worker_config(
@@ -308,7 +556,7 @@ fn allow_skip() -> bool {
 async fn create_root(
     svc: &WorkerService,
     config: proto::MachineConfig,
-) -> TestResult<(proto::Lease, proto::SnapshotRef)> {
+) -> TestResult<(proto::Lease, proto::TakeSnapshotResponse)> {
     let created = svc
         .create_vm(Request::new(proto::CreateVmRequest {
             config: Some(config),
@@ -328,9 +576,10 @@ async fn create_root(
         }))
         .await
         .map_err(|e| format!("TakeSnapshot root: {e}"))?
-        .into_inner()
-        .snapshot
-        .ok_or_else(|| "TakeSnapshot root returned no snapshot".to_owned())?;
+        .into_inner();
+    if snapshot.snapshot.is_none() {
+        return Err("TakeSnapshot root returned no snapshot".to_owned());
+    }
     Ok((lease, snapshot))
 }
 
@@ -342,7 +591,61 @@ async fn destroy_best_effort(svc: &WorkerService, lease: Option<proto::Lease>) {
     }
 }
 
-async fn run_child(
+fn snapshot_record(
+    guest: AcceptanceGuest,
+    index: usize,
+    slot_id: u64,
+    snapshot: proto::TakeSnapshotResponse,
+    segment_end_icount: u64,
+    segment_end_vns: u64,
+    cumulative_icount: u64,
+    cumulative_vns: u64,
+    frames_elapsed: u64,
+    meta_pvblk_checksum: Option<u64>,
+) -> TestResult<ChildRecord> {
+    let snapshot_ref = snapshot
+        .snapshot
+        .ok_or_else(|| format!("child {index} TakeSnapshot returned no snapshot"))?;
+    let state_hash = snapshot
+        .state_hash
+        .as_ref()
+        .map(|hash| arr32(&hash.hash, "child state_hash"))
+        .ok_or_else(|| format!("child {index} TakeSnapshot returned no state_hash"))?;
+    if snapshot.input_log_id.len() != 32 {
+        return Err(format!(
+            "child {index} input_log_id length {}, expected 32",
+            snapshot.input_log_id.len()
+        ));
+    }
+    if guest == AcceptanceGuest::Linux {
+        let expected_frame = snapshot
+            .frame_counter
+            .checked_sub(M9_LINUX_CHILD_FRAMES)
+            .ok_or_else(|| format!("child {index} Linux frame counter underflow"))?;
+        if snapshot.frame_counter != expected_frame + M9_LINUX_CHILD_FRAMES {
+            return Err(format!(
+                "child {index} Linux frame counter arithmetic failed at {}",
+                snapshot.frame_counter
+            ));
+        }
+    }
+    Ok(ChildRecord {
+        index,
+        slot_id,
+        snapshot: snapshot_ref,
+        state_hash,
+        input_log_id: snapshot.input_log_id,
+        segment_end_icount,
+        segment_end_vns,
+        cumulative_icount,
+        cumulative_vns,
+        frames_elapsed,
+        frame_counter: snapshot.frame_counter,
+        meta_pvblk_checksum,
+    })
+}
+
+async fn run_nanokernel_child(
     svc: WorkerService,
     index: usize,
     lease: proto::Lease,
@@ -412,41 +715,232 @@ async fn run_child(
             return Err(format!("child {index} TakeSnapshot: {e}"));
         }
     };
-    let snapshot_ref = snapshot
-        .snapshot
-        .ok_or_else(|| format!("child {index} TakeSnapshot returned no snapshot"))?;
-    let state_hash = snapshot
-        .state_hash
-        .as_ref()
-        .map(|hash| arr32(&hash.hash, "child state_hash"))
-        .ok_or_else(|| format!("child {index} TakeSnapshot returned no state_hash"))?;
-    if snapshot.input_log_id.len() != 32 {
-        destroy_best_effort(&svc, Some(lease)).await;
-        return Err(format!(
-            "child {index} input_log_id length {}, expected 32",
-            snapshot.input_log_id.len()
-        ));
-    }
     destroy_best_effort(&svc, Some(lease)).await;
-    Ok(ChildRecord {
+    snapshot_record(
+        AcceptanceGuest::Nanokernel,
         index,
         slot_id,
-        snapshot: snapshot_ref,
-        state_hash,
-        input_log_id: snapshot.input_log_id,
-    })
+        snapshot,
+        RUN_BUDGET,
+        VNS_PER_SECOND,
+        run.icount,
+        run.vns,
+        run.frames_elapsed,
+        None,
+    )
+}
+
+async fn read_linux_meta_io_proof(svc: &WorkerService, lease: proto::Lease) -> TestResult<u64> {
+    let meta = svc
+        .read_guest_memory(Request::new(proto::ReadGuestMemoryRequest {
+            lease: Some(lease),
+            ranges: Vec::new(),
+            region_ranges: vec![proto::RegionRange {
+                region: "meta".into(),
+                layout_version: 1,
+                offset: M9_LINUX_META_IO_MAGIC_OFF,
+                len: M9_LINUX_META_IO_PROOF_LEN,
+            }],
+        }))
+        .await
+        .map_err(|e| format!("ReadGuestMemory Linux meta IO proof: {e}"))?
+        .into_inner();
+    let chunk = meta
+        .chunks
+        .first()
+        .ok_or_else(|| "ReadGuestMemory returned no Linux meta IO proof".to_string())?;
+    assert_m9_meta_io_proof(chunk)
+}
+
+fn assert_m9_meta_io_proof(bytes: &[u8]) -> TestResult<u64> {
+    if bytes.len() != M9_LINUX_META_IO_PROOF_LEN as usize {
+        return Err(format!(
+            "M9 Linux meta IO proof length {}, expected {M9_LINUX_META_IO_PROOF_LEN}",
+            bytes.len()
+        ));
+    }
+    if &bytes[..8] != b"PVBLKIO1" {
+        return Err(format!(
+            "M9 Linux meta IO proof missing PVBLKIO1 magic: {:?}",
+            &bytes[..8]
+        ));
+    }
+    let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if checksum == 0 {
+        return Err("M9 Linux meta IO proof checksum must be nonzero".into());
+    }
+    Ok(checksum)
+}
+
+async fn run_linux_child(
+    svc: WorkerService,
+    index: usize,
+    lease: proto::Lease,
+    root_cumulative_icount: u64,
+    root_cumulative_vns: u64,
+    root_frame_counter: u32,
+) -> TestResult<ChildRecord> {
+    let slot_id = lease.slot_id;
+    let run = match svc
+        .run(Request::new(proto::RunRequest {
+            lease: Some(lease.clone()),
+            until: Some(proto::run_request::Until::FrameBudget(
+                M9_LINUX_CHILD_FRAMES,
+            )),
+            hard_icount_cap: M9_LINUX_CHILD_HARD_CAP,
+            capture: None,
+        }))
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(e) => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!("child {index} Linux Run: {e}"));
+        }
+    };
+    if run.reason != i32::from(proto::StopReason::BudgetReached) {
+        destroy_best_effort(&svc, Some(lease)).await;
+        return Err(format!(
+            "child {index} Linux Run stopped with {}, expected BUDGET_REACHED",
+            run.reason
+        ));
+    }
+    if run.frames_elapsed != u64::from(M9_LINUX_CHILD_FRAMES) {
+        destroy_best_effort(&svc, Some(lease)).await;
+        return Err(format!(
+            "child {index} Linux frames_elapsed {}, expected {M9_LINUX_CHILD_FRAMES}",
+            run.frames_elapsed
+        ));
+    }
+    let segment_end_icount = match run.icount.checked_sub(root_cumulative_icount) {
+        Some(value) => value,
+        None => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!(
+                "child {index} Linux cumulative icount {} is before root {}",
+                run.icount, root_cumulative_icount
+            ));
+        }
+    };
+    let segment_end_vns = match run.vns.checked_sub(root_cumulative_vns) {
+        Some(value) => value,
+        None => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!(
+                "child {index} Linux cumulative vns {} is before root {}",
+                run.vns, root_cumulative_vns
+            ));
+        }
+    };
+    if segment_end_icount == 0 || segment_end_icount > M9_LINUX_CHILD_HARD_CAP {
+        destroy_best_effort(&svc, Some(lease)).await;
+        return Err(format!(
+            "child {index} Linux segment icount {segment_end_icount}, expected 1..={M9_LINUX_CHILD_HARD_CAP}"
+        ));
+    }
+
+    let meta_pvblk_checksum = match read_linux_meta_io_proof(&svc, lease.clone()).await {
+        Ok(checksum) => checksum,
+        Err(e) => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!("child {index} Linux meta IO proof: {e}"));
+        }
+    };
+
+    let snapshot = match svc
+        .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+            lease: Some(lease.clone()),
+            seal_input_log: Some(true),
+            capture: None,
+        }))
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(e) => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!("child {index} Linux TakeSnapshot: {e}"));
+        }
+    };
+    let expected_frame_counter = match root_frame_counter.checked_add(M9_LINUX_CHILD_FRAMES) {
+        Some(frame) => frame,
+        None => {
+            destroy_best_effort(&svc, Some(lease)).await;
+            return Err(format!(
+                "child {index} Linux root frame counter {root_frame_counter} overflows"
+            ));
+        }
+    };
+    if snapshot.frame_counter != expected_frame_counter {
+        destroy_best_effort(&svc, Some(lease)).await;
+        return Err(format!(
+            "child {index} Linux snapshot frame_counter {}, expected {expected_frame_counter}",
+            snapshot.frame_counter
+        ));
+    }
+
+    destroy_best_effort(&svc, Some(lease)).await;
+    snapshot_record(
+        AcceptanceGuest::Linux,
+        index,
+        slot_id,
+        snapshot,
+        segment_end_icount,
+        segment_end_vns,
+        run.icount,
+        run.vns,
+        run.frames_elapsed,
+        Some(meta_pvblk_checksum),
+    )
+}
+
+async fn run_child(
+    svc: WorkerService,
+    guest: AcceptanceGuest,
+    index: usize,
+    lease: proto::Lease,
+    root_cumulative_icount: u64,
+    root_cumulative_vns: u64,
+    root_frame_counter: u32,
+) -> TestResult<ChildRecord> {
+    match guest {
+        AcceptanceGuest::Nanokernel => run_nanokernel_child(svc, index, lease).await,
+        AcceptanceGuest::Linux => {
+            run_linux_child(
+                svc,
+                index,
+                lease,
+                root_cumulative_icount,
+                root_cumulative_vns,
+                root_frame_counter,
+            )
+            .await
+        }
+    }
 }
 
 async fn run_child_batch(
-    svc: &WorkerService,
+    harness: &AcceptanceHarness,
     start_index: usize,
     leases: Vec<proto::Lease>,
 ) -> TestResult<Vec<ChildRecord>> {
     let mut tasks = Vec::with_capacity(leases.len());
     for (offset, lease) in leases.into_iter().enumerate() {
-        let svc = svc.clone();
+        let svc = harness.svc().clone();
+        let guest = harness.guest();
+        let root_cumulative_icount = harness.root_cumulative_icount();
+        let root_cumulative_vns = harness.root_cumulative_vns();
+        let root_frame_counter = harness.root_frame_counter();
         tasks.push(tokio::spawn(async move {
-            run_child(svc, start_index + offset, lease).await
+            run_child(
+                svc,
+                guest,
+                start_index + offset,
+                lease,
+                root_cumulative_icount,
+                root_cumulative_vns,
+                root_frame_counter,
+            )
+            .await
         }));
     }
 
@@ -467,16 +961,29 @@ async fn run_child_batch(
 }
 
 async fn run_same_seed_children(
-    svc: &WorkerService,
+    harness: &AcceptanceHarness,
     index: usize,
     leases: Vec<proto::Lease>,
 ) -> TestResult<Vec<ChildRecord>> {
     let mut tasks = Vec::with_capacity(leases.len());
     for lease in leases {
-        let svc = svc.clone();
-        tasks.push(tokio::spawn(
-            async move { run_child(svc, index, lease).await },
-        ));
+        let svc = harness.svc().clone();
+        let guest = harness.guest();
+        let root_cumulative_icount = harness.root_cumulative_icount();
+        let root_cumulative_vns = harness.root_cumulative_vns();
+        let root_frame_counter = harness.root_frame_counter();
+        tasks.push(tokio::spawn(async move {
+            run_child(
+                svc,
+                guest,
+                index,
+                lease,
+                root_cumulative_icount,
+                root_cumulative_vns,
+                root_frame_counter,
+            )
+            .await
+        }));
     }
 
     let mut records = Vec::with_capacity(tasks.len());
@@ -506,33 +1013,258 @@ fn fetch_log_payload(
     decoded.payload().to_vec()
 }
 
-fn validate_single_edge_lineage(root: &proto::SnapshotRef, child: &ChildRecord, log: &[u8]) {
-    let lineage = Lineage::new(&[log]).expect("child segment is a valid lineage edge");
-    assert_eq!(lineage.len(), 1);
-    assert_eq!(lineage.root_base(), arr32(&root.hash, "root snapshot"));
-    let (end_snapshot, end_state_hash, end_icount) = lineage.end_identity();
-    assert_eq!(end_snapshot, arr32(&child.snapshot.hash, "child snapshot"));
-    assert_eq!(end_state_hash, child.state_hash);
-    assert_eq!(end_icount, RUN_BUDGET);
+fn expected_frame_table(start_frame: u32, frames: u32) -> TestResult<Vec<u32>> {
+    let end = start_frame
+        .checked_add(frames)
+        .ok_or_else(|| format!("frame range overflows u32: start={start_frame} count={frames}"))?;
+    Ok((start_frame + 1..=end).collect())
+}
 
-    let reader = LogReader::parse(log).expect("child segment parses as DHILOG");
+fn parse_child_log(log: &[u8]) -> TestResult<ParsedChildLog> {
+    let reader = LogReader::parse(log).map_err(|e| format!("child DHILOG parse: {e:?}"))?;
+    let header = reader.header();
+    let epoch_hashes: Vec<_> = reader
+        .aux()
+        .filter_map(|rec| match rec.body() {
+            RecordBody::EpochHash {
+                epoch_index,
+                chain_value,
+            } => Some((epoch_index, rec.icount(), chain_value)),
+            _ => None,
+        })
+        .collect();
+    let frame_marks: Vec<_> = reader
+        .aux()
+        .filter_map(|rec| match rec.body() {
+            RecordBody::FrameMark { frame_index } => Some((rec.icount(), frame_index)),
+            _ => None,
+        })
+        .collect();
+    let canonical_count = reader.canonical().count() as u64;
+    let (_end_reason, end_state_hash) = reader.end();
+    if end_state_hash != header.end_state_hash {
+        return Err("child DHILOG END state hash does not match header".into());
+    }
+    Ok(ParsedChildLog {
+        dhilog_blake3: blake3_hex(log),
+        base_snapshot_id: header.base_snapshot_id,
+        end_snapshot_id: header.end_snapshot_id,
+        machine_config_hash: header.machine_config_hash,
+        record_count: header.record_count,
+        canonical_count,
+        end_icount: header.end_icount,
+        end_vns: header.end_vns,
+        end_state_hash: header.end_state_hash,
+        has_epoch_hashes: header.has_epoch_hashes(),
+        epoch_hashes,
+        frame_marks,
+    })
+}
+
+fn validate_single_edge_lineage(
+    harness: &AcceptanceHarness,
+    child: &ChildRecord,
+    log: &[u8],
+) -> TestResult<ParsedChildLog> {
+    let root = harness.root_snapshot();
+    let root_id = arr32(&root.hash, "root snapshot");
+    let child_id = arr32(&child.snapshot.hash, "child snapshot");
+
+    let lineage = Lineage::new(&[log]).map_err(|e| format!("child lineage edge: {e:?}"))?;
+    if lineage.len() != 1 {
+        return Err(format!(
+            "child {} lineage length {}, expected 1",
+            child.index,
+            lineage.len()
+        ));
+    }
+    if lineage.root_base() != root_id {
+        return Err(format!("child {} lineage root_base mismatch", child.index));
+    }
+    let (end_snapshot, end_state_hash, end_icount) = lineage.end_identity();
+    if end_snapshot != child_id {
+        return Err(format!(
+            "child {} lineage end snapshot mismatch",
+            child.index
+        ));
+    }
+    if end_state_hash != child.state_hash {
+        return Err(format!("child {} lineage end state mismatch", child.index));
+    }
+    if end_icount != child.segment_end_icount {
+        return Err(format!(
+            "child {} lineage end icount {}, expected {}",
+            child.index, end_icount, child.segment_end_icount
+        ));
+    }
+
+    let parsed = parse_child_log(log)?;
+    if parsed.base_snapshot_id != root_id {
+        return Err(format!(
+            "child {} DHILOG base snapshot mismatch",
+            child.index
+        ));
+    }
+    if parsed.end_snapshot_id != child_id {
+        return Err(format!(
+            "child {} DHILOG end snapshot mismatch",
+            child.index
+        ));
+    }
+    if parsed.end_state_hash != child.state_hash {
+        return Err(format!("child {} DHILOG end state mismatch", child.index));
+    }
+    if parsed.machine_config_hash != harness.machine_config_hash() {
+        return Err(format!(
+            "child {} DHILOG machine_config_hash mismatch",
+            child.index
+        ));
+    }
+    if parsed.end_icount != child.segment_end_icount {
+        return Err(format!(
+            "child {} DHILOG end_icount {}, expected {}",
+            child.index, parsed.end_icount, child.segment_end_icount
+        ));
+    }
+    if parsed.end_vns != child.segment_end_vns {
+        return Err(format!(
+            "child {} DHILOG end_vns {}, expected {}",
+            child.index, parsed.end_vns, child.segment_end_vns
+        ));
+    }
+
+    match harness.guest() {
+        AcceptanceGuest::Nanokernel => validate_nanokernel_log(child, log, &parsed)?,
+        AcceptanceGuest::Linux => validate_linux_log(harness, child, &parsed)?,
+    }
+    Ok(parsed)
+}
+
+fn validate_nanokernel_log(
+    child: &ChildRecord,
+    log: &[u8],
+    parsed: &ParsedChildLog,
+) -> TestResult<()> {
+    if parsed.end_icount != RUN_BUDGET || parsed.end_vns != VNS_PER_SECOND {
+        return Err(format!(
+            "child {} nanokernel DHILOG ended at {}/{}, expected {RUN_BUDGET}/{VNS_PER_SECOND}",
+            child.index, parsed.end_icount, parsed.end_vns
+        ));
+    }
+    let reader = LogReader::parse(log).map_err(|e| format!("child DHILOG parse: {e:?}"))?;
     let actual: Vec<_> = reader
         .canonical()
         .map(|rec| match rec.body() {
-            RecordBody::PadSet { port, buttons, .. } => (rec.icount(), port, buttons),
-            other => panic!(
+            RecordBody::PadSet { port, buttons, .. } => Ok((rec.icount(), port, buttons)),
+            other => Err(format!(
                 "child {} DHILOG contains unexpected canonical record {other:?}",
                 child.index
-            ),
+            )),
         })
+        .collect::<TestResult<Vec<_>>>()?;
+    let expected = expected_pad_records(child.index);
+    if parsed.canonical_count != expected.len() as u64 {
+        return Err(format!(
+            "child {} PAD_SET canonical count {}, expected {}",
+            child.index,
+            parsed.canonical_count,
+            expected.len()
+        ));
+    }
+    if actual != expected {
+        return Err(format!(
+            "child {} PAD_SET canonical records differed: actual={actual:?} expected={expected:?}",
+            child.index
+        ));
+    }
+    Ok(())
+}
+
+fn validate_linux_log(
+    harness: &AcceptanceHarness,
+    child: &ChildRecord,
+    parsed: &ParsedChildLog,
+) -> TestResult<()> {
+    if !parsed.has_epoch_hashes {
+        return Err(format!(
+            "child {} Linux DHILOG header does not advertise EPOCH_HASH records",
+            child.index
+        ));
+    }
+    if parsed.epoch_hashes.is_empty() {
+        return Err(format!(
+            "child {} Linux DHILOG contains zero EPOCH_HASH records",
+            child.index
+        ));
+    }
+    if parsed.record_count < parsed.canonical_count {
+        return Err(format!(
+            "child {} Linux DHILOG record_count {} is less than canonical_count {}",
+            child.index, parsed.record_count, parsed.canonical_count
+        ));
+    }
+    if parsed.frame_marks.len() != M9_LINUX_CHILD_FRAMES as usize {
+        return Err(format!(
+            "child {} Linux FRAME_MARK count {}, expected {M9_LINUX_CHILD_FRAMES}",
+            child.index,
+            parsed.frame_marks.len()
+        ));
+    }
+    let expected_frames =
+        expected_frame_table(harness.root_frame_counter(), M9_LINUX_CHILD_FRAMES)?;
+    let actual_frames: Vec<_> = parsed
+        .frame_marks
+        .iter()
+        .map(|(_, frame_index)| *frame_index)
         .collect();
-    assert_eq!(actual, expected_pad_records(child.index));
+    if actual_frames != expected_frames {
+        return Err(format!(
+            "child {} Linux FRAME_MARK frames {actual_frames:?}, expected {expected_frames:?}",
+            child.index
+        ));
+    }
+    if !parsed
+        .frame_marks
+        .windows(2)
+        .all(|window| window[0].0 < window[1].0)
+    {
+        return Err(format!(
+            "child {} Linux FRAME_MARK icounts are not strictly increasing: {:?}",
+            child.index, parsed.frame_marks
+        ));
+    }
+    if parsed
+        .frame_marks
+        .last()
+        .map(|(_, frame_index)| *frame_index)
+        != Some(child.frame_counter)
+    {
+        return Err(format!(
+            "child {} Linux final FRAME_MARK does not match child frame_counter {}",
+            child.index, child.frame_counter
+        ));
+    }
+    if child.frames_elapsed != u64::from(M9_LINUX_CHILD_FRAMES) {
+        return Err(format!(
+            "child {} Linux frames_elapsed {}, expected {M9_LINUX_CHILD_FRAMES}",
+            child.index, child.frames_elapsed
+        ));
+    }
+    if child.meta_pvblk_checksum.is_none() {
+        return Err(format!(
+            "child {} Linux missing meta IO checksum",
+            child.index
+        ));
+    }
+    Ok(())
 }
 
 async fn verify_child(
     svc: WorkerService,
+    guest: AcceptanceGuest,
     root: proto::SnapshotRef,
     child: ChildRecord,
+    parsed: ParsedChildLog,
 ) -> TestResult<ChildRecord> {
     let mut stream = svc
         .verify_replay(Request::new(proto::VerifyReplayRequest {
@@ -561,7 +1293,14 @@ async fn verify_child(
                 }
                 epoch_ok += 1;
             }
-            Some(proto::verify_replay_progress::Msg::Done(msg)) => done = Some(msg),
+            Some(proto::verify_replay_progress::Msg::Done(msg)) => {
+                if done.replace(msg).is_some() {
+                    return Err(format!(
+                        "child {} VerifyReplay emitted duplicate Done",
+                        child.index
+                    ));
+                }
+            }
             Some(proto::verify_replay_progress::Msg::Divergence(div)) => {
                 return Err(format!(
                     "child {} VerifyReplay diverged: {div:?}",
@@ -578,10 +1317,10 @@ async fn verify_child(
         ));
     }
     let done = done.ok_or_else(|| format!("child {} VerifyReplay emitted no Done", child.index))?;
-    if done.total_icount != RUN_BUDGET {
+    if done.total_icount != child.segment_end_icount {
         return Err(format!(
-            "child {} VerifyReplay Done total_icount {}, expected {RUN_BUDGET}",
-            child.index, done.total_icount
+            "child {} VerifyReplay Done total_icount {}, expected {}",
+            child.index, done.total_icount, child.segment_end_icount
         ));
     }
     let done_hash = done
@@ -595,21 +1334,48 @@ async fn verify_child(
             child.index
         ));
     }
+
+    match guest {
+        AcceptanceGuest::Nanokernel => {
+            if done.total_icount != RUN_BUDGET {
+                return Err(format!(
+                    "child {} nanokernel VerifyReplay total_icount {}, expected {RUN_BUDGET}",
+                    child.index, done.total_icount
+                ));
+            }
+        }
+        AcceptanceGuest::Linux => {
+            if epoch_ok as usize != parsed.epoch_hashes.len() {
+                return Err(format!(
+                    "child {} Linux VerifyReplay EpochOk count {}, expected parsed EPOCH_HASH count {}",
+                    child.index,
+                    epoch_ok,
+                    parsed.epoch_hashes.len()
+                ));
+            }
+            if done.total_icount != parsed.end_icount {
+                return Err(format!(
+                    "child {} Linux VerifyReplay total_icount {}, expected parsed end_icount {}",
+                    child.index, done.total_icount, parsed.end_icount
+                ));
+            }
+        }
+    }
     Ok(child)
 }
 
 async fn verify_batch(
-    svc: &WorkerService,
-    root: &proto::SnapshotRef,
-    children: Vec<ChildRecord>,
+    harness: &AcceptanceHarness,
+    children: Vec<(ChildRecord, ParsedChildLog)>,
 ) -> TestResult<Vec<ChildRecord>> {
     let mut tasks = Vec::with_capacity(children.len());
-    for child in children {
-        let svc = svc.clone();
-        let root = root.clone();
-        tasks.push(tokio::spawn(
-            async move { verify_child(svc, root, child).await },
-        ));
+    for (child, parsed) in children {
+        let svc = harness.svc().clone();
+        let guest = harness.guest();
+        let root = harness.root_snapshot().clone();
+        tasks.push(tokio::spawn(async move {
+            verify_child(svc, guest, root, child, parsed).await
+        }));
     }
 
     let mut verified = Vec::with_capacity(tasks.len());
@@ -629,10 +1395,7 @@ async fn verify_batch(
 }
 
 async fn cross_check_child_on_distinct_slots(
-    svc: &WorkerService,
-    root_lease: &proto::Lease,
-    root_snapshot: &proto::SnapshotRef,
-    store: &snapstore_client::blocking::SnapstoreClient,
+    harness: &AcceptanceHarness,
     index: usize,
     child_count: usize,
 ) -> TestResult<()> {
@@ -642,9 +1405,10 @@ async fn cross_check_child_on_distinct_slots(
         ));
     }
     let seed = child_seed(index);
-    let forked = svc
+    let forked = harness
+        .svc()
         .fork(Request::new(proto::ForkRequest {
-            parent: Some(root_lease.clone()),
+            parent: Some(harness.root_lease().clone()),
             count: child_count as u32,
             entropy_seeds: std::iter::repeat_n(seed, child_count).collect(),
         }))
@@ -670,15 +1434,19 @@ async fn cross_check_child_on_distinct_slots(
             ));
         }
 
-        let children = run_same_seed_children(svc, index, forked.clone()).await?;
+        let children = run_same_seed_children(harness, index, forked.clone()).await?;
         let mut logs = Vec::with_capacity(children.len());
-        for child in &children {
-            let log = tokio::task::block_in_place(|| fetch_log_payload(store, &child.input_log_id));
-            validate_single_edge_lineage(root_snapshot, child, &log);
-            logs.push((child.slot_id, log));
+        let mut validated = Vec::with_capacity(children.len());
+        for child in children {
+            let log = tokio::task::block_in_place(|| {
+                fetch_log_payload(harness.store(), &child.input_log_id)
+            });
+            let parsed = validate_single_edge_lineage(harness, &child, &log)?;
+            logs.push((child.slot_id, log, parsed.clone()));
+            validated.push((child, parsed));
         }
 
-        let mut verified = verify_batch(svc, root_snapshot, children).await?;
+        let mut verified = verify_batch(harness, validated).await?;
         verified.sort_by_key(|record| record.slot_id);
         let first = verified
             .first()
@@ -702,14 +1470,62 @@ async fn cross_check_child_on_distinct_slots(
                     first.slot_id, other.slot_id
                 ));
             }
+            if first.segment_end_icount != other.segment_end_icount {
+                return Err(format!(
+                    "cross-slot child {index} segment end icount diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.cumulative_icount != other.cumulative_icount {
+                return Err(format!(
+                    "cross-slot child {index} cumulative icount diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.cumulative_vns != other.cumulative_vns {
+                return Err(format!(
+                    "cross-slot child {index} cumulative vns diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.frame_counter != other.frame_counter {
+                return Err(format!(
+                    "cross-slot child {index} frame counter diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
+            if first.meta_pvblk_checksum != other.meta_pvblk_checksum {
+                return Err(format!(
+                    "cross-slot child {index} meta IO checksum diverged between slots {} and {}",
+                    first.slot_id, other.slot_id
+                ));
+            }
         }
         let first_log = logs
             .first()
             .ok_or_else(|| format!("cross-slot child {index} produced no input logs"))?;
-        for (slot_id, log) in logs.iter().skip(1) {
+        for (slot_id, log, parsed) in logs.iter().skip(1) {
             if first_log.1 != *log {
                 return Err(format!(
                     "cross-slot child {index} input log payloads diverged between slots {} and {}",
+                    first_log.0, slot_id
+                ));
+            }
+            if first_log.2.dhilog_blake3 != parsed.dhilog_blake3 {
+                return Err(format!(
+                    "cross-slot child {index} DHILOG blake3 diverged between slots {} and {}",
+                    first_log.0, slot_id
+                ));
+            }
+            if first_log.2.end_icount != parsed.end_icount {
+                return Err(format!(
+                    "cross-slot child {index} parsed end_icount diverged between slots {} and {}",
+                    first_log.0, slot_id
+                ));
+            }
+            if first_log.2.frame_marks != parsed.frame_marks {
+                return Err(format!(
+                    "cross-slot child {index} parsed frame marks diverged between slots {} and {}",
                     first_log.0, slot_id
                 ));
             }
@@ -720,7 +1536,7 @@ async fn cross_check_child_on_distinct_slots(
 
     if result.is_err() {
         for lease in forked {
-            destroy_best_effort(svc, Some(lease)).await;
+            destroy_best_effort(harness.svc(), Some(lease)).await;
         }
     }
     result
@@ -737,17 +1553,9 @@ fn cross_check_indices_cover_the_1000_job_universe() {
 }
 
 #[test]
-#[ignore = "M9 Linux acceptance guard: fails when DH_M7_ACCEPT_GUEST=linux until real Linux M7 coverage exists"]
-fn linux_m7_acceptance_requires_real_linux_fixture() {
-    reject_unimplemented_linux_m7_acceptance(
-        "m7_fork_verify::linux_m7_acceptance_requires_real_linux_fixture",
-    );
-}
-
-#[test]
 #[ignore = "M7 acceptance gate: 1000 forked children; run with --release -- --ignored --nocapture"]
 fn m7_accept_1000_seeded_forks_verify_replay_all() {
-    reject_unimplemented_linux_m7_acceptance("m7_accept_1000_seeded_forks_verify_replay_all");
+    let guest = AcceptanceGuest::configured();
     let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
         return;
     };
@@ -758,23 +1566,14 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
         "one slot is reserved for the reusable root parent"
     );
 
-    let image_cache = tempfile::TempDir::new().expect("image cache");
-    let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
-    let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::pad_echo_elf());
-    let config = pad_echo_config(base_hash, kernel_hash);
-
-    let store_dir = tempfile::TempDir::new().expect("snapstore data root");
-    let store_sock = "snapstore.sock";
-    let (_store_rt, _store_handle, store) =
-        common::spawn_store_at(store_dir.path().to_path_buf(), store_sock);
-    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
-
-    let svc = WorkerService::new(worker_config(
-        slot_cores,
-        image_cache.path().to_path_buf(),
-        snapstore,
-    ))
-    .expect("worker service");
+    let Some(harness) = AcceptanceHarness::new(
+        guest,
+        "m7_fork_verify::m7_accept_1000_seeded_forks_verify_replay_all",
+        slot_cores.clone(),
+    )
+    .expect("acceptance harness") else {
+        return;
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -782,16 +1581,17 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
         .build()
         .expect("test runtime");
     rt.block_on(async {
-        let (root_lease, root_snapshot) = create_root(&svc, config).await.expect("root snapshot");
         let mut verified = 0usize;
         let mut unique_hashes = BTreeSet::new();
+        let mut epoch_hashes = 0usize;
 
         while verified < jobs {
             let batch_count = child_capacity.min(jobs - verified);
             let seeds: Vec<_> = (verified..verified + batch_count).map(child_seed).collect();
-            let forked = svc
+            let forked = harness
+                .svc()
                 .fork(Request::new(proto::ForkRequest {
-                    parent: Some(root_lease.clone()),
+                    parent: Some(harness.root_lease().clone()),
                     count: batch_count as u32,
                     entropy_seeds: seeds,
                 }))
@@ -801,48 +1601,75 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
                 .children;
             assert_eq!(forked.len(), batch_count);
 
-            let children = run_child_batch(&svc, verified, forked)
+            let children = run_child_batch(&harness, verified, forked)
                 .await
                 .unwrap_or_else(|e| panic!("Run/Snapshot batch starting at {verified}: {e}"));
-            for child in &children {
+            let mut validated = Vec::with_capacity(children.len());
+            for child in children {
                 let log =
-                    tokio::task::block_in_place(|| fetch_log_payload(&store, &child.input_log_id));
-                validate_single_edge_lineage(&root_snapshot, child, &log);
+                    tokio::task::block_in_place(|| fetch_log_payload(harness.store(), &child.input_log_id));
+                let parsed = validate_single_edge_lineage(&harness, &child, &log)
+                    .unwrap_or_else(|e| panic!("Validate child {} DHILOG: {e}", child.index));
+                epoch_hashes += parsed.epoch_hashes.len();
+                validated.push((child, parsed));
             }
 
-            let children = verify_batch(&svc, &root_snapshot, children)
+            let children = verify_batch(&harness, validated)
                 .await
                 .unwrap_or_else(|e| panic!("VerifyReplay batch starting at {verified}: {e}"));
             for child in children {
                 unique_hashes.insert(child.state_hash);
             }
             verified += batch_count;
-            eprintln!("M7 fork/verify progress: {verified}/{jobs}");
+            match guest {
+                AcceptanceGuest::Nanokernel => {
+                    eprintln!("M7 fork/verify progress: {verified}/{jobs}");
+                }
+                AcceptanceGuest::Linux => {
+                    eprintln!("M7 Linux fork/verify progress: {verified}/{jobs}");
+                }
+            }
         }
 
         assert_eq!(verified, jobs);
-        assert_eq!(
-            unique_hashes.len(),
-            jobs,
-            "distinct seeded pad bursts should produce distinct child hashes"
-        );
+        if guest == AcceptanceGuest::Nanokernel {
+            assert_eq!(
+                unique_hashes.len(),
+                jobs,
+                "distinct seeded pad bursts should produce distinct child hashes"
+            );
+        }
 
-        destroy_best_effort(&svc, Some(root_lease)).await;
-        let info = svc
+        harness.destroy_root().await;
+        let info = harness
+            .svc()
             .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
             .await
             .expect("GetWorkerInfo after cleanup")
             .into_inner();
-        assert_eq!(info.slots_free as usize, child_capacity + 1);
+        assert_eq!(info.slots_free as usize, slot_cores.len());
+
+        match guest {
+            AcceptanceGuest::Nanokernel => {
+                eprintln!(
+                    "M7 fork/verify done: verified={verified} divergence=0 unique_hashes={}",
+                    unique_hashes.len()
+                );
+            }
+            AcceptanceGuest::Linux => {
+                eprintln!(
+                    "M7 Linux fork/verify done: verified={verified} divergence=0 unique_hashes={} epoch_hashes={epoch_hashes}",
+                    unique_hashes.len()
+                );
+            }
+        }
     });
 }
 
 #[test]
 #[ignore = "M7 acceptance gate: cross-slot same-seed reruns; run with --release -- --ignored --nocapture"]
 fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
-    reject_unimplemented_linux_m7_acceptance(
-        "m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs",
-    );
+    let guest = AcceptanceGuest::configured();
     let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
         return;
     };
@@ -863,23 +1690,14 @@ fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
     let checks = configured_cross_checks(jobs);
     let indices = cross_check_indices(jobs, checks);
 
-    let image_cache = tempfile::TempDir::new().expect("image cache");
-    let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
-    let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::pad_echo_elf());
-    let config = pad_echo_config(base_hash, kernel_hash);
-
-    let store_dir = tempfile::TempDir::new().expect("snapstore data root");
-    let store_sock = "snapstore.sock";
-    let (_store_rt, _store_handle, store) =
-        common::spawn_store_at(store_dir.path().to_path_buf(), store_sock);
-    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
-
-    let svc = WorkerService::new(worker_config(
+    let Some(harness) = AcceptanceHarness::new(
+        guest,
+        "m7_fork_verify::m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs",
         slot_cores.clone(),
-        image_cache.path().to_path_buf(),
-        snapstore,
-    ))
-    .expect("worker service");
+    )
+    .expect("acceptance harness") else {
+        return;
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -887,31 +1705,31 @@ fn m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs() {
         .build()
         .expect("test runtime");
     rt.block_on(async {
-        let (root_lease, root_snapshot) = create_root(&svc, config).await.expect("root snapshot");
         let mut first_error = None;
         for (offset, index) in indices.iter().copied().enumerate() {
-            if let Err(e) = cross_check_child_on_distinct_slots(
-                &svc,
-                &root_lease,
-                &root_snapshot,
-                &store,
-                index,
-                child_capacity,
-            )
-            .await
+            if let Err(e) =
+                cross_check_child_on_distinct_slots(&harness, index, child_capacity).await
             {
                 first_error = Some(format!("cross-slot check for child {index}: {e}"));
                 break;
             }
-            eprintln!(
-                "M7 cross-slot progress: {}/{} (job index {index})",
-                offset + 1,
-                indices.len()
-            );
+            match guest {
+                AcceptanceGuest::Nanokernel => eprintln!(
+                    "M7 cross-slot progress: {}/{} (job index {index})",
+                    offset + 1,
+                    indices.len()
+                ),
+                AcceptanceGuest::Linux => eprintln!(
+                    "M7 Linux cross-slot progress: {}/{} (job index {index})",
+                    offset + 1,
+                    indices.len()
+                ),
+            }
         }
 
-        destroy_best_effort(&svc, Some(root_lease)).await;
-        let info = svc
+        harness.destroy_root().await;
+        let info = harness
+            .svc()
             .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
             .await
             .expect("GetWorkerInfo after cleanup")

@@ -347,11 +347,22 @@ pub fn m9_worker_config(
     image_cache_dir: PathBuf,
     snapstore: snapstore_client::Transport,
 ) -> dh_worker::service::WorkerConfig {
+    let slot_cores = (0..slots)
+        .map(|slot| u32::try_from(slot).expect("slot core id fits u32"))
+        .collect();
+    m9_worker_config_with_slot_cores(test_name, slot_cores, image_cache_dir, snapstore)
+}
+
+#[allow(dead_code)]
+pub fn m9_worker_config_with_slot_cores(
+    test_name: &str,
+    slot_cores: Vec<u32>,
+    image_cache_dir: PathBuf,
+    snapstore: snapstore_client::Transport,
+) -> dh_worker::service::WorkerConfig {
     dh_worker::service::WorkerConfig {
         worker_id: test_name.into(),
-        slot_cores: (0..slots)
-            .map(|slot| u32::try_from(slot).expect("slot core id fits u32"))
-            .collect(),
+        slot_cores,
         lease_policy: dh_worker::slot_manager::LeasePolicy::default(),
         class: dh_proto::v1::DeterminismClass {
             cpu_model: "m9-test-cpu".into(),
@@ -382,10 +393,30 @@ pub fn m9_linux_ready_snapshot_with_config<F>(
 where
     F: FnOnce(&mut dh_vmm::config::MachineConfig),
 {
+    let slot_cores = (0..slots)
+        .map(|slot| u32::try_from(slot).expect("slot core id fits u32"))
+        .collect();
+    m9_linux_ready_snapshot_with_slot_cores_and_config(test_name, slot_cores, configure)
+}
+
+#[allow(dead_code)]
+pub fn m9_linux_ready_snapshot_with_slot_cores_and_config<F>(
+    test_name: &str,
+    slot_cores: Vec<u32>,
+    configure: F,
+) -> TestResult<Option<M9LinuxReady>>
+where
+    F: FnOnce(&mut dh_vmm::config::MachineConfig),
+{
     use dh_proto::v1 as proto;
     use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
     use tonic::Request;
 
+    if slot_cores.is_empty() {
+        return Err(format!(
+            "{test_name}: m9 Linux READY setup requires at least one slot core"
+        ));
+    }
     let Some(artifacts) = m9_artifacts(test_name)? else {
         return Ok(None);
     };
@@ -404,9 +435,9 @@ where
     let (_store_rt, _store_handle, store) =
         spawn_store_at(store_dir.path().to_path_buf(), store_sock);
     let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
-    let svc = dh_worker::service::WorkerService::new(m9_worker_config(
+    let svc = dh_worker::service::WorkerService::new(m9_worker_config_with_slot_cores(
         test_name,
-        slots,
+        slot_cores,
         artifacts.image_cache,
         snapstore,
     ))

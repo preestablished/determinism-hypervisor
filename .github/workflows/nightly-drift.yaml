@@ -151,6 +151,62 @@ jobs:
           cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
         working-directory: repo
 
+  m7-linux-fork-verify-100:
+    # Linux M7 canary: boot the M9 Linux fixture once to READY, fork 100
+    # children from that READY snapshot, and VerifyReplay every child log.
+    # Cross-slot Linux evidence remains operator-run to keep nightly bounded.
+    needs: determinism-class
+    runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 120
+    env:
+      DH_M7_ACCEPT_GUEST: linux
+      DH_M7_ACCEPT_JOBS: ${{ inputs.m7_fork_jobs || '100' }}
+      DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m7_slot_cores || '2-5' }}
+      DH_M7_ACCEPT_ALLOW_SKIP: "0"
+      DH_M9_ALLOW_SKIP: "0"
+      DH_M9_BZIMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/bzImage
+      DH_M9_INITRAMFS: /home/infra-admin/.cache/dh-m9/reference-workload/initramfs.cpio
+      DH_M9_BASE_IMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/base.img
+      DH_M9_GAME_IMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/game.img
+      DH_M9_IMAGE_CACHE: /home/infra-admin/.cache/dh-m9/image-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
+      - name: preflight M9 Linux artifacts and slot affinity
+        run: |
+          set -euo pipefail
+          mkdir -p "$DH_M9_IMAGE_CACHE"
+          test -f "$DH_M9_BZIMAGE" || { echo "::error::DH_M9_BZIMAGE missing: $DH_M9_BZIMAGE"; exit 1; }
+          test -f "$DH_M9_INITRAMFS" || { echo "::error::DH_M9_INITRAMFS missing: $DH_M9_INITRAMFS"; exit 1; }
+          test -f "$DH_M9_BASE_IMAGE" || { echo "::error::DH_M9_BASE_IMAGE missing: $DH_M9_BASE_IMAGE"; exit 1; }
+          test -f "$DH_M9_GAME_IMAGE" || { echo "::error::DH_M9_GAME_IMAGE missing: $DH_M9_GAME_IMAGE"; exit 1; }
+          test -d "$DH_M9_IMAGE_CACHE" || { echo "::error::DH_M9_IMAGE_CACHE missing: $DH_M9_IMAGE_CACHE"; exit 1; }
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" true || { echo "::error::slot cores unavailable: $DH_M7_ACCEPT_SLOT_CORES"; exit 1; }
+        working-directory: repo
+      - name: nightly 100-fork Linux M7 VerifyReplay canary
+        run: |
+          echo "M7 Linux fork/VerifyReplay canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES allow_skip=$DH_M7_ACCEPT_ALLOW_SKIP"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
+            m7_accept_1000_seeded_forks_verify_replay_all \
+            -- --ignored --nocapture
+        working-directory: repo
+
   # 1h libFuzzer budget over the DHILOG read and splice paths (beads
   # 1j4, 6zm): arbitrary bytes -> LogReader::parse / Lineage
   # composition; the invariant is no panics / no unbounded allocation on
@@ -220,7 +276,7 @@ jobs:
   # A silent-red nightly is the worst outcome for a determinism product:
   # route failures to a visible issue (updated, not duplicated).
   alert-on-failure:
-    needs: [determinism-class, determinism-canary, record-replay-corpus, m7-fork-verify-100, dhilog-fuzz]
+    needs: [determinism-class, determinism-canary, record-replay-corpus, m7-fork-verify-100, m7-linux-fork-verify-100, dhilog-fuzz]
     if: failure()
     runs-on: ubuntu-latest
     permissions:
@@ -231,8 +287,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
-          TITLE="nightly-drift FAILED: determinism class, corpus, canary, M7 fork verify, or DHILOG fuzz"
-          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary/M7 fork-verify failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
+          TITLE="nightly-drift FAILED: determinism class, corpus, canary, M7 fork verify, Linux M7 fork verify, or DHILOG fuzz"
+          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary/M7 fork-verify/Linux M7 fork-verify failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
