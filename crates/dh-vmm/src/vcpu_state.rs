@@ -112,6 +112,33 @@ pub fn canonicalize_sregs(sregs: &mut kvm_sregs) {
     }
 }
 
+/// KVM may leave descriptive event payload fields populated even when no
+/// event is injected or pending. Those bytes are not architectural state at
+/// a boundary, and KVM can rewrite them across SET/GET, so deterministic
+/// snapshots and hashes canonicalize them before use.
+pub fn canonicalize_vcpu_events(events: &mut kvm_vcpu_events) {
+    if events.exception.injected == 0 && events.exception.pending == 0 {
+        events.exception.nr = 0;
+        events.exception.has_error_code = 0;
+        events.exception.error_code = 0;
+        events.exception_has_payload = 0;
+        events.exception_payload = 0;
+    } else {
+        if events.exception.has_error_code == 0 {
+            events.exception.error_code = 0;
+        }
+        if events.exception_has_payload == 0 {
+            events.exception_payload = 0;
+        }
+    }
+    if events.interrupt.injected == 0 {
+        events.interrupt.nr = 0;
+        events.interrupt.soft = 0;
+    }
+    events.nmi.pad = 0;
+    events.reserved.fill(0);
+}
+
 /// Capture the full state set from a vCPU stopped at a boundary.
 pub fn capture(slot: &SlotVm) -> Result<VcpuState, KvmError> {
     let vcpu = &slot.vcpu;
@@ -151,6 +178,10 @@ pub fn capture(slot: &SlotVm) -> Result<VcpuState, KvmError> {
     }
     let mut sregs = vcpu.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
     canonicalize_sregs(&mut sregs);
+    let mut events = vcpu
+        .get_vcpu_events()
+        .map_err(kvm_err("KVM_GET_VCPU_EVENTS"))?;
+    canonicalize_vcpu_events(&mut events);
 
     Ok(VcpuState {
         regs: vcpu.get_regs().map_err(kvm_err("KVM_GET_REGS"))?,
@@ -159,9 +190,7 @@ pub fn capture(slot: &SlotVm) -> Result<VcpuState, KvmError> {
         xsave,
         xcrs: vcpu.get_xcrs().map_err(kvm_err("KVM_GET_XCRS"))?,
         msrs: msrs.as_slice().to_vec(),
-        events: vcpu
-            .get_vcpu_events()
-            .map_err(kvm_err("KVM_GET_VCPU_EVENTS"))?,
+        events,
         dbg: vcpu
             .get_debug_regs()
             .map_err(kvm_err("KVM_GET_DEBUGREGS"))?,
@@ -425,6 +454,32 @@ mod tests {
         assert_eq!(std::mem::size_of::<kvm_xcrs>(), 392);
         assert_eq!(std::mem::size_of::<kvm_vcpu_events>(), 64);
         assert_eq!(std::mem::size_of::<kvm_debugregs>(), 128);
+    }
+
+    #[test]
+    fn canonicalizes_inactive_vcpu_event_payloads() {
+        let mut events = kvm_vcpu_events::default();
+        events.exception.nr = 13;
+        events.exception.has_error_code = 1;
+        events.exception.error_code = 6;
+        events.exception_has_payload = 1;
+        events.exception_payload = 0xfeed_face;
+        events.interrupt.nr = 0x20;
+        events.interrupt.soft = 1;
+        events.nmi.pad = 0xee;
+        events.reserved = [0xaa; 26];
+
+        canonicalize_vcpu_events(&mut events);
+
+        assert_eq!(events.exception.nr, 0);
+        assert_eq!(events.exception.has_error_code, 0);
+        assert_eq!(events.exception.error_code, 0);
+        assert_eq!(events.exception_has_payload, 0);
+        assert_eq!(events.exception_payload, 0);
+        assert_eq!(events.interrupt.nr, 0);
+        assert_eq!(events.interrupt.soft, 0);
+        assert_eq!(events.nmi.pad, 0);
+        assert_eq!(events.reserved, [0; 26]);
     }
 
     #[test]

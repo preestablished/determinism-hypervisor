@@ -370,6 +370,18 @@ pub fn m9_worker_config(
 
 #[allow(dead_code)]
 pub fn m9_linux_ready_snapshot(test_name: &str, slots: usize) -> TestResult<Option<M9LinuxReady>> {
+    m9_linux_ready_snapshot_with_config(test_name, slots, |_| {})
+}
+
+#[allow(dead_code)]
+pub fn m9_linux_ready_snapshot_with_config<F>(
+    test_name: &str,
+    slots: usize,
+    configure: F,
+) -> TestResult<Option<M9LinuxReady>>
+where
+    F: FnOnce(&mut dh_vmm::config::MachineConfig),
+{
     use dh_proto::v1 as proto;
     use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
     use tonic::Request;
@@ -381,7 +393,8 @@ pub fn m9_linux_ready_snapshot(test_name: &str, slots: usize) -> TestResult<Opti
         return Ok(None);
     };
     let hashes = populate_m9_image_cache(&artifacts)?;
-    let config = m9_linux_machine_config(&hashes, cpuid_table);
+    let mut config = m9_linux_machine_config(&hashes, cpuid_table);
+    configure(&mut config);
     let config_hash = config
         .config_hash()
         .map_err(|e| format!("MachineConfig hash: {e:?}"))?;

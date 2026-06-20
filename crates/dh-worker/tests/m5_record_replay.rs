@@ -47,13 +47,15 @@ mod common;
 use std::sync::atomic::AtomicBool;
 use std::{collections::BTreeMap, fs, path::Path};
 
-use common::{gettid, kvm_available, spawn_store_blocking, VmMem};
+use common::{gettid, kvm_available, spawn_store_blocking, TestResult, VmMem};
 use dh_detclock::counter::{InstRetired, NEVER_FIRES_PERIOD};
 use dh_devices::entropy::{DetEntropy, PvEntropy};
 use dh_devices::pad::PvPad;
 use dh_devices::MmioBus;
 use dh_inputlog::dhilog::{LogWriter, SegmentHeader};
 use dh_inputlog::reader::{LogReader, RecordBody};
+use dh_proto::v1 as proto;
+use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 use dh_vmm::boundary::BoundaryError;
 use dh_vmm::config::{BootSpec, MachineConfig};
 use dh_vmm::dirty::PAGE_SIZE;
@@ -69,8 +71,9 @@ use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
 };
 use kvm_ioctls::VcpuExit;
-use snapstore_manifest::{DeviceBlob, Manifest};
+use snapstore_manifest::{input_log::InputLogContainer, DeviceBlob, Manifest};
 use snapstore_types::SnapshotRef;
+use tonic::Request;
 use vm_memory::{Bytes, GuestAddress};
 
 const MEM: u64 = 16 << 20;
@@ -99,6 +102,16 @@ const CORPUS_ROOT_SPARSE: &str = "root-sparse.bin";
 const CORPUS_DHSNAP: &str = "root.dhsnap";
 const CORPUS_DHILOG: &str = "recording.dhilog";
 const CORPUS_EXPECTED: &str = "expected.txt";
+const M9_LINUX_CORPUS_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/record_replay_corpus/m9_linux_post_ready"
+);
+const M9_LINUX_CORPUS_EXPECTED: &str = "expected.txt";
+const M9_LINUX_CORPUS_FRAMES: u32 = 5;
+const M9_LINUX_CORPUS_HARD_CAP: u64 = 5_000_000;
+const M9_LINUX_CORPUS_EPOCH_LEN: u64 = 745_000;
+const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
+const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
 const SPARSE_ROOT_MAGIC: &[u8; 8] = b"DHRRPG01";
 const DETERMINISM_CLASS_LOCK: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -106,12 +119,60 @@ const DETERMINISM_CLASS_LOCK: &str = concat!(
 );
 
 #[test]
-#[ignore = "M9 Linux acceptance guard: fails on the linux filter until real Linux corpus coverage exists"]
-fn linux_m5_record_replay_requires_real_linux_corpus() {
-    common::reject_unimplemented_m9_linux_gate(
-        "m5_record_replay::linux_m5_record_replay_requires_real_linux_corpus",
-        "Linux M5 corpus replay must use a Linux root snapshot and deterministic post-READY input script with nonzero EPOCH_HASH verification and matching END state hash.",
+#[ignore = "M9 Linux acceptance: requires KVM dirty-ring support and staged DH_M9_* artifacts"]
+fn linux_m5_record_replay_post_ready_corpus_reverifies() -> TestResult<()> {
+    let Some(evidence) = m9_linux_record_replay_evidence(
+        "m5_record_replay::linux_m5_record_replay_post_ready_corpus",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let expected_bytes = fs::read(m9_linux_fixture_path(M9_LINUX_CORPUS_EXPECTED))
+        .map_err(|e| format!("read M9 Linux expected manifest: {e}"))?;
+    let expected = expected_map(&expected_bytes);
+    assert_m9_linux_expected_matches(&evidence, &expected);
+
+    eprintln!(
+        "m9-linux-rr artifacts bzImage={} initramfs={} base={} game={}",
+        hex(&evidence.artifact_hashes.bzimage),
+        hex(&evidence.artifact_hashes.initramfs),
+        hex(&evidence.artifact_hashes.base_image),
+        hex(&evidence.artifact_hashes.game_image)
     );
+    eprintln!(
+        "m9-linux-rr frames={} hard_cap={} end_icount={} epochs={} end_state_hash={} checksum={:#x} dhilog={}",
+        M9_LINUX_CORPUS_FRAMES,
+        M9_LINUX_CORPUS_HARD_CAP,
+        evidence.parsed.end_icount,
+        evidence.parsed.epochs.len(),
+        hex(&evidence.parsed.end_state_hash),
+        evidence.meta_pvblk_checksum,
+        evidence.parsed.dhilog_blake3
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "explicit M9 re-baseline only: set DH_WORKER_REGEN_M9_LINUX_RR_CORPUS=1"]
+fn regenerate_m9_rr_corpus_manifest_for_reference_host() -> TestResult<()> {
+    if std::env::var_os("DH_WORKER_REGEN_M9_LINUX_RR_CORPUS").is_none() {
+        panic!("set DH_WORKER_REGEN_M9_LINUX_RR_CORPUS=1 to rewrite the M9 Linux manifest");
+    }
+    let Some(evidence) = m9_linux_record_replay_evidence(
+        "m5_record_replay::regenerate_m9_rr_corpus_manifest_for_reference_host",
+    )?
+    else {
+        return Ok(());
+    };
+    fs::create_dir_all(M9_LINUX_CORPUS_DIR)
+        .map_err(|e| format!("create M9 Linux corpus dir: {e}"))?;
+    fs::write(
+        m9_linux_fixture_path(M9_LINUX_CORPUS_EXPECTED),
+        expected_m9_linux_text(&evidence),
+    )
+    .map_err(|e| format!("write M9 Linux expected manifest: {e}"))?;
+    Ok(())
 }
 
 fn hex(b: &[u8; 32]) -> String {
@@ -135,8 +196,349 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
     Path::new(CORPUS_DIR).join(name)
 }
 
+fn m9_linux_fixture_path(name: &str) -> std::path::PathBuf {
+    Path::new(M9_LINUX_CORPUS_DIR).join(name)
+}
+
 fn determinism_class_lock_bytes() -> Vec<u8> {
     fs::read(DETERMINISM_CLASS_LOCK).expect("ci/determinism-class.lock")
+}
+
+fn arr32(bytes: &[u8], label: &str) -> TestResult<[u8; 32]> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("{label} must be 32 bytes, got {}", bytes.len()))
+}
+
+fn reference_host_id() -> TestResult<String> {
+    let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_err(|e| format!("read /proc/sys/kernel/hostname: {e}"))?;
+    Ok(hostname.trim().to_string())
+}
+
+fn input_log_payload(
+    store: &snapstore_client::blocking::SnapstoreClient,
+    input_log_id: &[u8],
+) -> TestResult<Vec<u8>> {
+    let id = arr32(input_log_id, "input log id")?;
+    let container = store
+        .get_input_log(snapstore_types::LogId::from_bytes(id))
+        .map_err(|e| format!("get_input_log: {e}"))?;
+    let decoded = InputLogContainer::decode(&container)
+        .map_err(|e| format!("input log container decode: {e}"))?;
+    Ok(decoded.payload().to_vec())
+}
+
+#[derive(Debug)]
+struct ParsedM9LinuxLog {
+    dhilog_blake3: String,
+    base_snapshot_id: [u8; 32],
+    end_snapshot_id: [u8; 32],
+    machine_config_hash: [u8; 32],
+    record_count: u64,
+    records_applied: u64,
+    end_icount: u64,
+    end_vns: u64,
+    end_state_hash: [u8; 32],
+    epochs: Vec<(u64, u64, [u8; 32])>,
+}
+
+#[derive(Debug)]
+struct VerifyReplayEvidence {
+    done: proto::VerifyDone,
+    epoch_ok_count: usize,
+}
+
+#[derive(Debug)]
+struct M9LinuxRecordReplayEvidence {
+    host_id: String,
+    artifact_hashes: common::M9CachedHashes,
+    config_hash: [u8; 32],
+    ready_snapshot_ref: [u8; 32],
+    post_snapshot_ref: [u8; 32],
+    post_state_hash: [u8; 32],
+    frame_counter: u32,
+    meta_pvblk_checksum: u64,
+    log: Vec<u8>,
+    parsed: ParsedM9LinuxLog,
+    verify: VerifyReplayEvidence,
+}
+
+fn parse_m9_linux_log(log: &[u8]) -> TestResult<ParsedM9LinuxLog> {
+    let reader =
+        LogReader::parse(log).map_err(|e| format!("M9 Linux DHILOG parse failed: {e:?}"))?;
+    let header = reader.header();
+    if !header.has_epoch_hashes() {
+        return Err("M9 Linux DHILOG header does not advertise EPOCH_HASH records".into());
+    }
+    let epochs: Vec<(u64, u64, [u8; 32])> = reader
+        .aux()
+        .filter_map(|rec| match rec.body() {
+            RecordBody::EpochHash {
+                epoch_index,
+                chain_value,
+            } => Some((epoch_index, rec.icount(), chain_value)),
+            _ => None,
+        })
+        .collect();
+    if epochs.is_empty() {
+        return Err("M9 Linux DHILOG contains zero EPOCH_HASH records".into());
+    }
+    let records_applied = reader.canonical().count() as u64;
+    let (_end_reason, end_state_hash) = reader.end();
+    if end_state_hash != header.end_state_hash {
+        return Err("M9 Linux DHILOG END state hash does not match header".into());
+    }
+    Ok(ParsedM9LinuxLog {
+        dhilog_blake3: blake3_hex(log),
+        base_snapshot_id: header.base_snapshot_id,
+        end_snapshot_id: header.end_snapshot_id,
+        machine_config_hash: header.machine_config_hash,
+        record_count: header.record_count,
+        records_applied,
+        end_icount: header.end_icount,
+        end_vns: header.end_vns,
+        end_state_hash: header.end_state_hash,
+        epochs,
+    })
+}
+
+fn assert_m9_meta_io_proof(bytes: &[u8]) -> TestResult<u64> {
+    if bytes.len() != M9_LINUX_META_IO_PROOF_LEN as usize {
+        return Err(format!(
+            "M9 Linux meta IO proof length {}, expected {M9_LINUX_META_IO_PROOF_LEN}",
+            bytes.len()
+        ));
+    }
+    if &bytes[..8] != b"PVBLKIO1" {
+        return Err(format!(
+            "M9 Linux meta IO proof missing PVBLKIO1 magic: {:?}",
+            &bytes[..8]
+        ));
+    }
+    let frame = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if frame != 0 {
+        return Err(format!("M9 Linux meta IO proof frame {frame}, expected 0"));
+    }
+    let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    if checksum == 0 {
+        return Err("M9 Linux meta IO proof checksum must be nonzero".into());
+    }
+    Ok(checksum)
+}
+
+async fn verify_replay_evidence(
+    svc: &dh_worker::service::WorkerService,
+    base: proto::SnapshotRef,
+    input_log_id: Vec<u8>,
+) -> TestResult<VerifyReplayEvidence> {
+    use tokio_stream::StreamExt;
+
+    let mut stream = svc
+        .verify_replay(Request::new(proto::VerifyReplayRequest {
+            base: Some(base),
+            log: Some(proto::verify_replay_request::Log::InputLogId(input_log_id)),
+            bisect_on_divergence: Some(false),
+        }))
+        .await
+        .map_err(|e| format!("VerifyReplay: {e}"))?
+        .into_inner();
+
+    let mut epoch_ok_count = 0usize;
+    let mut done = None;
+    while let Some(progress) = stream.as_mut().next().await {
+        let progress = progress.map_err(|e| format!("VerifyReplay progress: {e}"))?;
+        match progress.msg {
+            Some(proto::verify_replay_progress::Msg::EpochOk(_)) => {
+                if done.is_some() {
+                    return Err("VerifyReplay emitted EpochOk after Done".into());
+                }
+                epoch_ok_count += 1;
+            }
+            Some(proto::verify_replay_progress::Msg::Done(msg)) => {
+                if done.replace(msg).is_some() {
+                    return Err("VerifyReplay emitted duplicate Done".into());
+                }
+            }
+            Some(proto::verify_replay_progress::Msg::Divergence(divergence)) => {
+                return Err(format!("VerifyReplay divergence: {divergence:?}"));
+            }
+            None => return Err("VerifyReplay emitted empty progress message".into()),
+        }
+    }
+    let done = done.ok_or_else(|| "VerifyReplay ended without Done".to_string())?;
+    Ok(VerifyReplayEvidence {
+        done,
+        epoch_ok_count,
+    })
+}
+
+fn m9_linux_record_replay_evidence(
+    test_name: &str,
+) -> TestResult<Option<M9LinuxRecordReplayEvidence>> {
+    let Some(artifacts) = common::m9_artifacts(test_name)? else {
+        return Ok(None);
+    };
+    let artifact_hashes = common::M9CachedHashes {
+        bzimage: common::hash_file(&artifacts.bzimage)?,
+        initramfs: common::hash_file(&artifacts.initramfs)?,
+        base_image: common::hash_file(&artifacts.base_image)?,
+        game_image: common::hash_file(&artifacts.game_image)?,
+    };
+    let Some(ready) = common::m9_linux_ready_snapshot_with_config(test_name, 2, |config| {
+        config.epoch_len = M9_LINUX_CORPUS_EPOCH_LEN;
+    })?
+    else {
+        return Ok(None);
+    };
+    let ready_snapshot_ref = arr32(&ready.ready_snapshot_ref.hash, "READY snapshot ref")?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    let (run, post_snapshot, meta_proof) = rt.block_on(async {
+        let run = ready
+            .svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(ready.lease.clone()),
+                until: Some(proto::run_request::Until::FrameBudget(
+                    M9_LINUX_CORPUS_FRAMES,
+                )),
+                hard_icount_cap: M9_LINUX_CORPUS_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run M9 Linux post-READY segment: {e}"))?
+            .into_inner();
+        if run.reason != i32::from(proto::StopReason::BudgetReached) {
+            return Err(format!(
+                "M9 Linux run stopped with {}, expected BudgetReached",
+                run.reason
+            ));
+        }
+        if run.frames_elapsed != u64::from(M9_LINUX_CORPUS_FRAMES) {
+            return Err(format!(
+                "M9 Linux run frames_elapsed {}, expected {M9_LINUX_CORPUS_FRAMES}",
+                run.frames_elapsed
+            ));
+        }
+
+        let meta = ready
+            .svc
+            .read_guest_memory(Request::new(proto::ReadGuestMemoryRequest {
+                lease: Some(ready.lease.clone()),
+                ranges: Vec::new(),
+                region_ranges: vec![proto::RegionRange {
+                    region: "meta".into(),
+                    layout_version: 1,
+                    offset: M9_LINUX_META_IO_MAGIC_OFF,
+                    len: M9_LINUX_META_IO_PROOF_LEN,
+                }],
+            }))
+            .await
+            .map_err(|e| format!("ReadGuestMemory M9 Linux meta IO proof: {e}"))?
+            .into_inner();
+        let meta_proof = meta
+            .chunks
+            .first()
+            .cloned()
+            .ok_or_else(|| "ReadGuestMemory returned no M9 Linux meta IO proof".to_string())?;
+
+        let post_snapshot = ready
+            .svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(ready.lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot M9 Linux post-READY segment: {e}"))?
+            .into_inner();
+        Ok::<_, String>((run, post_snapshot, meta_proof))
+    })?;
+
+    let _run_icount = run.icount;
+    let post_snapshot_ref = post_snapshot
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| "M9 Linux post snapshot returned no snapshot ref".to_string())
+        .and_then(|snapshot| arr32(&snapshot.hash, "M9 Linux post snapshot ref"))?;
+    let post_state_hash = post_snapshot
+        .state_hash
+        .as_ref()
+        .ok_or_else(|| "M9 Linux post snapshot returned no state hash".to_string())
+        .and_then(|hash| arr32(&hash.hash, "M9 Linux post snapshot state hash"))?;
+    let log = input_log_payload(&ready.store, &post_snapshot.input_log_id)?;
+    let parsed = parse_m9_linux_log(&log)?;
+    if parsed.base_snapshot_id != ready_snapshot_ref {
+        return Err("M9 Linux DHILOG base_snapshot_id does not match READY snapshot".into());
+    }
+    if parsed.end_snapshot_id != post_snapshot_ref {
+        return Err("M9 Linux DHILOG end_snapshot_id does not match post snapshot".into());
+    }
+    if parsed.machine_config_hash != ready.config_hash {
+        return Err("M9 Linux DHILOG machine_config_hash does not match READY config".into());
+    }
+    if parsed.end_state_hash != post_state_hash {
+        return Err("M9 Linux DHILOG END state hash does not match post snapshot".into());
+    }
+    let meta_pvblk_checksum = assert_m9_meta_io_proof(&meta_proof)?;
+
+    let verify = rt.block_on(async {
+        let verify = verify_replay_evidence(
+            &ready.svc,
+            ready.ready_snapshot_ref.clone(),
+            post_snapshot.input_log_id.clone(),
+        )
+        .await?;
+        let _ = ready
+            .svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(ready.lease.clone()),
+            }))
+            .await;
+        Ok::<_, String>(verify)
+    })?;
+    if verify.epoch_ok_count == 0 {
+        return Err("VerifyReplay emitted no EpochOk progress".into());
+    }
+    if verify.epoch_ok_count != parsed.epochs.len() {
+        return Err(format!(
+            "VerifyReplay EpochOk count {} did not match parsed EPOCH_HASH count {}",
+            verify.epoch_ok_count,
+            parsed.epochs.len()
+        ));
+    }
+    if verify.done.total_icount != parsed.end_icount {
+        return Err(format!(
+            "VerifyReplay Done total_icount {}, expected parsed end_icount {}",
+            verify.done.total_icount, parsed.end_icount
+        ));
+    }
+    let verify_hash = verify
+        .done
+        .end_state_hash
+        .as_ref()
+        .ok_or_else(|| "VerifyReplay Done returned no end_state_hash".to_string())
+        .and_then(|hash| arr32(&hash.hash, "VerifyReplay Done end_state_hash"))?;
+    if verify_hash != post_state_hash {
+        return Err("VerifyReplay Done end_state_hash does not match post snapshot".into());
+    }
+
+    Ok(Some(M9LinuxRecordReplayEvidence {
+        host_id: reference_host_id()?,
+        artifact_hashes,
+        config_hash: ready.config_hash,
+        ready_snapshot_ref,
+        post_snapshot_ref,
+        post_state_hash,
+        frame_counter: post_snapshot.frame_counter,
+        meta_pvblk_checksum,
+        log,
+        parsed,
+        verify,
+    }))
 }
 
 /// SplitMix64 — tiny, dependency-free, and fully determined by the seed.
@@ -343,6 +745,265 @@ fn assert_expected_key_set(m: &BTreeMap<String, String>) {
     }
     let actual = m.keys().cloned().collect::<std::collections::BTreeSet<_>>();
     assert_eq!(actual, allowed, "expected.txt key set changed");
+}
+
+fn assert_m9_linux_expected_key_set(m: &BTreeMap<String, String>) {
+    let epoch_count = expected_u64(m, "epoch_hashes_verified");
+    let epoch_keys = m
+        .keys()
+        .filter_map(|key| {
+            let suffix = key.strip_prefix("epoch_")?;
+            suffix.parse::<u64>().ok().map(|_| key.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        epoch_keys.len() as u64,
+        epoch_count,
+        "M9 Linux expected epoch key count changed"
+    );
+    for key in &epoch_keys {
+        key.strip_prefix("epoch_")
+            .expect("epoch prefix")
+            .parse::<u64>()
+            .unwrap_or_else(|_| panic!("invalid M9 Linux epoch key {key}"));
+    }
+
+    let mut allowed = [
+        "name",
+        "host_id",
+        "determinism_class_lock_blake3",
+        "bzimage_blake3",
+        "initramfs_blake3",
+        "base_image_blake3",
+        "game_image_blake3",
+        "mem_bytes",
+        "epoch_len",
+        "machine_config_hash",
+        "ready_snapshot_ref",
+        "end_snapshot_ref",
+        "run_until",
+        "hard_icount_cap",
+        "dhilog_blake3",
+        "dhilog_records",
+        "records_applied",
+        "epoch_hashes_verified",
+        "end_icount",
+        "end_vns",
+        "end_state_hash",
+        "frame_counter",
+        "meta_pvblk_checksum",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+    allowed.extend(epoch_keys);
+    let actual = m.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, allowed, "M9 Linux expected.txt key set changed");
+}
+
+fn expected_m9_linux_text(evidence: &M9LinuxRecordReplayEvidence) -> String {
+    let mut out = String::new();
+    out.push_str("# M9 Linux post-READY record/replay corpus manifest.\n");
+    out.push_str("# Re-baseline only with reviewed M9 fixture, host, or hash-contract changes.\n");
+    out.push_str("name=m9_linux_post_ready\n");
+    out.push_str(&format!("host_id={}\n", evidence.host_id));
+    out.push_str(&format!(
+        "determinism_class_lock_blake3={}\n",
+        blake3_hex(&determinism_class_lock_bytes())
+    ));
+    out.push_str(&format!(
+        "bzimage_blake3={}\n",
+        hex(&evidence.artifact_hashes.bzimage)
+    ));
+    out.push_str(&format!(
+        "initramfs_blake3={}\n",
+        hex(&evidence.artifact_hashes.initramfs)
+    ));
+    out.push_str(&format!(
+        "base_image_blake3={}\n",
+        hex(&evidence.artifact_hashes.base_image)
+    ));
+    out.push_str(&format!(
+        "game_image_blake3={}\n",
+        hex(&evidence.artifact_hashes.game_image)
+    ));
+    out.push_str(&format!("mem_bytes={}\n", common::M9_LINUX_MEM_BYTES));
+    out.push_str(&format!("epoch_len={M9_LINUX_CORPUS_EPOCH_LEN}\n"));
+    out.push_str(&format!(
+        "machine_config_hash={}\n",
+        hex(&evidence.config_hash)
+    ));
+    out.push_str(&format!(
+        "ready_snapshot_ref={}\n",
+        hex(&evidence.ready_snapshot_ref)
+    ));
+    out.push_str(&format!(
+        "end_snapshot_ref={}\n",
+        hex(&evidence.post_snapshot_ref)
+    ));
+    out.push_str(&format!(
+        "run_until=frame_budget:{M9_LINUX_CORPUS_FRAMES}\n"
+    ));
+    out.push_str(&format!("hard_icount_cap={M9_LINUX_CORPUS_HARD_CAP}\n"));
+    out.push_str(&format!("dhilog_blake3={}\n", blake3_hex(&evidence.log)));
+    out.push_str(&format!(
+        "dhilog_records={}\n",
+        evidence.parsed.record_count
+    ));
+    out.push_str(&format!(
+        "records_applied={}\n",
+        evidence.parsed.records_applied
+    ));
+    out.push_str(&format!(
+        "epoch_hashes_verified={}\n",
+        evidence.parsed.epochs.len()
+    ));
+    out.push_str(&format!("end_icount={}\n", evidence.parsed.end_icount));
+    out.push_str(&format!("end_vns={}\n", evidence.parsed.end_vns));
+    out.push_str(&format!(
+        "end_state_hash={}\n",
+        hex(&evidence.parsed.end_state_hash)
+    ));
+    out.push_str(&format!("frame_counter={}\n", evidence.frame_counter));
+    out.push_str(&format!(
+        "meta_pvblk_checksum={}\n",
+        evidence.meta_pvblk_checksum
+    ));
+    for (epoch_index, icount, chain_value) in &evidence.parsed.epochs {
+        out.push_str(&format!(
+            "epoch_{epoch_index}={icount}:{}\n",
+            hex(chain_value)
+        ));
+    }
+    out
+}
+
+fn assert_m9_linux_expected_matches(
+    evidence: &M9LinuxRecordReplayEvidence,
+    expected: &BTreeMap<String, String>,
+) {
+    assert_m9_linux_expected_key_set(expected);
+    assert_eq!(expected_value(expected, "name"), "m9_linux_post_ready");
+    assert_eq!(expected_value(expected, "host_id"), evidence.host_id);
+    assert_eq!(
+        expected_value(expected, "determinism_class_lock_blake3"),
+        blake3_hex(&determinism_class_lock_bytes())
+    );
+    assert_eq!(
+        expected_value(expected, "bzimage_blake3"),
+        hex(&evidence.artifact_hashes.bzimage)
+    );
+    assert_eq!(
+        expected_value(expected, "initramfs_blake3"),
+        hex(&evidence.artifact_hashes.initramfs)
+    );
+    assert_eq!(
+        expected_value(expected, "base_image_blake3"),
+        hex(&evidence.artifact_hashes.base_image)
+    );
+    assert_eq!(
+        expected_value(expected, "game_image_blake3"),
+        hex(&evidence.artifact_hashes.game_image)
+    );
+    assert_eq!(
+        expected_u64(expected, "mem_bytes"),
+        common::M9_LINUX_MEM_BYTES
+    );
+    assert_eq!(
+        expected_u64(expected, "epoch_len"),
+        M9_LINUX_CORPUS_EPOCH_LEN
+    );
+    assert_eq!(
+        expected_value(expected, "machine_config_hash"),
+        hex(&evidence.config_hash)
+    );
+    assert_eq!(
+        expected_value(expected, "ready_snapshot_ref"),
+        hex(&evidence.ready_snapshot_ref)
+    );
+    assert_eq!(
+        expected_value(expected, "end_snapshot_ref"),
+        hex(&evidence.post_snapshot_ref)
+    );
+    assert_eq!(
+        expected_value(expected, "run_until"),
+        format!("frame_budget:{M9_LINUX_CORPUS_FRAMES}")
+    );
+    assert_eq!(
+        expected_u64(expected, "hard_icount_cap"),
+        M9_LINUX_CORPUS_HARD_CAP
+    );
+    assert_eq!(
+        expected_value(expected, "dhilog_blake3"),
+        blake3_hex(&evidence.log)
+    );
+    assert_eq!(
+        evidence.parsed.dhilog_blake3,
+        blake3_hex(&evidence.log),
+        "parsed DHILOG hash must match the stored payload"
+    );
+    assert_eq!(
+        expected_u64(expected, "dhilog_records"),
+        evidence.parsed.record_count
+    );
+    assert_eq!(
+        expected_u64(expected, "records_applied"),
+        evidence.parsed.records_applied
+    );
+    assert_eq!(
+        expected_u64(expected, "epoch_hashes_verified") as usize,
+        evidence.parsed.epochs.len()
+    );
+    assert_eq!(
+        evidence.verify.epoch_ok_count,
+        evidence.parsed.epochs.len(),
+        "VerifyReplay EpochOk count must match parsed EPOCH_HASH records"
+    );
+    assert_eq!(
+        evidence.verify.done.total_icount, evidence.parsed.end_icount,
+        "VerifyReplay Done total_icount must match the DHILOG END icount"
+    );
+    let verify_done_hash: [u8; 32] = evidence
+        .verify
+        .done
+        .end_state_hash
+        .as_ref()
+        .expect("VerifyReplay Done end_state_hash")
+        .hash
+        .as_slice()
+        .try_into()
+        .expect("VerifyReplay Done end_state_hash must be 32 bytes");
+    assert_eq!(
+        verify_done_hash, evidence.post_state_hash,
+        "VerifyReplay Done hash must match live snapshot hash"
+    );
+    assert_eq!(
+        expected_u64(expected, "end_icount"),
+        evidence.parsed.end_icount
+    );
+    assert_eq!(expected_u64(expected, "end_vns"), evidence.parsed.end_vns);
+    assert_eq!(
+        expected_value(expected, "end_state_hash"),
+        hex(&evidence.parsed.end_state_hash)
+    );
+    assert_eq!(
+        evidence.parsed.end_state_hash, evidence.post_state_hash,
+        "parsed END hash must match live snapshot hash"
+    );
+    assert_eq!(
+        expected_u64(expected, "frame_counter"),
+        u64::from(evidence.frame_counter)
+    );
+    assert_eq!(
+        expected_u64(expected, "meta_pvblk_checksum"),
+        evidence.meta_pvblk_checksum
+    );
+    for (epoch_index, icount, chain_value) in &evidence.parsed.epochs {
+        assert_eq!(
+            format!("{icount}:{}", hex(chain_value)),
+            expected_value(expected, &format!("epoch_{epoch_index}"))
+        );
+    }
 }
 
 fn expected_value<'a>(m: &'a BTreeMap<String, String>, key: &str) -> &'a str {
