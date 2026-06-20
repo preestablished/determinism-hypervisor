@@ -142,10 +142,9 @@ ci/check-determinism-class.sh` reported all 7 lock keys matched. `/dev/kvm`
 was present and rw, `nasm` was `/usr/bin/nasm`, and `taskset -c 2-5` reported
 `Cpus_allowed_list: 2-5`.
 
-This addendum is limited to preserving the pre-existing nanokernel M5/M7
-coverage after M9 Linux work. It does not claim the downstream
-Linux-plus-nanokernel Phase 2 evidence rollup tracked by
-`determinism-hypervisor-4s9.32`.
+This addendum preserves the pre-existing nanokernel M5/M7 coverage after M9
+Linux work. The Linux rollup below completes the M9 Phase 2 exit-gate update
+tracked by `determinism-hypervisor-4s9.32`.
 
 | Command | Evidence |
 |---|---|
@@ -161,6 +160,45 @@ determinism command are still separate nanokernel/default rows. Fixture
 preservation checks before the documentation edits showed no changes under
 `tests/nanokernel/**` or
 `crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s/**`.
+
+## M9 Linux Phase 2 rollup (2026-06-20)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`. These Linux artifact-backed gates
+require staged `DH_M9_*` artifacts, live KVM, and the `kvm-intel` host. Final
+M9 Phase 2 evidence must use `DH_M9_ALLOW_SKIP=0` and, for M7, also
+`DH_M7_ACCEPT_ALLOW_SKIP=0`; any `*_ALLOW_SKIP=1` run is guard-path evidence
+only and is rejected for acceptance.
+
+The accepted Linux M4/M5/M7 producer evidence used this artifact set:
+
+| Artifact | BLAKE3 |
+|---|---|
+| `bzImage` | `595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9` |
+| `initramfs.cpio` | `87edf64db22dc85ef0c6b17fdc6e58a8f73391a6053e96f7a1056da7d08b9f57` |
+| `base.img` | `488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8` |
+| `game.img` | `e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac` |
+| `m9-refwork-contract` workload | `5d5eef1996e2e05168d23f99c46ee56dbd3fe02806b37b089f973868d2271346` |
+
+| Gate | Command | Evidence |
+|---|---|---|
+| Linux M4 snapshot/restore/fork transparency | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m4_transparency --release linux -- --ignored --nocapture` | PASS with no skips: mid `icount=642343512`, `frame_counter=6`, state hash `f4a21f31c9f563163af5c69b528a5e66a0a8ccacd51c4d0a712718fd10a43928`; control/restored `icount=643343512`, `frame_counter=13`, state hash `e54386c97bffb09a898c7cf73b73cfeeff357d207fcfc83ef26f6dbc872e0ac3`; snapshot diff `reg_diffs=0`, `diff_pages=[]`. |
+| Linux M5 frame scheduling | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_frame_scheduling --release linux -- --ignored --nocapture` | PASS: first post-READY frame table `[(186992, 1), (330795, 2), (474598, 3)]`; restored frame table `[(143803, 4), (287606, 5)]`, proving frame-budget continuity across restore on the Linux fixture. |
+| Linux M5 deterministic I/O loopback | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_net_loopback --release linux -- --ignored --nocapture` | PASS: M9 ships without Linux pv-net, so the Linux filter uses a guest-driven pv-blk I/O loopback segment. Evidence: `run_icount=641530504`, `frame_counter=1`, meta proof checksum `0xcfe2fddd7d2669a3`, `blko_dirty_clusters=1`, and VerifyReplay reproduces the sealed segment. |
+| Linux M5 post-READY record/replay corpus | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test m5_record_replay --release linux_m5_record_replay_post_ready_corpus_reverifies -- --ignored --nocapture` | PASS against `crates/dh-worker/tests/fixtures/record_replay_corpus/m9_linux_post_ready/expected.txt`. Manifest pins `ready_snapshot_ref=8996b67f3a6578062f8838a53bd72945567a525a0ac476a3366bfb3a3df6c088`, `end_snapshot_ref=725a09e6bd6456575c9aab50cfbf637f37853152a55f87d6f34af8072ce5f15e`, `dhilog_blake3=5a31d75e48dc52f52dca57e946a5099b7e14c33fb9f963a276073e511e7666c2`, `epoch_hashes_verified=1`, `end_state_hash=32454a811351f338fedacd0294358e442b5a84e849b63b721db3cfbd631ce5a1`, `frame_counter=5`, and meta pv-blk checksum `14979814438316960163`. |
+| Linux worker API support | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test linux_worker_api --release -- --ignored --nocapture` | PASS: 2 ignored Linux worker API tests passed, covering CreateVm BzImage, Run-to-Ready EventKind 14, StreamGuestEvents, ReadGuestMemory region ranges, TakeSnapshot, RestoreSnapshot, Fork, child Run, and VerifyReplay. This is supporting API evidence for the M9 Phase 2 gates. |
+| Linux M7 full fork/VerifyReplay | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | PASS in the unfiltered ignored run: 2 tests passed in 802.23s. Full fork test reached `M7 Linux fork/verify done: verified=1000 divergence=0 unique_hashes=1 epoch_hashes=1000`; every VerifyReplay stream reached Done and `Done.end_state_hash` matched the child snapshot state hash. The same run completed cross-slot samples at job indices 0, 111, 222, 333, 444, 555, 666, 777, 888, and 999. |
+| Linux M7 cross-slot rerun determinism | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | PASS in 162.73s. The 10 sampled same-seed jobs matched child snapshot refs, state hashes, input log ids, DHILOG payloads, parsed end counters/frame marks, and meta I/O checksums across child slots. |
+| Linux M7 nightly canary | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` | PASS as a nightly-equivalent 100-child Linux canary with `verified=100`, `divergence=0`, `unique_hashes=1`, and `epoch_hashes=100`. `.github/workflows/nightly-drift.yaml` schedules this as `m7-linux-fork-verify-100` beside the existing nanokernel/default `m7-fork-verify-100` canary. |
+
+CI and nightly classification lives in
+[`docs/ops/test-partitioning.md`](ops/test-partitioning.md) and
+[`docs/ops/github-runner.md`](ops/github-runner.md): Linux fixture contract,
+Ready, Phase 1 CLI, timer/IRQ, landing/counting, M4/M5, M5 corpus, worker API,
+full Linux M7, and Linux cross-slot gates are operator-run acceptance commands
+except for the scheduled 100-child Linux M7 nightly canary. The nanokernel
+record/replay corpus reverify and nanokernel/default M7 nightly canary remain
+separate coverage.
 
 ## Known refinements baked into the gate
 

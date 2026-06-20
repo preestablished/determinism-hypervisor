@@ -3,15 +3,19 @@
 `.agents/docs/determinism-hypervisor/{API,ARCHITECTURE,IMPLEMENTATION-PLAN}.md` and
 `.agents/docs/guest-sdk/ARCHITECTURE.md` are **synced from an upstream planning
 tree** (last sync: commit `d55ecc3`). During implementation this repo found
-twenty-one places where those documents are stale or wrong; in every case **the code
-in this repo is authoritative** (it ships, round-trips, and is pinned by tests).
-Eight were amended locally after the sync and will be silently reverted by the next
-sync unless pushed; five are upstream-only wording fixes (no local doc edit was
-needed because the code or a decision doc is the authority); eight more were
-amended locally BEFORE the `d55ecc3` sync and were **already silently reverted by
-it** — the revert hazard this file exists to prevent is not theoretical, it has
-already happened once (entries #11–#18; for those, the current local copies are
-stale again too, so applying upstream + re-syncing fixes both sides).
+twenty-nine accepted divergences where those documents, the cited upstream phase
+docs, or the sibling reference-workload/guest-sdk planning docs are stale or
+wrong; in every case **the code in this repo is authoritative** (it ships,
+round-trips, and is pinned by tests). Eight were amended locally after the sync
+and will be silently reverted by the next sync unless pushed; five are
+upstream-only wording fixes (no local doc edit was needed because the code or a
+decision doc is the authority); eight more were amended locally BEFORE the
+`d55ecc3` sync and were **already silently reverted by it** — the revert hazard
+this file exists to prevent is not theoretical, it has already happened once
+(entries #11–#18; for those, the current local copies are stale again too, so
+applying upstream + re-syncing fixes both sides). Entries #22–#29 are the M9
+Linux accepted-drift ledger against the cited phase, hypervisor, guest-sdk, and
+reference-workload planning docs under `~/.agents/projects/determinism`.
 
 This file is the ready-to-apply artifact for whoever can write to the upstream tree:
 each entry gives the exact old text, the exact new text (or proposed wording), and
@@ -34,7 +38,8 @@ Operator instructions:
 - Quick index — amended locally after the sync (exact diffs): #1, #2, #7, #9, #10,
   #19, #20, #21;
   upstream-only proposals: #3, #4, #5, #6, #8; amended locally before the sync and
-  reverted by it (exact diffs recovered from `d55ecc3^`): #11–#18.
+  reverted by it (exact diffs recovered from `d55ecc3^`): #11–#18; M9
+  accepted-drift entries: #22–#29.
 
 ---
 
@@ -42,8 +47,8 @@ Operator instructions:
 
 The "New" texts in this section are verbatim copies of review-passed local edits
 (commits cited per entry). Once upstream applies an entry and `.agents/docs` is
-re-synced, the local amendment is subsumed by the sync; when all twenty-one entries
-in this file are applied/resolved, bead `veu` can close.
+re-synced, the local amendment is subsumed by the sync; when all entries in this
+file are applied/resolved, bead `veu` can close.
 
 ### #1 — API.md §3.1: `[240..256)` reserved row → `encoder_fingerprint` + `reserved` split
 
@@ -683,6 +688,199 @@ New:
 0x120000  reserved (unused page tail; ring sizes are powers of two)
 0x200000  end
 ```
+
+---
+
+## M9 accepted divergences from phase and sibling docs
+
+Entries #22–#29 are not `.agents/docs` sync diffs from `d55ecc3`; they are the
+M9 Linux local decisions and gate evidence that differ from the cited upstream
+planning tree at `~/.agents/projects/determinism`. They are still ready-to-apply
+upstream amendments: each names the stale upstream text or contract, the local
+amendment, the authority files/tests, and the rollback or follow-up path.
+
+### #22 — reference-workload `virtio-blk` game image → deterministic pv-blk exposed as `/dev/vdb`
+
+- **Old upstream contract:** `reference-workload/API.md` `WorkloadImage` lists
+  `machine.devices` as:
+
+```
+- { kind: virtio-blk, role: game-image, readonly: true, required: true }
+```
+
+  `reference-workload/ARCHITECTURE.md` also says the harness receives the game
+  image at `/dev/vdb` as "read-only virtio-blk".
+- **Local amendment:** M9 uses this repo's deterministic pv-blk device at MMIO
+  `0xD000_4000`. The Linux guest driver/shim exposes that deterministic device
+  as `/dev/vdb`, so the reference-workload `LoadGame{/dev/vdb}` and boot.toml
+  `game_dev = "/dev/vdb"` contract is preserved without implementing virtio-blk.
+  A deterministic virtio-blk subset is out of scope for M9.
+- **Authority:** `docs/decisions/m9-linux-ready-and-block-device.md`;
+  `docs/ops/test-partitioning.md` M9 artifact contract; `crates/dh-devices/src/blk.rs`;
+  `tests/determinism/tests/linux_fixture_contract.rs`;
+  `crates/dh-worker/tests/linux_worker_api.rs`; beads 4s9.5 and 4s9.30.
+- **Rollback / follow-up:** a superseding virtio-blk or multi-disk bead must own
+  the full deterministic device contract, including snapshot sections, state-hash
+  inputs, replay/VerifyReplay semantics, fixture probes, and this ledger entry.
+
+### #23 — M9 worker `base_image_hash` is the game image, not the fixture base image
+
+- **Old upstream contract:** the reference-workload manifest has separate
+  `artifacts.kernel` and `artifacts.initramfs`, then a `machine.devices` game
+  image device. The M9 operational staging added both `DH_M9_BASE_IMAGE` and
+  `DH_M9_GAME_IMAGE`, which can look like two guest block backings.
+- **Local amendment:** current M9 worker configs have one pv-blk backing for the
+  Linux game image. `MachineConfig.base_image_hash` is the BLAKE3 hash of
+  `DH_M9_GAME_IMAGE`; `DH_M9_BASE_IMAGE` is fixture context used by the Linux
+  fixture and staging helpers, not the pv-blk backing selected in the worker
+  `MachineConfig`.
+- **Authority:** `crates/dh-worker/tests/linux_worker_api.rs` asserts
+  `MachineConfig.base_image_hash must be DH_M9_GAME_IMAGE` and separately checks
+  the `DH_M9_BASE_IMAGE` fixture hash; `docs/ops/test-partitioning.md` documents
+  both env vars and the `DH_M9_IMAGE_CACHE` staging contract; bead 4s9.30.
+- **Rollback / follow-up:** a future two-disk, writable-root, or virtio-blk schema
+  must add an explicit MachineConfig/proto distinction between the root/base image
+  and read-only game image, then update worker tests, gate docs, and this entry.
+
+### #24 — Linux READY is EventKind 14 on detchannel, not serial or ad hoc readiness
+
+- **Old upstream contract:** guest-sdk and reference-workload docs describe the
+  deterministic READY point after channel init, `Hello`, the autostart control
+  leg, `LoadGame{/dev/vdb}`, `Start{}`, and expected-region registration. Those
+  docs are correct about the ordering, but they do not explicitly reject serial
+  console markers or other local M9 shortcuts as readiness evidence.
+- **Local amendment:** the only accepted M9 Linux READY evidence is guest-sdk
+  EventKind 14 `Ready{unit, region_count, manifest_generation}` on detchannel
+  after the channel, control, and expected-region work is complete. Serial-only
+  markers, console text, and ad hoc MMIO flags do not satisfy Linux READY for
+  M9 gates. This does not remove the reference-workload control leg; the local
+  fixture still requires `game_dev = "/dev/vdb"` and the Hello/LoadGame/Start
+  path before Ready where applicable.
+- **Authority:** `docs/decisions/m9-linux-ready-and-block-device.md`;
+  `docs/ops/test-partitioning.md`; `tests/determinism/tests/linux_ready.rs`;
+  `tools/dh-cli/src/gate.rs`; `docs/phase-1-exit-gate.md` M9 Linux rollup;
+  beads 4s9.23 and 4s9.24.
+- **Rollback / follow-up:** any alternate readiness signal must be specified in
+  guest-sdk wire docs, logged in replay/VerifyReplay evidence, and accepted by a
+  superseding M9 decision before gate tests can consume it.
+
+### #25 — M9 Linux command line baseline changed from `dh-pvclock` plan to jiffies/no-TSC policy
+
+- **Old upstream contract:** `determinism-hypervisor/ARCHITECTURE.md` §2.3
+  gives this canonical baseline:
+
+```
+console=ttyS0 nokaslr norandmaps random.trust_cpu=off tsc=unstable clocksource=dh-pvclock nohz=off highres=off init=/init
+```
+
+  `reference-workload/API.md` says WorkloadImage `boot.cmdline` only appends
+  extras such as `quiet`.
+- **Local amendment:** M9 forces these exact bytes before any allowed extras:
+
+```
+console=ttyS0 nokaslr norandmaps random.trust_cpu=off random.trust_bootloader=on page_alloc.shuffle=0 notsc tsc=unstable clocksource=jiffies vdso=0 lpj=4096 noapictimer default_hugepagesz=2M hugepagesz=2M hugepages=1 init=/init
+```
+
+  `BzImageBoot.cmdline` remains append-only, but the only accepted extras are
+  `quiet` and `loglevel=<n>` for `n` in `0..=7`; duplicate, conflicting, empty,
+  non-ASCII, NUL-containing, or unsupported tokens are config errors before
+  MachineConfig hashing.
+- **Authority:** `docs/decisions/m9-linux-cmdline-policy.md`;
+  `crates/dh-vmm/src/config.rs`; `crates/dh-worker/src/proto_map.rs`;
+  `proto/hypervisor.proto`; Linux Phase 1 evidence in
+  `docs/phase-1-exit-gate.md`.
+- **Rollback / follow-up:** upstream can move back toward `dh-pvclock`,
+  `nohz=off`, or `highres=off` only after those clock/timer surfaces exist in the
+  deterministic device model and pass the Linux Phase 1 timer/landing gates.
+
+### #26 — `LAPC` is a v2 deterministic userspace lAPIC section with mandatory replay coverage
+
+- **Old upstream contract:** `determinism-hypervisor/API.md` §4 has a generic row:
+
+```
+| `LAPC` | lapic-stub state (Rust struct, fixed-layout encode) |
+```
+
+  Architecture text says snapshots contain the lapic-stub plus every DetDevice
+  section, but does not pin the concrete section version or restore/replay
+  semantics for M9 Linux.
+- **Local amendment:** M9 ships `LAPC` `sec_version = 2`, a deterministic
+  userspace xAPIC/lAPIC typed section. Legacy empty LAPC v1 is compatibility
+  input only; current snapshots carry LAPC v2, state hashing frames LAPC
+  tag/version/length/content, restore rejects malformed LAPC, and replay plus
+  VerifyReplay fail on deliberate lAPIC mutations.
+- **Authority:** `crates/dh-snapshot/src/dhsnap.rs`;
+  `crates/dh-snapshot/tests/golden.rs` and
+  `crates/dh-snapshot/tests/fixtures/v1_kitchen_sink_lapc_v2.dhsnap`;
+  `crates/dh-vmm/src/lapic.rs`; `crates/dh-vmm/src/hash.rs`;
+  `crates/dh-worker/tests/lapc.rs`; `crates/dh-worker/tests/restore_engine.rs`;
+  `crates/dh-worker/tests/replay_engine.rs`; bead 4s9.17.
+- **Rollback / follow-up:** any LAPC v3 or removal of the lAPIC model requires a
+  DHSNAP format amendment, new golden fixture names or hashes, restore/replay
+  compatibility tests, and updates to the state-hash preimage docs.
+
+### #27 — Linux M9 gates are operator-run except the 100-child Linux M7 nightly canary
+
+- **Old upstream contract:** phase docs say Phase 3 re-runs Phase 1/2 gates against
+  the Linux guest. `determinism-hypervisor/IMPLEMENTATION-PLAN.md` says all
+  milestones run on the Intel box and describes CI-required determinism jobs,
+  nightly M7-style 100-fork verify, and corpus reverify.
+- **Local amendment:** artifact-backed M9 Linux gates depend on staged
+  `DH_M9_*` artifacts, live KVM, and deliberate `kvm-intel` scheduling. They are
+  operator-run acceptance commands except for the scheduled 100-child Linux M7
+  canary in `.github/workflows/nightly-drift.yaml`. Full Linux M7 1000-child
+  acceptance and Linux cross-slot rerun are operator-run, not required CI. The
+  existing nanokernel/default nightly canary and nanokernel M5 corpus reverify
+  remain separate coverage. `*_ALLOW_SKIP=1` evidence is never accepted for M9
+  final evidence.
+- **Authority:** `docs/ops/test-partitioning.md`; `docs/ops/github-runner.md`;
+  `.github/workflows/nightly-drift.yaml`; `docs/phase-1-exit-gate.md`;
+  `docs/phase-2-exit-gate.md`; bead 4s9.33.
+- **Rollback / follow-up:** making any Linux artifact gate required CI requires
+  checked-in or hosted artifacts, deterministic runner provisioning for those
+  artifacts, updated fork-PR security policy, and updated gate docs.
+
+### #28 — M9 Linux artifacts and corpus are externally staged; source keeps only the manifest
+
+- **Old upstream contract:** `reference-workload/API.md` describes a
+  `WorkloadImage` manifest with attached `bzImage` and `initramfs.cpio.zst`
+  artifacts stored by the control-plane registry. `determinism-hypervisor` M5
+  language also describes checked-in record/replay corpus bytes that are
+  reverified nightly.
+- **Local amendment:** this repo does not commit the large M9 Linux kernel,
+  initramfs, base image, game image, Linux snapshots, or Linux DHILOG payloads.
+  Operators stage them under `$HOME/.cache/dh-m9/reference-workload` and register
+  worker artifacts in `DH_M9_IMAGE_CACHE` by lowercase BLAKE3. The Linux M5
+  corpus under `crates/dh-worker/tests/fixtures/record_replay_corpus/m9_linux_post_ready/`
+  intentionally checks in only `README.md` and `expected.txt`; the test records
+  live from staged artifacts and asserts the live DHILOG/snapshot/hash evidence
+  matches the manifest.
+- **Authority:** `docs/ops/test-partitioning.md`; `docs/ops/github-runner.md`;
+  `crates/dh-worker/tests/fixtures/record_replay_corpus/m9_linux_post_ready/README.md`;
+  `crates/dh-worker/tests/fixtures/record_replay_corpus/m9_linux_post_ready/expected.txt`;
+  `crates/dh-worker/tests/m5_record_replay.rs`; beads 4s9.27 and 4s9.33.
+- **Rollback / follow-up:** if Linux artifacts become small or registry-backed
+  enough to check in or fetch hermetically, replace the live manifest-only corpus
+  with full corpus bytes or a registry-resolved fixture, then update nightly and
+  gate docs to reverify it without local operator staging.
+
+### #29 — Linux M5 `m5_net_loopback` uses guest-driven pv-blk I/O, not Linux pv-net
+
+- **Old upstream contract:** Phase 2/M5 coverage includes input-log device-event
+  and net-loopback surfaces, and M9 planning asked for Linux M4/M5 frame and pv-net
+  regression coverage where applicable.
+- **Local amendment:** M9 does not ship a Linux pv-net driver or Linux pv-net gate.
+  The Linux `m5_net_loopback` filter is accepted as a guest-driven pv-blk I/O
+  loopback: the workload writes, reads, and flushes through the deterministic pv-blk
+  path, stamps a meta proof, snapshots BLKO, and VerifyReplay reproduces the sealed
+  segment. This is the Linux-equivalent deterministic I/O fixture for M9, not a
+  claim that Linux pv-net exists.
+- **Authority:** `docs/ops/test-partitioning.md` Linux M5 guest-driven pv-blk
+  loopback row; `docs/phase-2-exit-gate.md` M9 Linux rollup;
+  `crates/dh-worker/tests/m5_net_loopback.rs`; bead 4s9.28.
+- **Rollback / follow-up:** adding Linux pv-net later requires a Linux guest driver,
+  deterministic NET_RX/TX contract, DHILOG coverage, snapshot/hash/replay tests,
+  and either replacement or explicit parallel coverage for this pv-blk substitute.
 
 ---
 

@@ -54,10 +54,10 @@ ci/check-determinism-class.sh` reported all 7 lock keys matched. `/dev/kvm`
 was present and rw, `nasm` was `/usr/bin/nasm`, and `taskset -c 2-5` reported
 `Cpus_allowed_list: 2-5`.
 
-This is a post-M9 preservation addendum only. It proves the original
-nanokernel Phase 1 gate and its supporting tests still run after the Linux
-guest path landed; it does not publish the downstream Linux-plus-nanokernel
-exit-gate rollup tracked by `determinism-hypervisor-4s9.32`.
+This addendum proves the original nanokernel Phase 1 gate and its supporting
+tests still run after the Linux guest path landed. The Linux rollup below
+completes the M9 Phase 1 exit-gate update tracked by
+`determinism-hypervisor-4s9.32`.
 
 | Command | Evidence |
 |---|---|
@@ -70,6 +70,41 @@ exit-gate rollup tracked by `determinism-hypervisor-4s9.32`.
 Fixture preservation checks before the documentation edits showed no changes
 under `tests/nanokernel/**` or
 `crates/dh-worker/tests/fixtures/record_replay_corpus/pad_echo_6s/**`.
+
+## M9 Linux Phase 1 rollup (2026-06-20)
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`. These Linux gates are
+artifact-backed operator-run acceptance gates on the `kvm-intel` host. Final
+M9 Phase 1 evidence must use `DH_M9_ALLOW_SKIP=0`; any `*_ALLOW_SKIP=1`
+run is guard-path evidence only and is rejected for acceptance.
+
+The accepted 4s9.24, 4s9.25, and 4s9.26 producer evidence used this staged
+artifact set:
+
+| Artifact | BLAKE3 |
+|---|---|
+| `bzImage` | `595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9` |
+| `initramfs.cpio` | `f130e1a329bf934651d89dccdec0a2dccd33862319cbbe95c30e0505382d12d4` |
+| `base.img` | `488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8` |
+| `game.img` | `e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac` |
+
+Later M4/M5/M7 Linux evidence in the Phase 2 rollup uses a newer reference-workload
+`initramfs.cpio` hash. The gate records intentionally keep hashes attached
+to the command evidence that produced them.
+
+| Gate | Command | Evidence |
+|---|---|---|
+| Linux Phase 1 CLI Ready/post-READY gate | `DH_M9_ALLOW_SKIP=0 cargo run -p dh-cli -- gate --linux --runs 100 --bzimage "$DH_M9_BZIMAGE" --initramfs "$DH_M9_INITRAMFS" --base-image "$DH_M9_BASE_IMAGE" --game-image "$DH_M9_GAME_IMAGE"` | PASS: `gate linux-phase1 runs=100 verdict=PASS`; 100/100 zero divergence. All runs matched `ready_event_kind=14`, `ready_unit=0`, `ready_region_count=3`, `ready_manifest_generation=6`, Ready payload digest `ddf4f8ffe8774c4ca4a78226302fefb0a67b1425da7940233a8ba4be99efdc16`, `ready_icount=641326674`, Ready state hash `f8b813ed797076ba9e5233e3a9bef09c6c4162abbd9e71fb8e721aa14fedc8e3`, `config_hash=e3391619f4c3af368e418febd94b511b668a9b6b7f6211c5e09d754ca0d03da6`, `post_ready_budget=2000000`, `post_ready_icount=643326674`, and post-READY state hash `b28f9c23a421ee04571bab4e4c94d243400a924e727a1f589a4516d24d17933c`. |
+| Linux timer/IRQ determinism | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture` | PASS: 100 cold Linux cases; `ready_icount=641326674`, vector `241`, delivered icounts `[642326674, 643326674, 644326674]`, final state hash `34bd14779d12c6005d2d16541bf40d8880b43cd720adcf5a6178327bb7b99dfe`. The gate compares delivered icount list, timer source/vector/deadline metadata, and final state hash, and fails if kvmclock, TSC-deadline, x2APIC, PIT, IOAPIC, or in-kernel irqchip surfaces appear. |
+| Linux landing/counting | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_landing_counting --release -- --ignored --nocapture` | PASS: 100 exact post-READY targets across two cold boots with identical `(icount, rip, rcx, state_hash, timer metadata)` tuples. Evidence: `ready_icount=641326674`, `timer_vector=241`, `timer_delivered_icount=642326674`, first target hash `7e1ac064d87ea33022b083f48aeeeb7617583e82da2bd19858dec80ec392a1c7`, last target hash `65602f999f0e0b5cdbf2dd09cd9ad13d2c151a38d4f0844e1c066a8136550d5c`. |
+
+CI and nightly classification lives in
+[`docs/ops/test-partitioning.md`](ops/test-partitioning.md) and
+[`docs/ops/github-runner.md`](ops/github-runner.md): the Linux artifact-backed
+Phase 1 gates are operator-run acceptance gates, while the nanokernel/default
+workspace and `dh-cli gate --runs 100` coverage remains separate regression
+coverage.
 
 ## Known refinements baked into the gate (not exceptions)
 
