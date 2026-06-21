@@ -822,7 +822,54 @@ fn assert_ready_snapshot_channel_reattaches(
         .get(tag::EVTC)
         .ok_or_else(|| "Ready snapshot missing EVTC section".to_string())?;
     const EVTC_V1_LEN: usize = 39;
-    if evtc.sec_version != 1 || evtc.contents.len() != EVTC_V1_LEN {
+    const EVTC_V2_BASE_LEN: usize = EVTC_V1_LEN + 4;
+    let evtc_shape_ok = match evtc.sec_version {
+        1 => evtc.contents.len() == EVTC_V1_LEN,
+        2 => {
+            if evtc.contents.len() < EVTC_V2_BASE_LEN {
+                false
+            } else {
+                let pending_count = u32::from_le_bytes(
+                    evtc.contents[EVTC_V1_LEN..EVTC_V2_BASE_LEN]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let mut at = EVTC_V2_BASE_LEN;
+                let mut ok = true;
+                for _ in 0..pending_count {
+                    let Some(header_end) = at.checked_add(12) else {
+                        ok = false;
+                        break;
+                    };
+                    if header_end > evtc.contents.len() {
+                        ok = false;
+                        break;
+                    }
+                    let name_len =
+                        u32::from_le_bytes(evtc.contents[at + 8..header_end].try_into().unwrap());
+                    at = header_end;
+                    if name_len != u32::MAX {
+                        let Ok(name_len) = usize::try_from(name_len) else {
+                            ok = false;
+                            break;
+                        };
+                        let Some(name_end) = at.checked_add(name_len) else {
+                            ok = false;
+                            break;
+                        };
+                        if name_end > evtc.contents.len() {
+                            ok = false;
+                            break;
+                        }
+                        at = name_end;
+                    }
+                }
+                ok && at == evtc.contents.len()
+            }
+        }
+        _ => false,
+    };
+    if !evtc_shape_ok {
         return Err(format!(
             "EVTC shape mismatch: v{} {} bytes",
             evtc.sec_version,

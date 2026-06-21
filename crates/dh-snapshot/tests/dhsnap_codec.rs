@@ -37,7 +37,7 @@ fn full_container() -> Vec<u8> {
     .unwrap();
     w.push_section(tag::CLKD, 1, &[0x66; 12]).unwrap(); // pv-clock regs (device owns)
     w.push_section(tag::PADD, 1, &[0x77; 21]).unwrap(); // pv-pad latches+vector+frame (device owns)
-    w.push_section(tag::EVTC, 1, &[0x88; 39]).unwrap(); // detchannel EVTC_LEN (device owns)
+    w.push_section(tag::EVTC, 1, &[0x88; 39]).unwrap(); // legacy detchannel EVTC v1
     w.push_section(tag::BLKO, 1, &[0x99; 36]).unwrap(); // pv-blk overlay (device owns)
     w.push_section(tag::NETL, 1, &[]).unwrap(); // pv-net: empty pending-RX rule
     w.push_section(tag::SERL, 1, &[]).unwrap(); // debug-serial: empty section rule
