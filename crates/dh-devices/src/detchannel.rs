@@ -411,11 +411,11 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         self.channel.as_ref()
     }
 
-    /// Borrow the INJECT responder's plan. Replay uses this immediately
-    /// after an INJECT `IN` to turn infallible `FaultPlan` cursor failures
-    /// into typed verifier diagnostics.
-    pub fn inject_plan_mut(&mut self) -> &mut P {
-        self.responder.plan_mut()
+    /// Observe the INJECT responder's plan inside a bounded mutable borrow.
+    /// Replay uses this immediately after an INJECT `IN` to turn infallible
+    /// `FaultPlan` cursor failures into typed verifier diagnostics.
+    pub fn with_inject_plan_mut<R>(&mut self, f: impl FnOnce(&mut P) -> R) -> R {
+        f(self.responder.plan_mut())
     }
 
     /// Push a command onto ring C (vCPU paused — pause boundary). The ring

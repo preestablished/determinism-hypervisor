@@ -1389,13 +1389,13 @@ fn verify_progress_to_proto(
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "none".into());
             let cause_prefix = if matches!(
-                what.as_str(),
+                what,
                 s if s.starts_with("skipped_input")
                     || s.starts_with("channel_mutation_drift")
                     || s.starts_with("pio_answer_mismatch")
                     || s.starts_with("pio_answer_missing")
             ) {
-                what
+                what.to_string()
             } else {
                 format!("coarse:{what}")
             };
@@ -1492,7 +1492,8 @@ fn run_verify_replay_on_current_thread(
         let header = reader.header().clone();
         let log_writer = log_writer_from_reader_header(&header);
         let replay_inject_source =
-            crate::replay_engine::ReplayInjectPlanSource::from_reader(&reader);
+            crate::replay_engine::ReplayInjectPlanSource::from_reader(&reader)
+                .map_err(|e| Status::data_loss(format!("DHILOG inject replay plan: {e}")))?;
         (checkpoint_index, header, log_writer, replay_inject_source)
     };
 
@@ -8756,7 +8757,7 @@ mod tests {
         let divergence = VerifyProgress::Divergence {
             first_bad_epoch: None,
             at_icount: 123,
-            what: "end_state_hash".into(),
+            what: "end_state_hash",
             expected: [0x11; 32],
             got: [0x22; 32],
         };
@@ -8775,8 +8776,27 @@ mod tests {
         assert!(div.reg_diff.is_empty());
         assert!(div.diff_page_idx.is_empty());
         assert!(div.suspected_cause.contains("first_bad_epoch=none"));
+        assert!(div.suspected_cause.starts_with("coarse:end_state_hash"));
         assert!(div.suspected_cause.contains("expected_hash="));
         assert!(div.suspected_cause.contains("got_hash="));
+
+        let pio = verify_progress_to_proto(
+            VerifyProgress::Divergence {
+                first_bad_epoch: None,
+                at_icount: 456,
+                what: "pio_answer_mismatch",
+                expected: [0x33; 32],
+                got: [0x44; 32],
+            },
+            false,
+        )
+        .unwrap();
+        let pio_div = match pio.msg.unwrap() {
+            VerifyMsg::Divergence(div) => div,
+            other => panic!("expected Divergence, got {other:?}"),
+        };
+        assert!(pio_div.suspected_cause.starts_with("pio_answer_mismatch"));
+        assert!(!pio_div.suspected_cause.starts_with("coarse:"));
 
         let refined = dh_verify::verify::BisectionDivergence {
             first_bad_epoch: Some(4),

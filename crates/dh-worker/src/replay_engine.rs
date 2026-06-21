@@ -62,7 +62,7 @@ type DivergenceCell = std::cell::Cell<Option<(&'static str, u64, [u8; 32], [u8; 
 
 #[derive(Debug)]
 struct ReplayDiagnosticDivergence {
-    what: String,
+    what: &'static str,
     at_icount: u64,
     expected: [u8; 32],
     got: [u8; 32],
@@ -86,11 +86,11 @@ pub struct ReplayInjectPlanSource {
 }
 
 impl ReplayInjectPlanSource {
-    pub fn from_reader(log: &LogReader<'_>) -> Self {
+    pub fn from_reader(log: &LogReader<'_>) -> Result<Self, ReplayInjectPlanSourceError> {
         let mut occurrence = 0u32;
-        let answers: Vec<_> = log
-            .canonical()
-            .filter_map(|rec| match rec.body() {
+        let mut answers = Vec::new();
+        for rec in log.canonical() {
+            match rec.body() {
                 RecordBody::DevEvent {
                     device_id,
                     event_type,
@@ -98,26 +98,27 @@ impl ReplayInjectPlanSource {
                 } if device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
                     && event_type == dh_inputlog::dhilog::EVENT_PIO_ANSWER =>
                 {
-                    let (port, value) = decode_pio_answer(data)?;
+                    let (port, value) = decode_pio_answer(data).ok_or(
+                        ReplayInjectPlanSourceError::MalformedPioAnswer { seq: rec.seq() },
+                    )?;
                     if port != PORT_INJECT {
-                        return None;
+                        continue;
                     }
-                    let out = RecordedInjectAnswer {
+                    answers.push(RecordedInjectAnswer {
                         occurrence,
                         seq: rec.seq(),
                         icount: rec.icount(),
                         boundary_rip: rec.boundary_rip(),
                         value,
-                    };
+                    });
                     occurrence = occurrence.saturating_add(1);
-                    Some(out)
                 }
-                _ => None,
-            })
-            .collect();
-        Self {
-            answers: Arc::from(answers),
+                _ => {}
+            }
         }
+        Ok(Self {
+            answers: Arc::from(answers),
+        })
     }
 
     fn plan(&self) -> ReplayInjectFaultPlan {
@@ -125,16 +126,34 @@ impl ReplayInjectPlanSource {
             source: self.clone(),
             cursor: 0,
             last_error: None,
+            consumed_current_in: None,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayInjectPlanSourceError {
+    MalformedPioAnswer { seq: u32 },
+}
+
+impl std::fmt::Display for ReplayInjectPlanSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayInjectPlanSourceError::MalformedPioAnswer { seq } => {
+                write!(f, "malformed detchannel PIO_ANSWER payload at seq {seq}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayInjectPlanSourceError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplayInjectPlanError {
     Missing {
         occurrence: u32,
-        iseq: u32,
-        name_id: u32,
+        iseq: Option<u32>,
+        name_id: Option<u32>,
         name: Option<String>,
     },
     Mismatch {
@@ -152,24 +171,18 @@ impl ReplayInjectPlanError {
                 name_id,
                 name,
             } => ReplayDiagnosticDivergence {
-                what: format!(
-                    "pio_answer_missing: occurrence={occurrence}; port={PORT_INJECT:#06x}; iseq={iseq}; name_id={name_id}; name={}",
-                    name.as_deref().unwrap_or("<unresolved>")
-                ),
+                what: "pio_answer_missing",
                 at_icount,
                 expected: [0; 32],
-                got: u32_hash(0),
+                got: u32_hash(
+                    occurrence
+                        ^ iseq.unwrap_or_default()
+                        ^ name_id.unwrap_or_default()
+                        ^ u32::from(name.is_some()),
+                ),
             },
             ReplayInjectPlanError::Mismatch { answer, got_value } => ReplayDiagnosticDivergence {
-                what: format!(
-                    "pio_answer_mismatch: occurrence={}; seq={}; recorded_icount={}; recorded_rip={:#x}; port={PORT_INJECT:#06x}; expected_value={:#010x}; got_value={:#010x}",
-                    answer.occurrence,
-                    answer.seq,
-                    answer.icount,
-                    answer.boundary_rip,
-                    answer.value,
-                    got_value
-                ),
+                what: "pio_answer_mismatch",
                 at_icount,
                 expected: u32_hash(answer.value),
                 got: u32_hash(got_value),
@@ -183,6 +196,7 @@ pub struct ReplayInjectFaultPlan {
     source: ReplayInjectPlanSource,
     cursor: usize,
     last_error: Option<ReplayInjectPlanError>,
+    consumed_current_in: Option<RecordedInjectAnswer>,
 }
 
 impl Default for ReplayInjectFaultPlan {
@@ -192,27 +206,71 @@ impl Default for ReplayInjectFaultPlan {
 }
 
 impl ReplayInjectFaultPlan {
-    fn take_error(&mut self) -> Option<ReplayInjectPlanError> {
-        self.last_error.take()
-    }
-}
-
-impl detguest_host::FaultPlan for ReplayInjectFaultPlan {
-    fn decide(&mut self, iseq: u32, name_id: u32, name: Option<&str>) -> FaultDecision {
+    fn consume_expected(
+        &mut self,
+        iseq: Option<u32>,
+        name_id: Option<u32>,
+        name: Option<&str>,
+    ) -> Result<RecordedInjectAnswer, ReplayInjectPlanError> {
         let Some(answer) = self.source.answers.get(self.cursor).copied() else {
-            self.last_error = Some(ReplayInjectPlanError::Missing {
+            return Err(ReplayInjectPlanError::Missing {
                 occurrence: u32::try_from(self.cursor).unwrap_or(u32::MAX),
                 iseq,
                 name_id,
                 name: name.map(str::to_owned),
             });
-            return FaultDecision::Proceed;
         };
         self.cursor += 1;
+        Ok(answer)
+    }
+
+    fn validate_answer(
+        &self,
+        answer: RecordedInjectAnswer,
+        got_value: u32,
+    ) -> Option<ReplayInjectPlanError> {
+        (got_value != answer.value).then_some(ReplayInjectPlanError::Mismatch { answer, got_value })
+    }
+
+    fn finish_inject_in(&mut self, got_value: u32) -> Option<ReplayInjectPlanError> {
+        let consumed = self.consumed_current_in.take();
+        if let Some(error) = self.last_error.take() {
+            return Some(error);
+        }
+        let answer = match consumed {
+            Some(answer) => answer,
+            None => match self.consume_expected(None, None, None) {
+                Ok(answer) => answer,
+                Err(error) => return Some(error),
+            },
+        };
+        self.validate_answer(answer, got_value)
+    }
+
+    fn unconsumed_error(&self) -> Option<ReplayInjectPlanError> {
+        (self.cursor < self.source.answers.len()).then_some(ReplayInjectPlanError::Missing {
+            occurrence: u32::try_from(self.cursor).unwrap_or(u32::MAX),
+            iseq: None,
+            name_id: None,
+            name: None,
+        })
+    }
+}
+
+impl detguest_host::FaultPlan for ReplayInjectFaultPlan {
+    fn decide(&mut self, iseq: u32, name_id: u32, name: Option<&str>) -> FaultDecision {
+        let answer = match self.consume_expected(Some(iseq), Some(name_id), name) {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.last_error = Some(error);
+                return FaultDecision::Proceed;
+            }
+        };
+        self.consumed_current_in = Some(answer);
         let decision = FaultDecision::unpack(answer.value);
         let got_value = decision.pack();
-        if got_value != answer.value {
-            self.last_error = Some(ReplayInjectPlanError::Mismatch { answer, got_value });
+        if let Some(error) = self.validate_answer(answer, got_value) {
+            self.last_error = Some(error);
         }
         decision
     }
@@ -442,7 +500,10 @@ where
             let n = data.len().min(4);
             data[..n].copy_from_slice(&bytes[..n]);
             if port == PORT_INJECT {
-                if let Some(error) = host.host_mut().inject_plan_mut().take_error() {
+                if let Some(error) = host
+                    .host_mut()
+                    .with_inject_plan_mut(|plan| plan.finish_inject_in(value))
+                {
                     return Err(ReplayServiceExitError::Divergence(
                         error.into_divergence(icount),
                     ));
@@ -547,7 +608,7 @@ pub enum ReplayError {
     /// The replayed machine diverged from the recording. The first
     /// mismatch is reported; nothing after it is trustworthy.
     Divergence {
-        what: String,
+        what: &'static str,
         at_icount: u64,
         expected: [u8; 32],
         got: [u8; 32],
@@ -709,6 +770,7 @@ fn detchannel_record_event_type(record: &dh_inputlog::reader::Record<'_>) -> Opt
     }
 }
 
+#[cfg(test)]
 fn detchannel_pio_answer(record: &dh_inputlog::reader::Record<'_>) -> Option<(u16, u32)> {
     match record.body() {
         RecordBody::DevEvent {
@@ -759,26 +821,6 @@ fn normalized_generated_record_equal(
         || (left.icount() == right.icount() && left.boundary_rip() == right.boundary_rip())
 }
 
-fn record_position_label(record: Option<&dh_inputlog::reader::Record<'_>>) -> String {
-    record
-        .map(|record| {
-            format!(
-                "seq={}; icount={}; rip={:#x}",
-                record.seq(),
-                record.icount(),
-                record.boundary_rip()
-            )
-        })
-        .unwrap_or_else(|| "missing".into())
-}
-
-fn pio_answer_label(record: Option<&dh_inputlog::reader::Record<'_>>) -> String {
-    match record.and_then(detchannel_pio_answer) {
-        Some((port, value)) => format!("port={port:#06x}; value={value:#010x}"),
-        None => "not-pio-answer".into(),
-    }
-}
-
 fn record_pair_hash(record: Option<&dh_inputlog::reader::Record<'_>>) -> [u8; 32] {
     record.map(record_hash).unwrap_or([0; 32])
 }
@@ -807,13 +849,7 @@ fn classify_reseal_record_drift(
         || got_event == Some(dh_inputlog::dhilog::EVENT_PIO_ANSWER)
     {
         return Some(ReplayDiagnosticDivergence {
-            what: format!(
-                "pio_answer_mismatch: record_index={index}; expected_{}; got_{}; expected_{}; got_{}",
-                record_position_label(expected),
-                record_position_label(got),
-                pio_answer_label(expected),
-                pio_answer_label(got)
-            ),
+            what: "pio_answer_mismatch",
             at_icount,
             expected: expected_hash,
             got: got_hash,
@@ -824,11 +860,7 @@ fn classify_reseal_record_drift(
         || got_event == Some(dh_inputlog::dhilog::EVENT_CONS_BUMP)
     {
         return Some(ReplayDiagnosticDivergence {
-            what: format!(
-                "channel_mutation_drift: record_index={index}; event=CONS_BUMP; expected_{}; got_{}",
-                record_position_label(expected),
-                record_position_label(got)
-            ),
+            what: "channel_mutation_drift",
             at_icount,
             expected: expected_hash,
             got: got_hash,
@@ -838,11 +870,7 @@ fn classify_reseal_record_drift(
     if expected.is_some_and(|record| !record.is_aux()) || got.is_some_and(|record| !record.is_aux())
     {
         return Some(ReplayDiagnosticDivergence {
-            what: format!(
-                "skipped_input: record_index={index}; expected_{}; got_{}",
-                record_position_label(expected),
-                record_position_label(got)
-            ),
+            what: "skipped_input",
             at_icount,
             expected: expected_hash,
             got: got_hash,
@@ -1561,7 +1589,7 @@ where
                     e
                 } else if let Some((what, at_icount, expected, got)) = divergence.take() {
                     ReplayError::Divergence {
-                        what: what.into(),
+                        what,
                         at_icount,
                         expected,
                         got,
@@ -1672,7 +1700,7 @@ where
                             break 'verify_current_epoch Ok(true);
                         }
                         return Err(ReplayError::Divergence {
-                            what: "EPOCH_HASH chain value".into(),
+                            what: "EPOCH_HASH chain value",
                             at_icount: $icount,
                             expected: *e_value,
                             got: value,
@@ -1930,7 +1958,7 @@ where
                     return Err(ReplayError::BisectionDivergence(divergence));
                 }
                 return Err(ReplayError::Divergence {
-                    what: "end_vns".into(),
+                    what: "end_vns",
                     at_icount: header.end_icount,
                     expected: u64_hash(header.end_vns),
                     got: u64_hash(out.vns),
@@ -1976,7 +2004,7 @@ where
                     return Err(ReplayError::BisectionDivergence(divergence));
                 }
                 return Err(ReplayError::Divergence {
-                    what: "end_vns".into(),
+                    what: "end_vns",
                     at_icount: header.end_icount,
                     expected: u64_hash(header.end_vns),
                     got: u64_hash(out.vns),
@@ -2043,7 +2071,7 @@ where
                         return Err(ReplayError::BisectionDivergence(divergence));
                     }
                     return Err(ReplayError::Divergence {
-                        what: "end_vns".into(),
+                        what: "end_vns",
                         at_icount: header.end_icount,
                         expected: u64_hash(header.end_vns),
                         got: u64_hash(out.vns),
@@ -2064,7 +2092,7 @@ where
             return Err(ReplayError::BisectionDivergence(divergence));
         }
         return Err(ReplayError::Divergence {
-            what: "EPOCH_HASH count (recording has more than replay produced)".into(),
+            what: "EPOCH_HASH count (recording has more than replay produced)",
             at_icount: header.end_icount,
             expected: [0; 32],
             got: [0; 32],
@@ -2077,10 +2105,26 @@ where
             return Err(ReplayError::BisectionDivergence(divergence));
         }
         return Err(ReplayError::Divergence {
-            what: "end_state_hash".into(),
+            what: "end_state_hash",
             at_icount: header.end_icount,
             expected: header.end_state_hash,
             got: live_end,
+        });
+    }
+    let unconsumed_inject_answer = {
+        let mut rail_ref = rail.borrow_mut();
+        replay_detchannel_mut::<M>(&mut rail_ref.bus).and_then(|host| {
+            host.host_mut()
+                .with_inject_plan_mut(|plan| plan.unconsumed_error())
+        })
+    };
+    if let Some(error) = unconsumed_inject_answer {
+        let divergence = error.into_divergence(header.end_icount);
+        return Err(ReplayError::Divergence {
+            what: divergence.what,
+            at_icount: divergence.at_icount,
+            expected: divergence.expected,
+            got: divergence.got,
         });
     }
 
@@ -2123,7 +2167,7 @@ where
             .position(|(a, b)| a != b)
             .unwrap_or_else(|| resealed.len().min(log_bytes.len()));
         return Err(ReplayError::Divergence {
-            what: "resealed log bytes (at_icount = first differing byte offset)".into(),
+            what: "resealed log bytes (at_icount = first differing byte offset)",
             at_icount: first_diff as u64,
             expected: header.body_hash,
             got: [0; 32],
@@ -2414,7 +2458,7 @@ mod tests {
         let decision = FaultDecision::Platform { kind: 2, arg: 512 };
         let recorded = log_with_inject_answer(decision.pack());
         let reader = LogReader::parse(&recorded).unwrap();
-        let source = ReplayInjectPlanSource::from_reader(&reader);
+        let source = ReplayInjectPlanSource::from_reader(&reader).unwrap();
         let mut rail = replay_rail(source);
         attach_detchannel(&mut rail);
         publish_inject_query(&rail.mem, 7, 11, b"disk_fault");
@@ -2453,14 +2497,33 @@ mod tests {
         pio_out(&mut rail, 5, PORT_INJECT, 7).unwrap();
         match pio_in(&mut rail, 6, PORT_INJECT).unwrap_err() {
             ReplayServiceExitError::Divergence(divergence) => {
-                assert!(divergence.what.starts_with("pio_answer_missing"));
-                assert!(divergence.what.contains("iseq=7"));
+                assert_eq!(divergence.what, "pio_answer_missing");
                 assert_eq!(divergence.at_icount, 6);
             }
             ReplayServiceExitError::Boundary(error) => {
                 panic!("missing inject answer should be a divergence, got {error:?}")
             }
         }
+    }
+
+    #[test]
+    fn replay_detchannel_consumes_unmatched_zero_before_nonzero_inject() {
+        let decision = FaultDecision::Platform { kind: 2, arg: 512 };
+        let mut writer = LogWriter::new(header());
+        writer.pio_answer(5, 0, PORT_INJECT, 0).unwrap();
+        writer
+            .pio_answer(10, 0, PORT_INJECT, decision.pack())
+            .unwrap();
+        let recorded = writer.seal(seal_params()).unwrap();
+        let reader = LogReader::parse(&recorded).unwrap();
+        let source = ReplayInjectPlanSource::from_reader(&reader).unwrap();
+        let mut rail = replay_rail(source);
+        attach_detchannel(&mut rail);
+
+        assert_eq!(pio_in(&mut rail, 5, PORT_INJECT).unwrap(), 0);
+        publish_inject_query(&rail.mem, 7, 11, b"disk_fault");
+        pio_out(&mut rail, 6, PORT_INJECT, 7).unwrap();
+        assert_eq!(pio_in(&mut rail, 7, PORT_INJECT).unwrap(), decision.pack());
     }
 
     #[test]
@@ -2471,9 +2534,7 @@ mod tests {
         let divergence = classify_reseal_divergence(&got, &expected_reader)
             .unwrap()
             .expect("PIO answer value drift should be classified");
-        assert!(divergence.what.starts_with("pio_answer_mismatch"));
-        assert!(divergence.what.contains("expected_port=0xd384"));
-        assert!(divergence.what.contains("got_port=0xd384"));
+        assert_eq!(divergence.what, "pio_answer_mismatch");
     }
 
     #[test]
@@ -2484,7 +2545,7 @@ mod tests {
         let divergence = classify_reseal_divergence(&got, &expected_reader)
             .unwrap()
             .expect("CONS_BUMP drift should be classified");
-        assert!(divergence.what.starts_with("channel_mutation_drift"));
+        assert_eq!(divergence.what, "channel_mutation_drift");
     }
 
     #[test]
@@ -2495,7 +2556,7 @@ mod tests {
         let divergence = classify_reseal_divergence(&got, &expected_reader)
             .unwrap()
             .expect("missing canonical input should be classified");
-        assert!(divergence.what.starts_with("skipped_input"));
+        assert_eq!(divergence.what, "skipped_input");
     }
 
     #[test]
