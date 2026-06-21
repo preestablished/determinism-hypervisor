@@ -574,6 +574,8 @@ where
 }
 
 fn detchannel_exit_generated_event(device_id: u16, event_type: u16) -> bool {
+    // Replay may regenerate these detchannel outputs at a different boundary,
+    // but their payload bytes still compare exactly.
     device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
         && matches!(
             event_type,
@@ -2619,6 +2621,15 @@ mod tests {
             .unwrap()
             .expect("RING_PUSH payload drift should remain a canonical input mismatch");
         assert_eq!(divergence.what, "skipped_input");
+    }
+
+    #[test]
+    fn reseal_comparison_rejects_ring_push_payload_drift() {
+        let expected = log_with_ring_push(4, 0xAA);
+        let got = log_with_ring_push(4, 0xBB);
+        let expected_reader = LogReader::parse(&expected).unwrap();
+
+        assert!(!reseal_equivalent_ignoring_bisection_checkpoints(&got, &expected_reader).unwrap());
     }
 
     #[test]
