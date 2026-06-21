@@ -577,7 +577,9 @@ fn detchannel_exit_generated_event(device_id: u16, event_type: u16) -> bool {
     device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
         && matches!(
             event_type,
-            dh_inputlog::dhilog::EVENT_PIO_ANSWER | dh_inputlog::dhilog::EVENT_CONS_BUMP
+            dh_inputlog::dhilog::EVENT_PIO_ANSWER
+                | dh_inputlog::dhilog::EVENT_RING_PUSH
+                | dh_inputlog::dhilog::EVENT_CONS_BUMP
         )
 }
 
@@ -2290,6 +2292,7 @@ mod tests {
     use dh_devices::MmioBus;
     use dh_inputlog::dhilog::{
         LogWriter, SealParams, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP,
+        EVENT_RING_PUSH,
     };
     use dh_vmm::boundary::Boundary;
     use dh_vmm::recording::{stop_reason_u8, DeviceRail};
@@ -2371,6 +2374,18 @@ mod tests {
         payload[4..8].copy_from_slice(&new_cons.to_le_bytes());
         writer
             .dev_event(10, 0, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP, &payload)
+            .unwrap();
+        writer.seal(seal_params()).unwrap()
+    }
+
+    fn log_with_ring_push(new_prod: u32, record_byte: u8) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        let mut payload = [0u8; 12];
+        payload[0] = 1;
+        payload[4..8].copy_from_slice(&new_prod.to_le_bytes());
+        payload[8..12].copy_from_slice(&[record_byte; 4]);
+        writer
+            .dev_event(10, 0, DEVICE_ID_DETCHANNEL, EVENT_RING_PUSH, &payload)
             .unwrap();
         writer.seal(seal_params()).unwrap()
     }
@@ -2487,6 +2502,15 @@ mod tests {
                 &[2, 0, 0, 0, 1, 0, 0, 0],
             )
             .unwrap();
+        writer
+            .dev_event(
+                icount,
+                0x1010,
+                dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL,
+                dh_inputlog::dhilog::EVENT_RING_PUSH,
+                &[1, 0, 0, 0, 4, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD],
+            )
+            .unwrap();
         writer.sdk_event(icount, 0, 14, 16, 0xBBBB).unwrap();
         writer.seal(seal_params()).unwrap()
     }
@@ -2584,6 +2608,17 @@ mod tests {
             .unwrap()
             .expect("CONS_BUMP drift should be classified");
         assert_eq!(divergence.what, "channel_mutation_drift");
+    }
+
+    #[test]
+    fn reseal_classifier_keeps_ring_push_payload_drift_as_skipped_input() {
+        let expected = log_with_ring_push(4, 0xAA);
+        let got = log_with_ring_push(4, 0xBB);
+        let expected_reader = LogReader::parse(&expected).unwrap();
+        let divergence = classify_reseal_divergence(&got, &expected_reader)
+            .unwrap()
+            .expect("RING_PUSH payload drift should remain a canonical input mismatch");
+        assert_eq!(divergence.what, "skipped_input");
     }
 
     #[test]
