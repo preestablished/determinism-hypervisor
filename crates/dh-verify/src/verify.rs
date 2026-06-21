@@ -72,7 +72,7 @@ pub enum VerifyProgress {
         /// space. For "resealed log bytes": the first differing BYTE
         /// OFFSET (the engine's report shape, documented there).
         at_icount: u64,
-        what: &'static str,
+        what: String,
         /// Hash pair for hash kinds; for "end_vns" these carry the two
         /// u64s LE-packed in the first 8 bytes (the engine's shape).
         expected: [u8; 32],
@@ -151,7 +151,7 @@ mod tests {
         bad.push(VerifyProgress::Divergence {
             first_bad_epoch: Some(2),
             at_icount: 60_000,
-            what: "EPOCH_HASH chain value",
+            what: "EPOCH_HASH chain value".into(),
             expected: [1; 32],
             got: [2; 32],
         });

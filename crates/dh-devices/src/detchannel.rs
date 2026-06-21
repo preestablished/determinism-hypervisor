@@ -411,6 +411,13 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         self.channel.as_ref()
     }
 
+    /// Borrow the INJECT responder's plan. Replay uses this immediately
+    /// after an INJECT `IN` to turn infallible `FaultPlan` cursor failures
+    /// into typed verifier diagnostics.
+    pub fn inject_plan_mut(&mut self) -> &mut P {
+        self.responder.plan_mut()
+    }
+
     /// Push a command onto ring C (vCPU paused — pause boundary). The ring
     /// write and producer-index publish are logged as DEV_EVENT/RING_PUSH.
     /// `Push(RingFull)` is retried by the caller at the next pause, never

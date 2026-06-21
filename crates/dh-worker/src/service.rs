@@ -1388,6 +1388,17 @@ fn verify_progress_to_proto(
             let first_bad_epoch_note = first_bad_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "none".into());
+            let cause_prefix = if matches!(
+                what.as_str(),
+                s if s.starts_with("skipped_input")
+                    || s.starts_with("channel_mutation_drift")
+                    || s.starts_with("pio_answer_mismatch")
+                    || s.starts_with("pio_answer_missing")
+            ) {
+                what
+            } else {
+                format!("coarse:{what}")
+            };
             Msg::Divergence(proto::Divergence {
                 first_bad_epoch: first_bad_epoch_value,
                 icount_lo: at_icount,
@@ -1397,7 +1408,7 @@ fn verify_progress_to_proto(
                 reg_diff: Vec::new(),
                 diff_page_idx: Vec::new(),
                 suspected_cause: format!(
-                    "coarse:{what}; first_bad_epoch={first_bad_epoch_note}; expected_hash={}; got_hash={}",
+                    "{cause_prefix}; first_bad_epoch={first_bad_epoch_note}; expected_hash={}; got_hash={}",
                     hex32(&expected),
                     hex32(&got)
                 ),
@@ -1462,7 +1473,7 @@ fn run_verify_replay_on_current_thread(
     let store = snapstore_client::blocking::SnapstoreClient::connect(transport)
         .map_err(|e| store_error_to_status("connect snapstore", e))?;
     let log_bytes = verify_replay_log_bytes(log_input, &store)?;
-    let (checkpoint_index, header, log_writer) = {
+    let (checkpoint_index, header, log_writer, replay_inject_source) = {
         let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
             .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
         let checkpoint_index = if bisect_on_divergence {
@@ -1480,7 +1491,9 @@ fn run_verify_replay_on_current_thread(
         };
         let header = reader.header().clone();
         let log_writer = log_writer_from_reader_header(&header);
-        (checkpoint_index, header, log_writer)
+        let replay_inject_source =
+            crate::replay_engine::ReplayInjectPlanSource::from_reader(&reader);
+        (checkpoint_index, header, log_writer, replay_inject_source)
     };
 
     let config = crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
@@ -1514,7 +1527,12 @@ fn run_verify_replay_on_current_thread(
         .create_slot_vm(config.mem_bytes)
         .map_err(|e| kvm_error_to_status("create slot VM", e))?;
     let _ = config_hash_for_slot(&config, &slot)?;
-    let bus = build_bus(&config, base_image, RuntimeVmMem(slot.guest_mem.clone()))?;
+    let bus = build_replay_bus(
+        &config,
+        base_image,
+        RuntimeVmMem(slot.guest_mem.clone()),
+        replay_inject_source,
+    )?;
     let rail = dh_vmm::recording::DeviceRail::new(
         bus,
         dh_devices::entropy::DetEntropy::from_seed([0; 32]),
@@ -1959,6 +1977,26 @@ fn build_bus(
     base_image: dh_vmm::blkfile::FileBase,
     mem: RuntimeVmMem,
 ) -> Result<dh_devices::MmioBus, Status> {
+    build_bus_with_replay_inject_source(config, base_image, mem, None)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_replay_bus(
+    config: &dh_vmm::config::MachineConfig,
+    base_image: dh_vmm::blkfile::FileBase,
+    mem: RuntimeVmMem,
+    replay_inject_source: crate::replay_engine::ReplayInjectPlanSource,
+) -> Result<dh_devices::MmioBus, Status> {
+    build_bus_with_replay_inject_source(config, base_image, mem, Some(replay_inject_source))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_bus_with_replay_inject_source(
+    config: &dh_vmm::config::MachineConfig,
+    base_image: dh_vmm::blkfile::FileBase,
+    mem: RuntimeVmMem,
+    replay_inject_source: Option<crate::replay_engine::ReplayInjectPlanSource>,
+) -> Result<dh_devices::MmioBus, Status> {
     let mut bus = dh_devices::MmioBus::new();
     let mut base_image = Some(base_image);
     for id in &config.device_set {
@@ -2006,11 +2044,16 @@ fn build_bus(
             dh_devices::detchannel::DEVICE_ID_DETCHANNEL => bus
                 .register(
                     DETCHANNEL_MMIO_BASE,
-                    Box::new(RuntimeDetChannel::new(
-                        mem.clone(),
-                        detguest_host::LogFaultPlan::default(),
-                        detguest_host::LogFaultPlan::default,
-                    )),
+                    match replay_inject_source.clone() {
+                        Some(source) => {
+                            crate::replay_engine::replay_detchannel_device(mem.clone(), source)
+                        }
+                        None => Box::new(RuntimeDetChannel::new(
+                            mem.clone(),
+                            detguest_host::LogFaultPlan::default(),
+                            detguest_host::LogFaultPlan::default,
+                        )),
+                    },
                 )
                 .map_err(|e| Status::internal(format!("register detchannel: {e:?}")))?,
             other => {
@@ -8713,7 +8756,7 @@ mod tests {
         let divergence = VerifyProgress::Divergence {
             first_bad_epoch: None,
             at_icount: 123,
-            what: "end_state_hash",
+            what: "end_state_hash".into(),
             expected: [0x11; 32],
             got: [0x22; 32],
         };

@@ -129,7 +129,7 @@ where
             expected,
             got,
         }) => Ok(VerifyProgress::Divergence {
-            first_bad_epoch: first_bad_epoch_for(what, at_icount, machine_config.epoch_len),
+            first_bad_epoch: first_bad_epoch_for(&what, at_icount, machine_config.epoch_len),
             at_icount,
             what,
             expected,

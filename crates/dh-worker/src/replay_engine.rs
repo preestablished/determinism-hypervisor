@@ -30,6 +30,7 @@
 //! scheduling contract and error as `NotYetWired`, never silently skip.
 //! The M5 demo path (polling pad-echo, loopback net) needs no vectors.
 
+use detguest_wire::{ports::PORT_INJECT, FaultDecision};
 use dh_detclock::counter::InstRetired;
 use dh_devices::ctx::GuestMem;
 use dh_inputlog::reader::{Header, LogReader, ReadError, RecordBody};
@@ -46,6 +47,7 @@ use dh_vmm::SlotState;
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_types::SnapshotRef;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::bisection_index::{
     BisectionCheckpointIndex, BisectionDivergenceSite, BisectionSelectionTarget,
@@ -58,11 +60,183 @@ use crate::runtime::runtime_hash_device_sections;
 /// `(what, at_icount, expected, got)`.
 type DivergenceCell = std::cell::Cell<Option<(&'static str, u64, [u8; 32], [u8; 32])>>;
 
-type ReplayDetChannel<M> = dh_devices::detchannel::DetChannelDevice<
-    M,
-    detguest_host::LogFaultPlan,
-    fn() -> detguest_host::LogFaultPlan,
->;
+#[derive(Debug)]
+struct ReplayDiagnosticDivergence {
+    what: String,
+    at_icount: u64,
+    expected: [u8; 32],
+    got: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordedInjectAnswer {
+    occurrence: u32,
+    seq: u32,
+    icount: u64,
+    boundary_rip: u64,
+    value: u32,
+}
+
+/// Replay-time source for guest-sdk `inject_point` answers. It is derived
+/// entirely from canonical DHILOG DEV_EVENT/PIO_ANSWER records before replay
+/// starts; no synthesizer/table plan is consulted on replay.
+#[derive(Clone, Debug, Default)]
+pub struct ReplayInjectPlanSource {
+    answers: Arc<[RecordedInjectAnswer]>,
+}
+
+impl ReplayInjectPlanSource {
+    pub fn from_reader(log: &LogReader<'_>) -> Self {
+        let mut occurrence = 0u32;
+        let answers: Vec<_> = log
+            .canonical()
+            .filter_map(|rec| match rec.body() {
+                RecordBody::DevEvent {
+                    device_id,
+                    event_type,
+                    data,
+                } if device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
+                    && event_type == dh_inputlog::dhilog::EVENT_PIO_ANSWER =>
+                {
+                    let (port, value) = decode_pio_answer(data)?;
+                    if port != PORT_INJECT {
+                        return None;
+                    }
+                    let out = RecordedInjectAnswer {
+                        occurrence,
+                        seq: rec.seq(),
+                        icount: rec.icount(),
+                        boundary_rip: rec.boundary_rip(),
+                        value,
+                    };
+                    occurrence = occurrence.saturating_add(1);
+                    Some(out)
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            answers: Arc::from(answers),
+        }
+    }
+
+    fn plan(&self) -> ReplayInjectFaultPlan {
+        ReplayInjectFaultPlan {
+            source: self.clone(),
+            cursor: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReplayInjectPlanError {
+    Missing {
+        occurrence: u32,
+        iseq: u32,
+        name_id: u32,
+        name: Option<String>,
+    },
+    Mismatch {
+        answer: RecordedInjectAnswer,
+        got_value: u32,
+    },
+}
+
+impl ReplayInjectPlanError {
+    fn into_divergence(self, at_icount: u64) -> ReplayDiagnosticDivergence {
+        match self {
+            ReplayInjectPlanError::Missing {
+                occurrence,
+                iseq,
+                name_id,
+                name,
+            } => ReplayDiagnosticDivergence {
+                what: format!(
+                    "pio_answer_missing: occurrence={occurrence}; port={PORT_INJECT:#06x}; iseq={iseq}; name_id={name_id}; name={}",
+                    name.as_deref().unwrap_or("<unresolved>")
+                ),
+                at_icount,
+                expected: [0; 32],
+                got: u32_hash(0),
+            },
+            ReplayInjectPlanError::Mismatch { answer, got_value } => ReplayDiagnosticDivergence {
+                what: format!(
+                    "pio_answer_mismatch: occurrence={}; seq={}; recorded_icount={}; recorded_rip={:#x}; port={PORT_INJECT:#06x}; expected_value={:#010x}; got_value={:#010x}",
+                    answer.occurrence,
+                    answer.seq,
+                    answer.icount,
+                    answer.boundary_rip,
+                    answer.value,
+                    got_value
+                ),
+                at_icount,
+                expected: u32_hash(answer.value),
+                got: u32_hash(got_value),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplayInjectFaultPlan {
+    source: ReplayInjectPlanSource,
+    cursor: usize,
+    last_error: Option<ReplayInjectPlanError>,
+}
+
+impl Default for ReplayInjectFaultPlan {
+    fn default() -> Self {
+        ReplayInjectPlanSource::default().plan()
+    }
+}
+
+impl ReplayInjectFaultPlan {
+    fn take_error(&mut self) -> Option<ReplayInjectPlanError> {
+        self.last_error.take()
+    }
+}
+
+impl detguest_host::FaultPlan for ReplayInjectFaultPlan {
+    fn decide(&mut self, iseq: u32, name_id: u32, name: Option<&str>) -> FaultDecision {
+        let Some(answer) = self.source.answers.get(self.cursor).copied() else {
+            self.last_error = Some(ReplayInjectPlanError::Missing {
+                occurrence: u32::try_from(self.cursor).unwrap_or(u32::MAX),
+                iseq,
+                name_id,
+                name: name.map(str::to_owned),
+            });
+            return FaultDecision::Proceed;
+        };
+        self.cursor += 1;
+        let decision = FaultDecision::unpack(answer.value);
+        let got_value = decision.pack();
+        if got_value != answer.value {
+            self.last_error = Some(ReplayInjectPlanError::Mismatch { answer, got_value });
+        }
+        decision
+    }
+}
+
+type ReplayInjectPlanFactory = Box<dyn FnMut() -> ReplayInjectFaultPlan + Send>;
+
+type ReplayDetChannel<M> =
+    dh_devices::detchannel::DetChannelDevice<M, ReplayInjectFaultPlan, ReplayInjectPlanFactory>;
+
+pub fn replay_detchannel_device<M>(
+    mem: M,
+    source: ReplayInjectPlanSource,
+) -> Box<dyn dh_devices::DetDevice>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
+    let restore_source = source.clone();
+    Box::new(ReplayDetChannel::new(
+        mem,
+        source.plan(),
+        Box::new(move || restore_source.plan()),
+    ))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReplaySdkEvent {
@@ -103,11 +277,39 @@ where
     })
 }
 
+fn decode_pio_answer(data: &[u8]) -> Option<(u16, u32)> {
+    if data.len() != 8 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes(data[0..2].try_into().ok()?),
+        u32::from_le_bytes(data[4..8].try_into().ok()?),
+    ))
+}
+
+fn u32_hash(v: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..4].copy_from_slice(&v.to_le_bytes());
+    out
+}
+
+#[derive(Debug)]
+enum ReplayServiceExitError {
+    Boundary(BoundaryError),
+    Divergence(ReplayDiagnosticDivergence),
+}
+
+impl From<BoundaryError> for ReplayServiceExitError {
+    fn from(value: BoundaryError) -> Self {
+        ReplayServiceExitError::Boundary(value)
+    }
+}
+
 fn replay_service_exit<M>(
     rail: &mut DeviceRail<M>,
     icount: u64,
     exit: kvm_ioctls::VcpuExit<'_>,
-) -> Result<ReplayExitEvents, BoundaryError>
+) -> Result<ReplayExitEvents, ReplayServiceExitError>
 where
     M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
 {
@@ -164,7 +366,8 @@ where
                     return Err(BoundaryError::Exit(format!(
                         "lapic rdmsr {:#x}: {e:?}",
                         msr.index
-                    )));
+                    ))
+                    .into());
                 }
             }
             ReplayExitEvents::default()
@@ -179,7 +382,8 @@ where
                     return Err(BoundaryError::Exit(format!(
                         "lapic wrmsr {:#x}: {e:?}",
                         msr.index
-                    )));
+                    ))
+                    .into());
                 }
             }
             ReplayExitEvents::default()
@@ -220,7 +424,7 @@ where
                 .host_mut()
                 .pio_out(port, u32::from_le_bytes(word), &mut ctx);
             if host.host().metrics.any_anomaly() {
-                return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
+                return Err(BoundaryError::Exit("detchannel drain anomaly".into()).into());
             }
             let sdk_events: Vec<ReplaySdkEvent> =
                 events.iter().filter_map(replay_sdk_event).collect();
@@ -237,8 +441,15 @@ where
             let bytes = value.to_le_bytes();
             let n = data.len().min(4);
             data[..n].copy_from_slice(&bytes[..n]);
+            if port == PORT_INJECT {
+                if let Some(error) = host.host_mut().inject_plan_mut().take_error() {
+                    return Err(ReplayServiceExitError::Divergence(
+                        error.into_divergence(icount),
+                    ));
+                }
+            }
             if host.host().metrics.any_anomaly() {
-                return Err(BoundaryError::Exit("detchannel drain anomaly".into()));
+                return Err(BoundaryError::Exit("detchannel drain anomaly".into()).into());
             }
             ReplayExitEvents {
                 sdk_events: Vec::new(),
@@ -262,11 +473,11 @@ where
             ReplayExitEvents::default()
         }
         other => {
-            return Err(BoundaryError::Exit(format!("unexpected exit: {other:?}")));
+            return Err(BoundaryError::Exit(format!("unexpected exit: {other:?}")).into());
         }
     };
     if let Some(e) = ctx.log_fault() {
-        return Err(BoundaryError::Exit(format!("log fault: {e:?}")));
+        return Err(BoundaryError::Exit(format!("log fault: {e:?}")).into());
     }
     Ok(sdk_events)
 }
@@ -336,7 +547,7 @@ pub enum ReplayError {
     /// The replayed machine diverged from the recording. The first
     /// mismatch is reported; nothing after it is trustworthy.
     Divergence {
-        what: &'static str,
+        what: String,
         at_icount: u64,
         expected: [u8; 32],
         got: [u8; 32],
@@ -475,6 +686,195 @@ fn reseal_equivalent_ignoring_bisection_checkpoints(
     Ok(replayed_records != recorded_records
         && comparable_replay_records_with_options(&replayed, true)
             == comparable_replay_records_with_options(recorded, true))
+}
+
+fn record_hash(record: &dh_inputlog::reader::Record<'_>) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(18 + record.payload().len());
+    bytes.push(record.kind());
+    bytes.push(record.rflags());
+    bytes.extend_from_slice(&record.icount().to_le_bytes());
+    bytes.extend_from_slice(&record.boundary_rip().to_le_bytes());
+    bytes.extend_from_slice(record.payload());
+    *blake3::hash(&bytes).as_bytes()
+}
+
+fn detchannel_record_event_type(record: &dh_inputlog::reader::Record<'_>) -> Option<u16> {
+    match record.body() {
+        RecordBody::DevEvent {
+            device_id,
+            event_type,
+            ..
+        } if device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL => Some(event_type),
+        _ => None,
+    }
+}
+
+fn detchannel_pio_answer(record: &dh_inputlog::reader::Record<'_>) -> Option<(u16, u32)> {
+    match record.body() {
+        RecordBody::DevEvent {
+            device_id,
+            event_type,
+            data,
+        } if device_id == dh_inputlog::dhilog::DEVICE_ID_DETCHANNEL
+            && event_type == dh_inputlog::dhilog::EVENT_PIO_ANSWER =>
+        {
+            decode_pio_answer(data)
+        }
+        _ => None,
+    }
+}
+
+fn normalized_generated_record_equal(
+    left: &dh_inputlog::reader::Record<'_>,
+    right: &dh_inputlog::reader::Record<'_>,
+) -> bool {
+    if left.kind() != right.kind() || left.rflags() != right.rflags() {
+        return false;
+    }
+    if left.payload() != right.payload() {
+        return false;
+    }
+    let normalize_position = match (left.body(), right.body()) {
+        (RecordBody::SdkEvent { .. }, RecordBody::SdkEvent { .. }) => true,
+        (
+            RecordBody::DevEvent {
+                device_id,
+                event_type,
+                ..
+            },
+            RecordBody::DevEvent {
+                device_id: right_device_id,
+                event_type: right_event_type,
+                ..
+            },
+        ) if device_id == right_device_id
+            && event_type == right_event_type
+            && detchannel_exit_generated_event(device_id, event_type) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    normalize_position
+        || (left.icount() == right.icount() && left.boundary_rip() == right.boundary_rip())
+}
+
+fn record_position_label(record: Option<&dh_inputlog::reader::Record<'_>>) -> String {
+    record
+        .map(|record| {
+            format!(
+                "seq={}; icount={}; rip={:#x}",
+                record.seq(),
+                record.icount(),
+                record.boundary_rip()
+            )
+        })
+        .unwrap_or_else(|| "missing".into())
+}
+
+fn pio_answer_label(record: Option<&dh_inputlog::reader::Record<'_>>) -> String {
+    match record.and_then(detchannel_pio_answer) {
+        Some((port, value)) => format!("port={port:#06x}; value={value:#010x}"),
+        None => "not-pio-answer".into(),
+    }
+}
+
+fn record_pair_hash(record: Option<&dh_inputlog::reader::Record<'_>>) -> [u8; 32] {
+    record.map(record_hash).unwrap_or([0; 32])
+}
+
+fn classify_reseal_record_drift(
+    index: usize,
+    expected: Option<&dh_inputlog::reader::Record<'_>>,
+    got: Option<&dh_inputlog::reader::Record<'_>>,
+) -> Option<ReplayDiagnosticDivergence> {
+    if let (Some(expected), Some(got)) = (expected, got) {
+        if normalized_generated_record_equal(expected, got) {
+            return None;
+        }
+    }
+
+    let at_icount = expected
+        .or(got)
+        .map(|record| record.icount())
+        .unwrap_or(index as u64);
+    let expected_hash = record_pair_hash(expected);
+    let got_hash = record_pair_hash(got);
+    let expected_event = expected.and_then(detchannel_record_event_type);
+    let got_event = got.and_then(detchannel_record_event_type);
+
+    if expected_event == Some(dh_inputlog::dhilog::EVENT_PIO_ANSWER)
+        || got_event == Some(dh_inputlog::dhilog::EVENT_PIO_ANSWER)
+    {
+        return Some(ReplayDiagnosticDivergence {
+            what: format!(
+                "pio_answer_mismatch: record_index={index}; expected_{}; got_{}; expected_{}; got_{}",
+                record_position_label(expected),
+                record_position_label(got),
+                pio_answer_label(expected),
+                pio_answer_label(got)
+            ),
+            at_icount,
+            expected: expected_hash,
+            got: got_hash,
+        });
+    }
+
+    if expected_event == Some(dh_inputlog::dhilog::EVENT_CONS_BUMP)
+        || got_event == Some(dh_inputlog::dhilog::EVENT_CONS_BUMP)
+    {
+        return Some(ReplayDiagnosticDivergence {
+            what: format!(
+                "channel_mutation_drift: record_index={index}; event=CONS_BUMP; expected_{}; got_{}",
+                record_position_label(expected),
+                record_position_label(got)
+            ),
+            at_icount,
+            expected: expected_hash,
+            got: got_hash,
+        });
+    }
+
+    if expected.is_some_and(|record| !record.is_aux()) || got.is_some_and(|record| !record.is_aux())
+    {
+        return Some(ReplayDiagnosticDivergence {
+            what: format!(
+                "skipped_input: record_index={index}; expected_{}; got_{}",
+                record_position_label(expected),
+                record_position_label(got)
+            ),
+            at_icount,
+            expected: expected_hash,
+            got: got_hash,
+        });
+    }
+
+    None
+}
+
+fn classify_reseal_divergence(
+    resealed: &[u8],
+    recorded: &LogReader<'_>,
+) -> Result<Option<ReplayDiagnosticDivergence>, ReplayError> {
+    let replayed = LogReader::parse(resealed).map_err(ReplayError::Log)?;
+    let replayed_records: Vec<_> = replayed
+        .records()
+        .filter(|rec| !matches!(rec.body(), RecordBody::BisectionCheckpoint { .. }))
+        .collect();
+    let recorded_records: Vec<_> = recorded
+        .records()
+        .filter(|rec| !matches!(rec.body(), RecordBody::BisectionCheckpoint { .. }))
+        .collect();
+    for index in 0..recorded_records.len().max(replayed_records.len()) {
+        if let Some(divergence) = classify_reseal_record_drift(
+            index,
+            recorded_records.get(index),
+            replayed_records.get(index),
+        ) {
+            return Ok(Some(divergence));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Debug)]
@@ -854,6 +1254,7 @@ where
     let verified = std::cell::Cell::new(0usize);
     let last_epoch_icount = std::cell::Cell::new(None);
     let divergence: DivergenceCell = std::cell::Cell::new(None);
+    let diagnostic_divergence = std::cell::RefCell::new(None::<ReplayDiagnosticDivergence>);
     let bisection_error = std::cell::RefCell::new(None);
     let pending_bisection = std::cell::RefCell::new(None::<PendingBisectionDivergence>);
     let progress_error = std::cell::RefCell::new(None);
@@ -925,7 +1326,17 @@ where
                     let icount = counter
                         .read()
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
-                    let exit_events = replay_service_exit(&mut rail.borrow_mut(), icount, exit)?;
+                    let exit_events =
+                        match replay_service_exit(&mut rail.borrow_mut(), icount, exit) {
+                            Ok(events) => events,
+                            Err(ReplayServiceExitError::Boundary(error)) => return Err(error),
+                            Err(ReplayServiceExitError::Divergence(divergence)) => {
+                                diagnostic_divergence.replace(Some(divergence));
+                                return Err(BoundaryError::Exit(
+                                    "replay diagnostic divergence".into(),
+                                ));
+                            }
+                        };
                     if let Some(target) = terminal_sdk_target {
                         if exit_events.sdk_events.contains(&target.event) {
                             observed_terminal_sdk_target.set(true);
@@ -1150,10 +1561,17 @@ where
                     e
                 } else if let Some((what, at_icount, expected, got)) = divergence.take() {
                     ReplayError::Divergence {
-                        what,
+                        what: what.into(),
                         at_icount,
                         expected,
                         got,
+                    }
+                } else if let Some(divergence) = diagnostic_divergence.borrow_mut().take() {
+                    ReplayError::Divergence {
+                        what: divergence.what,
+                        at_icount: divergence.at_icount,
+                        expected: divergence.expected,
+                        got: divergence.got,
                     }
                 } else {
                     ReplayError::Run(format!("{e}"))
@@ -1254,7 +1672,7 @@ where
                             break 'verify_current_epoch Ok(true);
                         }
                         return Err(ReplayError::Divergence {
-                            what: "EPOCH_HASH chain value",
+                            what: "EPOCH_HASH chain value".into(),
                             at_icount: $icount,
                             expected: *e_value,
                             got: value,
@@ -1512,7 +1930,7 @@ where
                     return Err(ReplayError::BisectionDivergence(divergence));
                 }
                 return Err(ReplayError::Divergence {
-                    what: "end_vns",
+                    what: "end_vns".into(),
                     at_icount: header.end_icount,
                     expected: u64_hash(header.end_vns),
                     got: u64_hash(out.vns),
@@ -1558,7 +1976,7 @@ where
                     return Err(ReplayError::BisectionDivergence(divergence));
                 }
                 return Err(ReplayError::Divergence {
-                    what: "end_vns",
+                    what: "end_vns".into(),
                     at_icount: header.end_icount,
                     expected: u64_hash(header.end_vns),
                     got: u64_hash(out.vns),
@@ -1625,7 +2043,7 @@ where
                         return Err(ReplayError::BisectionDivergence(divergence));
                     }
                     return Err(ReplayError::Divergence {
-                        what: "end_vns",
+                        what: "end_vns".into(),
                         at_icount: header.end_icount,
                         expected: u64_hash(header.end_vns),
                         got: u64_hash(out.vns),
@@ -1646,7 +2064,7 @@ where
             return Err(ReplayError::BisectionDivergence(divergence));
         }
         return Err(ReplayError::Divergence {
-            what: "EPOCH_HASH count (recording has more than replay produced)",
+            what: "EPOCH_HASH count (recording has more than replay produced)".into(),
             at_icount: header.end_icount,
             expected: [0; 32],
             got: [0; 32],
@@ -1659,7 +2077,7 @@ where
             return Err(ReplayError::BisectionDivergence(divergence));
         }
         return Err(ReplayError::Divergence {
-            what: "end_state_hash",
+            what: "end_state_hash".into(),
             at_icount: header.end_icount,
             expected: header.end_state_hash,
             got: live_end,
@@ -1689,6 +2107,14 @@ where
         .map_err(|e| ReplayError::Apply(format!("reseal: {e:?}")))?;
     if resealed != log_bytes && !reseal_equivalent_ignoring_bisection_checkpoints(&resealed, &log)?
     {
+        if let Some(divergence) = classify_reseal_divergence(&resealed, &log)? {
+            return Err(ReplayError::Divergence {
+                what: divergence.what,
+                at_icount: divergence.at_icount,
+                expected: divergence.expected,
+                got: divergence.got,
+            });
+        }
         // Find the first differing offset for the report (iteration-88
         // review I2 — an undiffable pair helps nobody).
         let first_diff = resealed
@@ -1697,7 +2123,7 @@ where
             .position(|(a, b)| a != b)
             .unwrap_or_else(|| resealed.len().min(log_bytes.len()));
         return Err(ReplayError::Divergence {
-            what: "resealed log bytes (at_icount = first differing byte offset)",
+            what: "resealed log bytes (at_icount = first differing byte offset)".into(),
             at_icount: first_diff as u64,
             expected: header.body_hash,
             got: [0; 32],
@@ -1771,8 +2197,22 @@ fn terminal_sdk_target_for_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dh_inputlog::dhilog::{LogWriter, SealParams, SegmentHeader};
-    use dh_vmm::recording::stop_reason_u8;
+    use detguest_host::{GuestMem as _, MockGuestMem};
+    use detguest_wire::events::{encode_event, EventPayload};
+    use detguest_wire::header::{
+        ChannelHeader, CHANNEL_SIZE, CHANNEL_SIZE_PAGES, OFF_MANIFEST, OFF_RESERVED,
+    };
+    use detguest_wire::manifest::{init_manifest, MANIFEST_TOTAL_SIZE};
+    use detguest_wire::ports::{InitStatus, PORT_INIT_GO, PORT_INIT_HI, PORT_INIT_LO};
+    use detguest_wire::RingId;
+    use dh_devices::MmioBus;
+    use dh_inputlog::dhilog::{
+        LogWriter, SealParams, SegmentHeader, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP,
+    };
+    use dh_vmm::boundary::Boundary;
+    use dh_vmm::recording::{stop_reason_u8, DeviceRail};
+    use dh_vmm::runctl::SegmentOutcome;
+    use std::sync::{Arc, Mutex};
 
     fn header() -> SegmentHeader {
         SegmentHeader {
@@ -1793,6 +2233,140 @@ mod tests {
             end_state_hash: [0x55; 32],
             stop_reason: 1,
         }
+    }
+
+    const CHANNEL_BASE: u64 = 0x1000_0000;
+    const DETCHANNEL_TEST_MMIO_BASE: u64 = 0xD000_3000;
+
+    #[derive(Clone)]
+    struct SharedMem(Arc<Mutex<MockGuestMem>>);
+
+    impl detguest_host::GuestMem for SharedMem {
+        fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), detguest_host::MemError> {
+            self.0.lock().unwrap().read(gpa, out)
+        }
+
+        fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), detguest_host::MemError> {
+            self.0.lock().unwrap().write(gpa, data)
+        }
+    }
+
+    impl dh_devices::ctx::GuestMem for SharedMem {
+        fn read(&self, gpa: u64, out: &mut [u8]) -> Result<(), dh_devices::ctx::MemError> {
+            detguest_host::GuestMem::read(self, gpa, out).map_err(|_| dh_devices::ctx::MemError)
+        }
+
+        fn write(&mut self, gpa: u64, data: &[u8]) -> Result<(), dh_devices::ctx::MemError> {
+            detguest_host::GuestMem::write(self, gpa, data).map_err(|_| dh_devices::ctx::MemError)
+        }
+    }
+
+    fn channel_mem() -> SharedMem {
+        let mut mem = MockGuestMem::with_zeroed(CHANNEL_BASE, CHANNEL_SIZE);
+        let mut header = [0u8; OFF_RESERVED];
+        ChannelHeader::canonical().write_to(&mut header).unwrap();
+        mem.write(CHANNEL_BASE, &header).unwrap();
+        let mut manifest = vec![0u8; MANIFEST_TOTAL_SIZE];
+        init_manifest(&mut manifest).unwrap();
+        mem.write(
+            CHANNEL_BASE + u64::try_from(OFF_MANIFEST).unwrap(),
+            &manifest,
+        )
+        .unwrap();
+        SharedMem(Arc::new(Mutex::new(mem)))
+    }
+
+    fn log_with_inject_answer(value: u32) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        writer.pio_answer(10, 0, PORT_INJECT, value).unwrap();
+        writer.seal(seal_params()).unwrap()
+    }
+
+    fn log_with_cons_bump(new_cons: u32) -> Vec<u8> {
+        let mut writer = LogWriter::new(header());
+        let mut payload = [0u8; 8];
+        payload[0] = 3;
+        payload[4..8].copy_from_slice(&new_cons.to_le_bytes());
+        writer
+            .dev_event(10, 0, DEVICE_ID_DETCHANNEL, EVENT_CONS_BUMP, &payload)
+            .unwrap();
+        writer.seal(seal_params()).unwrap()
+    }
+
+    fn publish_inject_query(mem: &SharedMem, iseq: u32, name_id: u32, name: &'static [u8]) {
+        let desc = RingId::W.canonical_desc();
+        let events = [
+            EventPayload::NameIntern { name_id, name },
+            EventPayload::InjectQuery { iseq, name_id },
+        ];
+        let mut off = 0u32;
+        for (seq, event) in events.iter().enumerate() {
+            let mut buf = [0u8; 4096];
+            let n = encode_event(&mut buf, seq as u32, 1, 0, event).unwrap();
+            mem.0
+                .lock()
+                .unwrap()
+                .write(
+                    CHANNEL_BASE + u64::from(desc.offset) + u64::from(off),
+                    &buf[..n],
+                )
+                .unwrap();
+            off += u32::try_from(n).unwrap();
+        }
+        mem.0
+            .lock()
+            .unwrap()
+            .write(
+                CHANNEL_BASE + u64::try_from(RingId::W.prod_offset()).unwrap(),
+                &off.to_le_bytes(),
+            )
+            .unwrap();
+    }
+
+    fn replay_rail(source: ReplayInjectPlanSource) -> DeviceRail<SharedMem> {
+        let mem = channel_mem();
+        let mut bus = MmioBus::new();
+        bus.register(
+            DETCHANNEL_TEST_MMIO_BASE,
+            replay_detchannel_device(mem.clone(), source),
+        )
+        .unwrap();
+        DeviceRail::new(
+            bus,
+            dh_devices::entropy::DetEntropy::from_seed([0xAB; 32]),
+            LogWriter::new(header()),
+            mem,
+        )
+    }
+
+    fn pio_out(
+        rail: &mut DeviceRail<SharedMem>,
+        icount: u64,
+        port: u16,
+        value: u32,
+    ) -> Result<(), ReplayServiceExitError> {
+        let data = value.to_le_bytes();
+        replay_service_exit(rail, icount, kvm_ioctls::VcpuExit::IoOut(port, &data)).map(|_| ())
+    }
+
+    fn pio_in(
+        rail: &mut DeviceRail<SharedMem>,
+        icount: u64,
+        port: u16,
+    ) -> Result<u32, ReplayServiceExitError> {
+        let mut data = [0u8; 4];
+        replay_service_exit(rail, icount, kvm_ioctls::VcpuExit::IoIn(port, &mut data))?;
+        Ok(u32::from_le_bytes(data))
+    }
+
+    fn attach_detchannel(rail: &mut DeviceRail<SharedMem>) {
+        pio_out(rail, 1, PORT_INIT_LO, CHANNEL_BASE as u32).unwrap();
+        pio_out(rail, 2, PORT_INIT_HI, (CHANNEL_BASE >> 32) as u32).unwrap();
+        pio_out(rail, 3, PORT_INIT_GO, CHANNEL_SIZE_PAGES).unwrap();
+        assert_eq!(
+            pio_in(rail, 4, PORT_INIT_GO).unwrap(),
+            InitStatus::Ok as u32
+        );
     }
 
     fn log_with_optional_checkpoint(buttons: u32, checkpoint: bool) -> Vec<u8> {
@@ -1833,6 +2407,95 @@ mod tests {
             .unwrap();
         writer.sdk_event(icount, 0, 14, 16, 0xBBBB).unwrap();
         writer.seal(seal_params()).unwrap()
+    }
+
+    #[test]
+    fn log_backed_replay_detchannel_answers_nonzero_inject() {
+        let decision = FaultDecision::Platform { kind: 2, arg: 512 };
+        let recorded = log_with_inject_answer(decision.pack());
+        let reader = LogReader::parse(&recorded).unwrap();
+        let source = ReplayInjectPlanSource::from_reader(&reader);
+        let mut rail = replay_rail(source);
+        attach_detchannel(&mut rail);
+        publish_inject_query(&rail.mem, 7, 11, b"disk_fault");
+
+        pio_out(&mut rail, 5, PORT_INJECT, 7).unwrap();
+        let value = pio_in(&mut rail, 6, PORT_INJECT).unwrap();
+        assert_eq!(value, decision.pack());
+
+        let outcome = SegmentOutcome {
+            reason: StopReason::BudgetReached,
+            boundary: Boundary {
+                icount: 20,
+                rip: 0,
+                rcx: 0,
+            },
+            vns: 20,
+            state_hash: [0x55; 32],
+            injections_delivered: 0,
+            timer_fired: None,
+            frames_elapsed: 0,
+        };
+        let sealed = rail.seal(&outcome, [0x44; 32]).unwrap();
+        let replayed = LogReader::parse(&sealed).unwrap();
+        assert!(replayed.records().any(|record| {
+            detchannel_pio_answer(&record) == Some((PORT_INJECT, decision.pack()))
+        }));
+    }
+
+    #[test]
+    fn replay_detchannel_reports_missing_inject_answer_as_divergence() {
+        let source = ReplayInjectPlanSource::default();
+        let mut rail = replay_rail(source);
+        attach_detchannel(&mut rail);
+        publish_inject_query(&rail.mem, 7, 11, b"disk_fault");
+
+        pio_out(&mut rail, 5, PORT_INJECT, 7).unwrap();
+        match pio_in(&mut rail, 6, PORT_INJECT).unwrap_err() {
+            ReplayServiceExitError::Divergence(divergence) => {
+                assert!(divergence.what.starts_with("pio_answer_missing"));
+                assert!(divergence.what.contains("iseq=7"));
+                assert_eq!(divergence.at_icount, 6);
+            }
+            ReplayServiceExitError::Boundary(error) => {
+                panic!("missing inject answer should be a divergence, got {error:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn reseal_classifier_labels_pio_answer_mismatch() {
+        let expected = log_with_inject_answer(0x0002_0002);
+        let got = log_with_inject_answer(0x0004_0002);
+        let expected_reader = LogReader::parse(&expected).unwrap();
+        let divergence = classify_reseal_divergence(&got, &expected_reader)
+            .unwrap()
+            .expect("PIO answer value drift should be classified");
+        assert!(divergence.what.starts_with("pio_answer_mismatch"));
+        assert!(divergence.what.contains("expected_port=0xd384"));
+        assert!(divergence.what.contains("got_port=0xd384"));
+    }
+
+    #[test]
+    fn reseal_classifier_labels_channel_mutation_drift() {
+        let expected = log_with_cons_bump(4);
+        let got = log_with_cons_bump(8);
+        let expected_reader = LogReader::parse(&expected).unwrap();
+        let divergence = classify_reseal_divergence(&got, &expected_reader)
+            .unwrap()
+            .expect("CONS_BUMP drift should be classified");
+        assert!(divergence.what.starts_with("channel_mutation_drift"));
+    }
+
+    #[test]
+    fn reseal_classifier_labels_skipped_input() {
+        let expected = log_with_optional_checkpoint(0xA5A5, false);
+        let got = LogWriter::new(header()).seal(seal_params()).unwrap();
+        let expected_reader = LogReader::parse(&expected).unwrap();
+        let divergence = classify_reseal_divergence(&got, &expected_reader)
+            .unwrap()
+            .expect("missing canonical input should be classified");
+        assert!(divergence.what.starts_with("skipped_input"));
     }
 
     #[test]
