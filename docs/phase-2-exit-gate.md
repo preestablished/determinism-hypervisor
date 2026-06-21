@@ -200,6 +200,31 @@ except for the scheduled 100-child Linux M7 nightly canary. The nanokernel
 record/replay corpus reverify and nanokernel/default M7 nightly canary remain
 separate coverage.
 
+## M9 final acceptance suite (2026-06-21)
+
+`determinism-hypervisor-4s9.35` was rerun end-to-end on infra-control before
+closing M9. The tested code was commit
+`f855dfb9800e969e8371016112aace7703ee402d`; raw local transcripts are under
+`target/m9-final-acceptance-20260621T004402Z`. The same host, runner
+reservation, and reference-workload artifact set are recorded in the Phase 1
+final acceptance section. All rows below used no-skip acceptance settings:
+`DH_M9_ALLOW_SKIP=0` for Linux gates and `DH_M7_ACCEPT_ALLOW_SKIP=0` for M7
+acceptance gates. Filtered ignored-test transcripts showed the named tests and
+nonzero passed counts; no `*_ALLOW_SKIP=1` evidence is used for acceptance.
+
+| Gate | Command | Evidence |
+|---|---|---|
+| Linux M4 snapshot/restore/fork transparency | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m4_transparency --release linux -- --ignored --nocapture` | PASS: mid `icount=642343512`, `vns=642343512`, `frame_counter=6`, state hash `c6e320337fd0d1c208ab76ed411989c2ca838908fea96a0833b097c1ff4350d4`; control/restored `icount=643343512`, `vns=643343512`, `frames=7`, `frame_counter=13`, state hash `201276c8bd969dbdbfb9fd1ae11f43b455f0569c959b8f1302dbc872d644c87b`; restored-mid hash matched mid, restored hash matched control, `rip_expected=0x7ffff7f9a5d8`, `rip_actual=0x7ffff7f9a5d8`, `reg_diffs=0`, `diff_pages=[]`; `1 passed`, no skips accepted. |
+| Linux M5 frame scheduling | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_frame_scheduling --release linux -- --ignored --nocapture` | PASS: `linux-m5 frames start=0`, `first_icount=641818110`, first frames `[(186992, 1), (330795, 2), (474598, 3)]`, `restored_icount=642105716`, restored frames `[(143803, 4), (287606, 5)]`; `1 passed`, no skips accepted. |
+| Linux M5 deterministic I/O loopback | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_net_loopback --release linux -- --ignored --nocapture` | PASS: `linux-pvblk-io run_icount=641530504`, `frame_counter=1`, checksum `0xcfe2fddd7d2669a3`, `blko_dirty_clusters=1`; `1 passed`, no skips accepted. |
+| Linux M5 post-READY record/replay corpus | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test m5_record_replay --release linux_m5_record_replay_post_ready_corpus_reverifies -- --ignored --nocapture` | PASS: current M9 artifacts matched `bzImage=595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9`, `initramfs=87edf64db22dc85ef0c6b17fdc6e58a8f73391a6053e96f7a1056da7d08b9f57`, `base=488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8`, `game=e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac`; `frames=5`, `hard_cap=5000000`, `end_icount=762204`, `epochs=1`, `end_state_hash=32454a811351f338fedacd0294358e442b5a84e849b63b721db3cfbd631ce5a1`, checksum `0xcfe2fddd7d2669a3`, `dhilog=5a31d75e48dc52f52dca57e946a5099b7e14c33fb9f963a276073e511e7666c2`; `1 passed`, no skips accepted. |
+| Linux worker API support | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test linux_worker_api --release -- --ignored --nocapture` | PASS: `2 passed`, no skips accepted, covering the Linux worker API path through CreateVm, Run, Snapshot, Restore, Fork, and VerifyReplay. |
+| Nanokernel M5 record/replay corpus | `cargo test -p dh-worker --test m5_record_replay record_replay_corpus_pad_echo_6s_reverifies -- --nocapture` | PASS: existing nanokernel corpus reverified; `1 passed`. |
+| Nanokernel M7 full fork/VerifyReplay | `env -u DH_M7_ACCEPT_GUEST DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | PASS: `M7 fork/verify done: verified=1000 divergence=0 unique_hashes=1000`; cross-slot samples completed through job index 999; `2 passed`, no skips accepted. |
+| Nanokernel M7 cross-slot rerun determinism | `env -u DH_M7_ACCEPT_GUEST DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | PASS: cross-slot progress reached `10/10 (job index 999)`; `1 passed`, no skips accepted. |
+| Linux M7 full fork/VerifyReplay | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | PASS: `M7 Linux fork/verify done: verified=1000 divergence=0 unique_hashes=1 epoch_hashes=1000`; cross-slot samples completed through job index 999; `2 passed`, no skips accepted. |
+| Linux M7 cross-slot rerun determinism | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` | PASS: Linux cross-slot progress reached `10/10 (job index 999)`; `1 passed`, no skips accepted. |
+
 ## Known refinements baked into the gate
 
 - Snapshot and restore perf numbers are storage telemetry on the

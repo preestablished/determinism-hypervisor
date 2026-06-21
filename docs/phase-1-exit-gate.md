@@ -106,6 +106,49 @@ Phase 1 gates are operator-run acceptance gates, while the nanokernel/default
 workspace and `dh-cli gate --runs 100` coverage remains separate regression
 coverage.
 
+## M9 final acceptance suite (2026-06-21)
+
+`determinism-hypervisor-4s9.35` was rerun end-to-end on the reference
+Linux/KVM host before closing M9. The tested code was commit
+`f855dfb9800e969e8371016112aace7703ee402d`; raw local transcripts are under
+`target/m9-final-acceptance-20260621T004402Z`.
+
+**Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
+i5-8400 CPU @ 2.80GHz, microcode `0xfa`; `ci/determinism-class.lock` matched
+the live host. `docs/ops/apply-host-config.sh --verify` passed, including
+`/dev/kvm` access for `infra-admin`, housekeeping CPUs 0-1, and isolated/nohz
+slot cores 2-5. `cargo run -p dh-worker --bin dh-workerd -- --preflight`
+reported `preflight OK`. The shell was pinned to `Cpus_allowed_list: 0-1`,
+and `taskset -c 2-5` children reported `Cpus_allowed_list: 2-5`.
+
+The repository self-hosted runner listener was suspended locally while this
+exclusive KVM suite ran because passwordless sudo was unavailable for stopping
+the systemd service. Listener PID 808415 was `SIGSTOP`ed after confirming no
+active GitHub runs, then `SIGCONT`ed after the KVM gates; the runner service
+was active again before closeout. No CI workflow run is used as acceptance
+evidence for this final suite.
+
+The final suite used the current staged reference-workload artifacts below.
+The `initramfs.cpio` hash intentionally differs from the earlier Phase 1
+producer row above; the earlier row is left attached to its original evidence.
+
+| Artifact | Path | BLAKE3 |
+|---|---|---|
+| `bzImage` | `/home/infra-admin/.cache/dh-m9/reference-workload/bzImage` | `595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9` |
+| `initramfs.cpio` | `/home/infra-admin/.cache/dh-m9/reference-workload/initramfs.cpio` | `87edf64db22dc85ef0c6b17fdc6e58a8f73391a6053e96f7a1056da7d08b9f57` |
+| `base.img` | `/home/infra-admin/.cache/dh-m9/reference-workload/base.img` | `488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8` |
+| `game.img` | `/home/infra-admin/.cache/dh-m9/reference-workload/game.img` | `e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac` |
+
+| Gate | Command | Evidence |
+|---|---|---|
+| Workspace regression suite | `cargo test --workspace` | PASS across the workspace before the KVM acceptance gates. |
+| Nanokernel Phase 1 CLI gate | `cargo run -p dh-cli -- gate --runs 100` | PASS: `PHASE-1 DETERMINISM GATE: PASS (100 runs each)`. `plain-landing` matched `icount=2000000`, `rip=0x1000b4`, `vns=2000000`, state hash `64eecca97eed5c9a3f75c14d76bc6d6a810242ad31366ba84fe4168d72ec6b6a`; `timer-event` matched `icount=2000000`, `rip=0x1000ea`, `vns=2000000`, state hash `02bb7b547cff16219356bc26c6b782af07eb72c2e08331a995aef16e52c85113`, timer `1234567`. |
+| Linux fixture contract | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture` | PASS: `M9 initramfs contract ok`, autostart unit 0, exec `/opt/m9-refwork-contract`, expected regions `framebuffer`, `meta`, and `wram`; `1 passed`, no skips accepted. |
+| Linux Ready fixture | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_ready --release -- --ignored --nocapture` | PASS: `ready_icount=641343512`, `unit=0`, `region_count=3`, `manifest_generation=6`, `machine_config_hash=2b638bdf9f61ea0b9c14958d48b9a0eda743ace322866fb90f5fc387256226e6`, Ready state hash `5449bd8fae5587b9f69542b9be646bf6a54a64cb7b323811418b208079c41fd5`; `1 passed`, no skips accepted. |
+| Linux Phase 1 CLI Ready/post-READY gate | `DH_M9_ALLOW_SKIP=0 cargo run -p dh-cli -- gate --linux --runs 100 --bzimage "$DH_M9_BZIMAGE" --initramfs "$DH_M9_INITRAMFS" --base-image "$DH_M9_BASE_IMAGE" --game-image "$DH_M9_GAME_IMAGE"` | PASS: `gate linux-phase1 runs=100 verdict=PASS`; `M9 LINUX PHASE-1 GATE: PASS (100 runs, Ready EventKind 14, post-Ready budget 2000000)`. All runs matched `ready_event_kind=14`, `ready_unit=0`, `ready_region_count=3`, `ready_manifest_generation=6`, Ready payload digest `ddf4f8ffe8774c4ca4a78226302fefb0a67b1425da7940233a8ba4be99efdc16`, `ready_icount=641343512`, Ready state hash `5449bd8fae5587b9f69542b9be646bf6a54a64cb7b323811418b208079c41fd5`, config hash `2b638bdf9f61ea0b9c14958d48b9a0eda743ace322866fb90f5fc387256226e6`, `post_ready_budget=2000000`, `post_ready_icount=643343512`, and post-READY state hash `389518828fe672f094a8bc54068134186635175f69563052ddbb9a8fe18bd23a`. |
+| Linux timer/IRQ determinism | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture` | PASS: 100 cold Linux cases; `ready_icount=641343512`, vector `241`, delivered icounts `[642343512, 643343512, 644343512]`, final state hash `af397aa09f3d568388fb0b8ab88dbb259d0a1020975f160973c1379fdd606b57`; `1 passed`, no skips accepted. |
+| Linux landing/counting | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_landing_counting --release -- --ignored --nocapture` | PASS: 100 exact post-READY targets; `ready_icount=641343512`, `timer_vector=241`, `timer_delivered_icount=642343512`, first target hash `79420d3ae1bcebe610188c1eb1e0e53db018feaefcfca62e9a78b8cf9db128ba`, last target hash `ee8cd0198d7cf95c4ae765dd46ced05d115b4d810e2fb1afd1b7cf72cf900281`; `1 passed`, no skips accepted. |
+
 ## Known refinements baked into the gate (not exceptions)
 
 - §3.1 exit-instruction retirement is the MEASURED rule (retire zero,
