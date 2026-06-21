@@ -126,6 +126,7 @@ Every command in this section requires the staging block above, plus
 | Linux M5 guest-driven pv-blk loopback | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_net_loopback --release linux -- --ignored --nocapture` |
 | Linux M5 corpus reverify | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test m5_record_replay --release linux_m5_record_replay_post_ready_corpus_reverifies -- --ignored --nocapture` |
 | Linux worker API | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test linux_worker_api --release -- --ignored --nocapture` |
+| Linux GS-7 inject-point replay | Operator-run acceptance, fixture-dependent | `DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test gs7_inject_replay --release linux_gs7_inject_points_verify_replay_from_dhilog -- --ignored --nocapture` |
 | Linux M7 nightly canary | Nightly | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=100 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release m7_accept_1000_seeded_forks_verify_replay_all -- --ignored --nocapture` |
 | Linux M7 full fork/VerifyReplay | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` |
 | Linux M7 cross-slot rerun determinism | Operator-run acceptance | `DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux DH_M7_ACCEPT_JOBS=1000 DH_M7_CROSS_CHECKS=10 DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_ALLOW_SKIP=0 taskset -c 2-5 cargo test -p dh-worker --test m7_fork_verify --release m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs -- --ignored --nocapture` |
@@ -143,6 +144,7 @@ Producer evidence reviewed for this classification:
 | `4s9.28` | Linux M4/M5 worker regressions accepted: M4 transparency, frame-budget/frame marks, and guest-driven pv-blk loopback all passed with no-skip staged artifacts. |
 | `4s9.29` | Linux M7 full 1000-child acceptance and cross-slot rerun passed under `taskset -c 2-5`; nightly Linux 100-child canary was added while preserving the nanokernel canary. |
 | `4s9.30` | Linux worker API accepted for CreateVm, Run-to-Ready, StreamGuestEvents, Snapshot, Restore, Fork, child Run, and VerifyReplay. |
+| `determinism-hypervisor-bid` | Added the ignored Linux GS-7 inject-point replay gate. It requires sibling guest-sdk/reference-workload fixture traffic: multiple `InjectQuery` events, matching `PORT_INJECT` `PIO_ANSWER` DHILOG records, at least two distinct non-`Proceed` decisions, and VerifyReplay `Done` from the READY snapshot using only the DHILOG. |
 
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 

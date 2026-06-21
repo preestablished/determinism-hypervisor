@@ -15,6 +15,7 @@ use dh_devices::serial::DebugSerial;
 use dh_devices::MmioBus;
 use snapstore_client::blocking::SnapstoreClient as BlockingClient;
 use snapstore_client::Transport;
+use snapstore_manifest::input_log::InputLogContainer;
 use snapstore_server::build_server::{serve_for_tests, ServerHandle};
 use snapstore_server::config::{PageChannelConfig, ServerConfig};
 use tempfile::TempDir;
@@ -571,6 +572,19 @@ pub fn snapshot_section(
                 std::str::from_utf8(&tag).unwrap_or("????")
             )
         })
+}
+
+#[allow(dead_code)]
+pub fn input_log_payload(store: &BlockingClient, input_log_id: &[u8]) -> TestResult<Vec<u8>> {
+    let id: [u8; 32] = input_log_id
+        .try_into()
+        .map_err(|_| format!("input log id must be 32 bytes, got {}", input_log_id.len()))?;
+    let container = store
+        .get_input_log(snapstore_types::LogId::from_bytes(id))
+        .map_err(|e| format!("get_input_log: {e}"))?;
+    let decoded = InputLogContainer::decode(&container)
+        .map_err(|e| format!("input log container decode: {e}"))?;
+    Ok(decoded.payload().to_vec())
 }
 
 #[allow(dead_code)]
