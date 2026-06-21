@@ -1409,11 +1409,11 @@ fn verify_progress_to_proto(
                     "VerifyReplay bisection produced an inverted icount range",
                 ));
             }
-            if divergence.evidence.coverage_icount_lo > divergence.icount_lo
-                || divergence.evidence.coverage_icount_hi < divergence.icount_hi
+            if divergence.evidence.coverage_icount_lo != divergence.icount_lo
+                || divergence.evidence.coverage_icount_hi != divergence.icount_hi
             {
                 return Err(Status::internal(
-                    "VerifyReplay bisection range is not covered by its evidence",
+                    "VerifyReplay bisection range must match its evidence window",
                 ));
             }
             if matches!(divergence.evidence.mode, BisectionMode::ReplayVsRecorded)
@@ -8731,7 +8731,7 @@ mod tests {
         assert!(div.suspected_cause.contains("expected_hash="));
         assert!(div.suspected_cause.contains("got_hash="));
 
-        let refined = VerifyProgress::BisectionDivergence(dh_verify::verify::BisectionDivergence {
+        let refined = dh_verify::verify::BisectionDivergence {
             first_bad_epoch: Some(4),
             icount_lo: 40_960,
             icount_hi: 41_472,
@@ -8747,8 +8747,17 @@ mod tests {
                 coverage_icount_lo: 40_960,
                 coverage_icount_hi: 41_472,
             },
-        });
-        let progress = verify_progress_to_proto(refined, true).unwrap();
+        };
+
+        let mut narrowed = refined.clone();
+        narrowed.icount_lo += 1;
+        let err = verify_progress_to_proto(VerifyProgress::BisectionDivergence(narrowed), true)
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(err.message().contains("must match its evidence window"));
+
+        let progress =
+            verify_progress_to_proto(VerifyProgress::BisectionDivergence(refined), true).unwrap();
         let div = match progress.msg.unwrap() {
             VerifyMsg::Divergence(div) => div,
             other => panic!("expected refined Divergence, got {other:?}"),
