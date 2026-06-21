@@ -1029,6 +1029,7 @@ fn image_error_to_status(e: ImageResolverError) -> Status {
         }
         ImageResolverError::HashMismatch { .. } => Status::data_loss(e.to_string()),
         ImageResolverError::TooLarge { .. } => Status::invalid_argument(e.to_string()),
+        ImageResolverError::AllocationFailed { .. } => Status::resource_exhausted(e.to_string()),
         ImageResolverError::Io { .. } => Status::unavailable(e.to_string()),
     }
 }
@@ -4973,14 +4974,14 @@ mod tests {
             ),
             (
                 image_error_to_status(ImageResolverError::NotFile {
-                    kind: crate::image_resolver::ImageBlobKind::Kernel,
+                    kind: crate::image_resolver::ImageBlobKind::BaseImage,
                     path: path.clone(),
                 }),
                 tonic::Code::FailedPrecondition,
             ),
             (
                 image_error_to_status(ImageResolverError::HashMismatch {
-                    kind: crate::image_resolver::ImageBlobKind::Kernel,
+                    kind: crate::image_resolver::ImageBlobKind::BaseImage,
                     path: path.clone(),
                     expected,
                     actual,
@@ -4989,12 +4990,20 @@ mod tests {
             ),
             (
                 image_error_to_status(ImageResolverError::TooLarge {
-                    kind: crate::image_resolver::ImageBlobKind::Initramfs,
+                    kind: crate::image_resolver::ImageBlobKind::BaseImage,
                     path: path.clone(),
-                    len: crate::image_resolver::MAX_INITRAMFS_BYTES + 1,
-                    max: crate::image_resolver::MAX_INITRAMFS_BYTES,
+                    len: crate::image_resolver::MAX_BASE_IMAGE_BYTES + 1,
+                    max: crate::image_resolver::MAX_BASE_IMAGE_BYTES,
                 }),
                 tonic::Code::InvalidArgument,
+            ),
+            (
+                image_error_to_status(ImageResolverError::AllocationFailed {
+                    kind: crate::image_resolver::ImageBlobKind::BaseImage,
+                    path: path.clone(),
+                    requested: crate::image_resolver::MAX_BASE_IMAGE_BYTES,
+                }),
+                tonic::Code::ResourceExhausted,
             ),
             (
                 image_error_to_status(ImageResolverError::Io {

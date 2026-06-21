@@ -99,7 +99,9 @@ building `MachineConfig`: BLAKE3-hash each staged file and copy/link it to
 `$DH_M9_IMAGE_CACHE/<lowercase-blake3-hex>`, matching
 `dh_worker::image_resolver::cache_key`. The original staged paths are operator
 inputs; the image-cache entries are the bytes the worker resolves for
-`CreateVm`.
+`CreateVm`. Worker runtimes detach verified base-image bytes into owned
+process memory before pv-blk reads them, so later cache-entry changes do not
+affect an already-created runtime.
 
 ## M9 Linux gate classification
 

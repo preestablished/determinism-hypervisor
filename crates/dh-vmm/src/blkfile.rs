@@ -1,9 +1,11 @@
-//! File-backed pv-blk base image (ARCH §6.5).
+//! pv-blk base image backing (ARCH §6.5).
 //!
-//! The production [`dh_devices::blk::BlockBase`]: the base image opened
-//! `O_RDONLY` — the fd cannot write, so the CoW contract ("base bytes and
-//! mtime never change") holds by construction. The image's content hash is
-//! recorded in MachineConfig (config bead); this module only serves bytes.
+//! [`dh_devices::blk::BlockBase`] requires immutable bytes. A direct
+//! file-backed base is suitable for trusted fixture/direct paths, but
+//! `O_RDONLY` only prevents writes through that descriptor; it does not freeze
+//! the inode for other writers. Worker cache resolution uses owned verified
+//! bytes via [`FileBase::from_owned_bytes`] before pv-blk sees untrusted cache
+//! entries.
 //!
 //! Lives here rather than dh-devices because that crate's deny-list
 //! forbids host I/O — the device model sees only the [`BlockBase`] seam.
@@ -12,26 +14,48 @@ use dh_devices::blk::{BaseIoError, BlockBase};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct FileBase {
-    file: File,
+    backing: BaseBacking,
     len: u64,
+}
+
+enum BaseBacking {
+    File(File),
+    Bytes(Arc<[u8]>),
 }
 
 impl FileBase {
     /// Open the base image read-only. The fd keeps no append/write modes;
-    /// every read goes through positional `pread` (no shared cursor).
+    /// every read goes through positional `pread` (no shared cursor). This is
+    /// for trusted direct paths; worker image-cache entries should be resolved
+    /// with [`FileBase::from_owned_bytes`].
     pub fn open(path: &Path) -> std::io::Result<FileBase> {
         let file = File::open(path)?; // read-only by definition
         Self::from_file(file)
     }
 
-    /// Build from an already-open read-only file. Used by dh-workerd's image
-    /// resolver so the descriptor handed to pv-blk is the descriptor whose
-    /// content hash was verified.
+    /// Build from an already-open read-only file. The caller is responsible
+    /// for ensuring no other writer can mutate the inode while pv-blk may read
+    /// from it.
     pub fn from_file(file: File) -> std::io::Result<FileBase> {
         let len = file.metadata()?.len();
-        Ok(FileBase { file, len })
+        Ok(FileBase {
+            backing: BaseBacking::File(file),
+            len,
+        })
+    }
+
+    /// Build from process-owned bytes that are detached from any mutable cache
+    /// inode. Worker image-cache resolution uses this after verifying the
+    /// content hash of the exact bytes.
+    pub fn from_owned_bytes(bytes: Vec<u8>) -> FileBase {
+        let len = bytes.len() as u64;
+        FileBase {
+            backing: BaseBacking::Bytes(Arc::from(bytes.into_boxed_slice())),
+            len,
+        }
     }
 
     /// Base image length in bytes.
@@ -58,9 +82,16 @@ impl BlockBase for FileBase {
         }
         let take =
             usize::try_from((self.len - offset).min(buf.len() as u64)).map_err(|_| BaseIoError)?;
-        self.file
-            .read_exact_at(&mut buf[..take], offset)
-            .map_err(|_| BaseIoError)
+        match &self.backing {
+            BaseBacking::File(file) => file
+                .read_exact_at(&mut buf[..take], offset)
+                .map_err(|_| BaseIoError),
+            BaseBacking::Bytes(bytes) => {
+                let off = usize::try_from(offset).map_err(|_| BaseIoError)?;
+                buf[..take].copy_from_slice(&bytes[off..off + take]);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -190,5 +221,29 @@ mod tests {
             "sector 1 still serves base after sector-0 write (RMW)"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn owned_bytes_serve_content_and_zero_fill_through_blockbase() {
+        let content: Vec<u8> = (0..SECTOR_SIZE + 17).map(|i| (i % 197) as u8).collect();
+        let base = FileBase::from_owned_bytes(content.clone());
+        assert_eq!(base.len(), content.len() as u64);
+
+        let block: &dyn BlockBase = &base;
+        assert_eq!(block.len_bytes(), content.len() as u64);
+
+        let mut got = vec![0u8; 64];
+        block.read_at(11, &mut got).unwrap();
+        assert_eq!(&got, &content[11..75]);
+
+        let mut tail = vec![0xA5; 64];
+        let tail_offset = content.len() as u64 - 13;
+        block.read_at(tail_offset, &mut tail).unwrap();
+        assert_eq!(&tail[..13], &content[content.len() - 13..]);
+        assert!(tail[13..].iter().all(|&b| b == 0));
+
+        let mut past = vec![0xA5; 8];
+        block.read_at(content.len() as u64, &mut past).unwrap();
+        assert_eq!(past, vec![0; 8]);
     }
 }
