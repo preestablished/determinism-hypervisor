@@ -834,7 +834,37 @@ fn assert_ready_snapshot_channel_reattaches(
                         .try_into()
                         .unwrap(),
                 ) as usize;
-                evtc.contents.len() == EVTC_V2_BASE_LEN + pending_count * 8
+                let mut at = EVTC_V2_BASE_LEN;
+                let mut ok = true;
+                for _ in 0..pending_count {
+                    let Some(header_end) = at.checked_add(12) else {
+                        ok = false;
+                        break;
+                    };
+                    if header_end > evtc.contents.len() {
+                        ok = false;
+                        break;
+                    }
+                    let name_len =
+                        u32::from_le_bytes(evtc.contents[at + 8..header_end].try_into().unwrap());
+                    at = header_end;
+                    if name_len != u32::MAX {
+                        let Ok(name_len) = usize::try_from(name_len) else {
+                            ok = false;
+                            break;
+                        };
+                        let Some(name_end) = at.checked_add(name_len) else {
+                            ok = false;
+                            break;
+                        };
+                        if name_end > evtc.contents.len() {
+                            ok = false;
+                            break;
+                        }
+                        at = name_end;
+                    }
+                }
+                ok && at == evtc.contents.len()
             }
         }
         _ => false,

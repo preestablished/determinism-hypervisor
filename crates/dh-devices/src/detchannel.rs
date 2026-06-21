@@ -50,6 +50,7 @@ pub use detguest_wire::ports::IDENT_VALUE as IDENT_ANSWER;
 /// post-commit statuses (0..=3); this sentinel is deliberately none of them
 /// so a guest reading status before committing cannot see a stale "OK".
 pub const INIT_STATUS_NEVER_COMMITTED: u32 = u32::MAX;
+const EVTC_PENDING_NAME_ABSENT: u32 = u32::MAX;
 
 /// Doorbell mask bits (guest-sdk API.md §5).
 pub const DOORBELL_RING_A: u32 = 1 << 0;
@@ -96,6 +97,12 @@ pub enum PushChannelError {
     Push(detguest_host::PushError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingInjectSnapshot {
+    name_id: u32,
+    name: Option<String>,
+}
+
 /// The detchannel host state for one VM slot.
 pub struct DetChannelHost<M: GuestMem + Clone, P: FaultPlan> {
     mem: M,
@@ -120,11 +127,11 @@ pub struct DetChannelHost<M: GuestMem + Clone, P: FaultPlan> {
     /// `Channel` owns the operational cache; this mirror exists so EVTC can
     /// restore the OUT/restore/IN gap where the ring record has already been
     /// consumed but the matching PIO answer has not yet been produced.
-    pending_injects: BTreeMap<u32, u32>,
+    pending_injects: BTreeMap<u32, PendingInjectSnapshot>,
     /// Pending queries loaded from EVTC. A fresh attach cannot reconstruct
     /// the guest-sdk `Channel` cache after the ring consumer has advanced, so
     /// these entries are answered directly and consumed here.
-    restored_pending_injects: BTreeMap<u32, u32>,
+    restored_pending_injects: BTreeMap<u32, PendingInjectSnapshot>,
     responder: InjectResponder<P>,
     /// Low 32 bits of the last QUIESCE_ACK token (run control reads this).
     last_quiesce_ack: Option<u32>,
@@ -280,7 +287,11 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
     /// Layout v2 appends:
     ///   pending_inject_count u32
     ///   repeated pending InjectQuery entries, sorted by iseq:
-    ///     iseq u32 | name_id u32
+    ///     iseq u32 | name_id u32 | name_len u32 | name bytes
+    ///
+    /// `name_len == u32::MAX` means no resolved interned name was available.
+    /// Otherwise name bytes are UTF-8 and preserve the exact string a live
+    /// `FaultPlan` would have received for this pending query.
     ///
     /// NOT serialized, by design: the manifest snapshot (guest RAM —
     /// restore re-reads it at re-attach, INTEGRATION contract) and the
@@ -309,17 +320,28 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
                 out.extend_from_slice(&[0u8; 16]);
             }
         }
-        out.extend_from_slice(&(self.pending_injects.len() as u32).to_le_bytes());
-        for (iseq, name_id) in &self.pending_injects {
+        let pending_count = u32::try_from(self.pending_injects.len())
+            .expect("pending inject table exceeds EVTC u32 count");
+        out.extend_from_slice(&pending_count.to_le_bytes());
+        for (iseq, pending) in &self.pending_injects {
             out.extend_from_slice(&iseq.to_le_bytes());
-            out.extend_from_slice(&name_id.to_le_bytes());
+            out.extend_from_slice(&pending.name_id.to_le_bytes());
+            match &pending.name {
+                Some(name) => {
+                    let name_len = u32::try_from(name.len())
+                        .expect("pending inject name exceeds EVTC u32 length");
+                    out.extend_from_slice(&name_len.to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                }
+                None => out.extend_from_slice(&EVTC_PENDING_NAME_ABSENT.to_le_bytes()),
+            }
         }
     }
 
     /// EVTC v1 section byte length.
     pub const EVTC_V1_LEN: usize = 4 + 4 + 4 + 5 + 5 + 1 + 16;
     /// EVTC v2 base length (zero pending InjectQuery entries). Non-empty
-    /// pending tables append 8 bytes per entry.
+    /// pending tables append variable-length entries.
     pub const EVTC_LEN: usize = Self::EVTC_V1_LEN + 4;
     pub const EVTC_VERSION: u16 = 2;
 
@@ -366,7 +388,7 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         bytes: &[u8],
         version: u16,
         attached: bool,
-    ) -> Result<BTreeMap<u32, u32>, crate::RestoreError> {
+    ) -> Result<BTreeMap<u32, PendingInjectSnapshot>, crate::RestoreError> {
         if version == 1 {
             if bytes.len() != Self::EVTC_V1_LEN {
                 return Err(crate::RestoreError);
@@ -379,11 +401,7 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
 
         let count = u32::from_le_bytes(bytes[Self::EVTC_V1_LEN..Self::EVTC_LEN].try_into().unwrap())
             as usize;
-        let entries_len = count.checked_mul(8).ok_or(crate::RestoreError)?;
-        let expected_len = Self::EVTC_LEN
-            .checked_add(entries_len)
-            .ok_or(crate::RestoreError)?;
-        if bytes.len() != expected_len || (!attached && count != 0) {
+        if !attached && count != 0 {
             return Err(crate::RestoreError);
         }
 
@@ -391,14 +409,35 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         let mut at = Self::EVTC_LEN;
         let mut prev_iseq = None;
         for _ in 0..count {
+            if at.checked_add(12).ok_or(crate::RestoreError)? > bytes.len() {
+                return Err(crate::RestoreError);
+            }
             let iseq = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
             let name_id = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+            let name_len = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap());
             if prev_iseq.is_some_and(|prev| iseq <= prev) {
                 return Err(crate::RestoreError);
             }
-            pending.insert(iseq, name_id);
+            at += 12;
+            let name = if name_len == EVTC_PENDING_NAME_ABSENT {
+                None
+            } else {
+                let name_len = usize::try_from(name_len).map_err(|_| crate::RestoreError)?;
+                let end = at.checked_add(name_len).ok_or(crate::RestoreError)?;
+                if end > bytes.len() {
+                    return Err(crate::RestoreError);
+                }
+                let name = std::str::from_utf8(&bytes[at..end])
+                    .map_err(|_| crate::RestoreError)?
+                    .to_owned();
+                at = end;
+                Some(name)
+            };
+            pending.insert(iseq, PendingInjectSnapshot { name_id, name });
             prev_iseq = Some(iseq);
-            at += 8;
+        }
+        if at != bytes.len() {
+            return Err(crate::RestoreError);
         }
         Ok(pending)
     }
@@ -662,13 +701,14 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
             ctx.log_pio_answer(PORT_INJECT, 0);
             return 0;
         };
-        if let Some(name_id) = self.restored_pending_injects.remove(&iseq) {
+        if let Some(pending) = self.restored_pending_injects.remove(&iseq) {
             self.pending_injects.remove(&iseq);
-            let name = channel.intern_name(name_id).map(str::to_owned);
+            let live_name = channel.intern_name(pending.name_id).map(str::to_owned);
+            let name = live_name.as_deref().or(pending.name.as_deref());
             let value = self
                 .responder
                 .plan_mut()
-                .decide(iseq, name_id, name.as_deref())
+                .decide(iseq, pending.name_id, name)
                 .pack();
             let mut sink = CtxSink { ctx };
             sink.pio_answer(PORT_INJECT, value);
@@ -704,7 +744,18 @@ impl<M: GuestMem + Clone, P: FaultPlan> DetChannelHost<M, P> {
         };
         for ev in &events {
             if let OwnedPayload::InjectQuery { iseq, name_id } = &ev.payload {
-                self.pending_injects.insert(*iseq, *name_id);
+                let name = self
+                    .channel
+                    .as_ref()
+                    .and_then(|channel| channel.intern_name(*name_id))
+                    .map(str::to_owned);
+                self.pending_injects.insert(
+                    *iseq,
+                    PendingInjectSnapshot {
+                        name_id: *name_id,
+                        name,
+                    },
+                );
                 self.restored_pending_injects.remove(iseq);
             }
             match sdk_event_digest(ev) {
@@ -1409,7 +1460,7 @@ mod tests {
         let mut host = DetChannelHost::new(
             mem.clone(),
             TableFaultPlan::new(vec![detguest_host::inject::FaultRule {
-                name_glob: "*".into(),
+                name_glob: "disk_fault".into(),
                 occurrence: None,
                 decision,
             }]),
@@ -1421,29 +1472,37 @@ mod tests {
         });
         put_ring_w(
             &mem,
-            &[EventPayload::InjectQuery {
-                iseq: 7,
-                name_id: 11,
-            }],
+            &[
+                EventPayload::NameIntern {
+                    name_id: 11,
+                    name: b"disk_fault",
+                },
+                EventPayload::InjectQuery {
+                    iseq: 7,
+                    name_id: 11,
+                },
+            ],
         );
 
         with_ctx(&mut l, 20, |ctx| {
             host.pio_out(PORT_INJECT, 7, ctx);
         });
         assert_eq!(host.inject_iseq, Some(7));
-        assert_eq!(host.pending_injects.get(&7), Some(&11));
+        let pending = host.pending_injects.get(&7).unwrap();
+        assert_eq!(pending.name_id, 11);
+        assert_eq!(pending.name.as_deref(), Some("disk_fault"));
 
         let mut section = Vec::new();
         host.snapshot(&mut section);
         assert_eq!(
             section.len(),
-            DetChannelHost::<SharedMem, TableFaultPlan>::EVTC_LEN + 8
+            DetChannelHost::<SharedMem, TableFaultPlan>::EVTC_LEN + 12 + "disk_fault".len()
         );
 
         let mut restored = DetChannelHost::new(
             mem,
             TableFaultPlan::new(vec![detguest_host::inject::FaultRule {
-                name_glob: "*".into(),
+                name_glob: "disk_fault".into(),
                 occurrence: None,
                 decision,
             }]),
@@ -1453,15 +1512,19 @@ mod tests {
                 &section,
                 DetChannelHost::<SharedMem, TableFaultPlan>::EVTC_VERSION,
                 TableFaultPlan::new(vec![detguest_host::inject::FaultRule {
-                    name_glob: "*".into(),
+                    name_glob: "disk_fault".into(),
                     occurrence: None,
                     decision,
                 }]),
             )
             .unwrap();
         assert_eq!(restored.inject_iseq, Some(7));
-        assert_eq!(restored.pending_injects.get(&7), Some(&11));
-        assert_eq!(restored.restored_pending_injects.get(&7), Some(&11));
+        let pending = restored.pending_injects.get(&7).unwrap();
+        assert_eq!(pending.name_id, 11);
+        assert_eq!(pending.name.as_deref(), Some("disk_fault"));
+        let restored_pending = restored.restored_pending_injects.get(&7).unwrap();
+        assert_eq!(restored_pending.name_id, 11);
+        assert_eq!(restored_pending.name.as_deref(), Some("disk_fault"));
 
         let mut l2 = log();
         let value = with_ctx(&mut l2, 21, |ctx| restored.pio_in(PORT_INJECT, ctx));
@@ -1978,6 +2041,58 @@ mod evtc_tests {
         });
         let mut attached = Vec::new();
         attached_host.snapshot(&mut attached);
+
+        let write_count = |section: &mut [u8], count: u32| {
+            section[DetChannelHost::<SharedMem, LogFaultPlan>::EVTC_V1_LEN
+                ..DetChannelHost::<SharedMem, LogFaultPlan>::EVTC_LEN]
+                .copy_from_slice(&count.to_le_bytes());
+        };
+        let append_pending =
+            |section: &mut Vec<u8>, iseq: u32, name_id: u32, name: Option<&[u8]>| {
+                section.extend_from_slice(&iseq.to_le_bytes());
+                section.extend_from_slice(&name_id.to_le_bytes());
+                match name {
+                    Some(name) => {
+                        let name_len =
+                            u32::try_from(name.len()).expect("test pending name length fits u32");
+                        section.extend_from_slice(&name_len.to_le_bytes());
+                        section.extend_from_slice(name);
+                    }
+                    None => section.extend_from_slice(&EVTC_PENDING_NAME_ABSENT.to_le_bytes()),
+                }
+            };
+
+        let mut detached_pending = detached.clone();
+        write_count(&mut detached_pending, 1);
+        append_pending(&mut detached_pending, 7, 11, None);
+        assert_bad(
+            &detached_pending,
+            "detached EVTC cannot carry pending injects",
+        );
+
+        let mut count_mismatch = attached.clone();
+        write_count(&mut count_mismatch, 1);
+        assert_bad(
+            &count_mismatch,
+            "pending count must match serialized entries",
+        );
+
+        let mut unsorted = attached.clone();
+        write_count(&mut unsorted, 2);
+        append_pending(&mut unsorted, 8, 11, None);
+        append_pending(&mut unsorted, 7, 12, None);
+        assert_bad(&unsorted, "pending entries must be sorted by iseq");
+
+        let mut duplicate = attached.clone();
+        write_count(&mut duplicate, 2);
+        append_pending(&mut duplicate, 7, 11, None);
+        append_pending(&mut duplicate, 7, 12, None);
+        assert_bad(&duplicate, "pending entries must have unique iseqs");
+
+        let mut invalid_name = attached.clone();
+        write_count(&mut invalid_name, 1);
+        append_pending(&mut invalid_name, 7, 11, Some(&[0xFF]));
+        assert_bad(&invalid_name, "pending names must be UTF-8");
 
         let mut attached_bad_status = attached.clone();
         attached_bad_status[8..12].copy_from_slice(&(InitStatus::BadGpa as u32).to_le_bytes());
