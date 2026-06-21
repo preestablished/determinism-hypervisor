@@ -144,7 +144,7 @@ Producer evidence reviewed for this classification:
 | `4s9.28` | Linux M4/M5 worker regressions accepted: M4 transparency, frame-budget/frame marks, and guest-driven pv-blk loopback all passed with no-skip staged artifacts. |
 | `4s9.29` | Linux M7 full 1000-child acceptance and cross-slot rerun passed under `taskset -c 2-5`; nightly Linux 100-child canary was added while preserving the nanokernel canary. |
 | `4s9.30` | Linux worker API accepted for CreateVm, Run-to-Ready, StreamGuestEvents, Snapshot, Restore, Fork, child Run, and VerifyReplay. |
-| `determinism-hypervisor-bid` | Added the ignored Linux GS-7 inject-point replay gate. It requires sibling guest-sdk/reference-workload fixture traffic: multiple `InjectQuery` events, matching `PORT_INJECT` `PIO_ANSWER` DHILOG records, at least two distinct non-`Proceed` decisions, and VerifyReplay `Done` from the READY snapshot using only the DHILOG. |
+| `determinism-hypervisor-bid` | Added the ignored Linux GS-7 inject-point replay gate. It requires sibling guest-sdk/reference-workload fixture traffic: multiple post-READY `InjectQuery` events, matching `PORT_INJECT` `PIO_ANSWER` DHILOG records, one workload-observed decision proof LogLine with prefix `gs7.inject_decisions=`, at least two distinct non-`Proceed` decisions, and VerifyReplay `Done` from the READY snapshot using only the DHILOG. |
 
 ## kvm-intel-gated (the lab box / self-hosted runner ONLY)
 
