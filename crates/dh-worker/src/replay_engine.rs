@@ -599,6 +599,21 @@ fn terminal_sdk_finish_tail_matches_recording(
         && (terminal_event_icount..=end_icount).contains(&finish_icount)
 }
 
+fn terminal_sdk_recorded_end_hash_substitution_allowed(
+    tail: Option<&dh_vmm::runctl::SegmentOutcome>,
+    terminal_event_icount: u64,
+    end_icount: u64,
+    expected_reason: StopReason,
+) -> bool {
+    matches!(
+        tail,
+        Some(out)
+            if expected_reason == StopReason::BudgetReached
+                && out.reason == StopReason::GuestHalted
+                && (terminal_event_icount..end_icount).contains(&out.boundary.icount)
+    )
+}
+
 #[derive(Debug)]
 pub enum ReplayError {
     Restore(RestoreError),
@@ -2027,13 +2042,23 @@ where
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
     }
     let mut live_end = chain.value();
-    if live_end != header.end_state_hash && terminal_sdk_target.is_some() {
+    if live_end != header.end_state_hash
+        && terminal_sdk_target.is_some_and(|target| {
+            terminal_sdk_recorded_end_hash_substitution_allowed(
+                tail.as_ref(),
+                target.icount,
+                header.end_icount,
+                expected_reason,
+            )
+        })
+    {
         // Linux can regenerate the same terminal detchannel output sequence
-        // at a different icount inside the final epoch. Epoch hashes already
-        // proved the prefix, and the reseal comparison below still requires
-        // the same generated detchannel outputs after position normalization.
-        // Report the recorded terminal hash for that normalized output-drift
-        // case so VerifyReplay remains tied to the recorded END identity.
+        // at a different icount inside the final epoch, then halt before the
+        // snapshot-sealed BudgetReached boundary. Epoch hashes already proved
+        // the prefix, and the reseal comparison below still requires the same
+        // generated detchannel outputs after position normalization. Keep this
+        // accommodation out of exact-end tails so a real final-state
+        // divergence is not hidden by a terminal SDK marker.
         live_end = header.end_state_hash;
     }
     if live_end != header.end_state_hash
@@ -2648,6 +2673,77 @@ mod tests {
         assert!(!terminal_sdk_finish_tail_matches_recording(
             StopReason::Paused,
             20,
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+    }
+
+    fn terminal_tail_outcome(reason: StopReason, icount: u64) -> SegmentOutcome {
+        SegmentOutcome {
+            reason,
+            boundary: Boundary {
+                icount,
+                rip: 0,
+                rcx: 0,
+            },
+            vns: icount,
+            state_hash: [0; 32],
+            injections_delivered: 0,
+            timer_fired: None,
+            frames_elapsed: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_sdk_end_hash_substitution_is_limited_to_early_hlt_tail() {
+        let early_hlt = terminal_tail_outcome(StopReason::GuestHalted, 12);
+        assert!(terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&early_hlt),
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+
+        let later_hlt = terminal_tail_outcome(StopReason::GuestHalted, 18);
+        assert!(terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&later_hlt),
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+
+        let exact_budget = terminal_tail_outcome(StopReason::BudgetReached, 20);
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&exact_budget),
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+
+        let exact_hlt = terminal_tail_outcome(StopReason::GuestHalted, 20);
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&exact_hlt),
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+
+        let before_event = terminal_tail_outcome(StopReason::GuestHalted, 11);
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&before_event),
+            12,
+            20,
+            StopReason::BudgetReached,
+        ));
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&early_hlt),
+            12,
+            20,
+            StopReason::NextSdkEvent,
+        ));
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            None,
             12,
             20,
             StopReason::BudgetReached,
