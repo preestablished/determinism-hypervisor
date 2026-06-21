@@ -345,11 +345,11 @@ fn append_test_newc_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) {
     out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(name.as_bytes());
     out.push(0);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out.extend_from_slice(data);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

@@ -105,17 +105,19 @@ fn typed_sections_roundtrip_and_pin_their_layout() {
 }
 
 fn lapc_fixture() -> LapcSection {
-    let mut lapc = LapcSection::default();
-    lapc.id = 0x20;
-    lapc.tpr = 0x44;
-    lapc.ldr = 0x0102_0304;
-    lapc.svr = 0x0000_01ff;
+    let mut lapc = LapcSection {
+        id: 0x20,
+        tpr: 0x44,
+        ldr: 0x0102_0304,
+        svr: 0x0000_01ff,
+        esr: 0x55aa,
+        lvt_lint0: 0x0001_0700,
+        timer_divide: 0x3,
+        ..Default::default()
+    };
     lapc.isr[2] = 0x8000_0000;
     lapc.tmr[4] = 0x0000_0001;
     lapc.irr[7] = 0x4000_0000;
-    lapc.esr = 0x55aa;
-    lapc.lvt_lint0 = 0x0001_0700;
-    lapc.timer_divide = 0x3;
     lapc
 }
 

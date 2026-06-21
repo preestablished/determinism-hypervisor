@@ -268,7 +268,7 @@ fn finish_fork(
 ) -> Result<ForkOutcome, ForkError> {
     // ── 3. Stuff the child through the one true codec (§8.3 order: RAM
     //       is already live via CoW, then devices, then vCPU) ─────────────
-    let applied = apply_dhsnap(&child, child_bus, machine_config, &dhsnap, counter, None).map_err(
+    let applied = apply_dhsnap(&child, child_bus, machine_config, dhsnap, counter, None).map_err(
         |e| match e {
             RestoreError::Kvm(m) => ForkError::Kvm(m),
             other => ForkError::Apply(format!("{other:?}")),

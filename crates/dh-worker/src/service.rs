@@ -1462,24 +1462,26 @@ fn run_verify_replay_on_current_thread(
     let store = snapstore_client::blocking::SnapstoreClient::connect(transport)
         .map_err(|e| store_error_to_status("connect snapstore", e))?;
     let log_bytes = verify_replay_log_bytes(log_input, &store)?;
-    let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
-        .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
-    let checkpoint_index = if bisect_on_divergence {
-        Some(
-            crate::bisection_index::BisectionCheckpointIndex::from_reader(&reader).map_err(
-                |e| {
-                    Status::failed_precondition(format!(
-                        "VerifyReplay bisection checkpoint index invalid: {e}"
-                    ))
-                },
-            )?,
-        )
-    } else {
-        None
+    let (checkpoint_index, header, log_writer) = {
+        let reader = dh_inputlog::reader::LogReader::parse(&log_bytes)
+            .map_err(|e| Status::data_loss(format!("DHILOG parse: {e:?}")))?;
+        let checkpoint_index = if bisect_on_divergence {
+            Some(
+                crate::bisection_index::BisectionCheckpointIndex::from_reader(&reader).map_err(
+                    |e| {
+                        Status::failed_precondition(format!(
+                            "VerifyReplay bisection checkpoint index invalid: {e}"
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let header = reader.header().clone();
+        let log_writer = log_writer_from_reader_header(&header);
+        (checkpoint_index, header, log_writer)
     };
-    let header = reader.header().clone();
-    let log_writer = log_writer_from_reader_header(&header);
-    drop(reader);
 
     let config = crate::restore_engine::recover_machine_config(base_snapshot.clone(), &store)
         .map_err(restore_engine_error_to_status)?;
@@ -1919,6 +1921,7 @@ fn config_hash_for_slot(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 fn runtime_with_log(
     slot: dh_vmm::kvm::SlotVm,
     bus: dh_devices::MmioBus,
@@ -2162,7 +2165,7 @@ fn append_guest_events_with_retention_cap(
 
 #[cfg(target_arch = "x86_64")]
 fn sdk_event_matches(filter: Option<u32>, event: &DrainedGuestEvent) -> bool {
-    filter.map_or(true, |stream| event.stream == stream)
+    filter.is_none_or(|stream| event.stream == stream)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3658,13 +3661,13 @@ impl HypervisorWorker for WorkerService {
                     let sdk_event_filter = run_until.sdk_event_filter;
                     let epoch_len = runtime.machine_config.epoch_len.max(1);
                     let start_segment_epoch = start_segment_icount / epoch_len;
-                    if bisection_checkpoints.enabled {
-                        if runtime.machine_config.hash_epochs != dh_vmm::config::HashEpochs::EpochsOn
-                        {
-                            return Err(Status::failed_precondition(
-                                "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
-                            ));
-                        }
+                    if bisection_checkpoints.enabled
+                        && runtime.machine_config.hash_epochs
+                            != dh_vmm::config::HashEpochs::EpochsOn
+                    {
+                        return Err(Status::failed_precondition(
+                            "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
+                        ));
                     }
                     let checkpoint_machine_config = bisection_checkpoints
                         .enabled
@@ -4267,7 +4270,7 @@ impl HypervisorWorker for WorkerService {
                 snapshot;
             self.inner
                 .metrics
-                .observe_snapshot(started.elapsed(), out.pages_shipped.into());
+                .observe_snapshot(started.elapsed(), out.pages_shipped);
             Ok(Response::new(proto::TakeSnapshotResponse {
                 snapshot: Some(proto::SnapshotRef {
                     hash: out.snapshot_ref.to_bytes().to_vec(),
@@ -5215,6 +5218,7 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::type_complexity)]
     fn capture_epoch_leg(
         capture: bool,
     ) -> (

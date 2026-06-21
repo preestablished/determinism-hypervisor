@@ -308,6 +308,7 @@ fn run_until_ready(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_timer_segment(
     label: &str,
     slot: &mut dh_vmm::kvm::SlotVm,
@@ -351,6 +352,7 @@ fn run_timer_segment(
     timer_delivery(label, target, deadline_vns, fired)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tail_segment(
     label: &str,
     slot: &mut dh_vmm::kvm::SlotVm,

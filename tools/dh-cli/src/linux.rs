@@ -480,7 +480,7 @@ pub fn parse_ready_payload(payload: &[u8]) -> Result<ReadyPayload, BoundaryError
             "Ready payload region_count must be nonzero".into(),
         ));
     }
-    if ready.manifest_generation % 2 != 0 {
+    if !ready.manifest_generation.is_multiple_of(2) {
         return Err(BoundaryError::Exit(format!(
             "Ready payload manifest_generation {} is odd",
             ready.manifest_generation

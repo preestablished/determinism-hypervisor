@@ -10,6 +10,7 @@
 //! HARDWARE-GATED: kvm-intel lane + lab box; self-skips elsewhere.
 
 #![cfg(target_arch = "x86_64")]
+#![allow(clippy::result_large_err)]
 
 mod common;
 

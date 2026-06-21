@@ -337,6 +337,7 @@ fn run_until_ready(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_timer_landing_target(
     label: &str,
     slot: &mut dh_vmm::kvm::SlotVm,

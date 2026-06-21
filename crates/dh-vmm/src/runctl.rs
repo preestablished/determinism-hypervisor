@@ -32,6 +32,12 @@ use crate::kvm::SlotVm;
 /// VM entry, so an epoch-sized budget (50M) would stall for minutes.
 const INJECT_DEFER_BUDGET: u64 = 1 << 16;
 
+type GoalFn<'a> = dyn FnMut() -> bool + 'a;
+type ExitSink<'a> = dyn FnMut(VcpuExit) -> Result<(), BoundaryError> + 'a;
+type InputSink<'a> = dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError> + 'a;
+type EpochSink<'a> =
+    dyn FnMut(u64, Boundary, [u8; 32], Option<&SlotVm>) -> Result<(), BoundaryError> + 'a;
+
 /// API.md §2.4 `Run.until`, Phase-1 shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Until {
@@ -248,8 +254,8 @@ fn hash_device_sections(seg: &Segment<'_>) -> Vec<u8> {
 pub fn run_segment(
     seg: &mut Segment<'_>,
     until: Until,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_options(seg, until, RunOptions::default(), goal, on_exit)
 }
@@ -259,8 +265,8 @@ pub fn run_segment_with_options(
     seg: &mut Segment<'_>,
     until: Until,
     options: RunOptions,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_epoch_options(seg, until, options, goal, on_exit, &mut |_, _, _, _| Ok(()))
 }
@@ -286,14 +292,9 @@ pub fn run_segment_with_options(
 pub fn run_segment_with_epochs(
     seg: &mut Segment<'_>,
     until: Until,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    epoch_sink: &mut dyn FnMut(
-        u64,
-        Boundary,
-        [u8; 32],
-        Option<&SlotVm>,
-    ) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    epoch_sink: &mut EpochSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_epoch_options(seg, until, RunOptions::default(), goal, on_exit, epoch_sink)
 }
@@ -306,9 +307,9 @@ pub fn run_segment_with_scheduled_inputs(
     seg: &mut Segment<'_>,
     until: Until,
     scheduled_inputs: &[u64],
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    input_sink: &mut InputSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_scheduled_inputs_and_frames(
         seg,
@@ -325,15 +326,16 @@ pub fn run_segment_with_scheduled_inputs(
 /// [`run_segment_with_scheduled_inputs`] plus dynamic frame-triggered
 /// inputs. Frame inputs land immediately after the frame-boundary MMIO exit
 /// is serviced, using the just-recorded absolute FRAME_COUNTER value.
+#[allow(clippy::too_many_arguments)]
 pub fn run_segment_with_scheduled_inputs_and_frames(
     seg: &mut Segment<'_>,
     until: Until,
     scheduled_inputs: &[u64],
     frame_inputs: &[ScheduledFrameInput],
     start_frame_counter: u32,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    input_sink: &mut InputSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_with_scheduled_inputs_frames_and_epochs(
         seg,
@@ -353,21 +355,17 @@ pub fn run_segment_with_scheduled_inputs_and_frames(
 /// the scheduled input landing contract. The final sink argument is
 /// `Some(slot)` only when the epoch boundary has no transient queued vector
 /// state and is therefore safe for restoreable checkpoint capture.
+#[allow(clippy::too_many_arguments)]
 pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
     seg: &mut Segment<'_>,
     until: Until,
     scheduled_inputs: &[u64],
     frame_inputs: &[ScheduledFrameInput],
     start_frame_counter: u32,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
-    epoch_sink: &mut dyn FnMut(
-        u64,
-        Boundary,
-        [u8; 32],
-        Option<&SlotVm>,
-    ) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    input_sink: &mut InputSink<'_>,
+    epoch_sink: &mut EpochSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
@@ -388,14 +386,9 @@ pub fn run_segment_with_epoch_options(
     seg: &mut Segment<'_>,
     until: Until,
     options: RunOptions,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    epoch_sink: &mut dyn FnMut(
-        u64,
-        Boundary,
-        [u8; 32],
-        Option<&SlotVm>,
-    ) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    epoch_sink: &mut EpochSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
@@ -419,15 +412,10 @@ fn run_segment_inner(
     scheduled_inputs: &[u64],
     frame_inputs: &[ScheduledFrameInput],
     start_frame_counter: u32,
-    goal: &mut dyn FnMut() -> bool,
-    on_exit: &mut dyn FnMut(VcpuExit) -> Result<(), BoundaryError>,
-    input_sink: &mut dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError>,
-    epoch_sink: &mut dyn FnMut(
-        u64,
-        Boundary,
-        [u8; 32],
-        Option<&SlotVm>,
-    ) -> Result<(), BoundaryError>,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    input_sink: &mut InputSink<'_>,
+    epoch_sink: &mut EpochSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {

@@ -557,6 +557,7 @@ fn selected_checkpoint_is_at_epoch(
         && selected.checkpoint.preceding_epoch_hash.position.icount == icount
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_bisection_probe<M>(
     slot: &SlotVm,
     rail: &DeviceRail<M>,
@@ -926,11 +927,7 @@ where
                         .map_err(|e| BoundaryError::Exit(format!("counter: {e:?}")))?;
                     let exit_events = replay_service_exit(&mut rail.borrow_mut(), icount, exit)?;
                     if let Some(target) = terminal_sdk_target {
-                        if exit_events
-                            .sdk_events
-                            .iter()
-                            .any(|event| *event == target.event)
-                        {
+                        if exit_events.sdk_events.contains(&target.event) {
                             observed_terminal_sdk_target.set(true);
                             if event_stop {
                                 sdk_event_feed.set(sdk_event_feed.get() + 1);
@@ -1459,7 +1456,7 @@ where
         last_canonical_icount = Some(icount);
         if canonical
             .get(index + 1)
-            .map_or(true, |next| next.icount() != icount)
+            .is_none_or(|next| next.icount() != icount)
             && epoch_after_canonical
         {
             let _ = verify_current_epoch!(slot, &mut chain, icount)?;
@@ -1483,7 +1480,7 @@ where
         )?;
         let drained = replay_detchannel_drain_at_pause(&mut rail.borrow_mut(), header.end_icount)
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
-        if drained.iter().any(|event| *event == target.event) {
+        if drained.contains(&target.event) {
             observed_terminal_sdk_target.set(true);
         }
         if !observed_terminal_sdk_target.get() {

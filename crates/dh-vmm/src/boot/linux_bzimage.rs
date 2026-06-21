@@ -310,7 +310,7 @@ pub fn parse_bzimage(
 
     let relocatable_kernel = image[RELOCATABLE_KERNEL_OFF] != 0;
     let pref_address = u64le(image, PREF_ADDRESS_OFF);
-    if relocatable_kernel && pref_address % u64::from(kernel_alignment) != 0 {
+    if relocatable_kernel && !pref_address.is_multiple_of(u64::from(kernel_alignment)) {
         return Err(BzImageError::UnsupportedRelocatableCombination {
             alignment: kernel_alignment,
             pref_address,

@@ -122,6 +122,7 @@ struct ParsedChildLog {
     frame_marks: Vec<(u64, u32)>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AcceptanceHarness {
     Nanokernel {
         svc: WorkerService,
@@ -591,6 +592,7 @@ async fn destroy_best_effort(svc: &WorkerService, lease: Option<proto::Lease>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_record(
     guest: AcceptanceGuest,
     index: usize,

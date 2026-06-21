@@ -433,11 +433,10 @@ mod tests {
             msrs: RESTORE_MSR_LIST
                 .iter()
                 .enumerate()
-                .map(|(i, &index)| {
-                    let mut entry = kvm_msr_entry::default();
-                    entry.index = index;
-                    entry.data = 0x1000 + i as u64;
-                    entry
+                .map(|(i, &index)| kvm_msr_entry {
+                    index,
+                    data: 0x1000 + i as u64,
+                    ..Default::default()
                 })
                 .collect(),
             events: Default::default(),

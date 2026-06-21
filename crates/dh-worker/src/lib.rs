@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::result_large_err)]
 
 #[cfg(target_arch = "x86_64")]
 pub mod bisection_index;

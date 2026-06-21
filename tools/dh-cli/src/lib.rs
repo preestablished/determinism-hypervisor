@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::result_large_err)]
 
 //! dh-cli library surface: the boot path is a lib module so the
 //! integration tests can drive it in-process (the M0 acceptance boots

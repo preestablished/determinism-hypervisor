@@ -353,18 +353,17 @@ pub struct SlotPosition {
     pub frame_counter: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RuntimeThreadState {
+    #[default]
     Parked,
-    Running { tid: i32 },
-    PauseRequested { tid: i32 },
+    Running {
+        tid: i32,
+    },
+    PauseRequested {
+        tid: i32,
+    },
     Faulted(String),
-}
-
-impl Default for RuntimeThreadState {
-    fn default() -> Self {
-        Self::Parked
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

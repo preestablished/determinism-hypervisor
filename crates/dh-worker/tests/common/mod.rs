@@ -796,8 +796,11 @@ pub fn test_bus() -> MmioBus {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{M9LinuxArtifacts, M9_LINUX_ARTIFACT_ENV_VARS};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn m9_artifact_lookup_reports_all_missing_vars() {

@@ -67,11 +67,9 @@ fn run_guest_byte_writes(slot: &mut SlotVm, writes: &[(u16, u8)]) {
     regs.rip = 0;
     regs.rflags = 2;
     slot.vcpu.set_regs(&regs).unwrap();
-    loop {
-        match classify_exit(slot.vcpu.run().unwrap()) {
-            ExitEvent::Hlt => break,
-            other => panic!("unexpected exit: {other:?}"),
-        }
+    match classify_exit(slot.vcpu.run().unwrap()) {
+        ExitEvent::Hlt => {}
+        other => panic!("unexpected exit: {other:?}"),
     }
 }
 

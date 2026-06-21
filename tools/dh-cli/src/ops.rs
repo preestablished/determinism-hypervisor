@@ -354,11 +354,7 @@ fn restore_output(response: proto::RestoreSnapshotResponse) -> OpOutput {
 }
 
 fn fork_output(response: proto::ForkResponse) -> OpOutput {
-    let children_json: Vec<_> = response
-        .children
-        .iter()
-        .map(|lease| lease_value_json(lease))
-        .collect();
+    let children_json: Vec<_> = response.children.iter().map(lease_value_json).collect();
     let children_human: Vec<_> = response.children.iter().map(lease_value_human).collect();
     OpOutput {
         json: format!(

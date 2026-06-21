@@ -39,11 +39,9 @@ fn dirty_tracking_reset_drains_a_used_slot() {
 
     // The default 65536-entry ring swallows page_dirtier's 3072 pages
     // without a ring-full exit; the guest parks in HLT.
-    loop {
-        match classify_exit(slot.vcpu.run().unwrap()) {
-            ExitEvent::Hlt => break,
-            other => panic!("unexpected exit {other:?}"),
-        }
+    match classify_exit(slot.vcpu.run().unwrap()) {
+        ExitEvent::Hlt => {}
+        other => panic!("unexpected exit {other:?}"),
     }
 
     // The slot is now exactly what restore_engine's precondition warns
