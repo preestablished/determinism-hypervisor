@@ -110,8 +110,12 @@ coverage.
 
 `determinism-hypervisor-4s9.35` was rerun end-to-end on the reference
 Linux/KVM host before closing M9. The tested code was commit
-`f855dfb9800e969e8371016112aace7703ee402d`; raw local transcripts are under
-`target/m9-final-acceptance-20260621T004402Z`.
+`f855dfb9800e969e8371016112aace7703ee402d`; later commits are docs-only
+evidence publication. Raw local transcripts are under
+`target/m9-final-acceptance-20260621T004402Z`; that path is local operator
+scratch, not a repo-tracked artifact. The durable audit record is this
+committed summary plus the Beads closeout comment on
+`determinism-hypervisor-4s9.35`.
 
 **Host:** infra-control, Linux `6.8.0-124-generic`, Intel(R) Core(TM)
 i5-8400 CPU @ 2.80GHz, microcode `0xfa`; `ci/determinism-class.lock` matched
@@ -123,14 +127,17 @@ and `taskset -c 2-5` children reported `Cpus_allowed_list: 2-5`.
 
 The repository self-hosted runner listener was suspended locally while this
 exclusive KVM suite ran because passwordless sudo was unavailable for stopping
-the systemd service. Listener PID 808415 was `SIGSTOP`ed after confirming no
-active GitHub runs, then `SIGCONT`ed after the KVM gates; the runner service
-was active again before closeout. No CI workflow run is used as acceptance
+the systemd service. The transcript set records listener PID 808415 and the
+stopped `Tl` state used for the reservation. The listener was resumed after
+the KVM gates as session hygiene; no CI workflow run is used as acceptance
 evidence for this final suite.
 
-The final suite used the current staged reference-workload artifacts below.
-The `initramfs.cpio` hash intentionally differs from the earlier Phase 1
-producer row above; the earlier row is left attached to its original evidence.
+The final suite rehashed the current staged reference-workload image artifacts
+below. The `m9-refwork-contract` workload binary was validated from inside the
+initramfs by the fixture-contract test, but was not materialized and rehashed
+as a separate file in this final run. The `initramfs.cpio` hash intentionally
+differs from the earlier Phase 1 producer row above; the earlier row is left
+attached to its original evidence.
 
 | Artifact | Path | BLAKE3 |
 |---|---|---|
@@ -141,7 +148,7 @@ producer row above; the earlier row is left attached to its original evidence.
 
 | Gate | Command | Evidence |
 |---|---|---|
-| Workspace regression suite | `cargo test --workspace` | PASS across the workspace before the KVM acceptance gates. |
+| Workspace regression suite | `cargo test --workspace` | PASS across the workspace during the final suite. |
 | Nanokernel Phase 1 CLI gate | `cargo run -p dh-cli -- gate --runs 100` | PASS: `PHASE-1 DETERMINISM GATE: PASS (100 runs each)`. `plain-landing` matched `icount=2000000`, `rip=0x1000b4`, `vns=2000000`, state hash `64eecca97eed5c9a3f75c14d76bc6d6a810242ad31366ba84fe4168d72ec6b6a`; `timer-event` matched `icount=2000000`, `rip=0x1000ea`, `vns=2000000`, state hash `02bb7b547cff16219356bc26c6b782af07eb72c2e08331a995aef16e52c85113`, timer `1234567`. |
 | Linux fixture contract | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture` | PASS: `M9 initramfs contract ok`, autostart unit 0, exec `/opt/m9-refwork-contract`, expected regions `framebuffer`, `meta`, and `wram`; `1 passed`, no skips accepted. |
 | Linux Ready fixture | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_ready --release -- --ignored --nocapture` | PASS: `ready_icount=641343512`, `unit=0`, `region_count=3`, `manifest_generation=6`, `machine_config_hash=2b638bdf9f61ea0b9c14958d48b9a0eda743ace322866fb90f5fc387256226e6`, Ready state hash `5449bd8fae5587b9f69542b9be646bf6a54a64cb7b323811418b208079c41fd5`; `1 passed`, no skips accepted. |
@@ -160,10 +167,11 @@ producer row above; the earlier row is left attached to its original evidence.
 - The §7.2 CPUID mask is host-placement-invariant (APIC-ID byte and
   topology leaves zeroed — found by review, verified across all cores).
 
-## What this unblocks
+## Historical Phase 1 unblock context
 
-M4 (snapshot/restore/fork) may begin. The restore-side preimages are
-already staged: §8.1 doc-order MSR blob with the normalized-TSC slot,
-device snapshot sections (EVTC layout v1, empty-serial rule), the
-SegmentHeader encoder fingerprint, and `StateHashChain::from_value`
-for chain continuation.
+At the original Phase 1 sign-off, M4 (snapshot/restore/fork) was allowed to
+begin. The later M9 addenda above document that Linux M4/M5/M7 acceptance has
+since landed. The restore-side preimages were already staged: §8.1 doc-order
+MSR blob with the normalized-TSC slot, device snapshot sections (EVTC layout
+v1, empty-serial rule), the SegmentHeader encoder fingerprint, and
+`StateHashChain::from_value` for chain continuation.
