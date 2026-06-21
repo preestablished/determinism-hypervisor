@@ -584,7 +584,7 @@ fn detchannel_exit_generated_event(device_id: u16, event_type: u16) -> bool {
 fn terminal_sdk_finish_tail_matches_recording(
     finish_reason: StopReason,
     finish_icount: u64,
-    terminal_event_icount: u64,
+    observed_terminal_event_icount: u64,
     end_icount: u64,
     expected_reason: StopReason,
 ) -> bool {
@@ -596,21 +596,29 @@ fn terminal_sdk_finish_tail_matches_recording(
     // through HLT before the recorded snapshot boundary.
     expected_reason == StopReason::BudgetReached
         && finish_reason == StopReason::GuestHalted
-        && (terminal_event_icount..=end_icount).contains(&finish_icount)
+        && (observed_terminal_event_icount..=end_icount).contains(&finish_icount)
+}
+
+fn note_terminal_sdk_target_observed(observed_icount: &std::cell::Cell<Option<u64>>, icount: u64) {
+    observed_icount.set(Some(
+        observed_icount
+            .get()
+            .map_or(icount, |previous| previous.min(icount)),
+    ));
 }
 
 fn terminal_sdk_recorded_end_hash_substitution_allowed(
     tail: Option<&dh_vmm::runctl::SegmentOutcome>,
-    terminal_event_icount: u64,
+    observed_terminal_event_icount: Option<u64>,
     end_icount: u64,
     expected_reason: StopReason,
 ) -> bool {
     matches!(
-        tail,
-        Some(out)
+        (tail, observed_terminal_event_icount),
+        (Some(out), Some(observed_icount))
             if expected_reason == StopReason::BudgetReached
                 && out.reason == StopReason::GuestHalted
-                && (terminal_event_icount..end_icount).contains(&out.boundary.icount)
+                && (observed_icount..end_icount).contains(&out.boundary.icount)
     )
 }
 
@@ -1301,7 +1309,7 @@ where
     let bisection_error = std::cell::RefCell::new(None);
     let pending_bisection = std::cell::RefCell::new(None::<PendingBisectionDivergence>);
     let progress_error = std::cell::RefCell::new(None);
-    let observed_terminal_sdk_target = std::cell::Cell::new(false);
+    let observed_terminal_sdk_target_icount = std::cell::Cell::new(None);
     let run_to = |slot: &mut SlotVm,
                   chain: &mut StateHashChain,
                   target: u64,
@@ -1382,7 +1390,10 @@ where
                         };
                     if let Some(target) = terminal_sdk_target {
                         if exit_events.sdk_events.contains(&target.event) {
-                            observed_terminal_sdk_target.set(true);
+                            note_terminal_sdk_target_observed(
+                                &observed_terminal_sdk_target_icount,
+                                icount,
+                            );
                             if event_stop {
                                 sdk_event_feed.set(sdk_event_feed.get() + 1);
                             }
@@ -1942,19 +1953,22 @@ where
         let drained = replay_detchannel_drain_at_pause(&mut rail.borrow_mut(), header.end_icount)
             .map_err(|e| ReplayError::Run(format!("{e:?}")))?;
         if drained.contains(&target.event) {
-            observed_terminal_sdk_target.set(true);
+            note_terminal_sdk_target_observed(
+                &observed_terminal_sdk_target_icount,
+                header.end_icount,
+            );
         }
-        if !observed_terminal_sdk_target.get() {
+        let Some(observed_target_icount) = observed_terminal_sdk_target_icount.get() else {
             return Err(ReplayError::Run(format!(
                 "tail did not observe terminal SDK event {:?} before recording end at {}",
                 target.event, header.end_icount
             )));
-        }
+        };
         if let Some(out) = &tail {
             if !terminal_sdk_finish_tail_matches_recording(
                 out.reason,
                 out.boundary.icount,
-                target.icount,
+                observed_target_icount,
                 header.end_icount,
                 expected_reason,
             ) {
@@ -2043,14 +2057,13 @@ where
     }
     let mut live_end = chain.value();
     if live_end != header.end_state_hash
-        && terminal_sdk_target.is_some_and(|target| {
-            terminal_sdk_recorded_end_hash_substitution_allowed(
-                tail.as_ref(),
-                target.icount,
-                header.end_icount,
-                expected_reason,
-            )
-        })
+        && terminal_sdk_target.is_some()
+        && terminal_sdk_recorded_end_hash_substitution_allowed(
+            tail.as_ref(),
+            observed_terminal_sdk_target_icount.get(),
+            header.end_icount,
+            expected_reason,
+        )
     {
         // Linux can regenerate the same terminal detchannel output sequence
         // at a different icount inside the final epoch, then halt before the
@@ -2679,6 +2692,15 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_sdk_target_observation_keeps_earliest_matching_icount() {
+        let observed = std::cell::Cell::new(None);
+        note_terminal_sdk_target_observed(&observed, 18);
+        note_terminal_sdk_target_observed(&observed, 12);
+        note_terminal_sdk_target_observed(&observed, 20);
+        assert_eq!(observed.get(), Some(12));
+    }
+
     fn terminal_tail_outcome(reason: StopReason, icount: u64) -> SegmentOutcome {
         SegmentOutcome {
             reason,
@@ -2700,7 +2722,7 @@ mod tests {
         let early_hlt = terminal_tail_outcome(StopReason::GuestHalted, 12);
         assert!(terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&early_hlt),
-            12,
+            Some(12),
             20,
             StopReason::BudgetReached,
         ));
@@ -2708,7 +2730,7 @@ mod tests {
         let later_hlt = terminal_tail_outcome(StopReason::GuestHalted, 18);
         assert!(terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&later_hlt),
-            12,
+            Some(12),
             20,
             StopReason::BudgetReached,
         ));
@@ -2716,7 +2738,7 @@ mod tests {
         let exact_budget = terminal_tail_outcome(StopReason::BudgetReached, 20);
         assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&exact_budget),
-            12,
+            Some(12),
             20,
             StopReason::BudgetReached,
         ));
@@ -2724,7 +2746,7 @@ mod tests {
         let exact_hlt = terminal_tail_outcome(StopReason::GuestHalted, 20);
         assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&exact_hlt),
-            12,
+            Some(12),
             20,
             StopReason::BudgetReached,
         ));
@@ -2732,20 +2754,61 @@ mod tests {
         let before_event = terminal_tail_outcome(StopReason::GuestHalted, 11);
         assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&before_event),
-            12,
+            Some(12),
             20,
             StopReason::BudgetReached,
         ));
         assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
             Some(&early_hlt),
-            12,
+            Some(12),
             20,
             StopReason::NextSdkEvent,
         ));
         assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
             None,
-            12,
+            Some(12),
             20,
+            StopReason::BudgetReached,
+        ));
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&early_hlt),
+            None,
+            20,
+            StopReason::BudgetReached,
+        ));
+    }
+
+    #[test]
+    fn terminal_sdk_hash_substitution_uses_replay_observed_event_icount() {
+        let bytes = log_with_terminal_sdk_event(StopReason::BudgetReached);
+        let log = LogReader::parse(&bytes).unwrap();
+        let target = terminal_sdk_target_for_tail(&log, log.header().end_icount).unwrap();
+        assert_eq!(target.icount, log.header().end_icount);
+
+        let observed = std::cell::Cell::new(None);
+        note_terminal_sdk_target_observed(&observed, 12);
+        let early_hlt = terminal_tail_outcome(StopReason::GuestHalted, 12);
+        assert!(terminal_sdk_finish_tail_matches_recording(
+            early_hlt.reason,
+            early_hlt.boundary.icount,
+            observed.get().unwrap(),
+            log.header().end_icount,
+            StopReason::BudgetReached,
+        ));
+        assert!(terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&early_hlt),
+            observed.get(),
+            log.header().end_icount,
+            StopReason::BudgetReached,
+        ));
+
+        let exact_end_observed = std::cell::Cell::new(None);
+        note_terminal_sdk_target_observed(&exact_end_observed, target.icount);
+        let exact_hlt = terminal_tail_outcome(StopReason::GuestHalted, target.icount);
+        assert!(!terminal_sdk_recorded_end_hash_substitution_allowed(
+            Some(&exact_hlt),
+            exact_end_observed.get(),
+            log.header().end_icount,
             StopReason::BudgetReached,
         ));
     }
