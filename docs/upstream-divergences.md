@@ -277,17 +277,24 @@ Unlike the section above, the "Proposed new" texts here are newly authored for t
 ledger (accurate against the cited code, but not themselves review-passed doc edits)
 — upstream is free to rewrap or rephrase as long as the technical content survives.
 
-### #3 — API.md §4: `EVTC` row understates the implemented v1 contents
+### #3 — API.md §4: `EVTC` row understates the implemented contents
 
 - **Found:** iteration 65 review. **Authority:** `crates/dh-devices/src/detchannel.rs`
-  (`EVTC_LEN = 39`, `EVTC_VERSION = 1`; ships and round-trips, pinned by the
-  `evtc_roundtrips_attached_state_and_seqs` test in the same file).
-- The row says the section is just the channel base GPA, but EVTC v1 carries:
+  (`EVTC_V1_LEN = 39`, `EVTC_LEN = 43`, `EVTC_VERSION = 2`; ships and
+  round-trips, pinned by the `evtc_roundtrips_attached_state_and_seqs` and
+  `evtc_restore_between_inject_out_and_in_preserves_pending_query` tests in the
+  same file).
+- The row says the section is just the channel base GPA, but EVTC carries:
   `init_lo u32, init_hi u32, init_status u32` (offsets 0/4/8), `inject_iseq`
   flag u8 + u32 (12..17), `last_quiesce_ack` flag u8 + u32 (17..22), then channel
   flag u8 + `gpa u64` + producer seqs `ring_c u32, ring_i u32` (22..39). The ring,
   manifest, and index state genuinely live in guest RAM (that part of the row is
   right); the host-side latch/seq state above does not and must be serialized.
+  EVTC v2 appends `pending_inject_count u32` at 39..43 followed by sorted
+  `iseq u32 | name_id u32` entries for drained but unanswered InjectQuery
+  records, preserving the restore window between `OUT PORT_INJECT` and the
+  matching `IN PORT_INJECT`. EVTC v1 remains restore-compatible for legacy
+  39-byte sections but new snapshots use v2.
 
 Old (upstream §4):
 
@@ -298,7 +305,7 @@ Old (upstream §4):
 Proposed new:
 
 ```
-| `EVTC` | detchannel host state, 39 bytes (v1): `init_lo u32, init_hi u32, init_status u32`, `inject_iseq` flag u8 + u32, `last_quiesce_ack` flag u8 + u32, attach flag u8 + channel base GPA `u64` + producer seqs `ring_c u32, ring_i u32` (attach flag 0 = not attached). Ring, manifest, and index state lives in guest RAM and travels with the pages (guest-sdk ARCHITECTURE §2); the host re-attaches at the recorded GPA after restore and reinstates the non-reconstructible producer seqs. Authoritative layout: `dh-devices/src/detchannel.rs` (`EVTC_LEN`/`EVTC_VERSION`) |
+| `EVTC` | detchannel host state (v2): 43-byte base `init_lo u32, init_hi u32, init_status u32`, `inject_iseq` flag u8 + u32, `last_quiesce_ack` flag u8 + u32, attach flag u8 + channel base GPA `u64` + producer seqs `ring_c u32, ring_i u32`, then `pending_inject_count u32` plus sorted `iseq u32 | name_id u32` entries for drained but unanswered InjectQuery records (attach flag 0 = not attached and pending count must be 0). Ring, manifest, and index state lives in guest RAM and travels with the pages (guest-sdk ARCHITECTURE §2); the host re-attaches at the recorded GPA after restore, reinstates the non-reconstructible producer seqs, and preserves the OUT/restore/IN inject-answer window. Authoritative layout: `dh-devices/src/detchannel.rs` (`EVTC_V1_LEN`/`EVTC_LEN`/`EVTC_VERSION`) |
 ```
 
 ### #4 — ARCHITECTURE.md §2 lifecycle one-liner: `Running → Frozen` should be `Paused → Frozen`
