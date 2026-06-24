@@ -11,12 +11,17 @@ Add focused tests for the new module and binary parsing:
 4. CLI rejects missing private handoff inputs.
 5. Private output creation sets directory mode `0700` and file mode `0600` or
    stricter on Unix.
-6. Public summary redaction fails when any private literal appears in the
-   summary.
-7. Generated `BRIDGE_REAL_SNAPSHOT_REF` formatting requires exactly 64 lowercase
+6. Private output validation rejects paths inside any git checkout.
+7. Snapstore config and private evidence files are written outside git with
+   mode `0600` or stricter.
+8. Public summary, stdout, and stderr redaction fails when any private literal
+   or generated snapshot ref appears.
+9. Generated `BRIDGE_REAL_SNAPSHOT_REF` formatting requires exactly 64 lowercase
    hex characters.
-8. Cleanup guard attempts to destroy every lease that was created before an
+10. Cleanup guard attempts to destroy every lease that was created before an
    injected failure.
+11. The generated snapshot handoff env omits `BRIDGE_CREATE_VM_CONFIG_REF` so
+    the downstream bridge selects the restore path.
 
 The tests should be host-runnable where possible. Gate KVM-only tests behind
 the same x86_64/KVM pattern used in existing `dh-worker` tests.
@@ -83,22 +88,41 @@ cargo run -p dh-worker --bin dh-m9-ready-handoff --release -- \
   --bridge-workload-image-ref "<operator-approved workload image ref>" \
   --bridge-capture-spec-ref "<operator-approved capture spec ref>" \
   --handoff-env "<private root>/rom-bridge-o73/handoff/bridge-real-restore-snapshot.env" \
+  --snapstore-config "<private root>/rom-bridge-o73/snapstore/config.toml" \
   --public-summary "<sanitized summary path>"
 ```
+
+The generator must print only sanitized status to stdout/stderr. If raw worker
+or snapstore diagnostics are needed, write them to `0600` private evidence files
+under the private root.
 
 Verify the private handoff file mode without printing contents:
 
 ```bash
-stat -c '%a %n' "<private root>/rom-bridge-o73/handoff/bridge-real-restore-snapshot.env"
+stat -c '%a' "<private root>/rom-bridge-o73/handoff/bridge-real-restore-snapshot.env" \
+  > "<private root>/rom-bridge-o73/evidence/handoff-mode.private.txt"
 ```
 
-Verify the produced manifest privately:
+Start a fresh snapstore server over the generated config before bridge checks or
+manual manifest verification:
+
+```bash
+cd /home/infra-admin/git/preestablished/snapshot-store
+nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
+  --config "<private root>/rom-bridge-o73/snapstore/config.toml" \
+  > "<private root>/rom-bridge-o73/evidence/snapstore-server.private.log" 2>&1 &
+echo $! > "<private root>/rom-bridge-o73/runtime/snapstore-server.pid"
+```
+
+Verify the produced manifest privately against that running server:
 
 ```bash
 cd /home/infra-admin/git/preestablished/snapshot-store
 cargo run -p snapstore-cli --bin snapstorectl -- \
   --endpoint "uds:<private snapstore uds>" \
-  dump-manifest "<private 64 hex snapshot ref>"
+  dump-manifest "<private 64 hex snapshot ref>" \
+  > "<private root>/rom-bridge-o73/evidence/snapstore-dump-manifest.private.txt" \
+  2> "<private root>/rom-bridge-o73/evidence/snapstore-dump-manifest.private.err"
 ```
 
 Raw output from `dump-manifest` stays private.
@@ -115,9 +139,11 @@ The request is fulfilled only when:
    `RestoreSnapshot`, and restored `DestroyVm` all succeed.
 6. Restored state hash equals the READY snapshot state hash.
 7. Private handoff file exists with mode `0600` or stricter.
-8. Sanitized public summary contains no private paths, refs, endpoints,
-   credentials, lease tokens, or raw worker/snapstore errors.
-9. The produced snapstore config and handoff fields are sufficient to start
+8. Private snapstore config and evidence files exist outside git with mode
+   `0600` or stricter.
+9. Sanitized public summary, stdout, and stderr contain no private paths, refs,
+   endpoints, credentials, lease tokens, or raw worker/snapstore errors.
+10. The produced snapstore config and handoff fields are sufficient to start
    `dh-workerd --snapstore-uds` for the bridge.
 
 ## Quality Gates Before Commit
@@ -126,9 +152,14 @@ Run the smallest host-runnable gates first:
 
 ```bash
 cargo test -p dh-worker --test arch_dependency_rule
+cargo test -p dh-worker m9_handoff
 cargo test -p dh-worker --bin dh-m9-ready-handoff
 cargo test -p dh-worker
 ```
+
+`cargo test -p dh-worker --bin dh-m9-ready-handoff` is expected only after the
+new binary exists; keep parser and redaction tests either in that binary test
+target or in the reusable `m9_handoff` module so they can run by name.
 
 If code touches shared worker lifecycle behavior, also run:
 

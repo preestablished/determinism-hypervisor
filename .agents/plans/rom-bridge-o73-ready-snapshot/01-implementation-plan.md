@@ -31,9 +31,11 @@ dh-m9-ready-handoff \
   --reference-workload-checkout /home/infra-admin/git/preestablished/reference-workload \
   --workload-manifest /home/infra-admin/git/preestablished/reference-workload/dist/workload-image-0.1.0/workload-image.yaml \
   --bridge-hypervisor-endpoint unix:///run/dh/grpc.sock \
+  --bridge-private-root <private bridge root> \
   --bridge-workload-image-ref <private operator-approved ref> \
   --bridge-capture-spec-ref <private operator-approved ref> \
   --handoff-env <private-root>/rom-bridge-o73/handoff/bridge-real-restore-snapshot.env \
+  --snapstore-config <private-root>/rom-bridge-o73/snapstore/config.toml \
   --public-summary <repo-or-private sanitized summary path> \
   --slot-cores 2-5
 ```
@@ -56,6 +58,11 @@ Do not import `crates/dh-worker/tests/common/mod.rs` from the binary. Instead,
 extract or duplicate the production-safe parts into a crate module such as
 `crates/dh-worker/src/m9_handoff.rs`.
 
+Export the module from `crates/dh-worker/src/lib.rs`, likely behind
+`#[cfg(target_arch = "x86_64")]`. Keep KVM and snapstore imports cfg-gated so
+the crate still builds on non-x86_64 and the binary can print the planned
+unsupported-platform error.
+
 Useful functions to promote from the tests:
 
 - artifact loading and path validation from `M9LinuxArtifacts`;
@@ -64,6 +71,11 @@ Useful functions to promote from the tests:
 - `m9_linux_machine_config`;
 - masked CPUID table validation;
 - READY hard cap and memory constants.
+
+Promote the stricter image-cache behavior from
+`crates/dh-worker/tests/common/mod.rs`: if a destination cache entry exists but
+does not match its content-address key, fail rather than deleting and replacing
+it. This avoids changing operator cache state behind their back.
 
 Keep test-only behavior out of the module:
 
@@ -90,15 +102,30 @@ If the team does not want an operator binary to call `serve_for_tests`, implemen
 an equivalent in-process server helper in `snapshot-store` first, or make the
 generator connect to an already-running snapstore endpoint supplied by
 `--snapstore-uds`. In all cases, write the snapstore config needed to serve the
-same data root later:
+same data root later, and include the config path in the private handoff:
 
 ```toml
 data_root = "<private snapstore data root>"
 grpc_uds_path = "<private snapstore uds path>"
 grpc_tcp_addr = "127.0.0.1:7410"
 http_addr = "127.0.0.1:7411"
-page_channel_path = "<private snapstore page channel path>"
 ```
+
+Use this command shape when serving the data root after generation:
+
+```bash
+cd /home/infra-admin/git/preestablished/snapshot-store
+nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
+  --config "<private snapstore config>" \
+  > "<private evidence root>/snapstore-server.private.log" 2>&1 &
+echo $! > "<private runtime root>/snapstore-server.pid"
+```
+
+Do not make `page_channel_path` a required handoff field for the bridge path
+unless `dh-workerd` also grows a flag that constructs
+`snapstore_client::Transport::Auto { page_channel_path: Some(...) }`.
+`dh-workerd --snapstore-uds` currently constructs `Transport::Uds`, so a page
+channel path in the snapstore config alone would not be used by the worker.
 
 ## 5. Run The Worker Lifecycle
 
@@ -114,6 +141,9 @@ Then perform the same lifecycle as the M9 worker API test:
 
 1. Populate the image cache for bzImage, initramfs, base image, and game image.
 2. Build the M9 Linux `MachineConfig` from artifact hashes and masked CPUID.
+   The current worker M9 config deliberately uses `DH_M9_GAME_IMAGE` as
+   `MachineConfig.base_image_hash`; `DH_M9_BASE_IMAGE` is still validated and
+   cached as fixture context.
 3. `CreateVm` with a 32-byte deterministic entropy seed.
 4. `TakeSnapshot` at icount zero with `seal_input_log = true`.
 5. `Run` until `NextSdkEvent` for `detguest_wire::record::EventKind::Ready`.
@@ -123,12 +153,19 @@ Then perform the same lifecycle as the M9 worker API test:
    `machine_config_hash`.
 9. Privately verify the READY manifest can be read from snapstore.
 10. `DestroyVm` for the source lease before restore verification.
-11. `RestoreSnapshot` from the READY ref with an empty entropy seed.
+11. `RestoreSnapshot` from the READY ref with `entropy_seed: Vec::new()`.
+    Do not send 32 zero bytes; the service treats an explicit all-zero seed as
+    invalid while an empty seed means continue the snapshot's PRNG stream.
 12. Verify restored state hash equals the READY state hash.
 13. `DestroyVm` for the restored lease.
 
 Use cleanup guards so `DestroyVm` is attempted for any lease created before an
 error. The public summary should include only slot counts and booleans.
+
+The lifecycle RPC methods are provided by the generated
+`dh_proto::v1::hypervisor_worker_server::HypervisorWorker` trait, not inherent
+`WorkerService` methods. Import the trait in the generator module or binary as
+the existing worker tests do.
 
 ## 6. Validate Reference-Workload Inputs
 
@@ -150,10 +187,11 @@ operator-provided strings.
 
 ## 7. Write Private And Public Outputs
 
-Create the private output root with `0700`. Write the handoff env file with
-`0600` using a temp file in the same directory followed by atomic rename.
+Create the private output root with `0700`. Reject private output roots inside
+any git checkout. Write the handoff env file and snapstore config with `0600`
+using temp files in the same directory followed by atomic rename.
 
-Write only these sensitive values to the private env file:
+Write these sensitive values to the private snapshot handoff env file:
 
 ```dotenv
 BRIDGE_HYPERVISOR_ENDPOINT=unix:///run/dh/grpc.sock
@@ -163,9 +201,28 @@ BRIDGE_CAPTURE_SPEC_REF=<operator-approved capture spec ref>
 BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=/home/infra-admin/git/preestablished/reference-workload
 BRIDGE_REAL_SNAPSHOT_REF=<64 hex snapshot ref>
 SNAPSTORE_DATA_ROOT=<private snapstore data root>
+SNAPSTORE_CONFIG_PATH=<private snapstore config path>
 SNAPSTORE_GRPC_UDS_PATH=<private snapstore uds path>
 DH_M9_IMAGE_CACHE=<image cache path>
 ```
+
+Do not include `BRIDGE_CREATE_VM_CONFIG_REF`; the downstream o73 run must select
+the `BRIDGE_REAL_SNAPSHOT_REF` restore path.
+
+This file is a snapshot handoff supplement, not necessarily a complete
+`rom-operator-bridge` service env file. If the operator wants a bridge-ready env
+from this generator, add an explicit mode that accepts bridge-owned secrets from
+private files and writes a second `0600` file containing, at minimum:
+
+```dotenv
+ROM_OPERATOR_BRIDGE_BACKEND=real
+ROM_OPERATOR_BRIDGE_BIND_ADDR=<operator-approved bind addr>
+ROM_OPERATOR_BRIDGE_PRIVATE_ROOT=<private bridge root>
+ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL=<private credential>
+ROM_OPERATOR_BRIDGE_SESSION_SECRET=<private session secret>
+```
+
+Keep that bridge-ready env outside git and subject to the same redaction sweep.
 
 The public summary must not contain any literal value from the private env file.
 It may contain:
@@ -177,11 +234,13 @@ It may contain:
 - `RestoreSnapshot` verification succeeded: yes/no;
 - source/restored leases destroyed: yes/no;
 - private handoff written: yes/no;
+- snapstore config written: yes/no;
 - worker slots before/after as counts only.
 
 Add a forbidden-literal sweep before writing the public summary. Compare the
-summary against all private input strings and the generated snapshot ref; fail
-if any are present.
+summary, stdout, and stderr against all private input strings and the generated
+snapshot ref; fail if any are present. Raw worker or snapstore error details
+belong only in `0600` private evidence files.
 
 ## 8. Add Operator Docs
 

@@ -12,12 +12,19 @@ BRIDGE_CAPTURE_SPEC_REF=<operator-approved capture spec ref>
 BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=/home/infra-admin/git/preestablished/reference-workload
 BRIDGE_REAL_SNAPSHOT_REF=<64 hex snapshot ref>
 SNAPSTORE_DATA_ROOT=<private snapstore data root>
+SNAPSTORE_CONFIG_PATH=<private snapstore config path>
 SNAPSTORE_GRPC_UDS_PATH=<private snapstore uds path>
 DH_M9_IMAGE_CACHE=<image cache path>
 ```
 
 The file path should be operator-owned, outside any git checkout, and mode
 `0600` or stricter. The parent directories should be mode `0700`.
+
+This file is the determinism-hypervisor snapshot handoff. It is not necessarily
+a complete `rom-operator-bridge` launch env unless the operator separately
+merges bridge-owned secrets such as `ROM_OPERATOR_BRIDGE_OPERATOR_CREDENTIAL`
+and `ROM_OPERATOR_BRIDGE_SESSION_SECRET`. The handoff must not define
+`BRIDGE_CREATE_VM_CONFIG_REF`.
 
 ## Redaction Rules
 
@@ -35,7 +42,9 @@ or shared terminal output:
 - raw manifest dumps.
 
 The generator should keep a list of private literals and scan every public
-summary before writing it. Treat a match as a hard failure.
+summary, stdout, and stderr before writing or returning them. Treat a match as a
+hard failure. Raw diagnostics should be written only to private `0600` evidence
+files under the operator-owned private root.
 
 ## Sanitized Success Note
 
@@ -52,7 +61,9 @@ Public results:
 - RestoreSnapshot verification: pass
 - source/restored lease cleanup: pass
 - private handoff file mode verified: pass
+- private snapstore config mode verified: pass
 - public summary redaction sweep: pass
+- stdout/stderr redaction sweep: pass
 
 Private handoff path and snapshot ref were provided only through the operator
 private channel.
@@ -75,7 +86,9 @@ Sanitized status:
 - READY snapshot generation: <pass/fail/not reached>
 - RestoreSnapshot verification: <pass/fail/not reached>
 - handoff file write: <pass/fail/not reached>
+- snapstore config write: <pass/fail/not reached>
 - public redaction sweep: <pass/fail/not reached>
+- stdout/stderr redaction sweep: <pass/fail/not reached>
 
 Raw logs and private values remain only in the operator-private evidence root.
 Next unblock step: <single concrete action>.
@@ -90,10 +103,21 @@ plan at:
 /home/infra-admin/git/preestablished/rom-operator-bridge/.agents/plans/live-restore-snapshot-acceptance-o73/
 ```
 
-The produced snapstore data root should be served by `snapstore-server`, and
-`dh-workerd` should be started with snapstore enabled:
+The produced snapstore data root should be served by `snapstore-server` using
+the private config file:
 
 ```bash
+cd /home/infra-admin/git/preestablished/snapshot-store
+nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
+  --config "<private snapstore config>" \
+  > "<private evidence root>/snapstore-server.private.log" 2>&1 &
+echo $! > "<private runtime root>/snapstore-server.pid"
+```
+
+Then `dh-workerd` should be started with snapstore enabled:
+
+```bash
+cd /home/infra-admin/git/preestablished/determinism-hypervisor
 cargo run -p dh-worker --bin dh-workerd -- serve \
   --uds /run/dh/grpc.sock \
   --snapstore-uds "<private snapstore uds>"

@@ -49,12 +49,14 @@ Implementing agent should produce:
 
 1. A durable private snapstore data root containing the M9/reference-workload
    READY snapshot.
-2. A private env handoff file, mode `0600` or stricter, containing the bridge
-   inputs required by `rom-operator-bridge`.
-3. A sanitized public summary containing only booleans, counts, command shapes,
+2. A private snapstore config, mode `0600` or stricter, that serves the durable
+   data root later.
+3. A private env handoff file, mode `0600` or stricter, containing the snapshot
+   bridge inputs required by `rom-operator-bridge`.
+4. A sanitized public summary containing only booleans, counts, command shapes,
    and non-sensitive status.
-4. Operator docs for regenerating, verifying, and serving the snapshot.
-5. Tests that prove the generator preserves the privacy contract and destroys
+5. Operator docs for regenerating, verifying, and serving the snapshot.
+6. Tests that prove the generator preserves the privacy contract and destroys
    every lease it creates.
 
 ## Non-Goals
@@ -67,3 +69,7 @@ operator-approved private inputs, then write them to the private handoff file.
 
 Do not print the real snapshot ref as a success message. It belongs only in the
 private handoff file.
+
+Do not treat the snapshot handoff env as a complete bridge service env unless
+the operator explicitly supplies bridge-owned secrets and asks the generator to
+write a second bridge-ready private file.
