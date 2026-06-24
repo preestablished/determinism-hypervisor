@@ -30,6 +30,7 @@ postcard.workspace = true
 serde.workspace = true
 snapstore-client.workspace = true
 snapstore-manifest.workspace = true
+snapstore-server.workspace = true
 snapstore-types.workspace = true
 vm-memory.workspace = true
 
@@ -44,7 +45,6 @@ hyper-util.workspace = true
 kvm-bindings = "0.14.0"
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }
-snapstore-server.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml = "0.8"
