@@ -611,6 +611,7 @@ impl From<SlotError> for ConfigError {
 pub enum ServeError {
     Config(ConfigError),
     Io(std::io::Error),
+    Join(tokio::task::JoinError),
     Transport(tonic::transport::Error),
 }
 
@@ -619,6 +620,7 @@ impl std::fmt::Display for ServeError {
         match self {
             ServeError::Config(e) => write!(f, "{e}"),
             ServeError::Io(e) => write!(f, "{e}"),
+            ServeError::Join(e) => write!(f, "{e}"),
             ServeError::Transport(e) => write!(f, "{e}"),
         }
     }
@@ -635,6 +637,12 @@ impl From<ConfigError> for ServeError {
 impl From<std::io::Error> for ServeError {
     fn from(e: std::io::Error) -> Self {
         ServeError::Io(e)
+    }
+}
+
+impl From<tokio::task::JoinError> for ServeError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        ServeError::Join(e)
     }
 }
 
@@ -765,7 +773,7 @@ pub async fn serve(
     uds_path: Option<PathBuf>,
     http_addr: std::net::SocketAddr,
 ) -> Result<(), ServeError> {
-    let service = WorkerService::new(config)?;
+    let service = tokio::task::spawn_blocking(move || WorkerService::new(config)).await??;
     let tcp_service = HypervisorWorkerServer::new(service.clone());
     let tcp = async move {
         Server::builder()
