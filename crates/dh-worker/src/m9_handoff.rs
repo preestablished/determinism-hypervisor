@@ -4,7 +4,7 @@ use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
@@ -396,16 +396,23 @@ async fn run_handoff_with_artifacts(
         config_hash,
     )
     .await;
-    server.shutdown();
-    let ready = ready?;
+    let stop = stop_snapstore(server, &args.snapstore_uds).await;
+    let ready = match (ready, stop) {
+        (Err(err), _) => return Err(err),
+        (Ok(_), Err(err)) => return Err(err),
+        (Ok(ready), Ok(())) => ready,
+    };
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let restart_uds = restart_snapstore_uds(args);
     let restart_server = start_snapstore(args, &restart_uds).await?;
     let restore =
         restore_ready_snapshot(args, &artifacts, &preflight_results, &restart_uds, &ready).await;
-    restart_server.shutdown();
-    let slots_free_after = restore?;
+    let stop = stop_snapstore(restart_server, &restart_uds).await;
+    let slots_free_after = match (restore, stop) {
+        (Err(err), _) => return Err(err),
+        (Ok(_), Err(err)) => return Err(err),
+        (Ok(slots_free_after), Ok(())) => slots_free_after,
+    };
 
     let snapshot_ref_hex = hex_lower(&ready.snapshot_ref.hash);
     write_handoff_env(args, &artifacts.image_cache, &snapshot_ref_hex)?;
@@ -423,10 +430,30 @@ fn validate_reference_workload(args: &HandoffArgs) -> HandoffResult<()> {
         &args.reference_workload_checkout,
     )?;
     require_regular_file("workload manifest", &args.workload_manifest)?;
-    if !args
-        .workload_manifest
-        .starts_with(&args.reference_workload_checkout)
-    {
+    reject_existing_symlink_components(
+        "reference workload checkout",
+        &args.reference_workload_checkout,
+    )?;
+    reject_existing_symlink_components("workload manifest", &args.workload_manifest)?;
+    let checkout = fs::canonicalize(&args.reference_workload_checkout).map_err(|e| {
+        HandoffError::new(
+            "validate reference workload",
+            format!(
+                "canonicalize reference workload checkout {}: {e}",
+                args.reference_workload_checkout.display()
+            ),
+        )
+    })?;
+    let manifest = fs::canonicalize(&args.workload_manifest).map_err(|e| {
+        HandoffError::new(
+            "validate reference workload",
+            format!(
+                "canonicalize workload manifest {}: {e}",
+                args.workload_manifest.display()
+            ),
+        )
+    })?;
+    if !manifest.starts_with(checkout) {
         return Err(HandoffError::new(
             "validate reference workload",
             "workload manifest must live under reference workload checkout",
@@ -486,6 +513,7 @@ fn validate_private_layout(args: &HandoffArgs) -> HandoffResult<()> {
             "snapstore config must live under private root",
         ));
     }
+    validate_public_summary_path(args)?;
     Ok(())
 }
 
@@ -526,7 +554,7 @@ fn create_private_dir(path: &Path) -> HandoffResult<()> {
 
 fn write_snapstore_config(args: &HandoffArgs) -> HandoffResult<()> {
     let config = format!(
-        "data_root = \"{}\"\ngrpc_uds_path = \"{}\"\ngrpc_tcp_addr = \"127.0.0.1:7410\"\nhttp_addr = \"127.0.0.1:7411\"\n",
+        "data_root = \"{}\"\ngrpc_uds_path = \"{}\"\ngrpc_tcp_addr = \"127.0.0.1:0\"\nhttp_addr = \"127.0.0.1:0\"\n",
         toml_escape_path(&args.snapstore_data_root)?,
         toml_escape_path(&args.snapstore_uds)?,
     );
@@ -545,6 +573,38 @@ async fn start_snapstore(args: &HandoffArgs, uds_path: &Path) -> HandoffResult<S
         .await
         .map_err(|e| HandoffError::new("start snapstore", e.to_string()))?;
     Ok(handle)
+}
+
+async fn stop_snapstore(handle: ServerHandle, uds_path: &Path) -> HandoffResult<()> {
+    handle.shutdown();
+    wait_for_snapstore_listener_closed(uds_path).await
+}
+
+async fn wait_for_snapstore_listener_closed(uds_path: &Path) -> HandoffResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::net::UnixStream::connect(uds_path).await {
+            Ok(stream) => {
+                drop(stream);
+                if Instant::now() >= deadline {
+                    return Err(HandoffError::new(
+                        "stop snapstore",
+                        format!(
+                            "snapstore UDS still accepts connections: {}",
+                            uds_path.display()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e)
+                if e.kind() == ErrorKind::NotFound || e.kind() == ErrorKind::ConnectionRefused =>
+            {
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+        }
+    }
 }
 
 fn snapstore_server_config(args: &HandoffArgs, uds_path: &Path) -> ServerConfig {
@@ -895,7 +955,7 @@ fn write_handoff_env(
         validate_no_newline(key, value)?;
         body.push_str(key);
         body.push('=');
-        body.push_str(value);
+        body.push_str(&shell_quote_value(value));
         body.push('\n');
     }
     if body.contains("BRIDGE_CREATE_VM_CONFIG_REF") {
@@ -1172,6 +1232,20 @@ fn validate_no_newline(name: &str, value: &str) -> HandoffResult<()> {
     Ok(())
 }
 
+fn shell_quote_value(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
 fn validate_hex_ref(value: &str) -> HandoffResult<()> {
     if value.len() == 64
         && value
@@ -1282,6 +1356,36 @@ fn validate_created_private_layout(args: &HandoffArgs) -> HandoffResult<()> {
     Ok(())
 }
 
+fn validate_public_summary_path(args: &HandoffArgs) -> HandoffResult<()> {
+    reject_existing_symlink_components("public summary", &args.public_summary)?;
+    for (name, private_path) in [
+        ("handoff env", args.handoff_env.as_path()),
+        ("snapstore config", args.snapstore_config.as_path()),
+    ] {
+        if paths_equal_lexically(&args.public_summary, private_path) {
+            return Err(HandoffError::new(
+                "validate private layout",
+                format!("public summary must not overlap {name}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn paths_equal_lexically(left: &Path, right: &Path) -> bool {
+    normalize_path_lexically(left) == normalize_path_lexically(right)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        if !matches!(component, std::path::Component::CurDir) {
+            normalized.push(component.as_os_str());
+        }
+    }
+    normalized
+}
+
 fn is_safe_private_root_for_log(private_root: &Path) -> bool {
     private_root.is_absolute()
         && reject_existing_symlink_components("private root", private_root).is_ok()
@@ -1334,7 +1438,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn usage() -> &'static str {
+pub fn usage() -> &'static str {
     "usage: dh-m9-ready-handoff --private-root PATH --snapstore-data-root PATH --snapstore-uds PATH --reference-workload-checkout PATH --workload-manifest PATH --bridge-hypervisor-endpoint ENDPOINT --bridge-private-root PATH --bridge-workload-image-ref REF --bridge-capture-spec-ref REF --handoff-env PATH --snapstore-config PATH --public-summary PATH [--slot-cores LIST]"
 }
 
@@ -1420,6 +1524,41 @@ mod tests {
     }
 
     #[test]
+    fn reference_workload_rejects_parent_dir_escape() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let checkout = dir.path().join("reference-workload");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest = outside.join("workload-image.yaml");
+        fs::write(&manifest, "name: escaped\n").unwrap();
+
+        let mut args = parse_args(full_args(dir.path())).unwrap();
+        args.workload_manifest = checkout.join("../outside/workload-image.yaml");
+        let err = validate_reference_workload(&args).unwrap_err();
+        assert!(err.private_detail().contains(".."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_workload_rejects_manifest_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let checkout = dir.path().join("reference-workload");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let real_manifest = outside.join("workload-image.yaml");
+        let link_manifest = checkout.join("workload-image.yaml");
+        fs::write(&real_manifest, "name: escaped\n").unwrap();
+        std::os::unix::fs::symlink(&real_manifest, &link_manifest).unwrap();
+
+        let mut args = parse_args(full_args(dir.path())).unwrap();
+        args.workload_manifest = link_manifest;
+        let err = validate_reference_workload(&args).unwrap_err();
+        assert!(err.private_detail().contains("symlink"));
+    }
+
+    #[test]
     fn private_layout_rejects_git_checkout() {
         let dir = tempfile::TempDir::new().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
@@ -1441,6 +1580,20 @@ mod tests {
         args.snapstore_data_root = dir.path().join("outside/data");
         let err = validate_private_layout(&args).unwrap_err();
         assert!(err.private_detail().contains("snapstore data root"));
+    }
+
+    #[test]
+    fn public_summary_must_not_overlap_private_outputs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut args = parse_args(full_args(dir.path())).unwrap();
+        args.public_summary = args.handoff_env.clone();
+        let err = validate_private_layout(&args).unwrap_err();
+        assert!(err.private_detail().contains("public summary"));
+
+        let mut args = parse_args(full_args(dir.path())).unwrap();
+        args.public_summary = args.snapstore_config.clone();
+        let err = validate_private_layout(&args).unwrap_err();
+        assert!(err.private_detail().contains("public summary"));
     }
 
     #[test]
@@ -1541,6 +1694,78 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn snapstore_config_parses_with_ephemeral_loopback_ports() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let private = dir.path().join("private");
+        let args = HandoffArgs {
+            private_root: private.clone(),
+            snapstore_data_root: private.join("snapstore-data"),
+            snapstore_uds: private.join("runtime/snapstore.sock"),
+            reference_workload_checkout: PathBuf::from("/reference-workload"),
+            workload_manifest: PathBuf::from("/reference-workload/dist/workload-image.yaml"),
+            bridge_hypervisor_endpoint: "unix:///run/dh/grpc.sock".into(),
+            bridge_private_root: private.join("bridge"),
+            bridge_workload_image_ref: "workload".into(),
+            bridge_capture_spec_ref: "capture".into(),
+            handoff_env: private.join("handoff/env"),
+            snapstore_config: private.join("snapstore/config.toml"),
+            public_summary: dir.path().join("summary.txt"),
+            slot_cores: None,
+        };
+
+        write_snapstore_config(&args).unwrap();
+        let config = snapstore_server::config::load_config(&args.snapstore_config).unwrap();
+        assert_eq!(config.data_root, args.snapstore_data_root);
+        assert_eq!(config.resolved_uds_path(), args.snapstore_uds);
+        assert_eq!(config.grpc_tcp_addr.port(), 0);
+        assert_eq!(config.http_addr.port(), 0);
+    }
+
+    #[test]
+    fn handoff_env_values_are_shell_safe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let private = dir.path().join("private");
+        let marker_a = dir.path().join("marker-a");
+        let marker_b = dir.path().join("marker-b");
+        let workload_ref = format!("workload $(touch {}) with spaces", marker_a.display());
+        let capture_ref = format!("capture 'quoted' `touch {}` ; #", marker_b.display());
+        let args = HandoffArgs {
+            private_root: private.clone(),
+            snapstore_data_root: private.join("snapstore-data"),
+            snapstore_uds: private.join("runtime/snapstore.sock"),
+            reference_workload_checkout: PathBuf::from("/reference-workload"),
+            workload_manifest: PathBuf::from("/reference-workload/dist/workload-image.yaml"),
+            bridge_hypervisor_endpoint: "unix:///run/dh/grpc.sock".into(),
+            bridge_private_root: private.join("bridge root"),
+            bridge_workload_image_ref: workload_ref.clone(),
+            bridge_capture_spec_ref: capture_ref.clone(),
+            handoff_env: private.join("handoff/env"),
+            snapstore_config: private.join("snapstore/config.toml"),
+            public_summary: dir.path().join("summary.txt"),
+            slot_cores: None,
+        };
+
+        write_handoff_env(&args, &private.join("image cache"), &"1".repeat(64)).unwrap();
+        let script = format!(
+            ". {}; printf '%s\\n%s\\n' \"$BRIDGE_WORKLOAD_IMAGE_REF\" \"$BRIDGE_CAPTURE_SPEC_REF\"",
+            shell_quote_value(&args.handoff_env.display().to_string())
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!marker_a.exists());
+        assert!(!marker_b.exists());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some(workload_ref.as_str()));
+        assert_eq!(lines.next(), Some(capture_ref.as_str()));
+        assert_eq!(lines.next(), None);
     }
 
     #[test]

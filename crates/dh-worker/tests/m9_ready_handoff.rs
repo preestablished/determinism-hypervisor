@@ -1,8 +1,21 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::fs;
+use std::process::Command;
 
 use dh_worker::m9_handoff;
+
+#[test]
+fn help_prints_usage_to_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dh-m9-ready-handoff"))
+        .arg("--help")
+        .output()
+        .expect("run dh-m9-ready-handoff --help");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("usage: dh-m9-ready-handoff"));
+    assert!(output.stderr.is_empty());
+}
 
 #[test]
 #[ignore = "requires KVM, DH_M9_* artifacts, and an operator-approved private host"]

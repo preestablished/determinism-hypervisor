@@ -91,16 +91,16 @@ The handoff env is:
 It contains:
 
 ```dotenv
-BRIDGE_HYPERVISOR_ENDPOINT=unix:///run/dh/grpc.sock
-BRIDGE_PRIVATE_ROOT=<private bridge root>
-BRIDGE_WORKLOAD_IMAGE_REF=<operator-approved workload image ref>
-BRIDGE_CAPTURE_SPEC_REF=<operator-approved capture spec ref>
-BRIDGE_REFERENCE_WORKLOAD_CHECKOUT=/home/infra-admin/git/preestablished/reference-workload
-BRIDGE_REAL_SNAPSHOT_REF=<64 hex snapshot ref>
-SNAPSTORE_DATA_ROOT=<private snapstore data root>
-SNAPSTORE_CONFIG_PATH=<private snapstore config path>
-SNAPSTORE_GRPC_UDS_PATH=<private snapstore uds path>
-DH_M9_IMAGE_CACHE=<image cache path>
+BRIDGE_HYPERVISOR_ENDPOINT='unix:///run/dh/grpc.sock'
+BRIDGE_PRIVATE_ROOT='<private bridge root>'
+BRIDGE_WORKLOAD_IMAGE_REF='<operator-approved workload image ref>'
+BRIDGE_CAPTURE_SPEC_REF='<operator-approved capture spec ref>'
+BRIDGE_REFERENCE_WORKLOAD_CHECKOUT='/home/infra-admin/git/preestablished/reference-workload'
+BRIDGE_REAL_SNAPSHOT_REF='<64 hex snapshot ref>'
+SNAPSTORE_DATA_ROOT='<private snapstore data root>'
+SNAPSTORE_CONFIG_PATH='<private snapstore config path>'
+SNAPSTORE_GRPC_UDS_PATH='<private snapstore uds path>'
+DH_M9_IMAGE_CACHE='<image cache path>'
 ```
 
 It deliberately omits `BRIDGE_CREATE_VM_CONFIG_REF`.
@@ -125,6 +125,10 @@ nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
   > "$private_root/rom-bridge-o73/evidence/snapstore-server.private.log" 2>&1 &
 echo $! > "$private_root/rom-bridge-o73/runtime/snapstore-server.pid"
 ```
+
+The generated config uses the private UDS as the stable endpoint. Any TCP/HTTP
+listeners are bound to ephemeral loopback ports and are not part of the bridge
+handoff.
 
 Privately verify the manifest:
 
