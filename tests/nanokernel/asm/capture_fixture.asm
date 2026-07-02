@@ -18,10 +18,11 @@
 ; digits (e.g. cmdline "2" → layout_version 2). No digits, empty cmdline,
 ; or "0" → DEFAULT_LAYOUT_VERSION — same parse contract as landing_loop.
 ;
-; The framebuffer is RAW known-pattern bytes — no FbInfo descriptor at
-; offset 0. This fixture feeds the C2 by-name/layout_version resolution
-; and C5 neutrality paths; a C4 FbInfo-decode path needs a richer guest
-; (or it would parse pattern qwords as garbage dimensions).
+; The framebuffer is RAW known-pattern bytes with no in-region header,
+; matching the D7 layout_version-1 region contract (geometry is keyed by
+; the manifest layout_version on the host side). This fixture feeds the
+; C2 by-name/layout_version resolution, C5 neutrality, and the
+; GetFramebuffer/CaptureSpec.framebuffer layout-contract paths.
 ;
 ; Channel page layout is CLEAN-ROOM from .agents/docs/guest-sdk/ ONLY,
 ; identical to device_exercise's header (same ring descs — the canonical
@@ -59,10 +60,12 @@ BITS 64
 %define OFF_ENTRY0      0x20         ; first region entry, area-relative
 %define OFF_EXTENT0     0x1820       ; extent pool slot 0, area-relative
 
-; The published FRAMEBUFFER region: 64 KiB directly after the channel.
+; The published FRAMEBUFFER region, directly after the channel. Sized to
+; the D7 layout_version-1 contract (stride 1024 x height 224 = 229,376 B)
+; so the worker's layout-keyed GetFramebuffer/CaptureSpec paths accept it.
 %define FB_GPA          0x600000
-%define FB_BYTES        0x10000
-%define FB_QWORDS       8192
+%define FB_BYTES        0x38000
+%define FB_QWORDS       28672
 %define FB_QWORD_BASE   0xFB00000000000000
 
 %define REGION_FLAG_FRAMEBUFFER 1

@@ -143,9 +143,9 @@ INPUT_LOG_ID_B64=$(jq -r '.inputLogId' <<<"$SNAP_OUT")
   '{lease:$lease, ranges:[{gpa:"0", len:"16"}]}')" \
   "$DH_ADDR" "$SERVICE/ReadGuestMemory"
 
-# The landing-loop fixture has no framebuffer descriptor. A framebuffer-capable
-# fixture should return pixels; this minimal fixture should reach the method and
-# fail with FAILED_PRECONDITION.
+# The landing-loop fixture publishes no framebuffer region. A framebuffer-
+# publishing fixture should return pixels; this minimal fixture should reach
+# the method and fail with FAILED_PRECONDITION.
 "${GRPC[@]}" -d "$(jq -cn --argjson lease "$LEASE_JSON" '{lease:$lease}')" \
   "$DH_ADDR" "$SERVICE/GetFramebuffer" || true
 
