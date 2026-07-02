@@ -41,6 +41,9 @@ decisions go in **`docs/decisions/`** (siblings: `proto-seam.md`,
   versions and wrong lengths are `FailedPrecondition`; no in-region
   descriptor for any known version; heuristic classification removed from
   the capture path because it made `FbInfo` frame-content-dependent.
+  (Use exactly that "frame-content-dependent" framing — the request's
+  "black frame silently emits zero FbInfo" narrative is factually wrong,
+  see `01-current-state.md` "Heuristic behavior correction".)
 - Consequences: adding a framebuffer layout means adding a table entry (and
   only that); an in-region header would require a new layout_version plus a
   D7 spec change; RGB565 stays proto-only until a layout defines it.
@@ -61,7 +64,14 @@ SHA containing the fix, noted in the request directory. After merge to main:
    unknown-version / wrong-length (they log worker errors verbatim), and a
    note that **they** rebuild and restart the deployed `dh-workerd`
    themselves (worker restart invalidates their in-memory leases — do NOT
-   restart the deployed worker for them).
+   restart the deployed worker for them). Also include two subtleties from
+   review: (a) `Run`/`TakeSnapshot` with a `CaptureSpec.framebuffer` against
+   an unknown-version/wrong-length region now *error* instead of silently
+   succeeding with zero-geometry FbInfo — and a failed-capture `Run` has
+   already executed the guest, so the caller loses the `RunResponse` even
+   though guest state advanced; (b) the zeroed/black-frame case is covered
+   by unit-level regression tests, not end-to-end (no fixture publishes a
+   zero-filled region).
 2. Do not touch the deployed worker, its pid file, or
    `/run/dh/grpc.sock`. Deployment timing is explicitly theirs.
 

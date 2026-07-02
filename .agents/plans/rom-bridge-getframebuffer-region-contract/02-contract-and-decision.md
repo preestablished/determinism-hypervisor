@@ -79,10 +79,13 @@ separate investigation on the bridge side.
 - Known layout version, wrong length, e.g.
   `"framebuffer region layout_version 1 expects 229376 bytes, got 65536"`.
 
-Keep the existing caller-context prefixes if house style wants them
-(GetFramebuffer vs CaptureSpec — see `FramebufferCaller`); exact wording is
-yours, but the layout_version or length figure must appear literally, and
-tests should assert on the stable substrings.
+**Caller prefixes (decided per review):** thread the existing
+`FramebufferCaller` enum into the new builder so messages keep their
+caller-context prefixes ("GetFramebuffer …" vs "CaptureSpec …"), matching
+the enum's existing error-message style — see the signature in
+`03-implementation-sequence.md` step 3. Exact wording is yours, but the
+layout_version or length figure must appear literally, and tests should
+assert on the stable substrings (the number, not the prefix).
 
 ### CaptureSpec.framebuffer (Run / TakeSnapshot)
 

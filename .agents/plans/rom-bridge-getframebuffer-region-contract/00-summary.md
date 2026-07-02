@@ -4,8 +4,17 @@
 
 `.agents/requests/rom-bridge-getframebuffer-region-contract/` (filed 2026-07-01
 by the rom-operator-bridge project, committed here as `a38a1a0`). Read all four
-request files before starting — they are accurate; every code claim in them was
-re-verified against the current tree while writing this plan.
+request files before starting — their code claims were re-verified against the
+current tree while writing this plan and hold, with **one narrative error**:
+the request's claim that a black frame makes capture "silently emit zero
+FbInfo" is wrong (see `01-current-state.md`, "Heuristic behavior correction").
+It changes nothing about the fix, but do not copy that narrative into the
+decision record or handback.
+
+This plan was reviewed by two independent reviewers (`reviews/`); their
+confirmed findings — including one critical test-budget landmine — are folded
+into files 01–05 below. `reviews/03-review-resolution.md` records the
+disposition of every finding.
 
 ## Goal In One Paragraph
 
@@ -56,6 +65,7 @@ most of the actual work. See `01-current-state.md` (inventory) and
 | `03-implementation-sequence.md` | Ordered code changes in `service.rs` |
 | `04-tests-and-fixtures.md` | Nanokernel fixture rework, test updates, new regression tests |
 | `05-docs-beads-closeout.md` | Decision record, handback reply, beads, session-close protocol |
+| `reviews/` | Two independent plan reviews + resolution of their findings |
 
 ## Definition Of Done
 

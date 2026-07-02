@@ -42,10 +42,14 @@ layout-keyed version, keeping the return shape so `get_framebuffer` (line
 
 ```rust
 fn framebuffer_response_from_region(
+    caller: FramebufferCaller,
     layout_version: u32,
     region: &[u8],
 ) -> Result<(u32, u32, u32, i32, Vec<u8>), Status>
 ```
+
+(`caller` keeps the existing "GetFramebuffer …"/"CaptureSpec …" message
+prefixes — decided in `02-contract-and-decision.md`.)
 
 Logic:
 1. `framebuffer_layout(layout_version)` → on `None`, FailedPrecondition
@@ -76,8 +80,18 @@ feed byte vectors, as today's tests do.
 - In `capture_at_boundary` (line 2856–2874): the `match .. { Some | None }`
   collapses — always compress the returned pixels and set the returned
   `fb_info`. The zero-`FbInfo` fallback branch is deleted. Errors now
-  propagate out of `Run`/`TakeSnapshot` as FailedPrecondition, which is the
-  request's explicit ask (no silent wrong geometry).
+  propagate out of `Run`/`TakeSnapshot` as FailedPrecondition. (Precision
+  from review: the request explicitly demands this rejection for
+  GetFramebuffer and deterministic FbInfo for known layouts on the capture
+  path; making Run/TakeSnapshot *fail* on unknown-version/wrong-length
+  capture is this plan's choice, consistent with the request's "no silent
+  wrong geometry". The failure shape is pre-existing — missing-region
+  capture errors already propagate from the same spot (service.rs:4047 `?`,
+  no `mark_faulted`, slot stays paused). Behavioral subtlety to note in the
+  handback: a `Run` whose capture fails has already executed the guest, so
+  the caller loses the `RunResponse` (icount, state_hash) even though guest
+  state advanced — previously such calls "succeeded" with zero-geometry
+  FbInfo.)
 
 ## Step 5 — Sweep dead code
 
@@ -108,10 +122,16 @@ See `05-docs-beads-closeout.md`.
   them blindly — `git diff` first; keep your commits scoped to the
   framebuffer change, and leave those hunks out unless they turn out to be
   yours to finish (check `bd list --status=in_progress` for context).
-- Determinism sensitivity: `capture_at_boundary` output (`feature_bytes`,
-  `fb_lz4`, `fb_info`) feeds snapshot capture in `TakeSnapshot`. Changing
-  `FbInfo` for raw regions from zeros to contract geometry can change
-  snapshot artifact bytes wherever `capture.framebuffer` is used. Nothing in
-  the repo's golden/entr tests is known to pin the old zero-FbInfo bytes,
-  but per process memory: 3+ consecutive full workspace runs before merge,
-  and investigate any hash mismatch rather than re-rolling goldens blindly.
+- Determinism sensitivity (corrected by review): `capture_at_boundary`
+  output (`feature_bytes`, `fb_lz4`, `fb_info`) goes only into the
+  `TakeSnapshotResponse`/`RunResponse` RPC payloads —
+  `take_snapshot_with_lapic` (service.rs:4193) does NOT consume
+  `CaptureOutput`, so **snapshot artifact bytes, refs, and hashes are
+  unaffected** by this change. Do not hunt for snapshot-hash regressions via
+  this path. Both reviewers verified no golden/entr test pins the old
+  zero-FbInfo bytes (m6 hashes `snapshot.fb_lz4` into its transcript at
+  m6_full_api_uds.rs:563, but with `framebuffer: false` it is empty and
+  stays empty). The 3+ consecutive full workspace runs before merge remain
+  mandatory per process memory — belt-and-braces, and the fixture resize
+  changes guest icount profiles; investigate any flake rather than
+  re-rolling anything blindly.

@@ -38,6 +38,16 @@ this plan. They will drift slightly as you edit; use the symbol names.
   `known_format || (width != 0 && height != 0 && stride >= width)` over the
   first 16 bytes. **Data-dependent per frame** against a raw-pixel region.
   To be deleted.
+  **Heuristic behavior correction (vs the request):** `known_format` includes
+  `PfUnspecified` (format value 0), so an all-zero (black) D7 frame is
+  classified as descriptor-bearing and capture **fails loudly** with
+  "descriptor has zero dimensions" — it does NOT "silently emit zero FbInfo"
+  as request `02-root-cause.md` claims. The silent zero-`FbInfo` fallback
+  fires only when the first 16 bytes have an unknown format AND implausible
+  dimensions (which the capture-fixture's `0xFB00…` qword pattern happens to
+  hit — that is why the test at line 7011 sees the fallback). Either way the
+  metadata is frame-content-dependent, which is the actual defect; use that
+  framing in the decision record, not the request's.
 - `capture_at_boundary(bus, capture, frame_counter)` (line 2784) — for
   `capture.framebuffer == true` (line 2856): reads the region, calls
   `descriptor_framebuffer_capture`; on `Some` emits parsed geometry, on
@@ -119,16 +129,46 @@ assembled by the crate's build into `OUT_DIR` ELFs)
   (line 7159) — boots capture_fixture; asserts GetFramebuffer fails with
   `FailedPrecondition` containing "framebuffer descriptor" (line 7226–7233).
   The `region_ranges` part (layout_version-checked reads) is unaffected.
+- Four more capture_fixture runtime tests (review finding):
+  `m6_accept_capture_neutrality_and_layout_precondition` (line 7482 —
+  **breaks at runtime after the fixture resize** via `capture_epoch_leg`'s
+  `IcountBudget(100_000)`, see `04-tests-and-fixtures.md`),
+  `run_capture_layout_mismatch_commits_successful_run_boundary` (~7664),
+  `take_snapshot_capture_checks_layout_version_and_returns_features` (~7695),
+  `verify_replay_rpc_handles_detchannel_capture_fixture_log` (~7792). The
+  latter three use `framebuffer: false` and 10M budgets — they survive the
+  resize unchanged, and their `contains("layout_version")` expectations
+  remain valid under the new contract.
 
 ### Integration tests (`crates/dh-worker/tests/`)
 
 - `m6_full_api_uds.rs` — uses `capture_fixture` and
   `CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION` for `capture.ranges`
-  (lines 105–142, 483, 498). Check whether its `capture_spec()` sets
-  `framebuffer: true`; if so its snapshot-capture assertions change too.
-  KVM-gated (`--ignored`).
-- No other test file references `GetFramebuffer` or the framebuffer fixtures
-  (verified by grep across `crates/`).
+  (lines 105–142, 483, 498). **Resolved by review:** `capture_spec()` sets
+  `framebuffer: false` (line 135), so its fb-empty assertion (line 507) and
+  leg-digest hash of `fb_lz4` (line 563, cross-leg comparison, not a pinned
+  golden) are unaffected; `expected_capture_bytes()` auto-adapts via the
+  constant. No framebuffer-assertion changes needed in m6. KVM + 64-core
+  gated (`--ignored`).
+
+### Nanokernel crate's own tests (`tests/nanokernel/tests/` — missed by the
+original `crates/`-scoped grep; added from review)
+
+- `elf_shape.rs` — drift-pin tests parsing the asm `%define`s:
+  `capture_fixture_asm_matches_rust_constants` (lines 357–418) pins
+  `FB_BYTES`/`FB_QWORDS` and must track the resize;
+  `framebuffer_fixture_asm_matches_rust_constants` (lines 425–497), the
+  shape assert at line 61, and the `"framebuffer_fixture.asm"` string entry
+  in `channel_guest_asm_ring_descs_match_the_constant` (line 511) all
+  reference the fixture being deleted. The line-511 entry has **no compile
+  error** — it fails only at test time; delete it explicitly.
+- `capture_manifest_interop.rs` — derives everything from
+  `CAPTURE_FIXTURE_FB_BYTES` (lines 18, 30, 64–157); auto-adapts to the
+  resize, no edits expected — just confirm it passes.
+- No other consumers exist: `fb_info`/`fb_lz4`/`CaptureOutput` appear only in
+  `service.rs` and `m6_full_api_uds.rs`; golden/hash tests
+  (`entr_golden.rs`, `dh-snapshot`/`dh-inputlog` goldens, snapshot_engine,
+  determinism-tests) reference none of this (verified by both reviewers).
 
 ## Provenance Note
 
