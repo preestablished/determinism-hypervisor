@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
 use dh_vmm::SlotState;
-use snapstore_client::blocking::SnapstoreClient as BlockingSnapstoreClient;
-use snapstore_client::Transport;
+use snapstore_client::{SnapstoreClient, Transport};
 use snapstore_manifest::Manifest;
 use snapstore_server::build_server::ServerHandle;
 use snapstore_server::config::ServerConfig;
@@ -617,6 +616,7 @@ fn snapstore_server_config(args: &HandoffArgs, uds_path: &Path) -> ServerConfig 
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     }
 }
 
@@ -667,7 +667,7 @@ struct ReadySnapshotOutcome {
     slots_free_before: usize,
 }
 
-fn build_worker_service(
+async fn build_worker_service(
     args: &HandoffArgs,
     artifacts: &M9LinuxArtifacts,
     preflight_results: &[crate::preflight::CheckResult],
@@ -682,8 +682,16 @@ fn build_worker_service(
     worker_config.image_cache_dir = artifacts.image_cache.clone();
     worker_config.snapstore = Some(Transport::Uds(snapstore_uds.to_path_buf()));
 
-    crate::service::WorkerService::new(worker_config)
+    tokio::task::spawn_blocking(move || crate::service::WorkerService::new(worker_config))
+        .await
+        .map_err(|e| HandoffError::new("create worker service", e.to_string()))?
         .map_err(|e| HandoffError::new("create worker service", format!("{e:?}")))
+}
+
+async fn drop_worker_service(svc: crate::service::WorkerService) -> HandoffResult<()> {
+    tokio::task::spawn_blocking(move || drop(svc))
+        .await
+        .map_err(|e| HandoffError::new("drop worker service", e.to_string()))
 }
 
 async fn create_ready_snapshot(
@@ -694,7 +702,7 @@ async fn create_ready_snapshot(
     config: dh_vmm::config::MachineConfig,
     config_hash: [u8; 32],
 ) -> HandoffResult<ReadySnapshotOutcome> {
-    let svc = build_worker_service(args, artifacts, preflight_results, snapstore_uds)?;
+    let svc = build_worker_service(args, artifacts, preflight_results, snapstore_uds).await?;
     let slots_before = slot_counts(&svc);
     let mut source_lease: Option<proto::Lease> = None;
 
@@ -822,7 +830,12 @@ async fn create_ready_snapshot(
         }
     }
 
-    lifecycle
+    let drop_result = drop_worker_service(svc).await;
+    match (lifecycle, drop_result) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(outcome), Ok(())) => Ok(outcome),
+    }
 }
 
 async fn restore_ready_snapshot(
@@ -832,8 +845,8 @@ async fn restore_ready_snapshot(
     snapstore_uds: &Path,
     ready: &ReadySnapshotOutcome,
 ) -> HandoffResult<usize> {
-    verify_snapshot_manifest(snapstore_uds, &ready.snapshot_ref)?;
-    let svc = build_worker_service(args, artifacts, preflight_results, snapstore_uds)?;
+    verify_snapshot_manifest(snapstore_uds, &ready.snapshot_ref).await?;
+    let svc = build_worker_service(args, artifacts, preflight_results, snapstore_uds).await?;
     let mut restored_lease: Option<proto::Lease> = None;
 
     let lifecycle = async {
@@ -881,7 +894,12 @@ async fn restore_ready_snapshot(
         }
     }
 
-    lifecycle
+    let drop_result = drop_worker_service(svc).await;
+    match (lifecycle, drop_result) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Ok(slots_free), Ok(())) => Ok(slots_free),
+    }
 }
 
 fn slot_counts(svc: &crate::service::WorkerService) -> (usize, usize) {
@@ -894,14 +912,16 @@ fn slot_counts(svc: &crate::service::WorkerService) -> (usize, usize) {
     (total, free)
 }
 
-fn verify_snapshot_manifest(uds: &Path, snapshot: &proto::SnapshotRef) -> HandoffResult<()> {
+async fn verify_snapshot_manifest(uds: &Path, snapshot: &proto::SnapshotRef) -> HandoffResult<()> {
     let hash: [u8; 32] = snapshot.hash.as_slice().try_into().map_err(|_| {
         HandoffError::new("verify snapshot manifest", "snapshot ref must be 32 bytes")
     })?;
-    let store = BlockingSnapstoreClient::connect(Transport::Uds(uds.to_path_buf()))
+    let store = SnapstoreClient::connect(Transport::Uds(uds.to_path_buf()))
+        .await
         .map_err(|e| HandoffError::new("connect snapstore", e.to_string()))?;
     let container = store
         .get_snapshot(snapstore_types::SnapshotRef::from_bytes(hash))
+        .await
         .map_err(|e| HandoffError::new("read snapshot manifest", e.to_string()))?;
     Manifest::decode(&container)
         .map_err(|e| HandoffError::new("decode snapshot manifest", e.to_string()))?;

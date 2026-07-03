@@ -5839,12 +5839,9 @@ mod tests {
 
         // Zeroed layout_version-1 region: a valid black frame, not an error.
         let zeroed = vec![0u8; v1_len];
-        let (width, height, stride, format, pixels) = framebuffer_response_from_region(
-            FramebufferCaller::GetFramebuffer,
-            1,
-            &zeroed,
-        )
-        .unwrap();
+        let (width, height, stride, format, pixels) =
+            framebuffer_response_from_region(FramebufferCaller::GetFramebuffer, 1, &zeroed)
+                .unwrap();
         assert_eq!(width, 256);
         assert_eq!(height, 224);
         assert_eq!(stride, 1024);
@@ -5853,15 +5850,17 @@ mod tests {
 
         // Nonzero region: contract geometry, pixels round-trip exactly.
         let patterned: Vec<u8> = (0..v1_len).map(|i| (i % 251) as u8).collect();
-        let (width, height, stride, format, pixels) = framebuffer_response_from_region(
-            FramebufferCaller::GetFramebuffer,
-            1,
-            &patterned,
-        )
-        .unwrap();
+        let (width, height, stride, format, pixels) =
+            framebuffer_response_from_region(FramebufferCaller::GetFramebuffer, 1, &patterned)
+                .unwrap();
         assert_eq!(
             (width, height, stride, format),
-            (256, 224, 1024, proto_pixel_format(proto::PixelFormat::Xrgb8888))
+            (
+                256,
+                224,
+                1024,
+                proto_pixel_format(proto::PixelFormat::Xrgb8888)
+            )
         );
         assert_eq!(pixels, patterned);
 
@@ -5872,8 +5871,18 @@ mod tests {
         assert_eq!(zero_pixels, zeroed);
         assert_eq!(pat_pixels, patterned);
         assert_eq!(
-            (zero_info.width, zero_info.height, zero_info.stride, zero_info.format),
-            (pat_info.width, pat_info.height, pat_info.stride, pat_info.format)
+            (
+                zero_info.width,
+                zero_info.height,
+                zero_info.stride,
+                zero_info.format
+            ),
+            (
+                pat_info.width,
+                pat_info.height,
+                pat_info.stride,
+                pat_info.format
+            )
         );
         assert_eq!(pat_info.width, 256);
         assert_eq!(pat_info.height, 224);
@@ -5894,23 +5903,24 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-            assert!(err.message().contains(&format!("layout_version {bad_version}")));
+            assert!(err
+                .message()
+                .contains(&format!("layout_version {bad_version}")));
             assert!(err.message().starts_with("GetFramebuffer"));
             let err = framebuffer_capture(bad_version, &zeroed, 7).unwrap_err();
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-            assert!(err.message().contains(&format!("layout_version {bad_version}")));
+            assert!(err
+                .message()
+                .contains(&format!("layout_version {bad_version}")));
             assert!(err.message().starts_with("CaptureSpec.framebuffer"));
         }
 
         // Wrong-length layout_version-1 regions name expected and actual.
         for bad_len in [0usize, 65_536, v1_len - 1, v1_len + 1] {
             let region = vec![0u8; bad_len];
-            let err = framebuffer_response_from_region(
-                FramebufferCaller::GetFramebuffer,
-                1,
-                &region,
-            )
-            .unwrap_err();
+            let err =
+                framebuffer_response_from_region(FramebufferCaller::GetFramebuffer, 1, &region)
+                    .unwrap_err();
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);
             assert!(err.message().contains("expects 229376 bytes"));
             assert!(err.message().contains(&format!("got {bad_len}")));
@@ -6240,6 +6250,7 @@ mod tests {
             pagestore: Default::default(),
             meta: Default::default(),
             page_channel: Default::default(),
+            gc: Default::default(),
         };
         let (handle, uds) = rt
             .block_on(snapstore_server::build_server::serve_for_tests(config))

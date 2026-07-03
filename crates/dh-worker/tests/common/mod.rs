@@ -767,6 +767,7 @@ fn spawn_store_at_inner(
             ingest_queue_pages: None,
             corrupt_cross_check_for_test: corrupt_page_channel.then_some(true),
         },
+        gc: Default::default(),
     };
     let (handle, uds) = rt
         .block_on(serve_for_tests(config))

@@ -425,10 +425,7 @@ fn capture_fixture_asm_matches_rust_constants() {
 /// slots against the constant.
 #[test]
 fn channel_guest_asm_ring_descs_match_the_constant() {
-    for file in [
-        "device_exercise.asm",
-        "capture_fixture.asm",
-    ] {
+    for file in ["device_exercise.asm", "capture_fixture.asm"] {
         let asm = std::fs::read_to_string(
             std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/asm")).join(file),
         )
