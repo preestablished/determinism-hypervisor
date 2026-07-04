@@ -762,10 +762,61 @@ async fn create_ready_snapshot(
             .map_err(|e| HandoffError::new("Run until Ready", e.to_string()))?
             .into_inner();
         if run.reason != i32::from(proto::StopReason::NextSdkEvent) {
-            return Err(HandoffError::new(
-                "Run until Ready",
-                format!("stop reason {}, expected NextSdkEvent", run.reason),
-            ));
+            // Evidence-quality error: dump the run position and whatever
+            // guest events the slot buffered, so a wedged boot names the
+            // layer it wedged in instead of only a stop reason.
+            let mut detail = format!(
+                "stop reason {}, expected NextSdkEvent; icount={} vns={} frames={}",
+                run.reason, run.icount, run.vns, run.frames_elapsed
+            );
+            if let Ok(stream) = svc
+                .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+                    lease: Some(lease.clone()),
+                    streams: Vec::new(),
+                }))
+                .await
+            {
+                use tokio_stream::StreamExt as _;
+                let mut stream = stream.into_inner();
+                let mut n = 0usize;
+                while n < 64 {
+                    match tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                        .await
+                    {
+                        Ok(Some(Ok(ev))) => {
+                            use std::fmt::Write as _;
+                            let printable: String = ev
+                                .payload
+                                .iter()
+                                .map(|&b| {
+                                    if (0x20..0x7f).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
+                            let _ = write!(
+                                detail,
+                                "
+  event stream={} icount={} payload[{}]={printable}",
+                                ev.stream,
+                                ev.icount,
+                                ev.payload.len()
+                            );
+                            n += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if n == 0 {
+                    detail.push_str(
+                        "
+  (no buffered guest events)",
+                    );
+                }
+            }
+            return Err(HandoffError::new("Run until Ready", detail));
         }
         if run.sdk_event.as_ref().map(|event| event.stream)
             != Some(detguest_wire::record::EventKind::Ready as u32)
