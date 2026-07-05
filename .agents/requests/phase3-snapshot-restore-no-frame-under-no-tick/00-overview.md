@@ -20,12 +20,9 @@ the same timerless cmdline, frames within milliseconds of Ready — and
 `VmHarness::from_snapshot()`**. So *within VmHarness, neither boot nor restore
 is broken.* The break lives on the **VmHarness → dh-workerd** axis.
 
-## Scope honesty: what we have and have NOT isolated
+## Isolation: the deciding control was RUN — it is H2, not restore-specific
 
-We have proven: (a) the workload frames no-tick in VmHarness on boot **and**
-restore; (b) the deployed **dh-workerd restore** path does **not** frame. We
-have **not** yet tested a **fresh boot through `dh-workerd`** under no-tick, so
-we cannot yet distinguish:
+We considered two hypotheses and ran the experiment that decides them:
 
 - **H1 — restore-specific:** dh-workerd restore fails to re-arm the ring-W
   drain / doorbell servicing that a fresh boot establishes; or
@@ -33,10 +30,20 @@ we cannot yet distinguish:
   fails on **boot or restore** alike (VmHarness passing only proves *VmHarness*
   drains, not dh-workerd).
 
-The single experiment that decides this — a dh-workerd fresh-boot →
-`Run(frame_budget)` control — is the first item in `03-ask.md`. We flag this
-openly rather than assert "restore-specific," a narrowing this project has been
-burned by before.
+**Result: H2.** We ran determinism-hypervisor's own `#[ignore]`d worker test
+`linux_m5_frame_budget_records_post_ready_frame_marks`
+(`crates/dh-worker/tests/m5_frame_scheduling.rs:50`) against the real
+reference-workload artifacts. Its **first** `Run{frame_budget}` — on a
+**freshly-booted** VM (`CreateVm` → run-to-`Ready`, **no snapshot**) — fails:
+`"first Linux run stopped with reason 4, expected BudgetReached"` (reason 4 =
+`HARD_CAP`; it never reaches the restore arm). So the workload boots to `Ready`
+through dh-worker fine, but **post-`Ready` framing hits the hard cap on a fresh
+boot** — the identical no-frame symptom as the deployed restore, with no
+snapshot involved. Meanwhile the same workload with the same no-tick flags
+frames in VmHarness. The failing variable is **VmHarness → dh-worker/dh-vmm**,
+present on boot *and* restore. Restore is **not** special; the re-attach path
+(H1) is at most a secondary contributor. Full command + output in
+`01-evidence.md`.
 
 ## Why this is determinism-hypervisor's and not guest-sdk / reference-workload
 
@@ -54,5 +61,6 @@ burned by before.
   `RestoreSnapshot → Run(frame_budget=1)` reproduces the failure with the
   bridge entirely out of the loop (`01-evidence.md`).
 
-Both surviving hypotheses (H1, H2) live in dh-worker / dh-vmm. The ask
-(`03-ask.md`) starts by disambiguating them.
+The confirmed defect (H2) lives in dh-worker / dh-vmm — the no-tick `Run`
+frame/drain path, on the boot path itself. The ask (`03-ask.md`) is scoped to
+that, with your own `linux_m5` test as the ready-made red repro.

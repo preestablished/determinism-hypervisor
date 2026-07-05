@@ -1,12 +1,14 @@
 # Hypothesis (offered, not asserted)
 
 We are downstream of the worker and cannot see guest serial through
-`dh-workerd`, so treat this as a lead to confirm or refute — not a diagnosis.
-Two hypotheses survive the evidence (see `00-overview.md`): **H1**
-(restore-specific re-attach gap) and **H2** (dh-workerd no-tick Run drain path
-fails on boot *or* restore). The §1 control in `03-ask.md` decides between
-them. The mechanism below applies to **both** — it is *where* the wedge is,
-independent of *when* (boot vs restore) the servicing goes missing.
+`dh-workerd`, so treat the *mechanism* below as a lead to confirm or refute —
+not a diagnosis. The *location*, however, is now pinned: the deciding control
+(`00-overview.md`, `01-evidence.md`) showed a **fresh boot** through dh-worker
+also `HARD_CAP`s with no frame, so this is **H2** — the dh-worker/dh-vmm
+no-tick `Run` frame/drain path, on the **boot path** itself. The
+restore-time re-attach (H1) is at most a secondary, additional break; the
+primary suspect is the ring-W drain servicing that never fires under no-tick on
+any path.
 
 ## The signature
 
@@ -51,19 +53,21 @@ nothing drains, `FRAME_COUNTER` is never written (it comes *after* the emit),
 
 ## Where to look (verified anchors in this repo)
 
-- `crates/dh-worker/src/restore_engine.rs:1-11` — RestoreSnapshot restores in
-  the §8.3 order **RAM → devices → vCPU**, and calls out **"DetChannelDevice's
-  EVTC re-attach (detchannel.rs) is the load-bearing consumer: its restore
-  needs the restored RAM page to hold the guest-sdk channel header before the
-  device loop supplies a fresh fault plan and re-attaches."** Under **H1** this
-  re-attach is the prime suspect: does it re-establish the **ring-W**
-  drain-on-doorbell servicing, or only re-seat the device's memory handle /
-  fault plan?
-- The fresh-boot / `Run` ring-W drain path (doorbell → drain) that services a
-  booted guest — under **H2**, verify this fires at all under the no-tick
-  config. `crates/dh-worker/src/runtime.rs:435` keeps the "Drained detchannel
-  events not yet selected by StreamGuestEvents" buffer; if it stays empty
-  post-Ready, nothing is draining (consistent with the zero-event observation).
+- **Primary (H2):** the fresh-boot / `Run` ring-W drain path (`DOORBELL_RING_W`
+  → drain) that is supposed to service a running guest — since a fresh boot
+  `HARD_CAP`s, verify this servicing fires **at all** under the no-tick config.
+  `crates/dh-worker/src/runtime.rs:435` keeps the "Drained detchannel events
+  not yet selected by StreamGuestEvents" buffer; if it stays empty post-`Ready`,
+  nothing is draining (consistent with the zero-event observation). Compare the
+  worker's doorbell/drain wiring to guest-sdk `VmHarness`, which drains ring W
+  at the `FRAME_COUNTER` MMIO exit and *does* frame this workload no-tick — the
+  delta between the two is the likely fix site.
+- **Secondary (restore only):** `crates/dh-worker/src/restore_engine.rs:1-11`
+  restores in the §8.3 order **RAM → devices → vCPU** and calls out
+  **"DetChannelDevice's EVTC re-attach (detchannel.rs) is the load-bearing
+  consumer … the device loop supplies a fresh fault plan and re-attaches."**
+  This matters only if restore *additionally* fails to re-arm servicing on top
+  of the boot-path break; fix the boot path first.
 
 ## Alternatives we have NOT excluded (do not tunnel on the spin)
 

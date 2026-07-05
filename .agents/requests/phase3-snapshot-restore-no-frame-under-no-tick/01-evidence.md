@@ -14,10 +14,11 @@ Proto: `determinism.hypervisor.v1` — `RunRequest` / `RunResponse`
 | Real workload, no-timer | guest-sdk `VmHarness` | **fresh boot** | **frames** — `f1 > f0`, 2 passed / 7.64s |
 | Real/fixture workload, no-timer | guest-sdk `VmHarness` | **restore** (`from_snapshot`) | **frames** (guest-sdk resolution: `no_timer_ready_snapshot_restore_produces_next_frame` passes) |
 | Real workload, no-timer | deployed **`dh-workerd`** | **restore** | **silent** — 0 frames, 0 drained GuestEvents / `10e9` instructions |
-| Real workload, no-timer | deployed **`dh-workerd`** | **fresh boot** | **not yet tested** (the decisive control — see `03-ask.md` §1) |
+| Real workload, no-timer | in-process **dh-worker** (`linux_m5` test) | **fresh boot** | **silent** — `Run{frame_budget}` stops `HARD_CAP` (reason 4), 0 frames (see below) |
 
-The failing cell differs from the passing cells on the **harness** axis
-(VmHarness → dh-workerd), not only on boot-vs-restore.
+The two **dh-worker** cells fail; the two **VmHarness** cells pass. The failing
+variable is the **harness** axis (VmHarness → dh-worker/dh-vmm), **on the boot
+path** — not boot-vs-restore. Restore is not implicated as special.
 
 ## Failing case — deployed `dh-workerd`, restore then run
 
@@ -59,6 +60,39 @@ This reproduces with the bridge out of the loop; it is exactly the RPC
 sequence `RealBackend::resume` issues
 (`rom-operator-bridge/service/src/backend.rs:2214-2223`:
 `Run{ hard_icount_cap: 0, until: FrameBudget(1) }`).
+
+## Deciding control — dh-worker FRESH BOOT (no snapshot) also HARD_CAPs
+
+Run **your own** `#[ignore]`d worker test against the real artifacts. Its first
+`Run{frame_budget}` is on a freshly-`CreateVm`'d VM run to `Ready` — no
+snapshot, no restore:
+
+```
+DH_M9_GUEST=linux \
+DH_M9_BZIMAGE=<real reference-workload bzImage> \
+DH_M9_INITRAMFS=<real reference-workload initramfs.cpio (decompressed)> \
+DH_M9_BASE_IMAGE=<real base.img>  DH_M9_GAME_IMAGE=<real game.img> \
+DH_M9_IMAGE_CACHE=<empty writable dir> \
+cargo test -p dh-worker --test m5_frame_scheduling \
+  linux_m5_frame_budget_records_post_ready_frame_marks -- --ignored --nocapture
+```
+```
+running 1 test
+test linux_m5_frame_budget_records_post_ready_frame_marks ...
+  Error: "first Linux run stopped with reason 4, expected BudgetReached"
+FAILED
+```
+
+The failure is at `m5_frame_scheduling.rs:82`
+(`assert_worker_frame_budget(&first_run, FIRST_FRAMES, "first Linux run")`) —
+**before** the snapshot/restore arm is ever reached. `m9_linux_ready_snapshot`
+completed (so boot-to-`Ready` through dh-worker succeeded), and then the
+fresh-boot `Run{frame_budget}` stopped `HARD_CAP` (StopReason 4;
+`proto/hypervisor.proto:244`) with no frame — **not** `GUEST_HALTED` (6) or
+`FAULTED` (7), so the guest ran to the cap rather than dying. The config is the
+worker's own `m9_linux_machine_config` (forced no-tick cmdline). This is the
+same no-frame symptom as the deployed restore, reproduced on a fresh boot
+inside your own test harness. **It is the ready-made red repro for the fix.**
 
 ## Passing control — fresh boot, guest-sdk `VmHarness`, real artifact
 

@@ -1,61 +1,43 @@
 # The ask
 
-## 1. Decide H1 vs H2 first: a dh-workerd fresh-boot frame control
+## 1. H1 vs H2 is already decided — it is H2 (we ran your own test)
 
-Before fixing anything, run the one experiment that tells us whether this is
-restore-specific (**H1**) or a general dh-workerd no-tick drain failure
-(**H2**): **fresh boot through `dh-workerd`** (no restore) of the real workload
-(or a guest-sdk frame-loop fixture that reaches Ready and frames), under
-`BZIMAGE_FORCED_CMDLINE`, then `Run{ frame_budget = 1 }`.
+We ran the deciding control so you don't have to: your `#[ignore]`d
+`linux_m5_frame_budget_records_post_ready_frame_marks` against the real
+artifacts. Its **first, fresh-boot** `Run{frame_budget}` (no snapshot) stops
+`HARD_CAP` with no frame — it fails at `m5_frame_scheduling.rs:82` before the
+restore arm (command + output in `01-evidence.md`). So this is **H2**: the
+dh-worker/dh-vmm **no-tick `Run` frame/drain path fails on the boot path
+itself**; restore is not special. You already have the red repro — it's your
+own test.
 
-- If it stops `BUDGET_REACHED` with `frames_elapsed >= 1` → **H1**: the defect
-  is in the restore path (re-attach). Proceed to §2.
-- If it also returns `HARD_CAP` / 0 frames → **H2**: retarget the whole
-  investigation at the dh-workerd no-tick `Run` ring-W drain path (boot and
-  restore alike); §2's restore focus becomes secondary.
+## 2. Fix the no-tick `Run` ring-W frame/drain path; make `linux_m5` a CI gate (primary deliverable)
 
-We (rom-operator-bridge) can run this control too if you'd rather we produce
-it — say the word. It is the single result that makes the request's title
-precise.
+The observable to fix: a workload that reaches `Ready` through dh-worker under
+`BZIMAGE_FORCED_CMDLINE` must reach its first pv-pad `FRAME_COUNTER` when run
+with `frame_budget`, i.e. `Run{frame_budget=N}` stops `BUDGET_REACHED` with
+`frames_elapsed == N` — **not** `HARD_CAP` — on a **fresh boot** (and,
+consequently, after restore).
 
-## 2. A regression test on the exact deployed path (primary deliverable)
+Make `linux_m5_frame_budget_records_post_ready_frame_marks` a CI gate rather
+than `#[ignore]`d — either by staging the DH_M9_* artifacts in CI, or by
+adding a sibling test that drives the same
+boot → `Run{frame_budget}` → assert-`BUDGET_REACHED` path with a fixture whose
+frames go through the real `frame_mark()` → ring-W `EventClass::Critical` emit
+(**not** `nanokernel::fake_frames_elf()`, which writes `FRAME_COUNTER` directly
+and bypasses the ring-W doorbell/drain — the very path under suspicion). The
+existing non-ignored `m5_accept_frame_budget_and_at_frame_absolute_across_restore`
+(line 384) uses that fake-frames kernel, which is why CI is green today while
+the real no-tick path is broken.
 
-Add a **dh-worker / dh-vmm** integration test, running in CI, that exercises
-the path the deployed bridge uses under the forced timerless cmdline
-(`BZIMAGE_FORCED_CMDLINE`, no-tick):
+## 3. Secondary — the restore-time DetChannelDevice re-attach
 
-1. Boot the real reference-workload image **or** a guest-sdk frame-loop fixture
-   that reaches Ready and emits a **ring-W** `FrameMark` via the real
-   `frame_mark()` path (see below) to the guest-sdk `Ready` event.
-2. `TakeSnapshot`.
-3. `RestoreSnapshot` into a fresh slot.
-4. `Run{ until: frame_budget = 1 }`.
-5. **Assert** `reason == BUDGET_REACHED` and `frames_elapsed >= 1`, not
-   `HARD_CAP`.
-
-**Why the existing coverage does not catch this** (please don't close as
-"already tested"): `crates/dh-worker/tests/m5_frame_scheduling.rs:50`
-`linux_m5_frame_budget_records_post_ready_frame_marks` does boot → snapshot →
-restore → frame_budget through the worker on an M9 Linux Ready snapshot, but it
-is `#[ignore]`d (line 49: "requires KVM dirty-ring support and staged DH_M9_*
-artifacts") so it does not run in CI; and the non-ignored
-`m5_accept_frame_budget_and_at_frame_absolute_across_restore` (line 384) boots
-`nanokernel::fake_frames_elf()` (line 394), which writes `FRAME_COUNTER`
-**directly** and never exercises the guest-sdk **ring-W** `emit()`/doorbell
-drain. So no *CI-run* test exercises post-restore ring-W frame emission — the
-exact path suspected in `02-hypothesis.md`. The new test should either
-un-`#[ignore]` the Linux path with staged artifacts, or use a fixture whose
-frames go through `frame_mark()` → ring-W `EventClass::Critical` emit.
-
-## 3. Investigate the restore-time DetChannelDevice re-attach (if H1)
-
-Determine whether `restore_engine.rs`'s device restore + the DetChannelDevice
-EVTC re-attach (`dh-devices/.../detchannel.rs`) re-establishes the **host-side
-ring-W drain / doorbell servicing** that a fresh boot's device loop provides —
-or whether it only re-seats the device's guest-memory handle and fault plan
-(and check `restore_producer_seqs` for a ring-W producer-sequence gap). If the
-drain servicing is not re-armed on restore, that is the fix: re-arm it so a
-restored guest's `DOORBELL_RING_W` is answered exactly as on a fresh boot.
+Once the boot path frames, re-check restore: does `restore_engine.rs`'s device
+restore + the DetChannelDevice EVTC re-attach (`dh-devices/.../detchannel.rs`)
+re-establish the same host-side ring-W drain / doorbell servicing (also check
+`restore_producer_seqs` for a ring-W producer-sequence gap)? This is only a
+concern if restore *additionally* breaks servicing on top of the boot-path
+fix — verify it with the restore arm of `linux_m5` after §2 lands.
 
 ## 4. Confirm or refute the mechanism
 
@@ -71,16 +53,17 @@ dh-workerd."
 
 ## Acceptance
 
-- The new CI test **reproduces the failure first** (`HARD_CAP`, 0 frames) on
-  `main`, then passes after the fix. The red/green oracle is either the
-  un-`#[ignore]`d Linux restore test with staged artifacts, or — if a
-  ring-W fixture does not reproduce `HARD_CAP` — the sender re-running the
-  deployed `RestoreSnapshot → Run(frame_budget=1)` against ref `1499c0a7…`.
-- A restored (and, per §1, freshly-booted) Ready workload, run with
-  `frame_budget = 1` under the timerless cmdline, stops at `BUDGET_REACHED`
-  with `frames_elapsed >= 1`.
+- `linux_m5_frame_budget_records_post_ready_frame_marks` (against the real
+  artifacts) currently fails at its **first, fresh-boot** `Run{frame_budget}`
+  (`HARD_CAP`, 0 frames) — the confirmed red state — and passes end to end
+  after the fix.
+- A **freshly-booted** Ready workload (and, consequently, a restored one), run
+  with `frame_budget = N` under the timerless cmdline, stops at
+  `BUDGET_REACHED` with `frames_elapsed == N` — verified in CI without staged
+  private artifacts (fixture-driven if needed, through the real `frame_mark()`
+  ring-W path).
 - No determinism regression: the fix must not perturb the DHILOG, the state
-  hash, or the fresh-boot / replay paths (ARCH §8.3, §6.10 C5).
+  hash, or the replay paths (ARCH §8.3, §6.10 C5).
 
 ## Handback
 
@@ -93,14 +76,18 @@ Tracking bead: rom-operator-bridge-9xo.
 
 ## Reproduction handles (non-secret)
 
-- Fresh-boot VmHarness control (already green): `refwork_ready_hold` with
-  `REFWORK_READY_INITRAMFS` / `REFWORK_READY_BZIMAGE` pointed at a locally
-  built `reference-workload/dist/workload-image-0.1.0/` (note: `dist/` is
-  git-ignored — build via `cargo xtask image build`; see `01-evidence.md`).
-- Failing path: deployed `dh-workerd` `RestoreSnapshot` of a Ready snapshot
-  then `Run{ frame_budget = 1, hard_icount_cap = 0 }` — expect `HARD_CAP` at
-  `+10e9` icount, `frames_elapsed = 0`, ~55 s wall.
-- Deployed snapshot ref:
-  `1499c0a77e883bc0f74d97a254e59508ea86b4d17976eba8cbf78e0c7961a270`.
+- **Red repro (in your own tree):** `linux_m5_frame_budget_records_post_ready_frame_marks`
+  with `DH_M9_*` env pointed at the real reference-workload artifacts — fails at
+  the fresh-boot `Run{frame_budget}` (`HARD_CAP`). Exact command + output in
+  `01-evidence.md`. Build the artifacts via `cargo xtask image build` in
+  `reference-workload` (`dist/` is git-ignored; decompress `initramfs.cpio.zst`).
+- Passing control (already green): guest-sdk `refwork_ready_hold` no-timer arm
+  with `REFWORK_READY_INITRAMFS` / `REFWORK_READY_BZIMAGE` — same workload, same
+  no-tick flags, frames in VmHarness.
+- Deployed corroboration: `dh-workerd` `RestoreSnapshot` of Ready snapshot ref
+  `1499c0a77e883bc0f74d97a254e59508ea86b4d17976eba8cbf78e0c7961a270` then
+  `Run{ frame_budget = 1, hard_icount_cap = 0 }` — `HARD_CAP` at `+10e9` icount,
+  `frames_elapsed = 0`, ~55 s wall.
 - Proto: `determinism.hypervisor.v1.RunRequest` / `RunResponse`
-  (`reason`, `frames_elapsed`).
+  (`reason`, `frames_elapsed`); `StopReason` `HARD_CAP = 4`
+  (`proto/hypervisor.proto:244`).
