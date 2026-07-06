@@ -56,9 +56,11 @@ rom-operator-bridge, and any snapshot-store serving runbook) for every
 `cargo run` / `target/debug` launch of a long-lived service:
 
 - `dh-workerd`
-- `snapstore-server` (confirmed running from `target/debug` today; its
-  runbook lives in the snapshot-store repo — file a bead there or fix the
-  copy referenced by this repo's ops docs)
+- `snapstore-server` (confirmed running from `target/debug` today; the
+  same runbook launches it via `cargo run` at
+  `docs/ops/rom-bridge-o73-ready-snapshot.md` line ~123 — fix both launch
+  commands in the same pass, and file a bead in snapshot-store if its own
+  docs repeat the pattern)
 - `dh-m9-ready-handoff` (one-shot; release still preferred for the
   snapshot write path but not perf-critical)
 

@@ -26,10 +26,32 @@ bridge, click Start then Play, and reach the same game point that takes
 
 ## Perf regression guard
 
-Add an `#[ignore]`d perf smoke (the M0 harness) with a generous threshold
-(e.g. ≥45 fps streamed on release builds on the reference host) so a
-future change that reintroduces per-frame hashing or debug-path work is
-caught before an operator feels it.
+Add an `#[ignore]`d perf smoke (the M0 harness) so a future change that
+reintroduces per-frame hashing or debug-path work is caught before an
+operator feels it. Two cautions from CI reality — there is exactly ONE
+self-hosted kvm-intel runner, shared with the 24h nightly fuzz lane:
+
+- do not gate PRs on an absolute wall-clock fps number on that shared
+  box; either pin the smoke to a nightly-only exclusive window, or make
+  the gate relative (streamed-fps versus a per-frame-Run baseline
+  measured in the same job — the regression being guarded is the RATIO
+  collapsing, which is contention-immune);
+- keep the absolute ≥45fps check as an operator-run acceptance step on
+  the reference host, not a CI gate.
+
+## Rollback / feature flag
+
+M2+B2 replace the frame-delivery hot path. Keep the per-frame
+`Run{frame_budget=1, capture}` path (bridge plan B1) intact behind a
+bridge config toggle for at least one release after streaming ships:
+rollback is flipping the toggle — no worker redeploy. Remove it only
+after a soak documented in `05-measurements.md`.
+
+## Observability acceptance
+
+The 02 metrics (frames emitted, emit latency, hold duration, termination
+reasons) are part of M2's definition of done: the private validation
+reference should assert they appear on `/metrics` during the B2 smoke.
 
 ## Suggested beads
 
@@ -42,14 +64,16 @@ parent:
    impl, p0) — depends on nothing; do immediately
 3. `Add build-profile visibility to worker startup/GetWorkerInfo` (M1,
    impl, p2)
-4. `Implement RunWithFrameCapture streaming RPC per API.md §2.7` (M2,
-   impl, p0) ← depends on 1
+4. `Implement RunWithFrameCapture streaming RPC (incl. stall watchdog +
+   metrics)` (M2, impl, p0) ← depends on 1
 5. `Capture-neutrality CI test for RunWithFrameCapture` (M2, testing, p0)
    ← 4
-6. `Accept InjectInputs at streaming-run frame-holds` (M3, impl, p1) ← 4
-7. `API.md amendment: frame-hold input semantics` (M3, docs, p1) ← 6
+6. `Accept InjectInputs at streaming-run frame-holds (out-of-band queue,
+   bypasses slot actor channel)` (M3, impl, p1) ← 4
+7. `API.md amendment: frame-hold input semantics + cancel-vs-Pause stop
+   latency` (M3, docs, p1) ← 6
 8. `Epoch-hash shadow/async pipeline (contingent on M0 data)` (M4, impl,
-   p2) ← 1, 4
+   p2) ← 1, 4, 6
 
 ## Privacy closeout
 

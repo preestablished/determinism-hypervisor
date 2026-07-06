@@ -45,14 +45,28 @@ Ranked by expected impact:
 ## Why This Repo
 
 Causes 1 and 2 live here. The already-specified-but-unimplemented
-`RunWithFrameCapture` server-streaming RPC (API.md §2.7, proto
-`proto/hypervisor.proto` line ~373, stub returning `unimplemented` at
-`crates/dh-worker/src/service.rs:4709`) is the architecture's own answer
-to the decoupling: one long Run streams a `CapturedFrame` per FRAME_MARK
-while chain links happen only at epoch boundaries and the final stop, and
-capture is normatively **capture-neutral** (must not perturb execution,
-DHILOG, or the state hash). Backpressure holds the vCPU at the FRAME_MARK
-boundary — which also gives the bridge real-time pacing for free.
+`RunWithFrameCapture` server-streaming RPC (API.md: the RunWithFrameCapture
+block appended after §2.7 Verification, before §2.8 — it has no numbered
+subsection of its own; proto `proto/hypervisor.proto` line ~373; stub
+returning `unimplemented` at `crates/dh-worker/src/service.rs:4709`) is
+the architecture's own answer to the decoupling: one long Run streams a
+`CapturedFrame` per FRAME_MARK while chain links happen only at epoch
+boundaries and the final stop, and capture is normatively
+**capture-neutral** (must not perturb execution, DHILOG, or the state
+hash). Backpressure holds the vCPU at the FRAME_MARK boundary — which
+also gives the bridge real-time pacing for free.
+
+Scope note: the spec labels this RPC "required by replay-renderer
+(Phase 7); not part of the v1 exploration loop" — an offline, no-live-
+input primitive. Using it for interactive play (and M3's live input at
+frame-holds) is a deliberate scope extension of that contract; the API.md
+amendment in 03 needs sign-off from whoever owns the Phase-7 surface.
+
+Backpressure clarification: only the bridge's single gRPC stream consumer
+can hold the vCPU. Downstream `/ws/frames` viewers are isolated by the
+bridge's lossy `tokio::sync::watch` fanout (latest-frame-wins), so N slow
+WebSocket clients cannot stall play — only the bridge loop's paced reads
+govern the guest.
 
 A sibling plan in
 `rom-operator-bridge/.agents/plans/play-60fps-streaming-frames/` covers
@@ -91,6 +105,14 @@ depends on Milestone M2 here.
 - Machine-config changes (e.g. `epoch_len`) change the machine identity
   hash and therefore require regenerating the READY snapshot lineage via
   `dh-m9-ready-handoff` — treat as a last resort (03).
+- Audio: N/A — the platform has no audio surface (framebuffer + state
+  regions only); nothing here adds one.
+- Slot occupancy: a play session pins one slot's actor thread (and its
+  pinned core) for minutes at a time. If the same worker process ever
+  serves the exploration-orchestrator concurrently, that is one slot
+  removed from its pool for the session's duration; today the operator
+  bridge uses a dedicated worker, so this is a documentation concern, not
+  a scheduling one — state it in the ops runbook when M2 lands.
 
 ## Tracking
 
