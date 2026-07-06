@@ -531,7 +531,15 @@ where
             rail.bus
                 .write(gpa, data, &mut ctx)
                 .map_err(|e| BoundaryError::Exit(format!("bus write {gpa:#x}: {e:?}")))?;
-            ReplayExitEvents::default()
+            if gpa == dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER
+                && data.len() == 4
+            {
+                ReplayExitEvents {
+                    sdk_events: replay_detchannel_drain_for_exit::<M>(&mut rail.bus, &mut ctx)?,
+                }
+            } else {
+                ReplayExitEvents::default()
+            }
         }
         other => {
             return Err(BoundaryError::Exit(format!("unexpected exit: {other:?}")).into());
@@ -541,6 +549,25 @@ where
         return Err(BoundaryError::Exit(format!("log fault: {e:?}")).into());
     }
     Ok(sdk_events)
+}
+
+fn replay_detchannel_drain_for_exit<M>(
+    bus: &mut dh_devices::MmioBus,
+    ctx: &mut dh_devices::DevCtx<'_>,
+) -> Result<Vec<ReplaySdkEvent>, BoundaryError>
+where
+    M: GuestMem + detguest_host::GuestMem + Clone + Send + 'static,
+{
+    let Some(host) = replay_detchannel_mut::<M>(bus) else {
+        return Ok(Vec::new());
+    };
+    let events = host.host_mut().drain_at_pause(ctx);
+    if host.host().metrics.any_anomaly() {
+        return Err(BoundaryError::Exit(
+            "detchannel frame-boundary drain anomaly".into(),
+        ));
+    }
+    Ok(events.iter().filter_map(replay_sdk_event).collect())
 }
 
 fn replay_detchannel_drain_at_pause<M>(
@@ -1810,7 +1837,6 @@ where
 
     // ── Walk the canonical records ────────────────────────────────────────
     let canonical: Vec<_> = log.canonical().collect();
-    let mut last_canonical_icount = None;
     macro_rules! replay_frame_marks_before {
         ($seq_limit:expr, $icount_limit:expr, $defer_same_icount_epoch:expr) => {{
             while frame_marks_replayed < frame_mark_records.len() {
@@ -1929,7 +1955,6 @@ where
                 "vectored input replay needs run control's injection scheduling",
             ));
         }
-        last_canonical_icount = Some(icount);
         if canonical
             .get(index + 1)
             .is_none_or(|next| next.icount() != icount)
@@ -2046,10 +2071,11 @@ where
         }
         tail
     };
-    if terminal_sdk_target.is_none()
-        && tail.is_none()
-        && last_canonical_icount == Some(header.end_icount)
-        && last_epoch_icount.get() != Some(header.end_icount)
+    let replay_counter_at_end = counter
+        .read()
+        .map_err(|e| ReplayError::Run(format!("{e:?}")))?
+        == header.end_icount;
+    if tail.is_none() && replay_counter_at_end && last_epoch_icount.get() != Some(header.end_icount)
     {
         let device_sections = {
             let rail_ref = rail.borrow();

@@ -2262,6 +2262,23 @@ fn select_stream_guest_events(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn drain_runtime_detchannel_for_exit(
+    bus: &mut dh_devices::MmioBus,
+    ctx: &mut dh_devices::DevCtx<'_>,
+    event_icount: u64,
+    anomaly_label: &'static str,
+) -> Result<Vec<DrainedGuestEvent>, dh_vmm::boundary::BoundaryError> {
+    let Some(host) = runtime_detchannel_mut(bus) else {
+        return Ok(Vec::new());
+    };
+    let events = host.host_mut().drain_at_pause(ctx);
+    if host.host().metrics.any_anomaly() {
+        return Err(dh_vmm::boundary::BoundaryError::Exit(anomaly_label.into()));
+    }
+    drained_guest_events_to_runtime(events, event_icount)
+}
+
+#[cfg(target_arch = "x86_64")]
 fn service_exit_with_detchannel(
     rail: &mut dh_vmm::recording::DeviceRail<RuntimeVmMem>,
     log_icount: u64,
@@ -2422,7 +2439,18 @@ fn service_exit_with_detchannel(
             rail.bus.write(gpa, data, &mut ctx).map_err(|e| {
                 dh_vmm::boundary::BoundaryError::Exit(format!("bus write {gpa:#x}: {e:?}"))
             })?;
-            Vec::new()
+            if gpa == dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER
+                && data.len() == 4
+            {
+                drain_runtime_detchannel_for_exit(
+                    &mut rail.bus,
+                    &mut ctx,
+                    event_icount,
+                    "detchannel frame-boundary drain anomaly",
+                )?
+            } else {
+                Vec::new()
+            }
         }
         other => {
             return Err(dh_vmm::boundary::BoundaryError::Exit(format!(

@@ -461,7 +461,9 @@ fn run_segment_inner(
     // Event-stop bookkeeping. Frame marks are decoded HERE (pure exit
     // decode against the device-side constants — pv-pad's FRAME_COUNTER
     // MMIO write); SDK-event matching is the CALLER's, consumed through
-    // the Segment::sdk_events feed.
+    // the Segment::sdk_events feed. That feed may be bumped by any
+    // caller-serviced drain at the current exit, including detcall doorbells
+    // and frame-boundary detchannel drains.
     let frame_mark_gpa = dh_devices::pad::PV_PAD_BASE + dh_devices::pad::REG_FRAME_COUNTER;
     let frame_target = match until {
         Until::FrameBudget { frames, .. } => Some(frames),
@@ -530,9 +532,9 @@ fn run_segment_inner(
     // Terminal HLT (proto GUEST_HALTED) is a STOP, not a fault: the
     // wrapper flags it and unwinds the landing loop via a sentinel error.
     // The event-driven stops use the same unwind: the triggering exit is
-    // serviced by on_exit FIRST (the rail logs FRAME_MARK / drains the
-    // doorbell at the exit's icount), THEN flagged — so the stop boundary
-    // is the exit boundary, with the device state already current.
+    // serviced by on_exit FIRST (the rail logs FRAME_MARK and drains any
+    // SDK events due at that exit), THEN flagged — so the stop boundary is
+    // the exit boundary, with the device state already current.
     let mut halted = false;
     let mut event_stop = false;
     let mut frames_seen = 0u64;

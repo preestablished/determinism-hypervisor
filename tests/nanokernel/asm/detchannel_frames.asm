@@ -1,9 +1,9 @@
 ; detchannel_frames: a public M5 frame-budget regression guest.
 ;
 ; It initializes detchannel, then for every frame publishes a ring-W
-; FrameMark record, rings the W doorbell, and only then writes pv-pad
-; FRAME_COUNTER. A worker that does not service the W doorbell cannot
-; reach the frame counter write, so Run{frame_budget} hits its hard cap.
+; FrameMark record and only then writes pv-pad FRAME_COUNTER. This matches
+; guest-sdk's normal non-full-ring frame_mark path: no W doorbell is rung
+; unless a critical event has to retry on a full ring.
 
 BITS 64
 
@@ -18,10 +18,6 @@ BITS 64
 %define PORT_INIT_LO    0xD374
 %define PORT_INIT_HI    0xD378
 %define PORT_INIT_GO    0xD37C
-%define PORT_DOORBELL   0xD380
-
-%define DOORBELL_RING_W 2
-
 ; Channel page: same clean-room layout as device_exercise.asm.
 %define CHANNEL_GPA     0x400000
 %define CHANNEL_PAGES   512
@@ -133,10 +129,6 @@ prog_main:
     add     eax, FRAME_RECORD_LEN
     mov     [ring_w_prod], eax
     mov     [rbx + RINGW_PROD_OFF], eax
-
-    mov     eax, DOORBELL_RING_W
-    mov     dx, PORT_DOORBELL
-    out     dx, eax
 
     mov     rdi, PAD_BASE
     mov     eax, [frame_index]

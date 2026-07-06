@@ -4,6 +4,7 @@
 //! and the canonical 4-device test bus. Every test target is x86_64-gated
 //! at its crate root, so this module never compiles elsewhere.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,14 @@ pub struct M9LinuxArtifacts {
     pub base_image: PathBuf,
     pub game_image: PathBuf,
     pub image_cache: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct M9RealEmulatorContract {
+    pub autostart_unit: i64,
+    pub exec_path: String,
+    pub expected_regions: BTreeMap<String, i64>,
 }
 
 #[allow(dead_code)]
@@ -224,6 +233,213 @@ pub fn hash_file(path: &Path) -> TestResult<[u8; 32]> {
         hasher.update(&buf[..n]);
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+#[allow(dead_code)]
+pub fn assert_m9_real_emulator_initramfs(initramfs: &Path) -> TestResult<M9RealEmulatorContract> {
+    let archive = std::fs::read(initramfs)
+        .map_err(|e| format!("read initramfs {}: {e}", initramfs.display()))?;
+    let boot_toml = initramfs_entry(&archive, "etc/detguest/boot.toml")?;
+    let boot_toml = std::str::from_utf8(boot_toml.data)
+        .map_err(|e| format!("boot.toml in {} is not UTF-8: {e}", initramfs.display()))?;
+    let contract = parse_m9_real_emulator_boot_toml(boot_toml)?;
+
+    initramfs_entry(&archive, "init")?;
+    let agent = initramfs_entry(&archive, "sbin/detguest-agent")?;
+    if !agent.is_executable() {
+        return Err("initramfs sbin/detguest-agent must be executable".into());
+    }
+    let harness = initramfs_entry(&archive, "usr/bin/refwork-harness")?;
+    if !harness.is_executable() {
+        return Err("initramfs usr/bin/refwork-harness must be executable".into());
+    }
+    if initramfs_entry(&archive, "opt/m9-refwork-contract").is_ok() {
+        return Err("initramfs contains stale synthetic /opt/m9-refwork-contract".into());
+    }
+    Ok(contract)
+}
+
+fn parse_m9_real_emulator_boot_toml(boot_toml: &str) -> TestResult<M9RealEmulatorContract> {
+    let manifest: toml::Value = boot_toml
+        .parse()
+        .map_err(|e| format!("parse initramfs boot.toml: {e}"))?;
+    let root = toml_table(&manifest, "boot.toml root")?;
+    if root
+        .get("boot_toml_version")
+        .and_then(toml::Value::as_integer)
+        != Some(1)
+    {
+        return Err("boot.toml must set boot_toml_version = 1".into());
+    }
+    let autostart_unit = root
+        .get("autostart")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("unit"))
+        .and_then(toml::Value::as_integer)
+        .ok_or_else(|| "boot.toml must autostart the reference workload unit".to_string())?;
+    let units = toml_array(root, "unit")?;
+    let unit = units
+        .iter()
+        .filter_map(toml::Value::as_table)
+        .find(|table| table.get("id").and_then(toml::Value::as_integer) == Some(autostart_unit))
+        .ok_or_else(|| format!("boot.toml autostart unit {autostart_unit} has no [[unit]]"))?;
+    let exec_path = unit
+        .get("exec")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| format!("boot.toml autostart unit {autostart_unit} must set exec"))?;
+    if exec_path != "/usr/bin/refwork-harness" {
+        return Err(format!(
+            "boot.toml autostart exec must be /usr/bin/refwork-harness, got {exec_path:?}"
+        ));
+    }
+    let control = unit
+        .get("control")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "autostart unit must declare [unit.control]".to_string())?;
+    if control.get("protocol").and_then(toml::Value::as_str) != Some("refwork-ctl") {
+        return Err("autostart unit.control must use protocol = \"refwork-ctl\"".into());
+    }
+    if control
+        .get("proto_version")
+        .and_then(toml::Value::as_integer)
+        != Some(1)
+    {
+        return Err("autostart unit.control must use proto_version = 1".into());
+    }
+    if control.get("game_dev").and_then(toml::Value::as_str) != Some("/dev/vdb") {
+        return Err("autostart unit.control must set game_dev = \"/dev/vdb\"".into());
+    }
+    if control.get("game_source").and_then(toml::Value::as_str) != Some("pv-blk") {
+        return Err("autostart unit.control must set game_source = \"pv-blk\"".into());
+    }
+
+    let expected_region_tables = toml_array(root, "expected_region")?;
+    let mut expected_regions = BTreeMap::new();
+    for (idx, region) in expected_region_tables.iter().enumerate() {
+        let region = region
+            .as_table()
+            .ok_or_else(|| format!("expected_region[{idx}] must be a table"))?;
+        let name = region
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("expected_region[{idx}] must name a region"))?;
+        let layout_version = region
+            .get("layout_version")
+            .and_then(toml::Value::as_integer)
+            .ok_or_else(|| format!("expected_region[{idx}] must set layout_version"))?;
+        expected_regions.insert(name.to_string(), layout_version);
+    }
+    for (name, version) in [("wram", 1), ("framebuffer", 1), ("meta", 1)] {
+        if expected_regions.get(name) != Some(&version) {
+            return Err(format!(
+                "boot.toml must list expected_region {name:?} with layout_version {version}"
+            ));
+        }
+    }
+
+    Ok(M9RealEmulatorContract {
+        autostart_unit,
+        exec_path: exec_path.to_string(),
+        expected_regions,
+    })
+}
+
+fn toml_table<'a>(
+    value: &'a toml::Value,
+    name: &str,
+) -> TestResult<&'a toml::map::Map<String, toml::Value>> {
+    value
+        .as_table()
+        .ok_or_else(|| format!("{name} must be a TOML table"))
+}
+
+fn toml_array<'a>(table: &'a toml::Table, key: &str) -> TestResult<&'a Vec<toml::Value>> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("boot.toml missing array [[{key}]]"))
+}
+
+struct InitramfsEntry<'a> {
+    mode: u32,
+    data: &'a [u8],
+}
+
+impl InitramfsEntry<'_> {
+    fn is_executable(&self) -> bool {
+        let kind = self.mode & 0o170000;
+        matches!(kind, 0o100000 | 0o120000) && self.mode & 0o111 != 0
+    }
+}
+
+fn initramfs_entry<'a>(archive: &'a [u8], needle: &str) -> TestResult<InitramfsEntry<'a>> {
+    const HEADER_LEN: usize = 110;
+    let needle = normalize_cpio_path(needle);
+    let mut offset = 0usize;
+    while offset
+        .checked_add(HEADER_LEN)
+        .is_some_and(|end| end <= archive.len())
+    {
+        let header = &archive[offset..offset + HEADER_LEN];
+        if &header[..6] != b"070701" {
+            return Err(format!(
+                "unsupported initramfs cpio magic at offset {offset}"
+            ));
+        }
+        let mode = parse_newc_hex(&header[14..22])? as u32;
+        let file_size = parse_newc_hex(&header[54..62])?;
+        let name_size = parse_newc_hex(&header[94..102])?;
+        offset += HEADER_LEN;
+
+        let name_end = offset
+            .checked_add(name_size)
+            .ok_or_else(|| "newc filename offset overflow".to_string())?;
+        if name_size == 0 || name_end > archive.len() {
+            return Err("truncated initramfs cpio filename".into());
+        }
+        let raw_name = &archive[offset..name_end - 1];
+        let name = std::str::from_utf8(raw_name).map_err(|e| format!("newc filename utf8: {e}"))?;
+        let data_start = align4(name_end).ok_or_else(|| "newc data offset overflow".to_string())?;
+        let data_end = data_start
+            .checked_add(file_size)
+            .ok_or_else(|| "newc file size overflow".to_string())?;
+        if data_end > archive.len() {
+            return Err(format!("truncated initramfs cpio entry {name:?}"));
+        }
+        if name == "TRAILER!!!" {
+            break;
+        }
+        if normalize_cpio_path(name) == needle {
+            return Ok(InitramfsEntry {
+                mode,
+                data: &archive[data_start..data_end],
+            });
+        }
+        offset = align4(data_end).ok_or_else(|| "newc next offset overflow".to_string())?;
+    }
+    Err(format!("initramfs missing {needle}"))
+}
+
+fn normalize_cpio_path(path: &str) -> &str {
+    path.trim_start_matches("./").trim_start_matches('/')
+}
+
+fn align4(n: usize) -> Option<usize> {
+    n.checked_add(3).map(|value| value & !3)
+}
+
+fn parse_newc_hex(raw: &[u8]) -> TestResult<usize> {
+    let s = std::str::from_utf8(raw).map_err(|e| format!("newc hex utf8: {e}"))?;
+    usize::from_str_radix(s, 16).map_err(|e| format!("newc hex {s:?}: {e}"))
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 #[allow(dead_code)]
@@ -421,6 +637,23 @@ where
     let Some(artifacts) = m9_artifacts(test_name)? else {
         return Ok(None);
     };
+    let contract = assert_m9_real_emulator_initramfs(&artifacts.initramfs)?;
+    let initramfs_hash = hash_file(&artifacts.initramfs)?;
+    let game_hash = hash_file(&artifacts.game_image)?;
+    let initramfs_size = std::fs::metadata(&artifacts.initramfs)
+        .map_err(|e| format!("{test_name}: stat DH_M9_INITRAMFS: {e}"))?
+        .len();
+    let game_size = std::fs::metadata(&artifacts.game_image)
+        .map_err(|e| format!("{test_name}: stat DH_M9_GAME_IMAGE: {e}"))?
+        .len();
+    eprintln!(
+        "{test_name}: real-emulator initramfs exec={} initramfs_blake3={} initramfs_size={} game_blake3={} game_size={}",
+        contract.exec_path,
+        hex32(&initramfs_hash),
+        initramfs_size,
+        hex32(&game_hash),
+        game_size
+    );
     let Some(cpuid_table) = m9_masked_cpuid_table(test_name)? else {
         return Ok(None);
     };
