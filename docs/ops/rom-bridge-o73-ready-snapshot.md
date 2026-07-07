@@ -118,9 +118,14 @@ Both files must be `600` or stricter. Private directories should be `700`.
 
 Start snapstore over the generated data root using the private config:
 
+Long-lived services MUST run release builds. `cargo run` without `--release`
+launches an unoptimized debug binary; a debug `snapstore-server`/`dh-workerd`
+pair is a measured multi-x slowdown on the bridge play path.
+
 ```bash
 cd /home/infra-admin/git/preestablished/snapshot-store
-nohup setsid cargo run -p snapstore-server --bin snapstore-server -- \
+cargo build --release -p snapstore-server --bin snapstore-server
+nohup setsid target/release/snapstore-server \
   --config "$private_root/rom-bridge-o73/snapstore/config.toml" \
   > "$private_root/rom-bridge-o73/evidence/snapstore-server.private.log" 2>&1 &
 echo $! > "$private_root/rom-bridge-o73/runtime/snapstore-server.pid"
@@ -148,7 +153,8 @@ cd /home/infra-admin/git/preestablished/determinism-hypervisor
 set -a
 . "$private_root/rom-bridge-o73/handoff/bridge-real-restore-snapshot.env"
 set +a
-nohup setsid cargo run -p dh-worker --bin dh-workerd -- serve \
+cargo build --release -p dh-worker --bin dh-workerd
+nohup setsid target/release/dh-workerd serve \
   --uds /run/dh/grpc.sock \
   --image-cache "$DH_M9_IMAGE_CACHE" \
   --snapstore-uds "$SNAPSTORE_GRPC_UDS_PATH" \
@@ -157,6 +163,9 @@ echo $! > "$private_root/rom-bridge-o73/runtime/dh-workerd.pid"
 ```
 
 Do not use `--no-snapstore` for the bridge run.
+
+Verify the profile after start: the worker startup log line and `GetWorkerInfo`
+report the build profile; both must say `release` before bridge acceptance.
 
 ## Bridge Hand-Off
 

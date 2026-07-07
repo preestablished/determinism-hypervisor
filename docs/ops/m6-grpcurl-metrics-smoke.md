@@ -7,10 +7,13 @@ are serving. `dh-workerd` does not expose gRPC reflection, so every
 
 ## Setup
 
-Start the worker with explicit local endpoints:
+Start the worker with explicit local endpoints. Serve from a release build —
+debug builds are only acceptable for throwaway local smokes, never for a
+worker any other component measures against:
 
 ```bash
-cargo run -p dh-worker --bin dh-workerd -- serve \
+cargo build --release -p dh-worker --bin dh-workerd
+target/release/dh-workerd serve \
   --tcp 127.0.0.1:7400 \
   --http 127.0.0.1:7401 \
   --uds /tmp/dh-grpc.sock \
