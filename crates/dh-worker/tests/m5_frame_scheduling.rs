@@ -44,7 +44,16 @@ use tonic::Request;
 const MEM: u64 = 16 << 20;
 const FIRST_FRAMES: u64 = 3;
 const AFTER_RESTORE_FRAMES: u64 = 2;
-const FRAME_HARD_CAP: u64 = 50_000_000;
+/// Measured 2026-07-07 against reference-workload dist workload-image-0.1.0
+/// (built_from 7b0c7b2, refwork >= 40eaf4f; initramfs blake3 36f50484…):
+/// max ~27.7M instr/frame (fresh f1=7.77M, f2/f3=27.68M; post-restore
+/// f4/f5=27.68M; NOP-game diagnostic frame 9.2M), identical across two
+/// consecutive runs. Cap = 27.7M/frame × 3 frames (FIRST_FRAMES) × ~1.8
+/// margin ≈ 150M — a safety net for runaway boots, not a perf assertion;
+/// the real-path normal stop is BUDGET_REACHED. Retune by re-running:
+/// cargo test -p dh-worker --release --test m5_frame_scheduling -- \
+///   --ignored linux_m5 --nocapture
+const FRAME_HARD_CAP: u64 = 150_000_000;
 const DETCHANNEL_FRAME_HARD_CAP: u64 = 1_000_000;
 const AT_FRAME_TARGET: u32 = 2;
 const DETCHANNEL_FRAME_TEST: &str =

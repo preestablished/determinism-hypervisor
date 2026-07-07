@@ -44,7 +44,15 @@ const HARD_CAP: u64 = 1_000_000;
 const EPOCH_LEN: u64 = 64;
 const NET_TX_DOORBELL_GPA: u64 = PV_NET_BASE + REG_TX_DOORBELL;
 const LINUX_IO_FRAMES: u32 = 1;
-const LINUX_FRAME_HARD_CAP: u64 = 50_000_000;
+/// Measured 2026-07-07 against reference-workload dist workload-image-0.1.0
+/// (built_from 7b0c7b2, refwork >= 40eaf4f): max ~27.7M instr/frame on the
+/// real emulator (m5_frame_scheduling linux_m5 frame table, identical
+/// across two consecutive runs). Cap = 27.7M × 1 frame (LINUX_IO_FRAMES)
+/// × ~2.2 margin ≈ 60M — a safety net, not a perf assertion; the normal
+/// stop is BUDGET_REACHED. Retune by re-running:
+/// cargo test -p dh-worker --release --test m5_frame_scheduling -- \
+///   --ignored linux_m5 --nocapture
+const LINUX_FRAME_HARD_CAP: u64 = 60_000_000;
 const META_IO_MAGIC_OFF: u64 = 32;
 const META_IO_PROOF_LEN: u64 = 24;
 const BLKO_DIRTY_COUNT_OFF: usize = 32;
