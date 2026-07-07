@@ -334,6 +334,7 @@ mod tests {
                 vmm_version: env!("CARGO_PKG_VERSION").into(),
             }),
             version: env!("CARGO_PKG_VERSION").into(),
+            build_profile: "release".into(),
         };
         assert_eq!(
             v1::GetWorkerInfoResponse::decode(info.encode_to_vec().as_slice()).unwrap(),

@@ -191,6 +191,7 @@ fn spawn_live_store() -> LiveStore {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

@@ -370,20 +370,28 @@ message Divergence {
   string suspected_cause   = 8;        // decoder hint, e.g. "RDTSC at divergent RIP"
 }
 
-// ---- RunWithFrameCapture (required by replay-renderer, Phase 7) ----
+// ---- RunWithFrameCapture (required by replay-renderer, Phase 7; also the ----
+// ---- approved interactive-play frame path — API.md amendment)           ----
 // Server-streaming frame extraction during a run: one CapturedFrame per FRAME_MARK
 // observed, then a terminal RunResponse. Capture-neutral (normative): the capture
 // MUST NOT perturb execution, the DHILOG, or the state hash — a capture run and a
 // no-capture run of the same (snapshot, inputs) produce identical refs and epoch
 // hashes (CI-tested). Backpressure: if the stream consumer stalls, the worker holds
-// the vCPU paused at the FRAME_MARK boundary; it never drops frames.
+// the vCPU paused at the FRAME_MARK boundary; it never drops frames. Cancelling the
+// stream ends the run AT the next FRAME_MARK (a Pause-equivalent stop: slot PAUSED_S
+// at a deterministic icount, normal final hash link) — the interactive-Stop path;
+// PauseRequest stays epoch-quantized. A consumer that holds the stream open without
+// reading trips a worker-constant watchdog (30s) that lands the same way.
 message RunWithFrameCaptureRequest {
   Lease lease = 1;
   oneof until {
     uint64 icount_budget = 2;
     uint64 vns_budget    = 3;
   }
-  uint64 hard_icount_cap = 4;          // 0 ⇒ worker default
+  uint64 hard_icount_cap = 4;          // 0 ⇒ worker default. Currently UNUSED:
+                                       //   the budget until arms are taken literally
+                                       //   (mirroring Run); the field is reserved
+                                       //   for a future event-driven until arm.
 }
 message FrameCaptureEvent {
   oneof msg {
@@ -408,6 +416,8 @@ message GetWorkerInfoResponse {
   uint32 slots_free  = 3;
   DeterminismClass class = 4;
   string version = 5;                  // dh-workerd semver
+  string build_profile = 6;            // "release" | "debug" (cfg!(debug_assertions));
+                                       //   long-lived operator workers MUST be "release"
 }
 message DeterminismClass {             // ARCH §7.4; embedded in manifests too
   string cpu_model    = 1;             // e.g. family/model/stepping string

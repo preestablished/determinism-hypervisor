@@ -15,6 +15,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use common::{gettid, kvm_available, spawn_store_blocking, TestResult, VmMem};
@@ -37,13 +38,17 @@ use dh_vmm::SlotState;
 use dh_worker::restore_engine::restore_snapshot;
 use dh_worker::snapshot_engine::{take_snapshot, BoundaryState, PageSource};
 use snapstore_manifest::input_log::InputLogContainer;
+use tokio_stream::StreamExt;
 use tonic::Request;
 
 const MEM: u64 = 16 << 20;
 const FIRST_FRAMES: u64 = 3;
 const AFTER_RESTORE_FRAMES: u64 = 2;
 const FRAME_HARD_CAP: u64 = 50_000_000;
+const DETCHANNEL_FRAME_HARD_CAP: u64 = 1_000_000;
 const AT_FRAME_TARGET: u32 = 2;
+const DETCHANNEL_FRAME_TEST: &str =
+    "m5_frame_scheduling::detchannel_frame_budget_drains_sdk_frame_marks_across_restore";
 
 #[test]
 #[ignore = "M9 Linux acceptance: requires KVM dirty-ring support and staged DH_M9_* artifacts"]
@@ -75,11 +80,39 @@ fn linux_m5_frame_budget_records_post_ready_frame_marks() -> TestResult<()> {
                     until: Some(proto::run_request::Until::FrameBudget(FIRST_FRAMES as u32)),
                     hard_icount_cap: FRAME_HARD_CAP,
                     capture: None,
-                }))
-                .await
-                .map_err(|e| format!("Run first Linux frame budget: {e}"))?
-                .into_inner();
-            assert_worker_frame_budget(&first_run, FIRST_FRAMES, "first Linux run")?;
+            }))
+            .await
+            .map_err(|e| format!("Run first Linux frame budget: {e}"))?
+            .into_inner();
+            if let Err(e) = assert_worker_frame_budget(&first_run, FIRST_FRAMES, "first Linux run")
+            {
+                let diagnostic_snapshot = ready
+                    .svc
+                    .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                        lease: Some(ready.lease.clone()),
+                        seal_input_log: Some(false),
+                        capture: None,
+                    }))
+                    .await
+                    .ok()
+                    .map(|response| response.into_inner());
+                let events = stream_guest_event_summaries(&ready.svc, &ready.lease, 64)
+                    .await
+                    .unwrap_or_else(|err| vec![format!("StreamGuestEvents failed: {err}")]);
+                let _ = ready
+                    .svc
+                    .destroy_vm(Request::new(proto::DestroyVmRequest {
+                        lease: Some(ready.lease.clone()),
+                    }))
+                    .await;
+                return Err(format!(
+                    "{e}; ready_icount={} ready_frame_counter={} post_run_icount={} post_run_frame_counter={:?} buffered_events={events:?}",
+                    ready.ready_snapshot.icount,
+                    start_frame,
+                    first_run.icount,
+                    diagnostic_snapshot.as_ref().map(|snapshot| snapshot.frame_counter),
+                ));
+            }
 
             let first_snapshot = ready
                 .svc
@@ -202,6 +235,357 @@ fn linux_m5_frame_budget_records_post_ready_frame_marks() -> TestResult<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "M9 Linux diagnostic: requires KVM dirty-ring support and real-emulator DH_M9_* artifacts"]
+fn linux_m5_real_emulator_nop_game_frame_budget_diagnostic() -> TestResult<()> {
+    let Some(artifacts) = common::m9_artifacts(
+        "m5_frame_scheduling::linux_m5_real_emulator_nop_game_frame_budget_diagnostic",
+    )?
+    else {
+        return Ok(());
+    };
+    common::assert_m9_real_emulator_initramfs(&artifacts.initramfs)?;
+    let nop_game_hash = write_cache_blob(&artifacts.image_cache, &nop_rom())?;
+    eprintln!(
+        "m5_frame_scheduling::linux_m5_real_emulator_nop_game_frame_budget_diagnostic: nop_game_blake3={}",
+        hex_hash(&nop_game_hash)
+    );
+    let Some(ready) = common::m9_linux_ready_snapshot_with_config(
+        "m5_frame_scheduling::linux_m5_real_emulator_nop_game_frame_budget_diagnostic",
+        2,
+        |config| {
+            config.base_image_hash = nop_game_hash;
+        },
+    )?
+    else {
+        return Ok(());
+    };
+
+    let start_frame = ready.ready_snapshot.frame_counter;
+    let expected = expected_frame_table(start_frame, 1)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    let (run, streamed, snapshot) = rt.block_on(async {
+        let run = ready
+            .svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(ready.lease.clone()),
+                until: Some(proto::run_request::Until::FrameBudget(1)),
+                hard_icount_cap: FRAME_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run real-emulator NOP-game frame budget: {e}"))?
+            .into_inner();
+        if let Err(e) = assert_worker_frame_budget(&run, 1, "real-emulator NOP-game run") {
+            let diagnostic_snapshot = ready
+                .svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(ready.lease.clone()),
+                    seal_input_log: Some(false),
+                    capture: None,
+                }))
+                .await
+                .ok()
+                .map(|response| response.into_inner());
+            let events = stream_guest_event_summaries(&ready.svc, &ready.lease, 64)
+                .await
+                .unwrap_or_else(|err| vec![format!("StreamGuestEvents failed: {err}")]);
+            let _ = ready
+                .svc
+                .destroy_vm(Request::new(proto::DestroyVmRequest {
+                    lease: Some(ready.lease.clone()),
+                }))
+                .await;
+            return Err(format!(
+                "{e}; ready_icount={} ready_frame_counter={} post_run_icount={} post_run_frame_counter={:?} buffered_events={events:?}",
+                ready.ready_snapshot.icount,
+                start_frame,
+                run.icount,
+                diagnostic_snapshot.as_ref().map(|snapshot| snapshot.frame_counter),
+            ));
+        }
+        let streamed =
+            stream_frame_mark_events(&ready.svc, &ready.lease, &expected, "NOP-game run").await?;
+        let snapshot = ready
+            .svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(ready.lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot real-emulator NOP-game frame: {e}"))?
+            .into_inner();
+        let _ = ready
+            .svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(ready.lease.clone()),
+            }))
+            .await;
+        Ok::<_, String>((run, streamed, snapshot))
+    })?;
+
+    let log = input_log_payload(&ready.store, &snapshot.input_log_id)?;
+    let marks = frame_marks(&log);
+    assert_strict_frame_table(&marks, &expected);
+    assert_sdk_frames_match_frame_marks(
+        &streamed,
+        &marks,
+        ready.ready_snapshot.icount,
+        "real-emulator NOP-game run",
+    );
+
+    eprintln!(
+        "linux-m5 real-emulator NOP-game start={} icount={} sdk_frames={:?} frame_marks={:?}",
+        start_frame, run.icount, streamed, marks
+    );
+    Ok(())
+}
+
+#[test]
+fn detchannel_frame_budget_drains_sdk_frame_marks_across_restore() -> TestResult<()> {
+    if !kvm_available() {
+        eprintln!("skipping: /dev/kvm not usable");
+        return Ok(());
+    }
+    let cpuid_table = match KvmSystem::open() {
+        Ok(sys) if sys.dirty_ring => sys
+            .masked_cpuid_table()
+            .map_err(|e| format!("masked CPUID table: {e:?}"))?,
+        Ok(_) => {
+            eprintln!("skipping: KVM dirty ring unavailable");
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("skipping: KVM unavailable: {e:?}");
+            return Ok(());
+        }
+    };
+
+    let image_cache = tempfile::TempDir::new().map_err(|e| format!("image cache tempdir: {e}"))?;
+    let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096])?;
+    let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::detchannel_frames_elf())?;
+    let config = detchannel_frame_machine_config(base_hash, kernel_hash, cpuid_table);
+
+    let store_dir = tempfile::TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+    let store_sock = "snapstore.sock";
+    let (_store_rt, _store_handle, store) =
+        common::spawn_store_at(store_dir.path().to_path_buf(), store_sock);
+    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
+    let svc = dh_worker::service::WorkerService::new(common::m9_worker_config(
+        DETCHANNEL_FRAME_TEST,
+        2,
+        image_cache.path().to_path_buf(),
+        snapstore,
+    ))
+    .map_err(|e| format!("WorkerService::new: {e:?}"))?;
+
+    let start_frame = 0;
+    let first_expected = expected_frame_table(start_frame, FIRST_FRAMES)?;
+    let first_end = *first_expected
+        .last()
+        .ok_or_else(|| "first expected frame table is empty".to_string())?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    let (
+        first_run,
+        first_sdk_frames,
+        first_snapshot,
+        restored_frame_counter,
+        second_run,
+        second_sdk_frames,
+        second_snapshot,
+        initial_ref,
+        first_ref,
+    ) = rt.block_on(async {
+        let created = svc
+            .create_vm(Request::new(proto::CreateVmRequest {
+                config: Some(dh_worker::proto_map::machine_config_to_proto(&config)),
+                entropy_seed: vec![0xD5; 32],
+            }))
+            .await
+            .map_err(|e| format!("CreateVm detchannel frames: {e}"))?
+            .into_inner();
+        let lease = created
+            .lease
+            .ok_or_else(|| "CreateVm returned no lease".to_string())?;
+
+        let initial_snapshot = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("initial TakeSnapshot detchannel frames: {e}"))?
+            .into_inner();
+        let initial_ref = initial_snapshot
+            .snapshot
+            .ok_or_else(|| "initial detchannel snapshot returned no snapshot ref".to_string())?;
+
+        let first_run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(lease.clone()),
+                until: Some(proto::run_request::Until::FrameBudget(FIRST_FRAMES as u32)),
+                hard_icount_cap: DETCHANNEL_FRAME_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run detchannel frame budget: {e}"))?
+            .into_inner();
+        assert_worker_frame_budget(&first_run, FIRST_FRAMES, "first detchannel run")?;
+        let first_sdk_frames =
+            stream_frame_mark_events(&svc, &lease, &first_expected, "first detchannel run").await?;
+
+        let first_snapshot = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot detchannel frame budget: {e}"))?
+            .into_inner();
+        let first_ref = first_snapshot.snapshot.clone().ok_or_else(|| {
+            "first detchannel frame snapshot returned no snapshot ref".to_string()
+        })?;
+
+        let restored = svc
+            .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                snapshot: Some(first_ref.clone()),
+                entropy_seed: Vec::new(),
+            }))
+            .await
+            .map_err(|e| format!("RestoreSnapshot detchannel frame boundary: {e}"))?
+            .into_inner();
+        let restored_frame_counter = restored.frame_counter;
+        let restored_lease = restored
+            .lease
+            .ok_or_else(|| "RestoreSnapshot returned no lease".to_string())?;
+
+        let second_expected = expected_frame_table(restored_frame_counter, AFTER_RESTORE_FRAMES)?;
+        let second_run = svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(restored_lease.clone()),
+                until: Some(proto::run_request::Until::FrameBudget(
+                    AFTER_RESTORE_FRAMES as u32,
+                )),
+                hard_icount_cap: DETCHANNEL_FRAME_HARD_CAP,
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("Run restored detchannel frame budget: {e}"))?
+            .into_inner();
+        assert_worker_frame_budget(&second_run, AFTER_RESTORE_FRAMES, "restored detchannel run")?;
+        let second_sdk_frames = stream_frame_mark_events(
+            &svc,
+            &restored_lease,
+            &second_expected,
+            "restored detchannel run",
+        )
+        .await?;
+
+        let second_snapshot = svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(restored_lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot restored detchannel frame budget: {e}"))?
+            .into_inner();
+
+        let _ = svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(restored_lease),
+            }))
+            .await;
+        let _ = svc
+            .destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+            .await;
+
+        Ok::<_, String>((
+            first_run,
+            first_sdk_frames,
+            first_snapshot,
+            restored_frame_counter,
+            second_run,
+            second_sdk_frames,
+            second_snapshot,
+            initial_ref,
+            first_ref,
+        ))
+    })?;
+
+    assert_eq!(
+        first_snapshot.frame_counter, first_end,
+        "first detchannel frame-budget snapshot must persist the absolute pv-pad counter"
+    );
+    assert_eq!(
+        restored_frame_counter, first_end,
+        "RestoreSnapshot must report the PADD-restored absolute frame counter"
+    );
+    let first_log = input_log_payload(&store, &first_snapshot.input_log_id)?;
+    let first_replay = rt.block_on(common::verify_replay_done(
+        &svc,
+        initial_ref,
+        first_snapshot.input_log_id.clone(),
+    ))?;
+    assert_eq!(
+        first_replay.total_icount, first_run.icount,
+        "first detchannel replay must cover the recorded segment"
+    );
+    let first_marks = frame_marks(&first_log);
+    assert_strict_frame_table(&first_marks, &first_expected);
+    assert_sdk_frames_match_frame_marks(&first_sdk_frames, &first_marks, 0, "first detchannel run");
+
+    let second_expected = expected_frame_table(first_end, AFTER_RESTORE_FRAMES)?;
+    let second_end = *second_expected
+        .last()
+        .ok_or_else(|| "second expected frame table is empty".to_string())?;
+    assert_eq!(
+        second_snapshot.frame_counter, second_end,
+        "restored detchannel frame-budget snapshot must continue the absolute pv-pad counter"
+    );
+    let second_log = input_log_payload(&store, &second_snapshot.input_log_id)?;
+    let second_replay = rt.block_on(common::verify_replay_done(
+        &svc,
+        first_ref,
+        second_snapshot.input_log_id.clone(),
+    ))?;
+    assert_eq!(
+        second_replay.total_icount,
+        second_run.icount - first_run.icount,
+        "restored detchannel replay must cover the restored segment delta"
+    );
+    let second_marks = frame_marks(&second_log);
+    assert_strict_frame_table(&second_marks, &second_expected);
+    assert_sdk_frames_match_frame_marks(
+        &second_sdk_frames,
+        &second_marks,
+        first_run.icount,
+        "restored detchannel run",
+    );
+
+    eprintln!(
+        "detchannel-frame-budget first_icount={} sdk_frames={:?} first_marks={:?} restored_icount={} restored_sdk_frames={:?} restored_marks={:?}",
+        first_run.icount,
+        first_sdk_frames,
+        first_marks,
+        second_run.icount,
+        second_sdk_frames,
+        second_marks
+    );
+
+    Ok(())
+}
+
 fn config() -> MachineConfig {
     MachineConfig::new(
         MEM,
@@ -211,6 +595,56 @@ fn config() -> MachineConfig {
             cmdline: Vec::new(),
         },
     )
+}
+
+fn detchannel_frame_machine_config(
+    base_hash: [u8; 32],
+    kernel_hash: [u8; 32],
+    cpuid_table: Vec<dh_vmm::config::CpuidLeaf>,
+) -> MachineConfig {
+    let mut config = MachineConfig::new(
+        MEM,
+        base_hash,
+        BootSpec::Elf {
+            kernel_hash,
+            cmdline: Vec::new(),
+        },
+    );
+    config.cpuid_table = cpuid_table;
+    config.device_set = vec![
+        dh_devices::detchannel::DEVICE_ID_DETCHANNEL,
+        dh_devices::clock::DEVICE_ID_PV_CLOCK,
+        dh_devices::pad::DEVICE_ID_PV_PAD,
+        dh_devices::entropy::DEVICE_ID_PV_ENTROPY,
+        dh_devices::serial::DEVICE_ID_DEBUG_SERIAL,
+    ];
+    config
+}
+
+fn write_cache_blob(root: &Path, bytes: &[u8]) -> TestResult<[u8; 32]> {
+    let hash = *blake3::hash(bytes).as_bytes();
+    std::fs::write(
+        root.join(dh_worker::image_resolver::cache_key(&hash)),
+        bytes,
+    )
+    .map_err(|e| format!("write image-cache blob: {e}"))?;
+    Ok(hash)
+}
+
+fn nop_rom() -> Vec<u8> {
+    let mut rom = vec![0xEA; 32 * 1024];
+    rom[0x7ffc] = 0x00;
+    rom[0x7ffd] = 0x80;
+    rom
+}
+
+fn hex_hash(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 fn frame_bus() -> MmioBus {
@@ -336,6 +770,23 @@ fn assert_strict_frame_table(marks: &[(u64, u32)], expected_frames: &[u32]) {
     );
 }
 
+fn assert_sdk_frames_match_frame_marks(
+    sdk_frames: &[(u64, u32)],
+    frame_marks: &[(u64, u32)],
+    segment_base_icount: u64,
+    label: &str,
+) {
+    let expected: Vec<(u64, u32)> = frame_marks
+        .iter()
+        .map(|(icount, frame)| (segment_base_icount.saturating_add(*icount), *frame))
+        .collect();
+    assert_eq!(
+        sdk_frames,
+        expected.as_slice(),
+        "{label}: SDK FrameMark events must be drained at the matching FRAME_COUNTER boundary"
+    );
+}
+
 fn expected_frame_table(start_frame: u32, frames: u64) -> TestResult<Vec<u32>> {
     let frames =
         u32::try_from(frames).map_err(|_| format!("frame count {frames} does not fit u32"))?;
@@ -363,6 +814,101 @@ fn assert_worker_frame_budget(
         ));
     }
     Ok(())
+}
+
+async fn stream_frame_mark_events(
+    svc: &dh_worker::service::WorkerService,
+    lease: &proto::Lease,
+    expected_frames: &[u32],
+    label: &str,
+) -> TestResult<Vec<(u64, u32)>> {
+    let mut stream = svc
+        .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+            lease: Some(lease.clone()),
+            streams: vec![detguest_wire::record::EventKind::FrameMark as u32],
+        }))
+        .await
+        .map_err(|e| format!("{label}: StreamGuestEvents(FrameMark): {e}"))?
+        .into_inner();
+    let mut frames = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.map_err(|e| format!("{label}: stream FrameMark event: {e}"))?;
+        if event.stream != detguest_wire::record::EventKind::FrameMark as u32 {
+            return Err(format!(
+                "{label}: unexpected stream {}, expected FrameMark",
+                event.stream
+            ));
+        }
+        if event.payload.len() != 8 {
+            return Err(format!(
+                "{label}: FrameMark payload length {}, expected 8",
+                event.payload.len()
+            ));
+        }
+        let frame = u32::from_le_bytes(
+            event.payload[0..4]
+                .try_into()
+                .map_err(|_| format!("{label}: FrameMark payload prefix"))?,
+        );
+        frames.push((event.icount, frame));
+    }
+    let actual: Vec<u32> = frames.iter().map(|(_, frame)| *frame).collect();
+    if actual != expected_frames {
+        return Err(format!(
+            "{label}: streamed FrameMark frames {:?}, expected {:?}",
+            actual, expected_frames
+        ));
+    }
+    if !frames.windows(2).all(|w| w[0].0 < w[1].0) {
+        return Err(format!(
+            "{label}: streamed FrameMark icounts must increase strictly: {frames:?}"
+        ));
+    }
+    Ok(frames)
+}
+
+async fn stream_guest_event_summaries(
+    svc: &dh_worker::service::WorkerService,
+    lease: &proto::Lease,
+    limit: usize,
+) -> TestResult<Vec<String>> {
+    let mut stream = svc
+        .stream_guest_events(Request::new(proto::StreamGuestEventsRequest {
+            lease: Some(lease.clone()),
+            streams: Vec::new(),
+        }))
+        .await
+        .map_err(|e| format!("StreamGuestEvents(any): {e}"))?
+        .into_inner();
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let Some(event) = stream.next().await else {
+            break;
+        };
+        let event = event.map_err(|e| format!("stream guest event: {e}"))?;
+        let printable: String = event
+            .payload
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        out.push(format!(
+            "stream={} icount={} vns={} payload_len={} payload={printable}",
+            event.stream,
+            event.icount,
+            event.vns,
+            event.payload.len(),
+        ));
+    }
+    if out.is_empty() {
+        out.push("no buffered guest events".to_string());
+    }
+    Ok(out)
 }
 
 fn input_log_payload(

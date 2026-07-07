@@ -27,6 +27,7 @@ async fn spawn_store() -> (ServerHandle, SnapstoreClient, TempDir) {
         pagestore: Default::default(),
         meta: Default::default(),
         page_channel: Default::default(),
+        gc: Default::default(),
     };
     let (handle, uds_path) = serve_for_tests(config).await.expect("serve_for_tests");
     // Readiness probe instead of a fixed settle sleep: retry the connect

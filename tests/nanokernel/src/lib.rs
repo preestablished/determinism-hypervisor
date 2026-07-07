@@ -258,6 +258,23 @@ pub const FAKE_FRAMES_BOOT_MARKER: u8 = b'G';
 /// (drift-tested).
 pub const FAKE_FRAMES_PACE_ITERS: u64 = 64;
 
+/// detchannel_frames: emits a ring-W FrameMark, rings the W doorbell, then
+/// writes pv-pad FRAME_COUNTER for every frame. This is the public regression
+/// fixture for worker-side frame-budget progress through detchannel drain.
+pub fn detchannel_frames_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/detchannel_frames.elf"))
+}
+
+/// The fixture emits this serial byte after CHANNEL_INIT succeeds; lowercase
+/// `d` means detchannel setup failed and the guest parked.
+pub const DETCHANNEL_FRAMES_READY_MARKER: u8 = b'D';
+pub const DETCHANNEL_FRAMES_CHANNEL_GPA: u64 = 0x40_0000;
+pub const DETCHANNEL_FRAMES_RING_DESCS: [(u32, u32); 4] = DEVICE_EXERCISE_RING_DESCS;
+pub const DETCHANNEL_FRAMES_RECORD_LEN: u16 = 24;
+pub const DETCHANNEL_FRAMES_EVENT_KIND: u8 = 13;
+pub const DETCHANNEL_FRAMES_DOORBELL_MASK: u32 = 2;
+pub const DETCHANNEL_FRAMES_PACE_ITERS: u64 = 64;
+
 /// The counting-semantics guest (bead d34; ARCH §3.1 empirics, M2):
 /// emits an 'S' marker OUT, executes EXACTLY 1,000 instructions (by
 /// construction — assembly fails otherwise), then an 'E' marker OUT.

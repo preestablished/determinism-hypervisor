@@ -63,8 +63,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(target_arch = "x86_64"))]
             let mut config = WorkerConfig::from_host_defaults()?;
             config.preflight = preflight;
+            // Build profile is load-bearing ops truth (play-60fps M1):
+            // long-lived operator workers must run release builds, and the
+            // runbooks assert this line before acceptance.
             eprintln!(
-                "dh-workerd serving gRPC TCP {tcp_addr}, HTTP {http_addr}{}",
+                "dh-workerd (build_profile={}) serving gRPC TCP {tcp_addr}, HTTP {http_addr}{}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
                 uds_path
                     .as_ref()
                     .map(|p| format!(" and UDS {}", p.display()))
