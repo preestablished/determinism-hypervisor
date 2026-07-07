@@ -50,6 +50,16 @@ multi-frame hiccups, but real-time 60fps requires reducing the in-guest
 emulator's instructions-per-frame (reference-workload scope, not this
 repo). Documented as the measured gap per plan 02 acceptance.
 
+## M2/M3 deployment
+
+- 2026-07-07: operator worker redeployed from main merge bdd476b
+  (pinned release binary), serving the full RunWithFrameCapture + live
+  frame-hold-input surface. Verified per the runbook: startup log and
+  `GetWorkerInfo` report `build_profile=release`; the frame-stream
+  metrics series are live on `/metrics`. snapstore-server restarted on
+  its release build in the same pass. Previous pinned release binary
+  (30d0cb9) retained as the rollback artifact.
+
 ## M1 rollout
 
 - 2026-07-07: runbook fixed (`docs/ops/rom-bridge-o73-ready-snapshot.md`,
