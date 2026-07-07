@@ -3644,6 +3644,10 @@ where
                 }
             }
             drained_guest_events.extend(events);
+            // Retention-cap DURING the run, not only at teardown (9f3x):
+            // only the capped tail survives the post-run append anyway,
+            // and an unbounded long-Run accumulation is an OOM vector.
+            trim_guest_events_to_retention_cap(&mut drained_guest_events);
             Ok(())
         };
         let mut input_sink = |idx: usize, boundary| {

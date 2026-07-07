@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dh_detclock::counter::InstRetired;
 use kvm_ioctls::VcpuExit;
 
-use crate::agenda::{compile, AgendaError, AgendaInputs, FinalStop, StopKind};
+use crate::agenda::{AgendaError, AgendaInputs, AgendaIter, FinalStop, StopKind};
 use crate::boundary::{land_at, Boundary, BoundaryError, Margins};
 use crate::config::MachineConfig;
 use crate::hash::StateHashChain;
@@ -608,7 +608,11 @@ fn run_segment_inner(
         final_stop,
         clock,
     };
-    let agenda = compile(&inputs).map_err(RunError::Agenda)?;
+    // Streamed, not materialized (9f3x): a long streaming Run's agenda
+    // has one point per epoch across the whole budget — compiling it to
+    // a Vec is O(budget/epoch_len) memory and OOM'd production under
+    // RunWithFrameCapture. The iterator yields the identical sequence.
+    let agenda = AgendaIter::new(&inputs).map_err(RunError::Agenda)?;
 
     // Terminal HLT (proto GUEST_HALTED) is a STOP, not a fault: the
     // wrapper flags it and unwinds the landing loop via a sentinel error.
@@ -764,7 +768,7 @@ fn run_segment_inner(
         };
     }
 
-    for point in &agenda {
+    for point in agenda {
         let boundary = unwind_or!(
             land_at(
                 &mut seg.slot.vcpu,

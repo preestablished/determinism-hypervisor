@@ -7,8 +7,10 @@
 //! writes (IER/LCR/MCR/...) are swallowed and read back as fixed
 //! constants. Serial output NEVER enters the state hash: the snapshot
 //! section is EMPTY by design (the pending output buffer is host-side
-//! observability — the run loop drains it to the slot's JSON log — not
-//! machine state).
+//! observability, not machine state). NOTE: no production caller drains
+//! `take_output` today (bead 9f3x follow-up) — the buffer is bounded at
+//! [`MAX_PENDING_OUTPUT`] with drop-oldest so a serial-chatty guest
+//! cannot grow worker RSS across a long Run.
 
 use crate::ctx::DevCtx;
 use crate::{DetDevice, RestoreError};
@@ -33,10 +35,18 @@ const LSR_ALWAYS_READY: u8 = 0x60;
 /// IIR: no interrupt pending.
 const IIR_NONE: u8 = 0x01;
 
+/// Pending-output bound (host-side observability buffer only — never
+/// machine state, never hashed). Oldest bytes are dropped past the cap;
+/// `dropped_bytes` records how much, so a future drain consumer can
+/// report truncation instead of silently presenting a gap.
+pub const MAX_PENDING_OUTPUT: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct DebugSerial {
     /// Pending output since the last drain (host observability only).
     out: Vec<u8>,
+    /// Bytes dropped (oldest-first) to keep `out` under the cap.
+    dropped_bytes: u64,
 }
 
 impl DebugSerial {
@@ -44,10 +54,26 @@ impl DebugSerial {
         Self::default()
     }
 
-    /// Drain pending output (the run loop flushes this to the slot's
-    /// JSON log / stdout).
+    /// Drain pending output. NOTE: nothing in production calls this yet
+    /// (bead 9f3x follow-up tracks wiring it to the slot's log); the
+    /// buffer is bounded either way.
     pub fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
+    }
+
+    /// Bytes dropped (oldest-first) since the last drain to hold the
+    /// [`MAX_PENDING_OUTPUT`] bound.
+    pub fn dropped_output_bytes(&self) -> u64 {
+        self.dropped_bytes
+    }
+
+    fn push_output(&mut self, data: &[u8]) {
+        self.out.extend_from_slice(data);
+        if self.out.len() > MAX_PENDING_OUTPUT {
+            let overflow = self.out.len() - MAX_PENDING_OUTPUT;
+            self.out.drain(..overflow);
+            self.dropped_bytes += overflow as u64;
+        }
     }
 
     /// Fixed read value for a 16550 register (output-only model).
@@ -73,7 +99,7 @@ impl DebugSerial {
     pub fn pio_write(&mut self, port: u16, data: &[u8]) {
         debug_assert!((SERIAL_PIO_BASE..SERIAL_PIO_BASE + SERIAL_PIO_LEN).contains(&port));
         if port == SERIAL_PIO_BASE + REG_THR_RBR {
-            self.out.extend_from_slice(data);
+            self.push_output(data);
         }
     }
 
@@ -114,7 +140,7 @@ impl DetDevice for DebugSerial {
         if data.len() == 4 && off == 0x08 {
             // THR mirror: low byte transmits (one register per 4-byte
             // slot, so unlike a PIO THR burst only data[0] is output).
-            self.out.push(data[0]);
+            self.push_output(&data[..1]);
         }
         // Everything else, incl. non-4-byte widths: swallowed (§6.9).
     }
@@ -129,6 +155,7 @@ impl DetDevice for DebugSerial {
         // Pending output is observability, not state: a restored slot
         // starts with an empty buffer.
         self.out.clear();
+        self.dropped_bytes = 0;
         Ok(())
     }
 }
@@ -155,6 +182,22 @@ mod tests {
             FakeEntropy(0),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn pending_output_is_bounded_with_drop_oldest() {
+        // 9f3x: no production drain exists, so a serial-chatty guest must
+        // not grow the buffer without bound across a long Run.
+        let mut s = DebugSerial::new();
+        let chunk = [b'x'; 4096];
+        for _ in 0..(MAX_PENDING_OUTPUT / chunk.len() + 10) {
+            s.pio_write(0x3F8, &chunk);
+        }
+        s.pio_write(0x3F8, b"TAIL");
+        assert!(s.out.len() <= MAX_PENDING_OUTPUT);
+        assert!(s.dropped_output_bytes() > 0);
+        let out = s.take_output();
+        assert!(out.ends_with(b"TAIL"), "newest bytes survive");
     }
 
     #[test]

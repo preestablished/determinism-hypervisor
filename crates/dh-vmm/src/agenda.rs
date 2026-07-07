@@ -102,106 +102,190 @@ pub enum AgendaError {
     BudgetOverflow,
 }
 
-/// Compile the sorted agenda. Pure: identical inputs yield identical output.
+/// Compile the sorted agenda into a materialized Vec. Pure: identical
+/// inputs yield identical output.
+///
+/// MEMORY WARNING (bead determinism-hypervisor-9f3x): the agenda has one
+/// StopPoint per epoch-grid and goal-poll point across the WHOLE budget —
+/// a streaming Run with an effectively-unbounded budget compiles to a
+/// multi-gigabyte Vec (the 2026-07-07 `dh-workerd` OOM). Run control
+/// iterates [`AgendaIter`] instead; use this only where the budget is
+/// known-small (tests, tooling).
 pub fn compile(inputs: &AgendaInputs<'_>) -> Result<Vec<StopPoint>, AgendaError> {
-    let start = inputs.start_icount;
-    let (final_icount, stop_kind) = match inputs.final_stop {
-        FinalStop::IcountBudget(b) => (
-            start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
-            StopKind::Budget,
-        ),
-        FinalStop::HardCap(b) => (
-            start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
-            StopKind::HardCap,
-        ),
-        FinalStop::VnsBudget(b) => {
-            // First icount whose vns reaches vns(start) + b. Both conversions
-            // are the §4 pure functions, so this is replay-stable.
-            let start_vns = inputs
-                .clock
-                .vns_from_icount(start)
-                .ok_or(AgendaError::BudgetOverflow)?;
-            let target_vns = start_vns
-                .checked_add(b)
-                .ok_or(AgendaError::BudgetOverflow)?;
-            let target = inputs
-                .clock
-                .icount_for_vns_target(target_vns)
-                .ok_or(AgendaError::BudgetOverflow)?;
-            // target < start happens only for zero/sub-instruction budgets
-            // (vns(start) truncates downward, and the ceil conversion of that
-            // truncated value can land at or before start). Clamping to
-            // start means "stop at the current boundary without executing".
-            (target.max(start), StopKind::Budget)
-        }
-    };
+    Ok(AgendaIter::new(inputs)?.collect())
+}
 
-    let mut points: Vec<StopPoint> = Vec::new();
-    let mut push = |icount: u64, f: &dyn Fn(&mut StopPoint)| match points
-        .binary_search_by_key(&icount, |p| p.icount)
-    {
-        Ok(i) => f(&mut points[i]),
-        Err(i) => {
-            let mut p = StopPoint {
-                icount,
-                inputs: Vec::new(),
-                injections: Vec::new(),
-                epoch_hash: false,
-                goal_poll: false,
-                final_stop: None,
-            };
-            f(&mut p);
-            points.insert(i, p);
-        }
-    };
+/// Streaming agenda: yields exactly the [`compile`] sequence — same
+/// points, same order, same flag/index aggregation — in O(scheduled
+/// inputs + injections) memory, independent of the budget. The epoch
+/// and goal-poll grids are advanced arithmetically per point instead of
+/// being materialized.
+///
+/// Every existing `compile` test exercises this type (compile collects
+/// it); `iter_matches_reference_compile` below additionally diffs it
+/// against the retired materializing implementation on random inputs.
+#[derive(Debug)]
+pub struct AgendaIter {
+    final_icount: u64,
+    stop_kind: StopKind,
+    /// (icount, original index) within (start, final], sorted by
+    /// (icount, index) — matching compile's per-point ascending-index
+    /// aggregation order.
+    inputs: std::iter::Peekable<std::vec::IntoIter<(u64, usize)>>,
+    injections: std::iter::Peekable<std::vec::IntoIter<(u64, usize)>>,
+    /// Next epoch-grid point ≤ final, if any.
+    epoch_next: Option<u64>,
+    epoch_len: u64,
+    /// Next goal-poll point ≤ final, if any.
+    goal_next: Option<u64>,
+    goal_period: u64,
+    done: bool,
+}
 
-    // Final stop first — it defines the agenda's end and always exists.
-    push(final_icount, &|p| p.final_stop = Some(stop_kind));
-
-    // Scheduled inputs within (start, final].
-    for (idx, &at) in inputs.scheduled_inputs.iter().enumerate() {
-        if at > start && at <= final_icount {
-            push(at, &|p| p.inputs.push(idx));
-        }
-    }
-
-    // Scheduled injections within (start, final].
-    for (idx, &at) in inputs.injections.iter().enumerate() {
-        if at > start && at <= final_icount {
-            push(at, &|p| p.injections.push(idx));
-        }
-    }
-
-    // Epoch grid: multiples of epoch_len from SEGMENT start (icount 0)
-    // within (start, final]. The checked k step matters: a grid point can
-    // legitimately land on u64::MAX, where an unchecked k+1 would overflow.
-    if let Some(len) = inputs.epoch_len {
-        let len = len.get();
-        let mut k = start / len + 1;
-        while let Some(at) = k.checked_mul(len) {
-            if at > final_icount {
-                break;
+impl AgendaIter {
+    pub fn new(inputs: &AgendaInputs<'_>) -> Result<Self, AgendaError> {
+        let start = inputs.start_icount;
+        let (final_icount, stop_kind) = match inputs.final_stop {
+            FinalStop::IcountBudget(b) => (
+                start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
+                StopKind::Budget,
+            ),
+            FinalStop::HardCap(b) => (
+                start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
+                StopKind::HardCap,
+            ),
+            FinalStop::VnsBudget(b) => {
+                // First icount whose vns reaches vns(start) + b. Both conversions
+                // are the §4 pure functions, so this is replay-stable.
+                let start_vns = inputs
+                    .clock
+                    .vns_from_icount(start)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                let target_vns = start_vns
+                    .checked_add(b)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                let target = inputs
+                    .clock
+                    .icount_for_vns_target(target_vns)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                // target < start happens only for zero/sub-instruction budgets
+                // (vns(start) truncates downward, and the ceil conversion of that
+                // truncated value can land at or before start). Clamping to
+                // start means "stop at the current boundary without executing".
+                (target.max(start), StopKind::Budget)
             }
-            push(at, &|p| p.epoch_hash = true);
-            let Some(next) = k.checked_add(1) else { break };
-            k = next;
-        }
-    }
+        };
 
-    // Goal polls: RUN-relative — start + k*period, k >= 1 (see field doc).
-    if let Some(period) = inputs.goal_poll_period {
-        let period = period.get();
-        let mut at = start.checked_add(period);
-        while let Some(p_at) = at {
-            if p_at > final_icount {
-                break;
+        let in_window = |at: u64| at > start && at <= final_icount;
+        let mut ins: Vec<(u64, usize)> = inputs
+            .scheduled_inputs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &at)| in_window(at))
+            .map(|(idx, &at)| (at, idx))
+            .collect();
+        ins.sort_unstable();
+        let mut injs: Vec<(u64, usize)> = inputs
+            .injections
+            .iter()
+            .enumerate()
+            .filter(|&(_, &at)| in_window(at))
+            .map(|(idx, &at)| (at, idx))
+            .collect();
+        injs.sort_unstable();
+
+        // Epoch grid: multiples of epoch_len from SEGMENT start (icount 0)
+        // within (start, final]. checked_mul matters: a grid point can
+        // legitimately land on u64::MAX.
+        let (epoch_len, epoch_next) = match inputs.epoch_len {
+            Some(len) => {
+                let len = len.get();
+                let first = (start / len + 1).checked_mul(len);
+                (len, first.filter(|&at| at <= final_icount))
             }
-            push(p_at, &|p| p.goal_poll = true);
-            at = p_at.checked_add(period);
-        }
-    }
+            None => (0, None),
+        };
+        // Goal polls: RUN-relative — start + k*period, k >= 1 (field doc).
+        let (goal_period, goal_next) = match inputs.goal_poll_period {
+            Some(period) => {
+                let period = period.get();
+                let first = start.checked_add(period);
+                (period, first.filter(|&at| at <= final_icount))
+            }
+            None => (0, None),
+        };
 
-    Ok(points)
+        Ok(AgendaIter {
+            final_icount,
+            stop_kind,
+            inputs: ins.into_iter().peekable(),
+            injections: injs.into_iter().peekable(),
+            epoch_next,
+            epoch_len,
+            goal_next,
+            goal_period,
+            done: false,
+        })
+    }
+}
+
+impl Iterator for AgendaIter {
+    type Item = StopPoint;
+
+    fn next(&mut self) -> Option<StopPoint> {
+        if self.done {
+            return None;
+        }
+        // Every source is filtered to ≤ final, so the merge minimum is the
+        // next agenda icount and the final point is the last one yielded.
+        let mut at = self.final_icount;
+        if let Some(&(a, _)) = self.inputs.peek() {
+            at = at.min(a);
+        }
+        if let Some(&(a, _)) = self.injections.peek() {
+            at = at.min(a);
+        }
+        if let Some(a) = self.epoch_next {
+            at = at.min(a);
+        }
+        if let Some(a) = self.goal_next {
+            at = at.min(a);
+        }
+
+        let mut point = StopPoint {
+            icount: at,
+            inputs: Vec::new(),
+            injections: Vec::new(),
+            epoch_hash: false,
+            goal_poll: false,
+            final_stop: None,
+        };
+        while self.inputs.peek().is_some_and(|&(a, _)| a == at) {
+            point.inputs.push(self.inputs.next().expect("peeked").1);
+        }
+        while self.injections.peek().is_some_and(|&(a, _)| a == at) {
+            point
+                .injections
+                .push(self.injections.next().expect("peeked").1);
+        }
+        if self.epoch_next == Some(at) {
+            point.epoch_hash = true;
+            self.epoch_next = at
+                .checked_add(self.epoch_len)
+                .filter(|&next| next <= self.final_icount);
+        }
+        if self.goal_next == Some(at) {
+            point.goal_poll = true;
+            self.goal_next = at
+                .checked_add(self.goal_period)
+                .filter(|&next| next <= self.final_icount);
+        }
+        if at == self.final_icount {
+            point.final_stop = Some(self.stop_kind);
+            self.done = true;
+        }
+        Some(point)
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +604,133 @@ mod tests {
                     assert_eq!(p.goal_poll, rel > 0 && rel % period == 0);
                 }
             }
+
+            // Differential: the streaming iterator (what run control
+            // consumes) must yield exactly the sequence the retired
+            // materializing implementation produced (9f3x fix).
+            assert_eq!(a, compile_reference(&in1).unwrap());
+        }
+    }
+
+    /// The pre-9f3x materializing implementation, retained verbatim as
+    /// the differential-test oracle for [`AgendaIter`]. Never call it
+    /// outside tests: its memory is O(budget/epoch_len) — the OOM.
+    fn compile_reference(inputs: &AgendaInputs<'_>) -> Result<Vec<StopPoint>, AgendaError> {
+        let start = inputs.start_icount;
+        let (final_icount, stop_kind) = match inputs.final_stop {
+            FinalStop::IcountBudget(b) => (
+                start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
+                StopKind::Budget,
+            ),
+            FinalStop::HardCap(b) => (
+                start.checked_add(b).ok_or(AgendaError::BudgetOverflow)?,
+                StopKind::HardCap,
+            ),
+            FinalStop::VnsBudget(b) => {
+                let start_vns = inputs
+                    .clock
+                    .vns_from_icount(start)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                let target_vns = start_vns
+                    .checked_add(b)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                let target = inputs
+                    .clock
+                    .icount_for_vns_target(target_vns)
+                    .ok_or(AgendaError::BudgetOverflow)?;
+                (target.max(start), StopKind::Budget)
+            }
+        };
+
+        let mut points: Vec<StopPoint> = Vec::new();
+        let mut push = |icount: u64, f: &dyn Fn(&mut StopPoint)| match points
+            .binary_search_by_key(&icount, |p| p.icount)
+        {
+            Ok(i) => f(&mut points[i]),
+            Err(i) => {
+                let mut p = StopPoint {
+                    icount,
+                    inputs: Vec::new(),
+                    injections: Vec::new(),
+                    epoch_hash: false,
+                    goal_poll: false,
+                    final_stop: None,
+                };
+                f(&mut p);
+                points.insert(i, p);
+            }
+        };
+
+        push(final_icount, &|p| p.final_stop = Some(stop_kind));
+
+        for (idx, &at) in inputs.scheduled_inputs.iter().enumerate() {
+            if at > start && at <= final_icount {
+                push(at, &|p| p.inputs.push(idx));
+            }
+        }
+
+        for (idx, &at) in inputs.injections.iter().enumerate() {
+            if at > start && at <= final_icount {
+                push(at, &|p| p.injections.push(idx));
+            }
+        }
+
+        if let Some(len) = inputs.epoch_len {
+            let len = len.get();
+            let mut k = start / len + 1;
+            while let Some(at) = k.checked_mul(len) {
+                if at > final_icount {
+                    break;
+                }
+                push(at, &|p| p.epoch_hash = true);
+                let Some(next) = k.checked_add(1) else { break };
+                k = next;
+            }
+        }
+
+        if let Some(period) = inputs.goal_poll_period {
+            let period = period.get();
+            let mut at = start.checked_add(period);
+            while let Some(p_at) = at {
+                if p_at > final_icount {
+                    break;
+                }
+                push(p_at, &|p| p.goal_poll = true);
+                at = p_at.checked_add(period);
+            }
+        }
+
+        Ok(points)
+    }
+
+    /// The 9f3x regression itself: a huge streaming budget must compile
+    /// its agenda in bounded memory. The iterator holds only cursors —
+    /// walking the first points of a u64::MAX/4 budget must not
+    /// materialize the ~10^11-point epoch grid (the retired compile()
+    /// would have needed terabytes here).
+    #[test]
+    fn huge_budget_agenda_is_bounded_memory() {
+        let inputs = AgendaInputs {
+            start_icount: 1_234,
+            scheduled_inputs: &[50_000],
+            injections: &[],
+            epoch_len: Some(nz(50_000_000)),
+            goal_poll_period: None,
+            final_stop: FinalStop::IcountBudget(u64::MAX / 4),
+            clock: ClockRatio::default(),
+        };
+        let mut iter = AgendaIter::new(&inputs).unwrap();
+        let first = iter.next().unwrap();
+        assert_eq!(first.icount, 50_000);
+        assert_eq!(first.inputs, vec![0]);
+        let second = iter.next().unwrap();
+        assert_eq!(second.icount, 50_000_000);
+        assert!(second.epoch_hash && second.final_stop.is_none());
+        // Walk a few grid points; each arrives lazily.
+        for k in 2..100u64 {
+            let p = iter.next().unwrap();
+            assert_eq!(p.icount, k * 50_000_000);
+            assert!(p.epoch_hash);
         }
     }
 }
