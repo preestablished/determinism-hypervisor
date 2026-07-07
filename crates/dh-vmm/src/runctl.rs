@@ -38,6 +38,7 @@ type InputSink<'a> = dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError
 type EpochSink<'a> =
     dyn FnMut(u64, Boundary, [u8; 32], Option<&SlotVm>) -> Result<(), BoundaryError> + 'a;
 type FrameSink<'a> = dyn FnMut(FrameMark) -> Result<FrameSinkFlow, BoundaryError> + 'a;
+type LiveInputSink<'a> = dyn FnMut(u32, Boundary) -> Result<(), BoundaryError> + 'a;
 
 /// One observed frame boundary: the pv-pad FRAME_COUNTER MMIO write's
 /// absolute value and the exit's icount. Handed to a [`FrameSink`] with
@@ -403,6 +404,7 @@ pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
         input_sink,
         epoch_sink,
         &mut |_| Ok(FrameSinkFlow::Continue),
+        &mut |_, _| Ok(()),
     )
 }
 
@@ -416,6 +418,16 @@ pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
 /// capture-neutral by contract: it must not touch guest state, the
 /// DHILOG, or the hash chain — chain links stay exactly where a plain
 /// run puts them (epoch grid + final stop), never per frame.
+///
+/// `live_input_sink` (M3: InjectInputs at streaming frame-holds) is
+/// called at each FRAME_MARK after the statically scheduled frame
+/// inputs and BEFORE `frame_sink`: the caller drains its out-of-band
+/// injection queue and applies any event due at this frame exactly as a
+/// pre-scheduled one — same boundary, same DHILOG records — so replay
+/// of the log reproduces the run bit-for-bit. Unlike `frame_sink` it is
+/// an input path, not a capture path: it may mutate device models and
+/// the DHILOG through the rail, but must not queue IRQ vectors (frame
+/// IRQ delivery is not wired, mirroring static frame inputs).
 #[allow(clippy::too_many_arguments)]
 pub fn run_segment_with_frame_captures(
     seg: &mut Segment<'_>,
@@ -428,6 +440,7 @@ pub fn run_segment_with_frame_captures(
     input_sink: &mut InputSink<'_>,
     epoch_sink: &mut EpochSink<'_>,
     frame_sink: &mut FrameSink<'_>,
+    live_input_sink: &mut LiveInputSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     run_segment_inner(
         seg,
@@ -441,6 +454,7 @@ pub fn run_segment_with_frame_captures(
         input_sink,
         epoch_sink,
         frame_sink,
+        live_input_sink,
     )
 }
 
@@ -465,6 +479,7 @@ pub fn run_segment_with_epoch_options(
         &mut |_, _| Ok(Vec::new()),
         epoch_sink,
         &mut |_| Ok(FrameSinkFlow::Continue),
+        &mut |_, _| Ok(()),
     )
 }
 
@@ -481,6 +496,7 @@ fn run_segment_inner(
     input_sink: &mut InputSink<'_>,
     epoch_sink: &mut EpochSink<'_>,
     frame_sink: &mut FrameSink<'_>,
+    live_input_sink: &mut LiveInputSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {
@@ -656,6 +672,17 @@ fn run_segment_inner(
                         }
                         frame_inputs_applied[slot] = true;
                     }
+                    // Live-injected inputs (M3) land after the static
+                    // set, before capture — the streamed frame reflects
+                    // every input applied at its boundary.
+                    live_input_sink(
+                        frame,
+                        Boundary {
+                            icount,
+                            rip: 0,
+                            rcx: 0,
+                        },
+                    )?;
                     // The capture sink runs with the vCPU held ON this
                     // boundary, after inputs — so the streamed frame
                     // reflects every input landed at it. It may block

@@ -173,6 +173,7 @@ pub struct SlotActor {
     slot_id: u64,
     tid: i32,
     pause: Arc<AtomicBool>,
+    live_inputs: Arc<SlotLiveInputs>,
     tx: mpsc::Sender<ActorCommand>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -201,6 +202,7 @@ impl SlotActor {
             slot_id,
             tid,
             pause,
+            live_inputs: Arc::new(SlotLiveInputs::new()),
             tx,
             join: Mutex::new(Some(join)),
         })
@@ -216,6 +218,13 @@ impl SlotActor {
 
     pub fn request_pause(&self) {
         self.pause.store(true, Ordering::SeqCst);
+    }
+
+    /// The live-injection side channel (M3): shared with the gRPC layer
+    /// so `InjectInputs` on a slot with an active streaming run never
+    /// queues behind the run on the actor command channel.
+    pub fn live_inputs(&self) -> Arc<SlotLiveInputs> {
+        Arc::clone(&self.live_inputs)
     }
 
     pub fn with_runtime<R>(
@@ -412,6 +421,102 @@ pub struct QueuedInput {
     pub at: QueuedInputAt,
     pub order: u64,
     pub kind: QueuedInputKind,
+}
+
+/// Live-injection side channel for a slot whose actor thread is occupied
+/// by a streaming run (M3, play-60fps plan).
+///
+/// The entire streaming run is ONE closure on the [`SlotActor`] command
+/// channel, so an `InjectInputs` routed through `with_runtime_mut` would
+/// silently queue behind it until the run — i.e. the whole play session
+/// — ends. This mirrors the one pattern that already crosses the actor
+/// boundary (the async-Pause `Arc<AtomicBool>`): the gRPC layer pushes
+/// into this shared queue without an actor command, and the run's
+/// FRAME_MARK live-input sink drains it with the vCPU held at the
+/// boundary. Everything drained is DHILOG-logged exactly as a
+/// pre-scheduled input, so replay reproduces the run bit-for-bit.
+pub struct SlotLiveInputs {
+    state: Mutex<Option<LiveInputRun>>,
+}
+
+/// State of the active streaming run, present only between
+/// [`SlotLiveInputs::activate`] and [`SlotLiveInputs::deactivate`].
+pub struct LiveInputRun {
+    /// Highest FRAME_MARK the run has reached — the rejection floor for
+    /// `at_frame` targets (must be strictly greater).
+    pub last_streamed_frame: u32,
+    /// Accepted, not-yet-due events.
+    pub pending: Vec<QueuedInput>,
+    /// Order space for live events; distinct from the runtime's so
+    /// leftovers can be re-ordered into `queued_inputs` on deactivation.
+    pub next_order: u64,
+    /// The VM's machine config, cloned at activation so the gRPC layer
+    /// can validate/convert events without touching the busy runtime.
+    pub machine_config: dh_vmm::config::MachineConfig,
+    /// Frame-scheduled-IRQ preconditions captured from the bus at
+    /// activation (the bus is unreachable mid-run): a `Some` reason
+    /// rejects live PadSet/NetRx events whose delivery would need to
+    /// queue an IRQ vector — delivery mid-run would fault the session.
+    pub pad_irq_blocked: Option<&'static str>,
+    pub net_irq_blocked: Option<&'static str>,
+}
+
+impl SlotLiveInputs {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    pub fn activate(&self, run: LiveInputRun) {
+        *self.state.lock().expect("live input mutex poisoned") = Some(run);
+    }
+
+    /// End the streaming run and return the events it never reached —
+    /// the caller re-queues them on the (now idle) runtime so an
+    /// accepted input is never silently dropped.
+    pub fn deactivate(&self) -> Vec<QueuedInput> {
+        self.state
+            .lock()
+            .expect("live input mutex poisoned")
+            .take()
+            .map(|run| run.pending)
+            .unwrap_or_default()
+    }
+
+    /// Record that the run reached `frame` and drain every pending event
+    /// now due (target frame ≤ `frame`; a target that slipped past while
+    /// the event was in flight applies at the next boundary rather than
+    /// being dropped — the DHILOG records the actual landing, so replay
+    /// is unaffected). Returned events preserve acceptance order.
+    pub fn observe_frame(&self, frame: u32) -> Vec<QueuedInput> {
+        let mut state = self.state.lock().expect("live input mutex poisoned");
+        let Some(run) = state.as_mut() else {
+            return Vec::new();
+        };
+        run.last_streamed_frame = run.last_streamed_frame.max(frame);
+        let mut due = Vec::new();
+        run.pending.retain(|input| match input.at {
+            QueuedInputAt::Frame(target) if target <= frame => {
+                due.push(input.clone());
+                false
+            }
+            _ => true,
+        });
+        due.sort_by_key(|input| input.order);
+        due
+    }
+
+    /// Run `f` against the active streaming run, if any. `None` means no
+    /// streaming run is active and the caller must use the normal
+    /// actor-channel path.
+    pub fn with_active<R>(&self, f: impl FnOnce(&mut LiveInputRun) -> R) -> Option<R> {
+        self.state
+            .lock()
+            .expect("live input mutex poisoned")
+            .as_mut()
+            .map(f)
+    }
 }
 
 /// The real resources owned by one worker slot.

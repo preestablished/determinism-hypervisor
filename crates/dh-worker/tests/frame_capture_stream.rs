@@ -365,6 +365,173 @@ fn linux_stream_cancel_lands_paused_at_a_frame_boundary() -> TestResult<()> {
 }
 
 #[test]
+#[ignore = "M9 Linux acceptance: requires KVM dirty-ring support and staged DH_M9_* artifacts"]
+fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<()> {
+    let Some(ready) = common::m9_linux_ready_snapshot(
+        "frame_capture_stream::linux_live_injected_inputs_at_frame_holds_replay_identically",
+        2,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    rt.block_on(async {
+        // A slow consumer holds the vCPU at each FRAME_MARK, giving the
+        // injection a stable frame-hold window (M3's operating mode).
+        let response = ready
+            .svc
+            .run_with_frame_capture(Request::new(proto::RunWithFrameCaptureRequest {
+                lease: Some(ready.lease.clone()),
+                until: Some(proto::run_with_frame_capture_request::Until::IcountBudget(
+                    12 * 28_000_000,
+                )),
+                hard_icount_cap: 0,
+            }))
+            .await
+            .map_err(|e| format!("RunWithFrameCapture: {e}"))?;
+        let mut stream = response.into_inner();
+        let mut frames_seen = 0u32;
+        let mut injected_at_frame = None;
+        let mut done = None;
+        while let Some(event) = stream.next().await {
+            match event.map_err(|e| format!("stream event: {e}"))?.msg {
+                Some(proto::frame_capture_event::Msg::Frame(frame)) => {
+                    frames_seen += 1;
+                    if frames_seen == 3 && injected_at_frame.is_none() {
+                        let target = frame.frame_index + 4;
+                        // Mid-run injection MUST return promptly (the
+                        // out-of-band queue, not the busy actor channel)
+                        // and be accepted for a future frame.
+                        let scheduled = ready
+                            .svc
+                            .inject_inputs(Request::new(proto::InjectInputsRequest {
+                                lease: Some(ready.lease.clone()),
+                                events: vec![proto::ScheduledEvent {
+                                    at: Some(proto::scheduled_event::At::AtFrame(target)),
+                                    event: Some(proto::scheduled_event::Event::PadSet(
+                                        proto::PadSet {
+                                            port: 0,
+                                            buttons: 0x0000_0010,
+                                        },
+                                    )),
+                                }],
+                            }))
+                            .await
+                            .map_err(|e| format!("live InjectInputs: {e}"))?
+                            .into_inner()
+                            .scheduled;
+                        if scheduled != 1 {
+                            return Err(format!("expected 1 scheduled, got {scheduled}"));
+                        }
+                        // Rejections: a held/past frame target and an
+                        // icount-scheduled event while streaming.
+                        let past = ready
+                            .svc
+                            .inject_inputs(Request::new(proto::InjectInputsRequest {
+                                lease: Some(ready.lease.clone()),
+                                events: vec![proto::ScheduledEvent {
+                                    at: Some(proto::scheduled_event::At::AtFrame(
+                                        frame.frame_index,
+                                    )),
+                                    event: Some(proto::scheduled_event::Event::PadSet(
+                                        proto::PadSet { port: 0, buttons: 1 },
+                                    )),
+                                }],
+                            }))
+                            .await;
+                        match past {
+                            Err(status) if status.code() == tonic::Code::InvalidArgument => {}
+                            other => {
+                                return Err(format!(
+                                    "past-frame live inject must fail INVALID_ARGUMENT, got {other:?}"
+                                ))
+                            }
+                        }
+                        let at_icount = ready
+                            .svc
+                            .inject_inputs(Request::new(proto::InjectInputsRequest {
+                                lease: Some(ready.lease.clone()),
+                                events: vec![proto::ScheduledEvent {
+                                    at: Some(proto::scheduled_event::At::AtIcount(u64::MAX)),
+                                    event: Some(proto::scheduled_event::Event::PadSet(
+                                        proto::PadSet { port: 0, buttons: 1 },
+                                    )),
+                                }],
+                            }))
+                            .await;
+                        match at_icount {
+                            Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
+                            other => {
+                                return Err(format!(
+                                    "icount live inject must fail FAILED_PRECONDITION, got {other:?}"
+                                ))
+                            }
+                        }
+                        injected_at_frame = Some(target);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Some(proto::frame_capture_event::Msg::Done(response)) => {
+                    done = Some(response);
+                }
+                None => return Err("FrameCaptureEvent without msg".into()),
+            }
+        }
+        let done =
+            done.ok_or_else(|| "stream ended without terminal RunResponse".to_string())?;
+        let injected_at_frame =
+            injected_at_frame.ok_or_else(|| "run too short to inject".to_string())?;
+        if u64::from(frames_seen) != done.frames_elapsed {
+            return Err("frame count mismatch".into());
+        }
+        if u64::from(injected_at_frame - ready.ready_snapshot.frame_counter)
+            > done.frames_elapsed
+        {
+            return Err(format!(
+                "budget ended before the injected frame {injected_at_frame} was reached; \
+                 raise the test budget"
+            ));
+        }
+
+        // Seal the segment and replay it from the READY base: the
+        // DHILOG must reproduce the live-injected run bit-for-bit.
+        let sealed = ready
+            .svc
+            .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                lease: Some(ready.lease.clone()),
+                seal_input_log: Some(true),
+                capture: None,
+            }))
+            .await
+            .map_err(|e| format!("TakeSnapshot seal: {e}"))?
+            .into_inner();
+        if sealed.state_hash != done.state_hash {
+            return Err("sealed snapshot state hash != streamed terminal state hash".into());
+        }
+        let verify = common::verify_replay_done(
+            &ready.svc,
+            ready.ready_snapshot_ref.clone(),
+            sealed.input_log_id.clone(),
+        )
+        .await?;
+        if verify.end_state_hash != done.state_hash {
+            return Err(
+                "DHILOG replay of the live-injected run diverged from the recorded terminal \
+                 state hash"
+                    .to_string(),
+            );
+        }
+        destroy(&ready.svc, &ready.lease).await;
+        Ok::<(), String>(())
+    })?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "M9 Linux acceptance (slow: ~40s watchdog wait): requires KVM dirty-ring support and staged DH_M9_* artifacts"]
 fn linux_stalled_consumer_watchdog_ends_the_run_paused() -> TestResult<()> {
     let Some(ready) = common::m9_linux_ready_snapshot(

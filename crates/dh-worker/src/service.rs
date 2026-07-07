@@ -1989,6 +1989,63 @@ fn queue_inputs_from_proto(
     Ok(scheduled)
 }
 
+/// `InjectInputs` against a slot whose streaming run is active (M3):
+/// validate and queue into the live side channel under its lock. Only
+/// `at_frame` events are accepted — the run's icount agenda is fixed at
+/// run start. Frame targets validate against the last streamed frame
+/// (the rejection floor the operator has actually seen); the IRQ
+/// preconditions were captured from the bus at run activation.
+#[cfg(target_arch = "x86_64")]
+fn live_inject_from_proto(
+    run: &mut crate::runtime::LiveInputRun,
+    events: &[proto::ScheduledEvent],
+) -> Result<u32, Status> {
+    let scheduled = u32::try_from(events.len())
+        .map_err(|_| Status::invalid_argument("too many scheduled events"))?;
+    let mut queued = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
+        match event.at.as_ref() {
+            Some(proto::scheduled_event::At::AtFrame(_)) => {}
+            Some(_) => {
+                return Err(Status::failed_precondition(format!(
+                    "events[{index}]: only at_frame events are accepted while a streaming \
+                     run is active (the icount agenda is fixed at run start)"
+                )));
+            }
+            None => {
+                return Err(Status::invalid_argument(format!(
+                    "events[{index}].at is required"
+                )));
+            }
+        }
+        let mut input = queued_input_from_proto(
+            index,
+            event,
+            0, // icount floor unused: at_frame events only
+            run.last_streamed_frame,
+            &run.machine_config,
+        )?;
+        let blocked = match &input.kind {
+            QueuedInputKind::PadSet { .. } => run.pad_irq_blocked,
+            QueuedInputKind::NetRx { .. } => run.net_irq_blocked,
+            QueuedInputKind::DevEvent { .. } => None,
+        };
+        if let Some(reason) = blocked {
+            return Err(Status::failed_precondition(format!(
+                "events[{index}].at_frame cannot queue an IRQ: {reason}"
+            )));
+        }
+        input.order = run.next_order;
+        run.next_order = run
+            .next_order
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("scheduled input order exhausted"))?;
+        queued.push(input);
+    }
+    run.pending.extend(queued);
+    Ok(scheduled)
+}
+
 #[cfg(target_arch = "x86_64")]
 fn record_error_to_boundary(e: dh_vmm::recording::RecordError) -> dh_vmm::boundary::BoundaryError {
     dh_vmm::boundary::BoundaryError::Exit(format!("device rail: {e:?}"))
@@ -3192,6 +3249,7 @@ fn drive_recorded_run<F>(
     run_until: RunUntil,
     capture: Option<proto::CaptureSpec>,
     mut frame_hook: Option<F>,
+    live_inputs: Option<Arc<crate::runtime::SlotLiveInputs>>,
 ) -> Result<proto::RunResponse, Status>
 where
     F: FnMut(proto::CapturedFrame) -> dh_vmm::runctl::FrameSinkFlow,
@@ -3228,6 +3286,34 @@ where
     let counter = runtime.counter.as_ref().ok_or_else(|| {
         Status::failed_precondition("slot actor has no InstRetired counter")
     })?;
+
+    // Open the live-injection window (M3) before the bus moves into the
+    // rail: the frame-scheduled-IRQ preconditions need the bus, and the
+    // gRPC layer needs the machine config, neither reachable mid-run.
+    if let Some(live) = live_inputs.as_ref() {
+        let pad_irq_blocked = frame_scheduled_irq_precondition(
+            &mut runtime.bus,
+            &QueuedInputKind::PadSet {
+                port: 0,
+                buttons: 0,
+                frame_hint: 0,
+            },
+        );
+        let net_irq_blocked = frame_scheduled_irq_precondition(
+            &mut runtime.bus,
+            &QueuedInputKind::NetRx { frame: Vec::new() },
+        );
+        live.activate(crate::runtime::LiveInputRun {
+            last_streamed_frame: runtime.position.frame_counter,
+            pending: Vec::new(),
+            // Live orders live in their own space; leftovers are
+            // re-ordered into the runtime's on deactivation.
+            next_order: 1 << 63,
+            machine_config: runtime.machine_config.clone(),
+            pad_irq_blocked,
+            net_irq_blocked,
+        });
+    }
 
     let mut goal = || false;
     let log = runtime.log.take().ok_or_else(|| {
@@ -3491,6 +3577,27 @@ where
             };
             Ok(hook(frame))
         };
+        // Live-injected inputs (M3): drained at the FRAME_MARK hold and
+        // applied through the rail exactly like pre-scheduled inputs —
+        // same boundary, same DHILOG records, so DHILOG replay
+        // reproduces the run bit-for-bit.
+        let mut live_input_sink = |frame: u32,
+                                   boundary: dh_vmm::boundary::Boundary|
+         -> Result<(), dh_vmm::boundary::BoundaryError> {
+            let Some(live) = live_inputs.as_ref() else {
+                return Ok(());
+            };
+            for input in live.observe_frame(frame) {
+                let vectors = apply_queued_input(&mut *rail.borrow_mut(), &input, boundary)?;
+                if !vectors.is_empty() {
+                    return Err(dh_vmm::boundary::BoundaryError::Exit(format!(
+                        "live frame input for FRAME_COUNTER {frame} queued IRQ vectors; \
+                         frame IRQ delivery is not wired"
+                    )));
+                }
+            }
+            Ok(())
+        };
         let run_result = {
             let mut segment = dh_vmm::runctl::Segment {
                 slot: &mut runtime.slot,
@@ -3515,6 +3622,7 @@ where
                 &mut input_sink,
                 &mut epoch_sink,
                 &mut frame_sink,
+                &mut live_input_sink,
             )
         };
         (
@@ -3533,6 +3641,26 @@ where
         &mut runtime.guest_events,
         drained_guest_events,
     );
+    // Close the live-injection window; accepted events the run never
+    // reached re-queue on the (now idle) runtime with fresh orders so
+    // they still apply on the next run — accepted is never dropped.
+    if let Some(live) = live_inputs.as_ref() {
+        let leftovers = live.deactivate();
+        if !leftovers.is_empty() {
+            for mut input in leftovers {
+                input.order = runtime.next_input_order;
+                runtime.next_input_order = runtime.next_input_order.saturating_add(1);
+                runtime.queued_inputs.push(input);
+            }
+            runtime.queued_inputs.sort_by_key(|input| {
+                let (kind, value) = match input.at {
+                    QueuedInputAt::Icount(icount) => (0u8, icount),
+                    QueuedInputAt::Frame(frame) => (1u8, u64::from(frame)),
+                };
+                (kind, value, input.order)
+            });
+        }
+    }
 
     match run_result {
         Ok(outcome) => {
@@ -4317,6 +4445,19 @@ impl HypervisorWorker for WorkerService {
                 manager
                     .checkout_write(&lease, "InjectInputs", lease_now_ms())
                     .map_err(slot_error_to_status)?;
+                // A slot with an active streaming run (M3): route through
+                // the live-injection side channel. The actor command
+                // channel is occupied by the run itself — queueing there
+                // would block until the play session ends.
+                let actor = runtimes
+                    .with(lease.slot_id, Arc::clone)
+                    .map_err(runtime_error_to_status)?;
+                let live = actor.live_inputs();
+                if let Some(result) =
+                    live.with_active(|run| live_inject_from_proto(run, &request.events))
+                {
+                    return result;
+                }
                 with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
                     queue_inputs_from_proto(runtime, request.events)
                 })?
@@ -4367,6 +4508,7 @@ impl HypervisorWorker for WorkerService {
                         run_until,
                         capture,
                         None::<fn(proto::CapturedFrame) -> dh_vmm::runctl::FrameSinkFlow>,
+                        None,
                     )
                 })?
             })
@@ -5054,6 +5196,10 @@ impl HypervisorWorker for WorkerService {
                         let actor_manager = manager.clone();
                         let actor_metrics = metrics.clone();
                         let actor_lease = lease.clone();
+                        let live_inputs = runtimes
+                            .with(lease.slot_id, Arc::clone)
+                            .map_err(runtime_error_to_status)?
+                            .live_inputs();
                         with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
                             drive_recorded_run(
                                 runtime,
@@ -5065,6 +5211,7 @@ impl HypervisorWorker for WorkerService {
                                 run_until,
                                 None,
                                 Some(hook),
+                                Some(live_inputs),
                             )
                         })?
                     }))

@@ -458,8 +458,10 @@ Amendment (play-60fps, M2/M3 — scope extension of the Phase-7 contract):
   scheduled before the run started — same injection windows (§3.4), same
   canonical DHILOG records, so DHILOG replay reproduces the run
   bit-for-bit. Events targeting the held or a past frame fail
-  FAILED_PRECONDITION. Icount-scheduled events are rejected while a
-  streaming run is active (their landing agenda is fixed at run start).
+  INVALID_ARGUMENT (the §2.9 past-target convention); icount-scheduled
+  events fail FAILED_PRECONDITION while a streaming run is active (the
+  run's landing agenda is fixed at run start). An accepted event the run
+  never reaches re-queues on the paused slot rather than being dropped.
   Input-to-effect latency: applied at the next FRAME_MARK hold, visible
   ≤2 frames (~33ms) later.
 - **Slot occupancy.** A play session pins one slot's actor thread (and
