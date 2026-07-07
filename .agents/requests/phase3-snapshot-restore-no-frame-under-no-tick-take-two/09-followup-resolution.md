@@ -1,7 +1,8 @@
 # Followup Resolution: Frame Hard Caps Retuned From Fresh Measurement
 
 Closes `08-followup-frame-hard-cap.md` (2026-07-07, bead
-`determinism-hypervisor-ego1`).
+`determinism-hypervisor-ego1`; retune commit `92bb674`, IO-frame cap
+correction in the same-day review-fix commit).
 
 ## Fresh measurement (not the trail's ~25M or 27.8M — re-derived)
 
@@ -19,10 +20,15 @@ temporarily at 500M, two consecutive runs bit-identical:
 - `FRAME_HARD_CAP` = **150,000,000**
   (`crates/dh-worker/tests/m5_frame_scheduling.rs`): 27.7M × 3 frames
   (FIRST_FRAMES) × ~1.8 margin; ratio to measured cost 1.81× (≤4× ✓).
-- `LINUX_FRAME_HARD_CAP` = **60,000,000**
-  (`crates/dh-worker/tests/m5_net_loopback.rs`): 27.7M × 1 frame
-  (LINUX_IO_FRAMES) × ~2.2 margin; ratio 2.17× (≤4× ✓). Now
-  measurement-anchored instead of coincidental.
+- `LINUX_FRAME_HARD_CAP` = **30,000,000**
+  (`crates/dh-worker/tests/m5_net_loopback.rs`): the IO frame itself
+  measured **7,768,576** instructions (io_frame_cost, identical across
+  two runs); 7.77M × 1 frame (LINUX_IO_FRAMES) × ~3.9 margin; ratio
+  3.86× (≤4× ✓), and the cap still covers a steady-state-cost frame
+  (~27.7M) if the IO ever moves past the warmup frame. (First landed as
+  60M off the frame-scheduling 27.7M proxy in `92bb674`; the review pass
+  measured the IO frame directly — 60M would have been 7.7×, over the
+  ≤4× bound — and corrected it.)
 - `DETCHANNEL_FRAME_HARD_CAP` = 1,000,000 **unchanged**: the detchannel
   test builds a synthetic VM (nanokernel `detchannel_frames_elf`,
   tempdir cache) and never loads the M9 Linux image — it does not gate

@@ -2373,7 +2373,7 @@ mod event_until_tests {
     #[test]
     fn next_sdk_event_idle_hlt_stops_guest_halted_not_wedged() {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let outcome = (|| {
                 let (mut slot, counter) = rig(nanokernel::idle_hlt_elf(), b"")?;
                 let config = cfg();
@@ -2414,10 +2414,18 @@ mod event_until_tests {
                     "idle HLT must stop far below the can't-fire cap, got {icount}"
                 );
             }
-            Err(_) => panic!(
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
                 "idle HLT wedged inside KVM_RUN for 60s — the NextSdkEvent \
                  wall-clock backstop is needed after all"
             ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker died without sending — resurface its panic
+                // rather than blaming a wedge that never happened.
+                match worker.join() {
+                    Ok(_) => panic!("probe thread exited without reporting an outcome"),
+                    Err(e) => std::panic::resume_unwind(e),
+                }
+            }
         }
     }
 
@@ -2425,13 +2433,15 @@ mod event_until_tests {
     /// (requests/nextsdkevent-run-wallclock-backstop): the best known
     /// attempt at a non-HLT zero-retirement block — MONITOR/MWAIT, then a
     /// PAUSE spin — under `Until::NextSdkEvent`. Acceptable outcomes are
-    /// anything that RETURNS: #UD escalation (no IDT → shutdown exit →
-    /// run error) or NOP-retirement into the PAUSE spin until the icount
-    /// hard cap trips. The only failure is not returning.
+    /// the two return paths: NOP-retirement into the PAUSE spin until the
+    /// icount hard cap trips at exactly the cap (the observed behavior on
+    /// the reference box), or #UD escalation (no IDT → shutdown exit →
+    /// run error) on a host that faults MWAIT instead. The failure modes
+    /// are not returning at all, or returning some other way.
     #[test]
     fn next_sdk_event_mwait_park_cannot_wedge_kvm_run() {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let outcome = (|| {
                 let (mut slot, counter) = rig(nanokernel::mwait_park_elf(), b"")?;
                 let config = cfg();
@@ -2457,21 +2467,35 @@ mod event_until_tests {
                     &mut |exit| Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}"))),
                 );
                 Some(match result {
-                    Ok(out) => format!("stopped: {:?} at icount {}", out.reason, out.boundary.icount),
-                    Err(e) => format!("errored (still a return): {e:?}"),
+                    Ok(out) => Ok((out.reason, out.boundary.icount)),
+                    Err(e) => Err(format!("{e:?}")),
                 })
             })();
             let _ = tx.send(outcome);
         });
         match rx.recv_timeout(std::time::Duration::from_secs(60)) {
             Ok(None) => (), // no usable /dev/kvm — skipped
-            Ok(Some(outcome)) => {
-                eprintln!("mwait_park probe outcome: {outcome}");
+            Ok(Some(Ok((reason, icount)))) => {
+                eprintln!("mwait_park probe outcome: stopped {reason:?} at icount {icount}");
+                assert_eq!(
+                    reason,
+                    StopReason::HardCap,
+                    "an MWAIT that retires must be bounded by the icount cap"
+                );
+                assert_eq!(icount, 300_000, "hard cap must trip at exactly the cap");
             }
-            Err(_) => panic!(
+            Ok(Some(Err(e))) => {
+                // #UD-escalation hosts: a loud run error is still a return.
+                eprintln!("mwait_park probe outcome: errored (still a return): {e}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
                 "MONITOR/MWAIT guest wedged inside KVM_RUN for 60s — the \
                  NextSdkEvent wall-clock backstop is needed after all"
             ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Ok(_) => panic!("probe thread exited without reporting an outcome"),
+                Err(e) => std::panic::resume_unwind(e),
+            },
         }
     }
 }

@@ -12,8 +12,8 @@ corroboration. **No backstop was implemented — none is needed.**
 - **Why, architecturally:** this VMM never creates an in-kernel irqchip
   or PIT — `crates/dh-vmm/src/lib.rs:170-189` lists
   `no_in_kernel_irqchip` in the forbidden-capability assertions, and
-  `crates/dh-vmm/src/kvm.rs:960` documents "We never call
-  KVM_CREATE_IRQCHIP/KVM_CREATE_PIT2" with a smoke test. Without an
+  `crates/dh-vmm/src/kvm.rs:955-964` (the forbidden-list smoke test)
+  documents "We never call KVM_CREATE_IRQCHIP/KVM_CREATE_PIT2". Without an
   in-kernel irqchip, KVM cannot emulate HLT in-kernel ("block until
   interrupt" has no kernel-side path here) — every guest `HLT` produces
   `KVM_EXIT_HLT` back to userspace. `runctl.rs`'s exit handler turns any
@@ -66,7 +66,7 @@ corroboration. **No backstop was implemented — none is needed.**
 - One wall-clock deadline does already exist in the run path — the
   RunWithFrameCapture stalled-consumer watchdog
   (`crates/dh-worker/src/service.rs:1493-1568`, `FrameSinkFlow::Stop`
-  reason `"watchdog"`, landing at `runctl.rs:742`) — but it applies only
+  reason `"watchdog"`, landing at `runctl.rs:741-748`) — but it applies only
   to capture runs (plain `Run` passes no frame sink, `service.rs:3738`)
   and acts only at frame-mark boundaries. It could never unwedge a
   `KVM_RUN` that doesn't exit, and per the above, no such `KVM_RUN`

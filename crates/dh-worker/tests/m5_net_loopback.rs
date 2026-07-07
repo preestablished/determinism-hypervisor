@@ -45,14 +45,16 @@ const EPOCH_LEN: u64 = 64;
 const NET_TX_DOORBELL_GPA: u64 = PV_NET_BASE + REG_TX_DOORBELL;
 const LINUX_IO_FRAMES: u32 = 1;
 /// Measured 2026-07-07 against reference-workload dist workload-image-0.1.0
-/// (built_from 7b0c7b2, refwork >= 40eaf4f): max ~27.7M instr/frame on the
-/// real emulator (m5_frame_scheduling linux_m5 frame table, identical
-/// across two consecutive runs). Cap = 27.7M × 1 frame (LINUX_IO_FRAMES)
-/// × ~2.2 margin ≈ 60M — a safety net, not a perf assertion; the normal
-/// stop is BUDGET_REACHED. Retune by re-running:
-/// cargo test -p dh-worker --release --test m5_frame_scheduling -- \
-///   --ignored linux_m5 --nocapture
-const LINUX_FRAME_HARD_CAP: u64 = 60_000_000;
+/// (built_from 7b0c7b2, refwork >= 40eaf4f): this test's one IO frame
+/// (the first post-READY frame) costs 7,768,576 instructions
+/// (`io_frame_cost` eprintln below, identical across two consecutive
+/// runs). Cap = 7.77M × 1 frame (LINUX_IO_FRAMES) × ~3.9 margin ≈ 30M —
+/// within the ≤4× acceptance bound while still covering a
+/// steady-state-cost frame (~27.7M, the m5_frame_scheduling figure) if
+/// the harness ever moves the IO past the cheap warmup frame. A safety
+/// net, not a perf assertion; the normal stop is BUDGET_REACHED. Retune
+/// by re-running this test with --nocapture and reading io_frame_cost.
+const LINUX_FRAME_HARD_CAP: u64 = 30_000_000;
 const META_IO_MAGIC_OFF: u64 = 32;
 const META_IO_PROOF_LEN: u64 = 24;
 const BLKO_DIRTY_COUNT_OFF: usize = 32;
@@ -149,6 +151,15 @@ fn linux_pvblk_io_loopback_records_and_replays() -> TestResult<()> {
         Ok::<_, String>((run, io_snapshot, meta_proof, verify_done))
     })?;
 
+    // Print the measured IO-frame cost BEFORE the meta-proof assertion so
+    // a fixture-era proof failure (bead determinism-hypervisor-jyo7) still
+    // records the number LINUX_FRAME_HARD_CAP is derived from.
+    eprintln!(
+        "linux-pvblk-io run_icount={} ready_icount={} io_frame_cost={}",
+        run.icount,
+        ready.ready_snapshot.icount,
+        run.icount - ready.ready_snapshot.icount
+    );
     let checksum = assert_meta_io_proof(&meta_proof)?;
     let io_ref = io_snapshot
         .snapshot

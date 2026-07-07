@@ -36,7 +36,9 @@ Repo revs: probes `90b37d3`, retune `92bb674`, ring-I handoff test
   instr/frame** (fresh 7.77M/27.68M/27.68M; post-restore 27.68M×2;
   NOP-game 9.2M).
 - `FRAME_HARD_CAP` 50M → **150M** (3 frames, 1.81× measured);
-  `LINUX_FRAME_HARD_CAP` 50M → **60M** (1 frame, 2.17×);
+  `LINUX_FRAME_HARD_CAP` 50M → **30M** (1 frame; the IO frame itself
+  measured 7.77M twice-identical, ratio 3.86× — corrected from an
+  initial 60M proxy derivation by the same-day review pass);
   `DETCHANNEL_FRAME_HARD_CAP` **unchanged** — verified synthetic-guest
   only (CreateVm + nanokernel `detchannel_frames_elf`, never the M9
   image), so it does not gate the real path. Derivation comments in the
