@@ -2360,4 +2360,118 @@ mod event_until_tests {
         assert_eq!(out.reason, StopReason::HardCap);
         assert_eq!(out.boundary.icount, 300_000);
     }
+
+    /// Wall-clock backstop probe A
+    /// (requests/nextsdkevent-run-wallclock-backstop): an idle-parked
+    /// guest — STI then HLT with no timer armed and no SDK event ever fed
+    /// — under `Until::NextSdkEvent`. With no in-kernel irqchip (lib.rs
+    /// forbidden-capability list) KVM cannot emulate HLT in-kernel, so
+    /// the HLT must exit to userspace and stop the run as GuestHalted.
+    /// The watchdog thread turns a wedged KVM_RUN into a test failure
+    /// instead of a hung job; if this ever fires, the host-side deadline
+    /// backstop the request deferred becomes real work.
+    #[test]
+    fn next_sdk_event_idle_hlt_stops_guest_halted_not_wedged() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = (|| {
+                let (mut slot, counter) = rig(nanokernel::idle_hlt_elf(), b"")?;
+                let config = cfg();
+                let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+                let pause = AtomicBool::new(false);
+                let events = std::cell::Cell::new(0u64);
+                let mut seg = Segment {
+                    slot: &mut slot,
+                    counter: &counter,
+                    chain: &mut chain,
+                    config: &config,
+                    start_icount: 0,
+                    injections: &[],
+                    timer: None,
+                    pause: &pause,
+                    sdk_events: Some(&events),
+                    hash_device_sections: None,
+                };
+                let out = run_segment(
+                    &mut seg,
+                    Until::NextSdkEvent {
+                        hard_cap: 1_000_000_000,
+                    },
+                    &mut || false,
+                    &mut |exit| Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}"))),
+                )
+                .unwrap();
+                Some((out.reason, out.boundary.icount))
+            })();
+            let _ = tx.send(outcome);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(None) => (), // no usable /dev/kvm — skipped
+            Ok(Some((reason, icount))) => {
+                assert_eq!(reason, StopReason::GuestHalted);
+                assert!(
+                    icount < 1_000_000_000,
+                    "idle HLT must stop far below the can't-fire cap, got {icount}"
+                );
+            }
+            Err(_) => panic!(
+                "idle HLT wedged inside KVM_RUN for 60s — the NextSdkEvent \
+                 wall-clock backstop is needed after all"
+            ),
+        }
+    }
+
+    /// Wall-clock backstop probe B
+    /// (requests/nextsdkevent-run-wallclock-backstop): the best known
+    /// attempt at a non-HLT zero-retirement block — MONITOR/MWAIT, then a
+    /// PAUSE spin — under `Until::NextSdkEvent`. Acceptable outcomes are
+    /// anything that RETURNS: #UD escalation (no IDT → shutdown exit →
+    /// run error) or NOP-retirement into the PAUSE spin until the icount
+    /// hard cap trips. The only failure is not returning.
+    #[test]
+    fn next_sdk_event_mwait_park_cannot_wedge_kvm_run() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = (|| {
+                let (mut slot, counter) = rig(nanokernel::mwait_park_elf(), b"")?;
+                let config = cfg();
+                let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+                let pause = AtomicBool::new(false);
+                let events = std::cell::Cell::new(0u64);
+                let mut seg = Segment {
+                    slot: &mut slot,
+                    counter: &counter,
+                    chain: &mut chain,
+                    config: &config,
+                    start_icount: 0,
+                    injections: &[],
+                    timer: None,
+                    pause: &pause,
+                    sdk_events: Some(&events),
+                    hash_device_sections: None,
+                };
+                let result = run_segment(
+                    &mut seg,
+                    Until::NextSdkEvent { hard_cap: 300_000 },
+                    &mut || false,
+                    &mut |exit| Err(BoundaryError::Exit(format!("unexpected exit: {exit:?}"))),
+                );
+                Some(match result {
+                    Ok(out) => format!("stopped: {:?} at icount {}", out.reason, out.boundary.icount),
+                    Err(e) => format!("errored (still a return): {e:?}"),
+                })
+            })();
+            let _ = tx.send(outcome);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(None) => (), // no usable /dev/kvm — skipped
+            Ok(Some(outcome)) => {
+                eprintln!("mwait_park probe outcome: {outcome}");
+            }
+            Err(_) => panic!(
+                "MONITOR/MWAIT guest wedged inside KVM_RUN for 60s — the \
+                 NextSdkEvent wall-clock backstop is needed after all"
+            ),
+        }
+    }
 }

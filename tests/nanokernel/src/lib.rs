@@ -68,6 +68,20 @@ pub fn sti_window_elf() -> &'static [u8] {
     include_bytes!(concat!(env!("OUT_DIR"), "/sti_window.elf"))
 }
 
+/// Wall-clock backstop probe A guest (see asm/idle_hlt.asm): STI then an
+/// idle HLT park — the epoll-parked-agent shape. Must exit to userspace
+/// (GuestHalted), never wedge inside KVM_RUN.
+pub fn idle_hlt_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/idle_hlt.elf"))
+}
+
+/// Wall-clock backstop probe B guest (see asm/mwait_park.asm):
+/// MONITOR/MWAIT then a PAUSE spin — the best known attempt at a non-HLT
+/// zero-retirement block. Every branch returns from KVM_RUN.
+pub fn mwait_park_elf() -> &'static [u8] {
+    include_bytes!(concat!(env!("OUT_DIR"), "/mwait_park.elf"))
+}
+
 /// The M3 interrupt guest (see asm/timer_guest.asm): IDT with recording
 /// ISRs for vectors 0x40/0x41, STI by default ("mask" keeps IF=0; "arm"
 /// is the full MMIO arming loop awaiting the device-bus run loop).

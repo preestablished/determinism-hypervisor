@@ -21,6 +21,8 @@ const PROGRAMS: &[&str] = &[
     "fake_frames",
     "detchannel_frames",
     "hello",
+    "idle_hlt",
+    "mwait_park",
     "sti_window",
     "timer_guest",
     "counting",
