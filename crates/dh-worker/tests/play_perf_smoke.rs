@@ -28,7 +28,11 @@ use tokio_stream::StreamExt;
 use tonic::Request;
 
 const PER_FRAME_SAMPLES: u64 = 240;
-const FRAME_HARD_CAP: u64 = 50_000_000;
+/// Per-frame Run hard cap: ~2 frames of headroom over the measured
+/// workload. Each Run asserts BUDGET_REACHED, so if instructions/frame
+/// drifts past the cap the smoke fails loudly instead of silently
+/// skewing instr_per_frame and the fps ratio.
+const FRAME_HARD_CAP: u64 = 2 * common::M9_INSTR_PER_FRAME_ESTIMATE;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
@@ -69,6 +73,13 @@ fn linux_play_path_perf_smoke() -> TestResult<()> {
                 .await
                 .map_err(|e| format!("per-frame Run {i}: {e}"))?
                 .into_inner();
+            if run.reason != i32::from(proto::StopReason::BudgetReached) {
+                return Err(format!(
+                    "per-frame Run {i} stopped with reason {} instead of BUDGET_REACHED — \
+                     FRAME_HARD_CAP / M9_INSTR_PER_FRAME_ESTIMATE is stale",
+                    run.reason
+                ));
+            }
             let run_elapsed = t.elapsed();
             run_total += run_elapsed;
             run_max = run_max.max(run_elapsed);

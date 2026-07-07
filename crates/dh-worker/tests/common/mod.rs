@@ -39,6 +39,15 @@ pub const DH_M9_IMAGE_CACHE: &str = "DH_M9_IMAGE_CACHE";
 #[allow(dead_code)]
 pub const DH_M9_GUEST: &str = "DH_M9_GUEST";
 
+/// Measured instructions-per-frame of the M9 reference workload
+/// (play-60fps M0, 2026-07-07: ~27.8M on the real-emulator image).
+/// M9 frame/budget constants derive from this ONE number so workload
+/// drift is adjusted in one place; tests that consume it must fail
+/// loudly (assert BUDGET_REACHED / frames observed), never skew
+/// silently, when the estimate goes stale.
+#[allow(dead_code)]
+pub const M9_INSTR_PER_FRAME_ESTIMATE: u64 = 28_000_000;
+
 #[allow(dead_code)]
 pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [
     DH_M9_BZIMAGE,

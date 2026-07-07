@@ -2071,6 +2071,19 @@ where
         }
         tail
     };
+    // The PHYSICAL counter — not the last canonical record's icount — is
+    // authoritative for the segment-final link: frame-mark replays (the
+    // no-doorbell frame-boundary drains above) legitimately advance the
+    // counter past the last canonical record, so keying on canonical
+    // icounts would skip the final link the recording pushed at its stop.
+    // No `terminal_sdk_target.is_none()` guard here either, on purpose:
+    // when an sdk-terminated recording ends with the counter already AT
+    // end_icount (tail == None), the recording's finish_at_counter still
+    // pushed a final link, and the recorded-end-hash substitution below
+    // requires `tail == Some(_)` — so skipping the link here would
+    // manufacture a spurious Divergence rather than avoid one. The link
+    // is pushed exactly when the recording pushed it: counter at end and
+    // no epoch link already on that boundary.
     let replay_counter_at_end = counter
         .read()
         .map_err(|e| ReplayError::Run(format!("{e:?}")))?

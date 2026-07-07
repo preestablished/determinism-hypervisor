@@ -388,7 +388,10 @@ message RunWithFrameCaptureRequest {
     uint64 icount_budget = 2;
     uint64 vns_budget    = 3;
   }
-  uint64 hard_icount_cap = 4;          // 0 ⇒ worker default
+  uint64 hard_icount_cap = 4;          // 0 ⇒ worker default. Currently UNUSED:
+                                       //   the budget until arms are taken literally
+                                       //   (mirroring Run); the field is reserved
+                                       //   for a future event-driven until arm.
 }
 message FrameCaptureEvent {
   oneof msg {

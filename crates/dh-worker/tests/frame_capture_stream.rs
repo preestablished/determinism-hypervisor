@@ -19,12 +19,18 @@ use tokio_stream::StreamExt;
 use tonic::Request;
 
 /// Budget for the capture-neutrality leg: crosses the 50M-instruction
-/// epoch grid at least twice so streaming-path epoch links are exercised,
-/// not just the final stop link.
+/// epoch grid at least twice (so streaming-path epoch links are
+/// exercised, not just the final stop link) and spans several frames.
 const NEUTRALITY_BUDGET: u64 = 120_000_000;
-/// Budget for the slow-consumer and cancel legs: long enough for tens of
-/// frames, short enough that a paced consumer finishes quickly.
-const SHORT_BUDGET: u64 = 20_000_000;
+/// Budget for the slow-consumer leg: ~8 frames' worth of the measured
+/// workload (common::M9_INSTR_PER_FRAME_ESTIMATE), so a paced consumer
+/// finishes quickly but the leg still streams multiple frames — the
+/// leg asserts frames > 0 so estimate drift fails loudly.
+const SHORT_BUDGET: u64 = 8 * common::M9_INSTR_PER_FRAME_ESTIMATE;
+/// Budget for the live-inject leg: the injection targets ~7 frames in
+/// (3 observed + 4 ahead); 12 frames' worth gives drift headroom, and
+/// the test fails loudly if the injected frame is never reached.
+const LIVE_INJECT_BUDGET: u64 = 12 * common::M9_INSTR_PER_FRAME_ESTIMATE;
 
 /// layout_version 1: XRGB8888 256x224, stride 1024 (D7 contract).
 const FB_V1_BYTES: usize = 1024 * 224;
@@ -212,6 +218,13 @@ fn linux_streaming_capture_is_neutral_complete_and_backpressure_safe() -> TestRe
         .await?;
         destroy(&ready.svc, &slow_lease).await;
 
+        if slow.frames.is_empty() {
+            return Err(
+                "slow-consumer leg streamed no frames; SHORT_BUDGET / \
+                 M9_INSTR_PER_FRAME_ESTIMATE is stale"
+                    .into(),
+            );
+        }
         if fast_short.done.state_hash != slow.done.state_hash
             || fast_short.done.icount != slow.done.icount
             || fast_short.frames.len() != slow.frames.len()
@@ -387,7 +400,7 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
             .run_with_frame_capture(Request::new(proto::RunWithFrameCaptureRequest {
                 lease: Some(ready.lease.clone()),
                 until: Some(proto::run_with_frame_capture_request::Until::IcountBudget(
-                    12 * 28_000_000,
+                    LIVE_INJECT_BUDGET,
                 )),
                 hard_icount_cap: 0,
             }))

@@ -312,6 +312,7 @@ struct WorkerMetrics {
     frame_emit_ms: Mutex<MetricHistogram>,
     frame_hold_ms: Mutex<MetricHistogram>,
     frame_holds_in_progress: std::sync::atomic::AtomicU64,
+    frame_stream_threads: std::sync::atomic::AtomicU64,
     frame_stream_terminations: Mutex<BTreeMap<&'static str, u64>>,
 }
 
@@ -329,6 +330,17 @@ const FRAME_STREAM_TERMINATION_LABELS: &[&str] = &[
     "fault",
     "other",
 ];
+
+/// Fold an unlisted termination label into `"other"` so a future
+/// mislabel is still exposed by `render` (which iterates the fixed list)
+/// instead of being recorded invisibly.
+fn canonical_termination_label(reason: &'static str) -> &'static str {
+    if FRAME_STREAM_TERMINATION_LABELS.contains(&reason) {
+        reason
+    } else {
+        "other"
+    }
+}
 
 impl WorkerMetrics {
     fn record_exit(&self, slot_id: u64, reason: &'static str) {
@@ -365,7 +377,19 @@ impl WorkerMetrics {
             .frame_stream_terminations
             .lock()
             .expect("metrics mutex poisoned");
-        *terminations.entry(reason).or_insert(0) += 1;
+        *terminations
+            .entry(canonical_termination_label(reason))
+            .or_insert(0) += 1;
+    }
+
+    fn frame_stream_thread_started(&self) {
+        self.frame_stream_threads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn frame_stream_thread_finished(&self) {
+        self.frame_stream_threads
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn observe_snapshot(&self, elapsed: Duration, dirty_pages: u64) {
@@ -521,7 +545,7 @@ impl WorkerMetrics {
             .render(
                 &mut out,
                 "dh_worker_frame_emit_duration_milliseconds",
-                "Per-frame capture+emit latency (framebuffer read, lz4, stream send incl. backpressure hold).",
+                "Per-frame stream-send latency including the backpressure hold (framebuffer read and lz4 happen before this measurement).",
                 MS_BUCKETS,
             );
         self.frame_hold_ms
@@ -542,6 +566,17 @@ impl WorkerMetrics {
         out.push_str(&format!(
             "dh_worker_frame_holds_in_progress {}\n",
             self.frame_holds_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        push_help_type(
+            &mut out,
+            "dh_worker_frame_stream_threads",
+            "Live RunWithFrameCapture orchestration threads; a persistently nonzero value with no active stream is a stuck thread.",
+            "gauge",
+        );
+        out.push_str(&format!(
+            "dh_worker_frame_stream_threads {}\n",
+            self.frame_stream_threads
                 .load(std::sync::atomic::Ordering::Relaxed)
         ));
         push_help_type(
@@ -1459,9 +1494,144 @@ const FRAME_STREAM_CHANNEL_CAPACITY: usize = 2;
 /// but stops reading would otherwise hold the vCPU, the slot's actor
 /// thread, and its pinned core forever (leases have no TTL). After this
 /// long at one hold, the run ends at the held frame boundary exactly as
-/// a cancel would.
+/// a cancel would. The same bound applies separately to the terminal
+/// `Done` delivery, so a consumer that stalls mid-stream pins stream
+/// resources for at most ~two watchdog periods (one for the emit hold,
+/// one for the terminal send) — bounded, never indefinite.
 #[cfg(target_arch = "x86_64")]
 const FRAME_STREAM_STALL_WATCHDOG: Duration = Duration::from_secs(30);
+
+#[cfg(target_arch = "x86_64")]
+type FrameStreamSender = tokio::sync::mpsc::Sender<Result<proto::FrameCaptureEvent, Status>>;
+
+/// RAII backpressure-hold accounting: decrements the
+/// `dh_worker_frame_holds_in_progress` gauge (and observes the hold
+/// histogram) on drop, so a panic unwinding the actor thread mid-hold
+/// cannot strand the gauge at a nonzero value — a gauge is the one
+/// metric that never self-corrects.
+#[cfg(target_arch = "x86_64")]
+struct FrameHoldGuard<'a> {
+    metrics: &'a WorkerMetrics,
+    started: Instant,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<'a> FrameHoldGuard<'a> {
+    fn start(metrics: &'a WorkerMetrics) -> Self {
+        metrics.frame_hold_started();
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for FrameHoldGuard<'_> {
+    fn drop(&mut self) {
+        self.metrics.frame_hold_finished(self.started.elapsed());
+    }
+}
+
+/// Emit one `CapturedFrame` into the stream channel, holding until the
+/// consumer frees capacity. Returns the sink flow plus the stop cause
+/// (`"cancel"` / `"watchdog"`) when the emit itself ended the run.
+///
+/// This is DELIBERATELY a `try_send` + 1ms-sleep poll loop, not
+/// `send().await`: it runs on the slot's dedicated actor OS thread (the
+/// vCPU hold IS the backpressure), and an async send would have to move
+/// the block onto a shared runtime worker — do not "optimize" it.
+#[cfg(target_arch = "x86_64")]
+fn stream_frame_event(
+    tx: &FrameStreamSender,
+    metrics: &WorkerMetrics,
+    stall_deadline: Duration,
+    frame: proto::CapturedFrame,
+) -> (dh_vmm::runctl::FrameSinkFlow, Option<&'static str>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    let emit_start = Instant::now();
+    let mut event = Ok(proto::FrameCaptureEvent {
+        msg: Some(proto::frame_capture_event::Msg::Frame(frame)),
+    });
+    let mut hold: Option<FrameHoldGuard<'_>> = None;
+    loop {
+        match tx.try_send(event) {
+            Ok(()) => {
+                drop(hold);
+                metrics.record_streamed_frame(emit_start.elapsed());
+                return (dh_vmm::runctl::FrameSinkFlow::Continue, None);
+            }
+            Err(TrySendError::Full(returned)) => {
+                event = returned;
+                let guard = hold.get_or_insert_with(|| FrameHoldGuard::start(metrics));
+                if guard.started.elapsed() >= stall_deadline {
+                    return (dh_vmm::runctl::FrameSinkFlow::Stop, Some("watchdog"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(TrySendError::Closed(_)) => {
+                return (dh_vmm::runctl::FrameSinkFlow::Stop, Some("cancel"));
+            }
+        }
+    }
+}
+
+/// RAII accounting for the `dh_worker_frame_stream_threads` gauge: the
+/// decrement rides Drop so a panic anywhere in the orchestration-thread
+/// closure (including its post-`catch_unwind` epilogue, where a
+/// poisoned-mutex `expect` can still unwind) cannot strand the gauge —
+/// which would fabricate the very "stuck thread" signal it exists to
+/// detect. Same rationale as [`FrameHoldGuard`].
+#[cfg(target_arch = "x86_64")]
+struct FrameStreamThreadGuard(Arc<WorkerMetrics>);
+
+#[cfg(target_arch = "x86_64")]
+impl FrameStreamThreadGuard {
+    fn start(metrics: Arc<WorkerMetrics>) -> Self {
+        metrics.frame_stream_thread_started();
+        Self(metrics)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for FrameStreamThreadGuard {
+    fn drop(&mut self) {
+        self.0.frame_stream_thread_finished();
+    }
+}
+
+/// Bounded terminal delivery (dual-review finding I1): when the watchdog
+/// ends a run the channel is still FULL of unread frames, so an
+/// unbounded `blocking_send(Done)` would pin this orchestration thread
+/// (plus the buffered framebuffers) for the lifetime of a connection the
+/// consumer never reads again — the exact adversary the watchdog exists
+/// to defend against, repeatable per lease. Bound it by the same
+/// deadline and drop the terminal event if the consumer is gone; a
+/// consumer that violated the read contract observes a truncated stream,
+/// a live one is unaffected. Returns whether the event was delivered.
+#[cfg(target_arch = "x86_64")]
+fn send_terminal_frame_event(
+    tx: &FrameStreamSender,
+    event: Result<proto::FrameCaptureEvent, Status>,
+    stall_deadline: Duration,
+) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    let deadline = Instant::now() + stall_deadline;
+    let mut event = event;
+    loop {
+        match tx.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                event = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
@@ -1992,8 +2162,9 @@ fn queue_inputs_from_proto(
 /// `InjectInputs` against a slot whose streaming run is active (M3):
 /// validate and queue into the live side channel under its lock. Only
 /// `at_frame` events are accepted — the run's icount agenda is fixed at
-/// run start. Frame targets validate against the last streamed frame
-/// (the rejection floor the operator has actually seen); the IRQ
+/// run start. Frame targets validate against the highest frame the run
+/// has reached (which may be ~2 frames ahead of what the consumer has
+/// displayed — see `LiveInputRun::last_reached_frame`); the IRQ
 /// preconditions were captured from the bus at run activation.
 #[cfg(target_arch = "x86_64")]
 fn live_inject_from_proto(
@@ -2022,7 +2193,7 @@ fn live_inject_from_proto(
             index,
             event,
             0, // icount floor unused: at_frame events only
-            run.last_streamed_frame,
+            run.last_reached_frame,
             &run.machine_config,
         )?;
         let blocked = match &input.kind {
@@ -3229,6 +3400,87 @@ where
         .map_err(runtime_actor_error_to_status)
 }
 
+/// Segment-invariant inputs for epoch-boundary bisection checkpoints —
+/// everything `capture_epoch_bisection_checkpoint` needs besides the
+/// per-epoch values (icount, chain value, anchor).
+#[cfg(target_arch = "x86_64")]
+struct BisectionCheckpointCtx<'a> {
+    machine_config: &'a dh_vmm::config::MachineConfig,
+    store: &'a Mutex<snapstore_client::blocking::SnapstoreClient>,
+    start_segment_icount: u64,
+    start_segment_vns: u64,
+    start_segment_epoch: u64,
+    start_cumulative_icount: u64,
+    start_vns: u64,
+    start_cumulative_epoch: u64,
+    epoch_len: u64,
+}
+
+/// Capture one bisection checkpoint snapshot at a checkpoint-safe epoch
+/// boundary (extracted from the recorded-run epoch sink). Returns the
+/// `(snapshot_ref_bytes, checkpoint_vns, max_covered_gap)` triple the
+/// sink logs as the AUX BISECTION_CHECKPOINT record.
+#[cfg(target_arch = "x86_64")]
+fn capture_epoch_bisection_checkpoint(
+    ctx: &BisectionCheckpointCtx<'_>,
+    slot: &dh_vmm::kvm::SlotVm,
+    rail: &dh_vmm::recording::DeviceRail<RuntimeVmMem>,
+    pending_inputs: &[QueuedInput],
+    anchor_icount: u64,
+    icount: u64,
+    chain_value: [u8; 32],
+) -> Result<([u8; 32], u64, u32), dh_vmm::boundary::BoundaryError> {
+    let checkpoint_vns = segment_vns_from_icount(ctx.machine_config, icount).map_err(|e| {
+        dh_vmm::boundary::BoundaryError::Exit(format!(
+            "bisection checkpoint vns: {}: {}",
+            e.code(),
+            e.message()
+        ))
+    })?;
+    let max_covered_gap = u32::try_from(icount.saturating_sub(anchor_icount)).map_err(|_| {
+        dh_vmm::boundary::BoundaryError::Exit(format!(
+            "bisection checkpoint gap {} exceeds u32",
+            icount.saturating_sub(anchor_icount)
+        ))
+    })?;
+    let segment_delta = icount.saturating_sub(ctx.start_segment_icount);
+    let vns_delta = checkpoint_vns.saturating_sub(ctx.start_segment_vns);
+    let segment_epoch = icount / ctx.epoch_len;
+    let epoch_delta = segment_epoch.saturating_sub(ctx.start_segment_epoch);
+    let agenda_empty = !pending_inputs.iter().any(|input| match input.at {
+        QueuedInputAt::Icount(at) => at > icount,
+        QueuedInputAt::Frame(_) => true,
+    });
+    let checkpoint_boundary = crate::snapshot_engine::BoundaryState {
+        icount: ctx.start_cumulative_icount.saturating_add(segment_delta),
+        vns: ctx.start_vns.saturating_add(vns_delta),
+        epoch_index: ctx.start_cumulative_epoch.saturating_add(epoch_delta),
+        hash_chain: chain_value,
+        agenda_empty,
+    };
+    let store = ctx.store.lock().map_err(|_| {
+        dh_vmm::boundary::BoundaryError::Exit("snapshot-store client mutex poisoned".into())
+    })?;
+    let checkpoint = crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
+        slot,
+        dh_vmm::SlotState::Paused,
+        &rail.bus,
+        &rail.lapic,
+        &rail.entropy,
+        ctx.machine_config,
+        checkpoint_boundary,
+        &store,
+    )
+    .map_err(|e| {
+        dh_vmm::boundary::BoundaryError::Exit(format!("bisection checkpoint snapshot: {e:?}"))
+    })?;
+    Ok((
+        checkpoint.snapshot_ref.to_bytes(),
+        checkpoint_vns,
+        max_covered_gap,
+    ))
+}
+
 /// The recorded-run core shared by `Run` and `RunWithFrameCapture`:
 /// occupies the slot's actor thread, drives one segment with the
 /// recording rail attached, and lands the slot Paused at the stop
@@ -3304,7 +3556,7 @@ where
             &QueuedInputKind::NetRx { frame: Vec::new() },
         );
         live.activate(crate::runtime::LiveInputRun {
-            last_streamed_frame: runtime.position.frame_counter,
+            last_reached_frame: runtime.position.frame_counter,
             pending: Vec::new(),
             // Live orders live in their own space; leftovers are
             // re-ordered into the runtime's on deactivation.
@@ -3411,92 +3663,36 @@ where
              chain_value,
              checkpoint_slot: Option<&dh_vmm::kvm::SlotVm>| {
                 let icount = boundary.icount;
-                let pending_checkpoint = if let Some(slot) = checkpoint_slot {
-                    if let Some(machine_config) = checkpoint_machine_config.as_ref()
-                    {
-                        let checkpoint_vns =
-                            segment_vns_from_icount(machine_config, icount)
-                                .map_err(|e| {
-                                    dh_vmm::boundary::BoundaryError::Exit(
-                                        format!(
-                                            "bisection checkpoint vns: {}: {}",
-                                            e.code(),
-                                            e.message()
-                                        ),
-                                    )
-                                })?;
-                        let max_covered_gap = u32::try_from(
-                            icount.saturating_sub(checkpoint_anchor_icount),
-                        )
-                        .map_err(|_| {
-                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                "bisection checkpoint gap {} exceeds u32",
-                                icount.saturating_sub(checkpoint_anchor_icount)
-                            ))
+                let pending_checkpoint = match (checkpoint_slot, checkpoint_machine_config.as_ref())
+                {
+                    (Some(slot), Some(machine_config)) => {
+                        let store = checkpoint_store.as_ref().ok_or_else(|| {
+                            dh_vmm::boundary::BoundaryError::Exit(
+                                "bisection checkpoint store missing".into(),
+                            )
                         })?;
-                        let segment_delta =
-                            icount.saturating_sub(start_segment_icount);
-                        let vns_delta =
-                            checkpoint_vns.saturating_sub(start_segment_vns);
-                        let segment_epoch = icount / epoch_len;
-                        let epoch_delta =
-                            segment_epoch.saturating_sub(start_segment_epoch);
-                        let agenda_empty = !pending_inputs.iter().any(|input| {
-                            match input.at {
-                                QueuedInputAt::Icount(at) => at > icount,
-                                QueuedInputAt::Frame(_) => true,
-                            }
-                        });
-                        let checkpoint_boundary =
-                            crate::snapshot_engine::BoundaryState {
-                                icount: start_cumulative_icount
-                                    .saturating_add(segment_delta),
-                                vns: start_vns.saturating_add(vns_delta),
-                                epoch_index: start_cumulative_epoch
-                                    .saturating_add(epoch_delta),
-                                hash_chain: chain_value,
-                                agenda_empty,
-                            };
-                        let rail_ref = rail.borrow();
-                        let store = checkpoint_store
-                            .as_ref()
-                            .ok_or_else(|| {
-                                dh_vmm::boundary::BoundaryError::Exit(
-                                    "bisection checkpoint store missing".into(),
-                                )
-                            })?
-                            .lock()
-                            .map_err(|_| {
-                                dh_vmm::boundary::BoundaryError::Exit(
-                                    "snapshot-store client mutex poisoned".into(),
-                                )
-                            })?;
-                        let checkpoint =
-                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
-                            slot,
-                            dh_vmm::SlotState::Paused,
-                            &rail_ref.bus,
-                            &rail_ref.lapic,
-                            &rail_ref.entropy,
+                        let ctx = BisectionCheckpointCtx {
                             machine_config,
-                            checkpoint_boundary,
-                            &store,
-                        )
-                        .map_err(|e| {
-                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                "bisection checkpoint snapshot: {e:?}"
-                            ))
-                        })?;
-                        Some((
-                            checkpoint.snapshot_ref.to_bytes(),
-                            checkpoint_vns,
-                            max_covered_gap,
-                        ))
-                    } else {
-                        None
+                            store,
+                            start_segment_icount,
+                            start_segment_vns,
+                            start_segment_epoch,
+                            start_cumulative_icount,
+                            start_vns,
+                            start_cumulative_epoch,
+                            epoch_len,
+                        };
+                        Some(capture_epoch_bisection_checkpoint(
+                            &ctx,
+                            slot,
+                            &rail.borrow(),
+                            &pending_inputs,
+                            checkpoint_anchor_icount,
+                            icount,
+                            chain_value,
+                        )?)
                     }
-                } else {
-                    None
+                    _ => None,
                 };
                 rail.borrow_mut()
                     .log_epoch_hash(epoch_index, icount, chain_value)
@@ -3643,7 +3839,14 @@ where
     );
     // Close the live-injection window; accepted events the run never
     // reached re-queue on the (now idle) runtime with fresh orders so
-    // they still apply on the next run — accepted is never dropped.
+    // they still apply on the next run. Semantics note: as static
+    // frame inputs they match their target frame EXACTLY (runctl's
+    // `scheduled.frame != frame` skip), whereas the live path drains
+    // with `target <= frame` catch-up — so "accepted is never dropped"
+    // is strict within one run, but an input carried across the run
+    // boundary is lost if the guest ever skips its exact FRAME_COUNTER
+    // value (monotonicity permits jumps > 1; pv-pad in practice
+    // increments by 1).
     if let Some(live) = live_inputs.as_ref() {
         let leftovers = live.deactivate();
         if !leftovers.is_empty() {
@@ -4449,6 +4652,15 @@ impl HypervisorWorker for WorkerService {
                 // the live-injection side channel. The actor command
                 // channel is occupied by the run itself — queueing there
                 // would block until the play session ends.
+                //
+                // Accepted window: if a streaming run starts between this
+                // check returning None and the with_runtime_mut send
+                // below, that one InjectInputs queues behind the session
+                // on the actor channel. It stays correct (validated
+                // against the then-current state when it eventually
+                // runs), and the window only exists for an injection
+                // racing the session's very first frame — the bridge
+                // issues Play before it accepts pad input.
                 let actor = runtimes
                     .with(lease.slot_id, Arc::clone)
                     .map_err(runtime_error_to_status)?;
@@ -5133,6 +5345,7 @@ impl HypervisorWorker for WorkerService {
             let spawn = std::thread::Builder::new()
                 .name(format!("dh-frames-{}", lease.slot_id))
                 .spawn(move || {
+                    let _thread_gauge = FrameStreamThreadGuard::start(thread_metrics.clone());
                     // Set by the emit hook when IT ended the run; the
                     // terminal StopReason is PAUSED either way, so this is
                     // the only place cancel and watchdog stay distinct.
@@ -5145,53 +5358,24 @@ impl HypervisorWorker for WorkerService {
                         let frames_tx = tx.clone();
                         let emit_metrics = metrics.clone();
                         let emit_stop_cause = stop_cause.clone();
+                        // Blocking in the hook holds the vCPU at the
+                        // FRAME_MARK boundary — the emit loop IS the
+                        // backpressure. The run occupies the slot's
+                        // dedicated actor thread, never a shared async
+                        // runtime.
                         let hook = move |frame: proto::CapturedFrame| {
-                            use tokio::sync::mpsc::error::TrySendError;
-                            let emit_start = Instant::now();
-                            let mut event = Ok(proto::FrameCaptureEvent {
-                                msg: Some(proto::frame_capture_event::Msg::Frame(frame)),
-                            });
-                            let mut hold_started: Option<Instant> = None;
-                            // Blocking here holds the vCPU at the FRAME_MARK
-                            // boundary — this loop IS the backpressure. The
-                            // run occupies the slot's dedicated actor thread,
-                            // never a shared async runtime.
-                            loop {
-                                match frames_tx.try_send(event) {
-                                    Ok(()) => {
-                                        if let Some(started) = hold_started {
-                                            emit_metrics.frame_hold_finished(started.elapsed());
-                                        }
-                                        emit_metrics.record_streamed_frame(emit_start.elapsed());
-                                        return dh_vmm::runctl::FrameSinkFlow::Continue;
-                                    }
-                                    Err(TrySendError::Full(returned)) => {
-                                        event = returned;
-                                        let started = *hold_started.get_or_insert_with(|| {
-                                            emit_metrics.frame_hold_started();
-                                            Instant::now()
-                                        });
-                                        if started.elapsed() >= FRAME_STREAM_STALL_WATCHDOG {
-                                            emit_metrics.frame_hold_finished(started.elapsed());
-                                            *emit_stop_cause
-                                                .lock()
-                                                .expect("stop cause mutex poisoned") =
-                                                Some("watchdog");
-                                            return dh_vmm::runctl::FrameSinkFlow::Stop;
-                                        }
-                                        std::thread::sleep(Duration::from_millis(1));
-                                    }
-                                    Err(TrySendError::Closed(_)) => {
-                                        if let Some(started) = hold_started {
-                                            emit_metrics.frame_hold_finished(started.elapsed());
-                                        }
-                                        *emit_stop_cause
-                                            .lock()
-                                            .expect("stop cause mutex poisoned") = Some("cancel");
-                                        return dh_vmm::runctl::FrameSinkFlow::Stop;
-                                    }
-                                }
+                            let (flow, cause) = stream_frame_event(
+                                &frames_tx,
+                                &emit_metrics,
+                                FRAME_STREAM_STALL_WATCHDOG,
+                                frame,
+                            );
+                            if let Some(cause) = cause {
+                                *emit_stop_cause
+                                    .lock()
+                                    .expect("stop cause mutex poisoned") = Some(cause);
                             }
+                            flow
                         };
                         let actor_manager = manager.clone();
                         let actor_metrics = metrics.clone();
@@ -5245,16 +5429,17 @@ impl HypervisorWorker for WorkerService {
                         (Err(_), None) => "fault",
                     };
                     thread_metrics.record_frame_stream_termination(termination);
-                    match result {
-                        Ok(done) => {
-                            let _ = tx.blocking_send(Ok(proto::FrameCaptureEvent {
-                                msg: Some(proto::frame_capture_event::Msg::Done(done)),
-                            }));
-                        }
-                        Err(e) => {
-                            let _ = tx.blocking_send(Err(e));
-                        }
-                    }
+                    let terminal = match result {
+                        Ok(done) => Ok(proto::FrameCaptureEvent {
+                            msg: Some(proto::frame_capture_event::Msg::Done(done)),
+                        }),
+                        Err(e) => Err(e),
+                    };
+                    let _ = send_terminal_frame_event(
+                        &tx,
+                        terminal,
+                        FRAME_STREAM_STALL_WATCHDOG,
+                    );
                 });
             if let Err(e) = spawn {
                 return Err(Status::internal(format!(
@@ -5330,6 +5515,132 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use crate::runtime::{SlotActor, SlotPosition, SlotRuntime};
     use dh_proto::v1::hypervisor_worker_server::HypervisorWorker;
+
+    /// Host-level coverage of the frame-stream hook state machine —
+    /// where the watchdog/cancel/terminal-delivery logic lives, and the
+    /// only place the never-reading-consumer hang (dual-review I1) can
+    /// be exercised without KVM or M9 artifacts.
+    #[cfg(target_arch = "x86_64")]
+    mod frame_stream_hook {
+        use super::super::*;
+
+        fn test_frame() -> proto::CapturedFrame {
+            proto::CapturedFrame {
+                frame_index: 1,
+                icount: 1,
+                fb_lz4: Vec::new(),
+                fb_info: None,
+            }
+        }
+
+        fn done_event() -> Result<proto::FrameCaptureEvent, Status> {
+            Ok(proto::FrameCaptureEvent {
+                msg: Some(proto::frame_capture_event::Msg::Done(
+                    proto::RunResponse::default(),
+                )),
+            })
+        }
+
+        #[test]
+        fn emit_continues_when_capacity_is_available() {
+            let metrics = WorkerMetrics::default();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            let (flow, cause) =
+                stream_frame_event(&tx, &metrics, Duration::from_secs(1), test_frame());
+            assert_eq!(flow, dh_vmm::runctl::FrameSinkFlow::Continue);
+            assert_eq!(cause, None);
+            assert!(rx.try_recv().is_ok());
+            assert_eq!(
+                metrics
+                    .frames_streamed_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        }
+
+        #[test]
+        fn emit_reports_cancel_when_the_consumer_is_gone() {
+            let metrics = WorkerMetrics::default();
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            drop(rx);
+            let (flow, cause) =
+                stream_frame_event(&tx, &metrics, Duration::from_secs(1), test_frame());
+            assert_eq!(flow, dh_vmm::runctl::FrameSinkFlow::Stop);
+            assert_eq!(cause, Some("cancel"));
+        }
+
+        #[test]
+        fn emit_trips_the_watchdog_on_a_full_channel_and_balances_the_gauge() {
+            let metrics = WorkerMetrics::default();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(done_event()).expect("fill capacity");
+            let deadline = Duration::from_millis(30);
+            let started = Instant::now();
+            let (flow, cause) = stream_frame_event(&tx, &metrics, deadline, test_frame());
+            assert_eq!(flow, dh_vmm::runctl::FrameSinkFlow::Stop);
+            assert_eq!(cause, Some("watchdog"));
+            assert!(started.elapsed() >= deadline);
+            assert_eq!(
+                metrics
+                    .frame_holds_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "hold gauge must return to zero on the watchdog path"
+            );
+        }
+
+        /// Dual-review I1 regression: after the watchdog fires the
+        /// channel is still full; the terminal delivery must give up
+        /// within the deadline instead of pinning the orchestration
+        /// thread for the lifetime of a connection the consumer never
+        /// reads again.
+        #[test]
+        fn terminal_send_does_not_pin_the_thread_on_a_never_reading_consumer() {
+            let (tx, _rx_held_open_but_never_read) = tokio::sync::mpsc::channel(2);
+            tx.try_send(done_event()).expect("fill 1");
+            tx.try_send(done_event()).expect("fill 2");
+            let deadline = Duration::from_millis(50);
+            let started = Instant::now();
+            let delivered = send_terminal_frame_event(&tx, done_event(), deadline);
+            assert!(!delivered, "terminal event must be dropped, not queued");
+            assert!(started.elapsed() >= deadline);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "terminal send must be bounded"
+            );
+        }
+
+        #[test]
+        fn terminal_send_delivers_when_the_consumer_drains() {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(done_event()).expect("fill capacity");
+            let drainer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let first = rx.blocking_recv();
+                let second = rx.blocking_recv();
+                (first.is_some(), second.is_some())
+            });
+            let delivered =
+                send_terminal_frame_event(&tx, done_event(), Duration::from_secs(5));
+            assert!(delivered, "a live consumer must receive the terminal event");
+            drop(tx);
+            let (first, second) = drainer.join().expect("drainer thread");
+            assert!(first && second);
+        }
+
+        #[test]
+        fn unlisted_termination_label_folds_into_other() {
+            // The fold is tested directly (unconditionally, in every
+            // build) — record_frame_stream_termination debug_asserts on
+            // unlisted labels, so routing a bad label through it here
+            // would abort debug test runs.
+            assert_eq!(canonical_termination_label("watchdog"), "watchdog");
+            assert_eq!(canonical_termination_label("not-a-real-label"), "other");
+            for label in FRAME_STREAM_TERMINATION_LABELS {
+                assert_eq!(canonical_termination_label(label), *label);
+            }
+        }
+    }
 
     fn test_config(slots: usize) -> WorkerConfig {
         WorkerConfig {

@@ -443,8 +443,13 @@ pub struct SlotLiveInputs {
 /// [`SlotLiveInputs::activate`] and [`SlotLiveInputs::deactivate`].
 pub struct LiveInputRun {
     /// Highest FRAME_MARK the run has reached — the rejection floor for
-    /// `at_frame` targets (must be strictly greater).
-    pub last_streamed_frame: u32,
+    /// `at_frame` targets (must be strictly greater). Deliberately the
+    /// RUN's position, not the last frame the consumer received: with a
+    /// capacity-2 stream the run can be ~2 frames ahead of the viewer,
+    /// and the floor must stay at the run position — injecting into a
+    /// frame whose boundary the run has already passed is a determinism
+    /// hazard, so do not "fix" this toward the consumer's position.
+    pub last_reached_frame: u32,
     /// Accepted, not-yet-due events.
     pub pending: Vec<QueuedInput>,
     /// Order space for live events; distinct from the runtime's so
@@ -494,7 +499,7 @@ impl SlotLiveInputs {
         let Some(run) = state.as_mut() else {
             return Vec::new();
         };
-        run.last_streamed_frame = run.last_streamed_frame.max(frame);
+        run.last_reached_frame = run.last_reached_frame.max(frame);
         let mut due = Vec::new();
         run.pending.retain(|input| match input.at {
             QueuedInputAt::Frame(target) if target <= frame => {
