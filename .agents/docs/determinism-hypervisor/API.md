@@ -424,6 +424,56 @@ message CapturedFrame {
 }
 ```
 
+Amendment (play-60fps, M2/M3 — scope extension of the Phase-7 contract):
+
+- **Interactive play is an approved consumer.** The RPC was specified for
+  the offline replay-renderer; the rom-operator-bridge play path now uses
+  it live. Capture-neutrality and the never-drop backpressure rule are
+  unchanged and CI-tested (`crates/dh-worker/tests/frame_capture_stream.rs`).
+  Chain links happen only on the epoch grid plus one final-stop link —
+  never per frame.
+- **Stopping a streaming run: cancel, not Pause.** Cancelling the gRPC
+  stream ends the run AT the next FRAME_MARK boundary (≤1 frame of
+  latency) as a Pause-equivalent stop: the slot lands `PAUSED_S` at that
+  deterministic icount with the normal final hash link, and the DHILOG
+  reflects a normal segment stop. `Pause` remains the exploration/audit
+  primitive and is grid-quantized (§2.4): it rolls forward to the NEXT
+  EPOCH boundary — up to ~one epoch (≈50 frames / ~1s at ~1M
+  instructions/frame) of extra play. Interactive Stop MUST use stream
+  cancellation; clients must not be offered both paths with silently
+  different latencies.
+- **Stalled-consumer watchdog.** A consumer that keeps the stream open
+  but stops reading holds the vCPU at the FRAME_MARK boundary; after a
+  worker-constant deadline (30s) the run ends at the held boundary
+  exactly as a cancel would (terminal `RunResponse` reason `PAUSED`).
+  The distinct cause is surfaced in
+  `dh_worker_frame_stream_terminations_total{reason="watchdog"}`.
+- **"Run until I say stop"** is a large `icount_budget` plus cancel — no
+  `frame_budget` arm is added unless operating experience demands it.
+- **`InjectInputs` during a streaming frame-hold (M3).** A slot whose
+  streaming run is holding at a FRAME_MARK accepts `InjectInputs` for
+  events scheduled `at_frame(N)` with N strictly greater than the last
+  streamed frame index: they are merged into the active run's
+  frame-input set and applied at the matching FRAME_MARK exactly as if
+  scheduled before the run started — same injection windows (§3.4), same
+  canonical DHILOG records, so DHILOG replay reproduces the run
+  bit-for-bit. Events targeting the held or a past frame fail
+  FAILED_PRECONDITION. Icount-scheduled events are rejected while a
+  streaming run is active (their landing agenda is fixed at run start).
+  Input-to-effect latency: applied at the next FRAME_MARK hold, visible
+  ≤2 frames (~33ms) later.
+- **Slot occupancy.** A play session pins one slot's actor thread (and
+  its pinned core) for the session's duration; a worker shared with the
+  exploration orchestrator loses that slot from its pool while the
+  session lasts. The operator bridge uses a dedicated worker today.
+- **Observability.** Streaming runs record `/metrics` (§2.8):
+  `dh_worker_frames_streamed_total`,
+  `dh_worker_frame_emit_duration_milliseconds`,
+  `dh_worker_frame_hold_duration_milliseconds`,
+  `dh_worker_frame_holds_in_progress`, and
+  `dh_worker_frame_stream_terminations_total{reason=
+  budget|hard_cap|paused|halted|cancel|watchdog|fault|other}`.
+
 ### 2.8 Worker / health
 
 ```proto
@@ -434,6 +484,8 @@ message GetWorkerInfoResponse {
   uint32 slots_free  = 3;
   DeterminismClass class = 4;
   string version = 5;                  // dh-workerd semver
+  string build_profile = 6;            // "release" | "debug"; long-lived
+                                       //   operator workers MUST be "release"
 }
 message DeterminismClass {             // ARCH §7.4; embedded in manifests too
   string cpu_model    = 1;             // e.g. family/model/stepping string

@@ -37,6 +37,30 @@ type ExitSink<'a> = dyn FnMut(VcpuExit) -> Result<(), BoundaryError> + 'a;
 type InputSink<'a> = dyn FnMut(usize, Boundary) -> Result<Vec<u8>, BoundaryError> + 'a;
 type EpochSink<'a> =
     dyn FnMut(u64, Boundary, [u8; 32], Option<&SlotVm>) -> Result<(), BoundaryError> + 'a;
+type FrameSink<'a> = dyn FnMut(FrameMark) -> Result<FrameSinkFlow, BoundaryError> + 'a;
+
+/// One observed frame boundary: the pv-pad FRAME_COUNTER MMIO write's
+/// absolute value and the exit's icount. Handed to a [`FrameSink`] with
+/// the vCPU paused ON that exit, after exit servicing and frame-scheduled
+/// input landing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMark {
+    pub frame: u32,
+    pub icount: u64,
+}
+
+/// A frame sink's verdict. `Stop` ends the segment AT the held frame
+/// boundary with `StopReason::Paused` and the normal final hash link —
+/// the streaming-capture cancel/watchdog landing (a Pause-equivalent
+/// stop; DHILOG reflects a normal segment stop). The sink MUST be
+/// read-only with respect to guest state, the DHILOG, and the hash chain
+/// (capture-neutrality, ARCH §6.10 C5); blocking inside it implements
+/// streaming backpressure — the vCPU stays held at the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSinkFlow {
+    Continue,
+    Stop,
+}
 
 /// API.md §2.4 `Run.until`, Phase-1 shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,6 +402,45 @@ pub fn run_segment_with_scheduled_inputs_frames_and_epochs(
         on_exit,
         input_sink,
         epoch_sink,
+        &mut |_| Ok(FrameSinkFlow::Continue),
+    )
+}
+
+/// [`run_segment_with_scheduled_inputs_frames_and_epochs`] plus a
+/// per-frame capture sink (`RunWithFrameCapture`, API.md Phase-7 block):
+/// `frame_sink` is called once per FRAME_MARK with the vCPU paused ON the
+/// frame-boundary exit, after `on_exit` servicing and frame-scheduled
+/// input landing. Blocking in the sink holds the vCPU (backpressure);
+/// returning [`FrameSinkFlow::Stop`] ends the segment at that boundary
+/// with `StopReason::Paused` and the normal final hash link. The sink is
+/// capture-neutral by contract: it must not touch guest state, the
+/// DHILOG, or the hash chain — chain links stay exactly where a plain
+/// run puts them (epoch grid + final stop), never per frame.
+#[allow(clippy::too_many_arguments)]
+pub fn run_segment_with_frame_captures(
+    seg: &mut Segment<'_>,
+    until: Until,
+    scheduled_inputs: &[u64],
+    frame_inputs: &[ScheduledFrameInput],
+    start_frame_counter: u32,
+    goal: &mut GoalFn<'_>,
+    on_exit: &mut ExitSink<'_>,
+    input_sink: &mut InputSink<'_>,
+    epoch_sink: &mut EpochSink<'_>,
+    frame_sink: &mut FrameSink<'_>,
+) -> Result<SegmentOutcome, RunError> {
+    run_segment_inner(
+        seg,
+        until,
+        RunOptions::default(),
+        scheduled_inputs,
+        frame_inputs,
+        start_frame_counter,
+        goal,
+        on_exit,
+        input_sink,
+        epoch_sink,
+        frame_sink,
     )
 }
 
@@ -401,6 +464,7 @@ pub fn run_segment_with_epoch_options(
         on_exit,
         &mut |_, _| Ok(Vec::new()),
         epoch_sink,
+        &mut |_| Ok(FrameSinkFlow::Continue),
     )
 }
 
@@ -416,6 +480,7 @@ fn run_segment_inner(
     on_exit: &mut ExitSink<'_>,
     input_sink: &mut InputSink<'_>,
     epoch_sink: &mut EpochSink<'_>,
+    frame_sink: &mut FrameSink<'_>,
 ) -> Result<SegmentOutcome, RunError> {
     let clock = seg.config.clock;
     let margins = Margins {
@@ -537,6 +602,7 @@ fn run_segment_inner(
     // the exit boundary, with the device state already current.
     let mut halted = false;
     let mut event_stop = false;
+    let mut frame_sink_stop = false;
     let mut frames_seen = 0u64;
     let mut last_frame_counter = start_frame_counter;
     let mut frame_inputs_applied = vec![false; frame_inputs.len()];
@@ -590,6 +656,19 @@ fn run_segment_inner(
                         }
                         frame_inputs_applied[slot] = true;
                     }
+                    // The capture sink runs with the vCPU held ON this
+                    // boundary, after inputs — so the streamed frame
+                    // reflects every input landed at it. It may block
+                    // (backpressure) but never mutates guest state.
+                    match frame_sink(FrameMark { frame, icount })? {
+                        FrameSinkFlow::Continue => {}
+                        FrameSinkFlow::Stop => {
+                            frame_sink_stop = true;
+                            return Err(BoundaryError::Exit(
+                                "frame sink requested stop".into(),
+                            ));
+                        }
+                    }
                     if frame_target == Some(frames_seen) {
                         event_stop = true;
                         return Err(BoundaryError::Exit("frame budget reached".into()));
@@ -622,6 +701,20 @@ fn run_segment_inner(
                         seg,
                         clock,
                         StopReason::GuestHalted,
+                        delivered,
+                        timer_fired,
+                        frames_seen,
+                        options.hash_final_stop,
+                    )
+                }
+                Err(_) if frame_sink_stop => {
+                    // Streaming-capture cancel/watchdog: a Pause-equivalent
+                    // stop AT the held frame boundary (deterministic icount,
+                    // normal final hash link).
+                    return finish_at_counter(
+                        seg,
+                        clock,
+                        StopReason::Paused,
                         delivered,
                         timer_fired,
                         frames_seen,
@@ -1989,6 +2082,161 @@ mod event_until_tests {
         assert_eq!(out.reason, StopReason::HardCap);
         assert_eq!(out.boundary.icount, 300_000);
         assert_eq!(out.frames_elapsed, 0);
+    }
+
+    /// The frame sink sees one FrameMark per FRAME_COUNTER write —
+    /// contiguous absolute indices, icounts matching the exit — and a
+    /// sink-observed run is capture-neutral: identical stop boundary and
+    /// state hash to a plain run over the same budget.
+    #[test]
+    fn frame_sink_observes_every_frame_and_is_capture_neutral_live() {
+        let run = |collect: bool| {
+            let (mut slot, counter) = rig(nanokernel::pad_echo_elf(), b"")?;
+            let config = cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: None,
+                hash_device_sections: None,
+            };
+            let mut marks: Vec<FrameMark> = Vec::new();
+            let out = if collect {
+                run_segment_with_frame_captures(
+                    &mut seg,
+                    Until::IcountBudget(300_000),
+                    &[],
+                    &[],
+                    0,
+                    &mut || false,
+                    &mut pad_serial_exits,
+                    &mut |_, _| Ok(Vec::new()),
+                    &mut |_, _, _, _| Ok(()),
+                    &mut |mark| {
+                        marks.push(mark);
+                        Ok(FrameSinkFlow::Continue)
+                    },
+                )
+                .unwrap()
+            } else {
+                run_segment(
+                    &mut seg,
+                    Until::IcountBudget(300_000),
+                    &mut || false,
+                    &mut pad_serial_exits,
+                )
+                .unwrap()
+            };
+            Some((out, marks))
+        };
+        let (Some((plain, _)), Some((captured, marks))) = (run(false), run(true)) else {
+            return;
+        };
+        assert_eq!(
+            (plain.boundary, plain.state_hash, plain.frames_elapsed),
+            (captured.boundary, captured.state_hash, captured.frames_elapsed),
+            "a sink-observed run must be indistinguishable from a plain run"
+        );
+        assert!(captured.frames_elapsed > 0, "fixture must emit frames");
+        assert_eq!(marks.len() as u64, captured.frames_elapsed);
+        for (i, mark) in marks.iter().enumerate() {
+            assert_eq!(u64::from(mark.frame), i as u64 + 1, "contiguous indices");
+            assert!(mark.icount > 0 && mark.icount <= captured.boundary.icount);
+        }
+        assert!(
+            marks.windows(2).all(|w| w[0].icount < w[1].icount),
+            "frame icounts must be strictly increasing"
+        );
+    }
+
+    /// FrameSinkFlow::Stop ends the run AT the held frame boundary with
+    /// StopReason::Paused and the same final link a FrameBudget stop at
+    /// that frame pushes — the streaming cancel/watchdog landing.
+    #[test]
+    fn frame_sink_stop_lands_paused_at_the_frame_boundary_live() {
+        let stopped = || {
+            let (mut slot, counter) = rig(nanokernel::pad_echo_elf(), b"")?;
+            let config = cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: None,
+                hash_device_sections: None,
+            };
+            let out = run_segment_with_frame_captures(
+                &mut seg,
+                Until::IcountBudget(50_000_000),
+                &[],
+                &[],
+                0,
+                &mut || false,
+                &mut pad_serial_exits,
+                &mut |_, _| Ok(Vec::new()),
+                &mut |_, _, _, _| Ok(()),
+                &mut |mark| {
+                    Ok(if mark.frame >= 3 {
+                        FrameSinkFlow::Stop
+                    } else {
+                        FrameSinkFlow::Continue
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(out.reason, StopReason::Paused);
+            assert_eq!(out.frames_elapsed, 3);
+            Some((out.boundary, out.state_hash))
+        };
+        let budgeted = || {
+            let (mut slot, counter) = rig(nanokernel::pad_echo_elf(), b"")?;
+            let config = cfg();
+            let mut chain = StateHashChain::new(&[1; 32], &[2; 32]);
+            let pause = AtomicBool::new(false);
+            let mut seg = Segment {
+                slot: &mut slot,
+                counter: &counter,
+                chain: &mut chain,
+                config: &config,
+                start_icount: 0,
+                injections: &[],
+                timer: None,
+                pause: &pause,
+                sdk_events: None,
+                hash_device_sections: None,
+            };
+            let out = run_segment(
+                &mut seg,
+                Until::FrameBudget {
+                    frames: 3,
+                    hard_cap: 50_000_000,
+                },
+                &mut || false,
+                &mut pad_serial_exits,
+            )
+            .unwrap();
+            Some((out.boundary, out.state_hash))
+        };
+        let (Some(a), Some(b)) = (stopped(), budgeted()) else {
+            return;
+        };
+        assert_eq!(
+            a, b,
+            "sink stop and frame-budget stop at the same frame must land identically"
+        );
     }
 
     /// NextSdkEvent stops ON the exit whose servicing reported a

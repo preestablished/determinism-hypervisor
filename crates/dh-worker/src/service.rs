@@ -308,12 +308,64 @@ struct WorkerMetrics {
     fork_ms: Mutex<MetricHistogram>,
     restore_ms: Mutex<MetricHistogram>,
     snapshot_dirty_pages: Mutex<MetricHistogram>,
+    frames_streamed_total: std::sync::atomic::AtomicU64,
+    frame_emit_ms: Mutex<MetricHistogram>,
+    frame_hold_ms: Mutex<MetricHistogram>,
+    frame_holds_in_progress: std::sync::atomic::AtomicU64,
+    frame_stream_terminations: Mutex<BTreeMap<&'static str, u64>>,
 }
+
+/// `dh_worker_frame_stream_terminations_total` label set — `render`
+/// iterates this fixed list, so a termination recorded with a label
+/// outside it would be invisible. Keep in sync with the reasons
+/// `run_with_frame_capture` records.
+const FRAME_STREAM_TERMINATION_LABELS: &[&str] = &[
+    "budget",
+    "hard_cap",
+    "paused",
+    "halted",
+    "cancel",
+    "watchdog",
+    "fault",
+    "other",
+];
 
 impl WorkerMetrics {
     fn record_exit(&self, slot_id: u64, reason: &'static str) {
         let mut exits = self.exits.lock().expect("metrics mutex poisoned");
         *exits.entry((slot_id, reason)).or_insert(0) += 1;
+    }
+
+    fn record_streamed_frame(&self, emit: Duration) {
+        self.frames_streamed_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.frame_emit_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(emit.as_secs_f64() * 1000.0, MS_BUCKETS);
+    }
+
+    fn frame_hold_started(&self) {
+        self.frame_holds_in_progress
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn frame_hold_finished(&self, hold: Duration) {
+        self.frame_holds_in_progress
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.frame_hold_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .observe(hold.as_secs_f64() * 1000.0, MS_BUCKETS);
+    }
+
+    fn record_frame_stream_termination(&self, reason: &'static str) {
+        debug_assert!(FRAME_STREAM_TERMINATION_LABELS.contains(&reason));
+        let mut terminations = self
+            .frame_stream_terminations
+            .lock()
+            .expect("metrics mutex poisoned");
+        *terminations.entry(reason).or_insert(0) += 1;
     }
 
     fn observe_snapshot(&self, elapsed: Duration, dirty_pages: u64) {
@@ -451,6 +503,64 @@ impl WorkerMetrics {
                 "Dirty pages shipped by snapshot commits.",
                 DIRTY_PAGE_BUCKETS,
             );
+
+        push_help_type(
+            &mut out,
+            "dh_worker_frames_streamed_total",
+            "CapturedFrames emitted by RunWithFrameCapture streams.",
+            "counter",
+        );
+        out.push_str(&format!(
+            "dh_worker_frames_streamed_total {}\n",
+            self.frames_streamed_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        self.frame_emit_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .render(
+                &mut out,
+                "dh_worker_frame_emit_duration_milliseconds",
+                "Per-frame capture+emit latency (framebuffer read, lz4, stream send incl. backpressure hold).",
+                MS_BUCKETS,
+            );
+        self.frame_hold_ms
+            .lock()
+            .expect("metrics mutex poisoned")
+            .render(
+                &mut out,
+                "dh_worker_frame_hold_duration_milliseconds",
+                "Backpressure hold time per frame while the stream consumer catches up.",
+                MS_BUCKETS,
+            );
+        push_help_type(
+            &mut out,
+            "dh_worker_frame_holds_in_progress",
+            "Frame-capture streams currently holding the vCPU at a FRAME_MARK boundary.",
+            "gauge",
+        );
+        out.push_str(&format!(
+            "dh_worker_frame_holds_in_progress {}\n",
+            self.frame_holds_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        push_help_type(
+            &mut out,
+            "dh_worker_frame_stream_terminations_total",
+            "RunWithFrameCapture stream terminations by reason.",
+            "counter",
+        );
+        let terminations = self
+            .frame_stream_terminations
+            .lock()
+            .expect("metrics mutex poisoned");
+        for reason in FRAME_STREAM_TERMINATION_LABELS {
+            let value = terminations.get(reason).copied().unwrap_or(0);
+            out.push_str(&format!(
+                "dh_worker_frame_stream_terminations_total{{reason=\"{reason}\"}} {value}\n"
+            ));
+        }
+        drop(terminations);
 
         push_help_type(
             &mut out,
@@ -1010,6 +1120,18 @@ fn slot_error_code(e: &SlotError) -> &'static str {
     }
 }
 
+/// Build profile of this worker binary, surfaced in `GetWorkerInfo` and
+/// the serve startup log. Long-lived operator workers must be "release":
+/// a debug worker is a measured multi-x slowdown on every guest hot path
+/// (play-60fps plan, M1).
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
 fn unimplemented_status(method: &'static str) -> Status {
     Status::unimplemented(format!(
         "{method} awaits real KVM/store runtime ownership in determinism-hypervisor-rfv"
@@ -1299,6 +1421,47 @@ fn until_from_run_request(req: &proto::RunRequest) -> Result<RunUntil, Status> {
         WireUntil::Goal(_) => Err(unimplemented_status("Run goal")),
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+fn until_from_frame_capture_request(
+    req: &proto::RunWithFrameCaptureRequest,
+) -> Result<RunUntil, Status> {
+    use proto::run_with_frame_capture_request::Until as WireUntil;
+    // The spec'd request carries only the budget arms (no frame_budget,
+    // no goal, no SDK filter): "run until I say stop" is a large budget
+    // plus stream cancellation, which lands at the current frame
+    // boundary (plan 02, decision (a)). `hard_icount_cap` is unused by
+    // the budget modes, mirroring `until_from_run_request`.
+    match req
+        .until
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("RunWithFrameCaptureRequest.until is required"))?
+    {
+        WireUntil::IcountBudget(budget) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::IcountBudget(*budget),
+            sdk_event_filter: None,
+        }),
+        WireUntil::VnsBudget(budget) => Ok(RunUntil {
+            until: dh_vmm::runctl::Until::VnsBudget(*budget),
+            sdk_event_filter: None,
+        }),
+    }
+}
+
+/// RunWithFrameCapture stream channel capacity: 2 tolerates consumer
+/// jitter while keeping the vCPU at most ~2 frames ahead of the viewer.
+/// A full channel IS the backpressure hold (worker constant by design —
+/// plan 02, not config).
+#[cfg(target_arch = "x86_64")]
+const FRAME_STREAM_CHANNEL_CAPACITY: usize = 2;
+
+/// Stalled-consumer watchdog: a consumer that keeps the connection open
+/// but stops reading would otherwise hold the vCPU, the slot's actor
+/// thread, and its pinned core forever (leases have no TTL). After this
+/// long at one hold, the run ends at the held frame boundary exactly as
+/// a cancel would.
+#[cfg(target_arch = "x86_64")]
+const FRAME_STREAM_STALL_WATCHDOG: Duration = Duration::from_secs(30);
 
 #[cfg(target_arch = "x86_64")]
 fn proto_stop_reason(reason: dh_vmm::runctl::StopReason) -> i32 {
@@ -2627,6 +2790,7 @@ fn fault_runtime_after_pause_drain_error(
 enum FramebufferCaller {
     GetFramebuffer,
     CaptureSpec,
+    RunWithFrameCapture,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2635,6 +2799,7 @@ impl FramebufferCaller {
         match self {
             FramebufferCaller::GetFramebuffer => "GetFramebuffer",
             FramebufferCaller::CaptureSpec => "CaptureSpec.framebuffer",
+            FramebufferCaller::RunWithFrameCapture => "RunWithFrameCapture",
         }
     }
 
@@ -2646,6 +2811,9 @@ impl FramebufferCaller {
             FramebufferCaller::CaptureSpec => {
                 "CaptureSpec requires DetChannelDevice in machine_config"
             }
+            FramebufferCaller::RunWithFrameCapture => {
+                "RunWithFrameCapture requires DetChannelDevice in machine_config"
+            }
         }
     }
 
@@ -2653,6 +2821,9 @@ impl FramebufferCaller {
         match self {
             FramebufferCaller::GetFramebuffer => "GetFramebuffer requires an attached detchannel",
             FramebufferCaller::CaptureSpec => "CaptureSpec requires an attached detchannel",
+            FramebufferCaller::RunWithFrameCapture => {
+                "RunWithFrameCapture requires an attached detchannel"
+            }
         }
     }
 
@@ -2660,6 +2831,7 @@ impl FramebufferCaller {
         match self {
             FramebufferCaller::GetFramebuffer => "read framebuffer manifest",
             FramebufferCaller::CaptureSpec => "read capture manifest",
+            FramebufferCaller::RunWithFrameCapture => "read frame-capture manifest",
         }
     }
 
@@ -2670,6 +2842,9 @@ impl FramebufferCaller {
             }
             FramebufferCaller::CaptureSpec => {
                 "CaptureSpec.framebuffer requested but no framebuffer region is published"
+            }
+            FramebufferCaller::RunWithFrameCapture => {
+                "RunWithFrameCapture requested but no framebuffer region is published"
             }
         }
     }
@@ -2996,6 +3171,451 @@ where
         .with_runtime_mut(f)
         .map_err(runtime_actor_error_to_status)
 }
+
+/// The recorded-run core shared by `Run` and `RunWithFrameCapture`:
+/// occupies the slot's actor thread, drives one segment with the
+/// recording rail attached, and lands the slot Paused at the stop
+/// boundary. `frame_hook`, when present, receives one `CapturedFrame`
+/// per FRAME_MARK with the vCPU held at that boundary; its return value
+/// continues or stops the run (streaming cancel/watchdog). The hook is
+/// capture-neutral: chain links stay on the epoch grid plus the final
+/// stop, exactly as a plain Run.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+fn drive_recorded_run<F>(
+    runtime: &mut SlotRuntime,
+    manager: &SlotManager,
+    metrics: &WorkerMetrics,
+    bisection_checkpoints: BisectionCheckpointConfig,
+    checkpoint_store: Option<Arc<Mutex<snapstore_client::blocking::SnapstoreClient>>>,
+    lease: &Lease,
+    run_until: RunUntil,
+    capture: Option<proto::CaptureSpec>,
+    mut frame_hook: Option<F>,
+) -> Result<proto::RunResponse, Status>
+where
+    F: FnMut(proto::CapturedFrame) -> dh_vmm::runctl::FrameSinkFlow,
+{
+    let tid = dh_vmm::run::current_tid();
+    let start_segment_icount = runtime.position.segment_icount;
+    let start_cumulative_icount = runtime.position.cumulative_icount;
+    let start_vns = runtime.position.vns;
+    let start_cumulative_epoch = runtime.position.epoch_index;
+    let start_segment_vns =
+        segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
+    let sdk_event_filter = run_until.sdk_event_filter;
+    let epoch_len = runtime.machine_config.epoch_len.max(1);
+    let start_segment_epoch = start_segment_icount / epoch_len;
+    if bisection_checkpoints.enabled
+        && runtime.machine_config.hash_epochs
+            != dh_vmm::config::HashEpochs::EpochsOn
+    {
+        return Err(Status::failed_precondition(
+            "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
+        ));
+    }
+    let checkpoint_machine_config = bisection_checkpoints
+        .enabled
+        .then(|| runtime.machine_config.clone());
+    let mut checkpoint_anchor_icount =
+        runtime.bisection_checkpoint_anchor_icount;
+    manager
+        .mark_running(lease, lease_now_ms())
+        .map_err(slot_error_to_status)?;
+    runtime.thread = RuntimeThreadState::Running { tid };
+    runtime.clear_pause_request();
+    let pause = runtime.pause_flag();
+    let counter = runtime.counter.as_ref().ok_or_else(|| {
+        Status::failed_precondition("slot actor has no InstRetired counter")
+    })?;
+
+    let mut goal = || false;
+    let log = runtime.log.take().ok_or_else(|| {
+        Status::failed_precondition("slot has no active DHILOG segment")
+    })?;
+    let bus = std::mem::take(&mut runtime.bus);
+    let lapic = std::mem::take(&mut runtime.lapic);
+    let entropy = std::mem::replace(
+        &mut runtime.entropy,
+        dh_devices::entropy::DetEntropy::from_seed([0; 32]),
+    );
+    let pending_inputs = runtime.queued_inputs.clone();
+    let scheduled_input_icounts: Vec<u64> = pending_inputs
+        .iter()
+        .map(|input| match input.at {
+            QueuedInputAt::Icount(icount) => icount,
+            QueuedInputAt::Frame(_) => start_segment_icount,
+        })
+        .collect();
+    let scheduled_frame_inputs: Vec<_> = pending_inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, input)| match input.at {
+            QueuedInputAt::Frame(frame) => {
+                Some(dh_vmm::runctl::ScheduledFrameInput { frame, index })
+            }
+            QueuedInputAt::Icount(_) => None,
+        })
+        .collect();
+    let (
+        run_result,
+        consumed_input_orders,
+        drained_guest_events,
+        first_matching_sdk_event,
+        rail,
+    ) = {
+        let mut rail_inner = dh_vmm::recording::DeviceRail::new(
+            bus,
+            entropy,
+            log,
+            RuntimeVmMem(runtime.slot.guest_mem.clone()),
+        );
+        rail_inner.lapic = lapic;
+        let rail = std::cell::RefCell::new(rail_inner);
+        let mut consumed_input_orders = Vec::new();
+        let mut drained_guest_events = Vec::new();
+        let sdk_event_feed = std::cell::Cell::new(0u64);
+        let mut first_matching_sdk_event: Option<DrainedGuestEvent> = None;
+        let counter_ref = counter;
+        let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
+            metrics.record_exit(lease.slot_id, vcpu_exit_reason_label(&exit));
+            let icount = counter_ref.read().map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!(
+                    "counter read: {e:?}"
+                ))
+            })?;
+            let event_icount = cumulative_event_icount(
+                start_segment_icount,
+                start_cumulative_icount,
+                icount,
+            );
+            let events = service_exit_with_detchannel(
+                &mut rail.borrow_mut(),
+                icount,
+                event_icount,
+                exit,
+            )?;
+            if let Some(filter) = sdk_event_filter {
+                for event in &events {
+                    if sdk_event_matches(filter, event) {
+                        sdk_event_feed.set(sdk_event_feed.get() + 1);
+                        if first_matching_sdk_event.is_none() {
+                            first_matching_sdk_event = Some(event.clone());
+                        }
+                    }
+                }
+            }
+            drained_guest_events.extend(events);
+            Ok(())
+        };
+        let mut input_sink = |idx: usize, boundary| {
+            let input = pending_inputs.get(idx).ok_or_else(|| {
+                dh_vmm::boundary::BoundaryError::Exit(format!(
+                    "scheduled input index {idx} out of range"
+                ))
+            })?;
+            let vectors =
+                apply_queued_input(&mut *rail.borrow_mut(), input, boundary)?;
+            consumed_input_orders.push(input.order);
+            Ok(vectors)
+        };
+        let mut epoch_sink =
+            |epoch_index,
+             boundary: dh_vmm::boundary::Boundary,
+             chain_value,
+             checkpoint_slot: Option<&dh_vmm::kvm::SlotVm>| {
+                let icount = boundary.icount;
+                let pending_checkpoint = if let Some(slot) = checkpoint_slot {
+                    if let Some(machine_config) = checkpoint_machine_config.as_ref()
+                    {
+                        let checkpoint_vns =
+                            segment_vns_from_icount(machine_config, icount)
+                                .map_err(|e| {
+                                    dh_vmm::boundary::BoundaryError::Exit(
+                                        format!(
+                                            "bisection checkpoint vns: {}: {}",
+                                            e.code(),
+                                            e.message()
+                                        ),
+                                    )
+                                })?;
+                        let max_covered_gap = u32::try_from(
+                            icount.saturating_sub(checkpoint_anchor_icount),
+                        )
+                        .map_err(|_| {
+                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                "bisection checkpoint gap {} exceeds u32",
+                                icount.saturating_sub(checkpoint_anchor_icount)
+                            ))
+                        })?;
+                        let segment_delta =
+                            icount.saturating_sub(start_segment_icount);
+                        let vns_delta =
+                            checkpoint_vns.saturating_sub(start_segment_vns);
+                        let segment_epoch = icount / epoch_len;
+                        let epoch_delta =
+                            segment_epoch.saturating_sub(start_segment_epoch);
+                        let agenda_empty = !pending_inputs.iter().any(|input| {
+                            match input.at {
+                                QueuedInputAt::Icount(at) => at > icount,
+                                QueuedInputAt::Frame(_) => true,
+                            }
+                        });
+                        let checkpoint_boundary =
+                            crate::snapshot_engine::BoundaryState {
+                                icount: start_cumulative_icount
+                                    .saturating_add(segment_delta),
+                                vns: start_vns.saturating_add(vns_delta),
+                                epoch_index: start_cumulative_epoch
+                                    .saturating_add(epoch_delta),
+                                hash_chain: chain_value,
+                                agenda_empty,
+                            };
+                        let rail_ref = rail.borrow();
+                        let store = checkpoint_store
+                            .as_ref()
+                            .ok_or_else(|| {
+                                dh_vmm::boundary::BoundaryError::Exit(
+                                    "bisection checkpoint store missing".into(),
+                                )
+                            })?
+                            .lock()
+                            .map_err(|_| {
+                                dh_vmm::boundary::BoundaryError::Exit(
+                                    "snapshot-store client mutex poisoned".into(),
+                                )
+                            })?;
+                        let checkpoint =
+                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
+                            slot,
+                            dh_vmm::SlotState::Paused,
+                            &rail_ref.bus,
+                            &rail_ref.lapic,
+                            &rail_ref.entropy,
+                            machine_config,
+                            checkpoint_boundary,
+                            &store,
+                        )
+                        .map_err(|e| {
+                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                "bisection checkpoint snapshot: {e:?}"
+                            ))
+                        })?;
+                        Some((
+                            checkpoint.snapshot_ref.to_bytes(),
+                            checkpoint_vns,
+                            max_covered_gap,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                rail.borrow_mut()
+                    .log_epoch_hash(epoch_index, icount, chain_value)
+                    .map_err(|e| {
+                        dh_vmm::boundary::BoundaryError::Exit(format!(
+                            "epoch log: {e:?}"
+                        ))
+                    })?;
+                if let Some((
+                    checkpoint_snapshot_ref,
+                    checkpoint_vns,
+                    max_covered_gap,
+                )) = pending_checkpoint
+                {
+                    rail.borrow_mut()
+                        .log_bisection_checkpoint(
+                            icount,
+                            boundary.rip,
+                            max_covered_gap,
+                            checkpoint_snapshot_ref,
+                            checkpoint_vns,
+                        )
+                        .map_err(|e| {
+                            dh_vmm::boundary::BoundaryError::Exit(format!(
+                                "bisection checkpoint log: {e:?}"
+                            ))
+                        })?;
+                    checkpoint_anchor_icount = icount;
+                }
+                Ok(())
+        };
+        let hash_device_sections = || {
+            let rail_ref = rail.borrow();
+            runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
+        };
+        // RunWithFrameCapture's per-frame sink: read-only framebuffer
+        // extraction at the held FRAME_MARK boundary (capture-neutral,
+        // ARCH §6.10 C5) handed to the caller's emit hook, which owns
+        // backpressure, cancel, and watchdog policy. Plain Run passes no
+        // hook and this closure is a no-op.
+        let mut frame_sink = |mark: dh_vmm::runctl::FrameMark| -> Result<
+            dh_vmm::runctl::FrameSinkFlow,
+            dh_vmm::boundary::BoundaryError,
+        > {
+            let Some(hook) = frame_hook.as_mut() else {
+                return Ok(dh_vmm::runctl::FrameSinkFlow::Continue);
+            };
+            let region = read_framebuffer_region_from_bus(
+                &mut rail.borrow_mut().bus,
+                FramebufferCaller::RunWithFrameCapture,
+            )
+            .map_err(|e| {
+                dh_vmm::boundary::BoundaryError::Exit(format!(
+                    "frame capture: {}: {}",
+                    e.code(),
+                    e.message()
+                ))
+            })?;
+            let (pixels, fb_info) =
+                framebuffer_capture(region.layout_version, &region.bytes, mark.frame).map_err(
+                    |e| {
+                        dh_vmm::boundary::BoundaryError::Exit(format!(
+                            "frame capture: {}: {}",
+                            e.code(),
+                            e.message()
+                        ))
+                    },
+                )?;
+            let frame = proto::CapturedFrame {
+                frame_index: mark.frame,
+                icount: cumulative_event_icount(
+                    start_segment_icount,
+                    start_cumulative_icount,
+                    mark.icount,
+                ),
+                fb_lz4: lz4_flex::compress_prepend_size(&pixels),
+                fb_info: Some(fb_info),
+            };
+            Ok(hook(frame))
+        };
+        let run_result = {
+            let mut segment = dh_vmm::runctl::Segment {
+                slot: &mut runtime.slot,
+                counter,
+                chain: &mut runtime.chain,
+                config: &runtime.machine_config,
+                start_icount: start_segment_icount,
+                injections: &[],
+                timer: None,
+                pause: pause.as_ref(),
+                sdk_events: sdk_event_filter.map(|_| &sdk_event_feed),
+                hash_device_sections: Some(&hash_device_sections),
+            };
+            dh_vmm::runctl::run_segment_with_frame_captures(
+                &mut segment,
+                run_until.until,
+                &scheduled_input_icounts,
+                &scheduled_frame_inputs,
+                runtime.position.frame_counter,
+                &mut goal,
+                &mut on_exit,
+                &mut input_sink,
+                &mut epoch_sink,
+                &mut frame_sink,
+            )
+        };
+        (
+            run_result,
+            consumed_input_orders,
+            drained_guest_events,
+            first_matching_sdk_event,
+            rail.into_inner(),
+        )
+    };
+    runtime.bus = rail.bus;
+    runtime.lapic = rail.lapic;
+    runtime.entropy = rail.entropy;
+    runtime.log = Some(rail.log);
+    append_guest_events_with_retention_cap(
+        &mut runtime.guest_events,
+        drained_guest_events,
+    );
+
+    match run_result {
+        Ok(outcome) => {
+            runtime.thread = RuntimeThreadState::Parked;
+            runtime.clear_pause_request();
+            let segment_delta =
+                outcome.boundary.icount.saturating_sub(start_segment_icount);
+            let vns_delta = outcome.vns.saturating_sub(start_segment_vns);
+            let segment_epoch = outcome.boundary.icount / epoch_len;
+            let epoch_delta = segment_epoch.saturating_sub(start_segment_epoch);
+            let cumulative_icount =
+                start_cumulative_icount.saturating_add(segment_delta);
+            let cumulative_vns = start_vns.saturating_add(vns_delta);
+            let cumulative_epoch =
+                runtime.position.epoch_index.saturating_add(epoch_delta);
+            runtime.set_boundary(
+                cumulative_icount,
+                outcome.boundary.icount,
+                cumulative_vns,
+                cumulative_epoch,
+                runtime.chain.clone(),
+            );
+            runtime.bisection_checkpoint_anchor_icount =
+                checkpoint_anchor_icount;
+            runtime.position.frame_counter =
+                frame_counter_from_bus(&mut runtime.bus);
+            if !consumed_input_orders.is_empty() {
+                runtime
+                    .queued_inputs
+                    .retain(|input| !consumed_input_orders.contains(&input.order));
+            }
+            manager
+                .mark_paused_at_position(
+                    lease,
+                    cumulative_icount,
+                    runtime
+                        .base_snapshot
+                        .as_ref()
+                        .map(snapstore_types::SnapshotRef::to_bytes),
+                    lease_now_ms(),
+                )
+                .map_err(slot_error_to_status)?;
+            if let Err(e) = drain_runtime_detchannel_at_pause(runtime) {
+                return Err(fault_runtime_after_pause_drain_error(
+                    manager,
+                    runtime,
+                    lease.slot_id,
+                    e,
+                ));
+            }
+            let capture = capture_at_boundary(
+                &mut runtime.bus,
+                capture.as_ref(),
+                runtime.position.frame_counter,
+            )?;
+            Ok(proto::RunResponse {
+                reason: proto_stop_reason(outcome.reason),
+                icount: cumulative_icount,
+                vns: cumulative_vns,
+                state_hash: Some(proto::StateHash {
+                    hash: outcome.state_hash.to_vec(),
+                }),
+                frames_elapsed: outcome.frames_elapsed,
+                sdk_event: if outcome.reason
+                    == dh_vmm::runctl::StopReason::NextSdkEvent
+                {
+                    first_matching_sdk_event.map(drained_guest_event_to_proto)
+                } else {
+                    None
+                },
+                feature_bytes: capture.feature_bytes,
+                fb_lz4: capture.fb_lz4,
+                fb_info: capture.fb_info,
+            })
+        }
+        Err(e) => {
+            runtime.thread = RuntimeThreadState::Faulted(e.to_string());
+            let _ = manager.mark_faulted(lease.slot_id);
+            Err(run_error_to_status(e))
+        }
+    }
+}
+
 
 #[cfg(target_arch = "x86_64")]
 fn with_paused_runtime_mut<R>(
@@ -3734,379 +4354,20 @@ impl HypervisorWorker for WorkerService {
                 manager
                     .checkout_write(&lease, "Run", lease_now_ms())
                     .map_err(slot_error_to_status)?;
+                let actor_manager = manager.clone();
+                let actor_metrics = metrics.clone();
                 with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
-                    let tid = dh_vmm::run::current_tid();
-                    let start_segment_icount = runtime.position.segment_icount;
-                    let start_cumulative_icount = runtime.position.cumulative_icount;
-                    let start_vns = runtime.position.vns;
-                    let start_cumulative_epoch = runtime.position.epoch_index;
-                    let start_segment_vns =
-                        segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
-                    let sdk_event_filter = run_until.sdk_event_filter;
-                    let epoch_len = runtime.machine_config.epoch_len.max(1);
-                    let start_segment_epoch = start_segment_icount / epoch_len;
-                    if bisection_checkpoints.enabled
-                        && runtime.machine_config.hash_epochs
-                            != dh_vmm::config::HashEpochs::EpochsOn
-                    {
-                        return Err(Status::failed_precondition(
-                            "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
-                        ));
-                    }
-                    let checkpoint_machine_config = bisection_checkpoints
-                        .enabled
-                        .then(|| runtime.machine_config.clone());
-                    let mut checkpoint_anchor_icount =
-                        runtime.bisection_checkpoint_anchor_icount;
-                    manager
-                        .mark_running(&lease, lease_now_ms())
-                        .map_err(slot_error_to_status)?;
-                    runtime.thread = RuntimeThreadState::Running { tid };
-                    runtime.clear_pause_request();
-                    let pause = runtime.pause_flag();
-                    let counter = runtime.counter.as_ref().ok_or_else(|| {
-                        Status::failed_precondition("slot actor has no InstRetired counter")
-                    })?;
-
-                    let mut goal = || false;
-                    let log = runtime.log.take().ok_or_else(|| {
-                        Status::failed_precondition("slot has no active DHILOG segment")
-                    })?;
-                    let bus = std::mem::take(&mut runtime.bus);
-                    let lapic = std::mem::take(&mut runtime.lapic);
-                    let entropy = std::mem::replace(
-                        &mut runtime.entropy,
-                        dh_devices::entropy::DetEntropy::from_seed([0; 32]),
-                    );
-                    let pending_inputs = runtime.queued_inputs.clone();
-                    let scheduled_input_icounts: Vec<u64> = pending_inputs
-                        .iter()
-                        .map(|input| match input.at {
-                            QueuedInputAt::Icount(icount) => icount,
-                            QueuedInputAt::Frame(_) => start_segment_icount,
-                        })
-                        .collect();
-                    let scheduled_frame_inputs: Vec<_> = pending_inputs
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, input)| match input.at {
-                            QueuedInputAt::Frame(frame) => {
-                                Some(dh_vmm::runctl::ScheduledFrameInput { frame, index })
-                            }
-                            QueuedInputAt::Icount(_) => None,
-                        })
-                        .collect();
-                    let (
-                        run_result,
-                        consumed_input_orders,
-                        drained_guest_events,
-                        first_matching_sdk_event,
-                        rail,
-                    ) = {
-                        let mut rail_inner = dh_vmm::recording::DeviceRail::new(
-                            bus,
-                            entropy,
-                            log,
-                            RuntimeVmMem(runtime.slot.guest_mem.clone()),
-                        );
-                        rail_inner.lapic = lapic;
-                        let rail = std::cell::RefCell::new(rail_inner);
-                        let mut consumed_input_orders = Vec::new();
-                        let mut drained_guest_events = Vec::new();
-                        let sdk_event_feed = std::cell::Cell::new(0u64);
-                        let mut first_matching_sdk_event: Option<DrainedGuestEvent> = None;
-                        let counter_ref = counter;
-                        let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
-                            metrics.record_exit(lease.slot_id, vcpu_exit_reason_label(&exit));
-                            let icount = counter_ref.read().map_err(|e| {
-                                dh_vmm::boundary::BoundaryError::Exit(format!(
-                                    "counter read: {e:?}"
-                                ))
-                            })?;
-                            let event_icount = cumulative_event_icount(
-                                start_segment_icount,
-                                start_cumulative_icount,
-                                icount,
-                            );
-                            let events = service_exit_with_detchannel(
-                                &mut rail.borrow_mut(),
-                                icount,
-                                event_icount,
-                                exit,
-                            )?;
-                            if let Some(filter) = sdk_event_filter {
-                                for event in &events {
-                                    if sdk_event_matches(filter, event) {
-                                        sdk_event_feed.set(sdk_event_feed.get() + 1);
-                                        if first_matching_sdk_event.is_none() {
-                                            first_matching_sdk_event = Some(event.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            drained_guest_events.extend(events);
-                            Ok(())
-                        };
-                        let mut input_sink = |idx: usize, boundary| {
-                            let input = pending_inputs.get(idx).ok_or_else(|| {
-                                dh_vmm::boundary::BoundaryError::Exit(format!(
-                                    "scheduled input index {idx} out of range"
-                                ))
-                            })?;
-                            let vectors =
-                                apply_queued_input(&mut *rail.borrow_mut(), input, boundary)?;
-                            consumed_input_orders.push(input.order);
-                            Ok(vectors)
-                        };
-                        let mut epoch_sink =
-                            |epoch_index,
-                             boundary: dh_vmm::boundary::Boundary,
-                             chain_value,
-                             checkpoint_slot: Option<&dh_vmm::kvm::SlotVm>| {
-                                let icount = boundary.icount;
-                                let pending_checkpoint = if let Some(slot) = checkpoint_slot {
-                                    if let Some(machine_config) = checkpoint_machine_config.as_ref()
-                                    {
-                                        let checkpoint_vns =
-                                            segment_vns_from_icount(machine_config, icount)
-                                                .map_err(|e| {
-                                                    dh_vmm::boundary::BoundaryError::Exit(
-                                                        format!(
-                                                            "bisection checkpoint vns: {}: {}",
-                                                            e.code(),
-                                                            e.message()
-                                                        ),
-                                                    )
-                                                })?;
-                                        let max_covered_gap = u32::try_from(
-                                            icount.saturating_sub(checkpoint_anchor_icount),
-                                        )
-                                        .map_err(|_| {
-                                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                                "bisection checkpoint gap {} exceeds u32",
-                                                icount.saturating_sub(checkpoint_anchor_icount)
-                                            ))
-                                        })?;
-                                        let segment_delta =
-                                            icount.saturating_sub(start_segment_icount);
-                                        let vns_delta =
-                                            checkpoint_vns.saturating_sub(start_segment_vns);
-                                        let segment_epoch = icount / epoch_len;
-                                        let epoch_delta =
-                                            segment_epoch.saturating_sub(start_segment_epoch);
-                                        let agenda_empty = !pending_inputs.iter().any(|input| {
-                                            match input.at {
-                                                QueuedInputAt::Icount(at) => at > icount,
-                                                QueuedInputAt::Frame(_) => true,
-                                            }
-                                        });
-                                        let checkpoint_boundary =
-                                            crate::snapshot_engine::BoundaryState {
-                                                icount: start_cumulative_icount
-                                                    .saturating_add(segment_delta),
-                                                vns: start_vns.saturating_add(vns_delta),
-                                                epoch_index: start_cumulative_epoch
-                                                    .saturating_add(epoch_delta),
-                                                hash_chain: chain_value,
-                                                agenda_empty,
-                                            };
-                                        let rail_ref = rail.borrow();
-                                        let store = checkpoint_store
-                                            .as_ref()
-                                            .ok_or_else(|| {
-                                                dh_vmm::boundary::BoundaryError::Exit(
-                                                    "bisection checkpoint store missing".into(),
-                                                )
-                                            })?
-                                            .lock()
-                                            .map_err(|_| {
-                                                dh_vmm::boundary::BoundaryError::Exit(
-                                                    "snapshot-store client mutex poisoned".into(),
-                                                )
-                                            })?;
-                                        let checkpoint =
-                                            crate::snapshot_engine::capture_bisection_checkpoint_snapshot_with_lapic(
-                                            slot,
-                                            dh_vmm::SlotState::Paused,
-                                            &rail_ref.bus,
-                                            &rail_ref.lapic,
-                                            &rail_ref.entropy,
-                                            machine_config,
-                                            checkpoint_boundary,
-                                            &store,
-                                        )
-                                        .map_err(|e| {
-                                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                                "bisection checkpoint snapshot: {e:?}"
-                                            ))
-                                        })?;
-                                        Some((
-                                            checkpoint.snapshot_ref.to_bytes(),
-                                            checkpoint_vns,
-                                            max_covered_gap,
-                                        ))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-                                rail.borrow_mut()
-                                    .log_epoch_hash(epoch_index, icount, chain_value)
-                                    .map_err(|e| {
-                                        dh_vmm::boundary::BoundaryError::Exit(format!(
-                                            "epoch log: {e:?}"
-                                        ))
-                                    })?;
-                                if let Some((
-                                    checkpoint_snapshot_ref,
-                                    checkpoint_vns,
-                                    max_covered_gap,
-                                )) = pending_checkpoint
-                                {
-                                    rail.borrow_mut()
-                                        .log_bisection_checkpoint(
-                                            icount,
-                                            boundary.rip,
-                                            max_covered_gap,
-                                            checkpoint_snapshot_ref,
-                                            checkpoint_vns,
-                                        )
-                                        .map_err(|e| {
-                                            dh_vmm::boundary::BoundaryError::Exit(format!(
-                                                "bisection checkpoint log: {e:?}"
-                                            ))
-                                        })?;
-                                    checkpoint_anchor_icount = icount;
-                                }
-                                Ok(())
-                        };
-                        let hash_device_sections = || {
-                            let rail_ref = rail.borrow();
-                            runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
-                        };
-                        let run_result = {
-                            let mut segment = dh_vmm::runctl::Segment {
-                                slot: &mut runtime.slot,
-                                counter,
-                                chain: &mut runtime.chain,
-                                config: &runtime.machine_config,
-                                start_icount: start_segment_icount,
-                                injections: &[],
-                                timer: None,
-                                pause: pause.as_ref(),
-                                sdk_events: sdk_event_filter.map(|_| &sdk_event_feed),
-                                hash_device_sections: Some(&hash_device_sections),
-                            };
-                            dh_vmm::runctl::run_segment_with_scheduled_inputs_frames_and_epochs(
-                                &mut segment,
-                                run_until.until,
-                                &scheduled_input_icounts,
-                                &scheduled_frame_inputs,
-                                runtime.position.frame_counter,
-                                &mut goal,
-                                &mut on_exit,
-                                &mut input_sink,
-                                &mut epoch_sink,
-                            )
-                        };
-                        (
-                            run_result,
-                            consumed_input_orders,
-                            drained_guest_events,
-                            first_matching_sdk_event,
-                            rail.into_inner(),
-                        )
-                    };
-                    runtime.bus = rail.bus;
-                    runtime.lapic = rail.lapic;
-                    runtime.entropy = rail.entropy;
-                    runtime.log = Some(rail.log);
-                    append_guest_events_with_retention_cap(
-                        &mut runtime.guest_events,
-                        drained_guest_events,
-                    );
-
-                    match run_result {
-                        Ok(outcome) => {
-                            runtime.thread = RuntimeThreadState::Parked;
-                            runtime.clear_pause_request();
-                            let segment_delta =
-                                outcome.boundary.icount.saturating_sub(start_segment_icount);
-                            let vns_delta = outcome.vns.saturating_sub(start_segment_vns);
-                            let segment_epoch = outcome.boundary.icount / epoch_len;
-                            let epoch_delta = segment_epoch.saturating_sub(start_segment_epoch);
-                            let cumulative_icount =
-                                start_cumulative_icount.saturating_add(segment_delta);
-                            let cumulative_vns = start_vns.saturating_add(vns_delta);
-                            let cumulative_epoch =
-                                runtime.position.epoch_index.saturating_add(epoch_delta);
-                            runtime.set_boundary(
-                                cumulative_icount,
-                                outcome.boundary.icount,
-                                cumulative_vns,
-                                cumulative_epoch,
-                                runtime.chain.clone(),
-                            );
-                            runtime.bisection_checkpoint_anchor_icount =
-                                checkpoint_anchor_icount;
-                            runtime.position.frame_counter =
-                                frame_counter_from_bus(&mut runtime.bus);
-                            if !consumed_input_orders.is_empty() {
-                                runtime
-                                    .queued_inputs
-                                    .retain(|input| !consumed_input_orders.contains(&input.order));
-                            }
-                            manager
-                                .mark_paused_at_position(
-                                    &lease,
-                                    cumulative_icount,
-                                    runtime
-                                        .base_snapshot
-                                        .as_ref()
-                                        .map(snapstore_types::SnapshotRef::to_bytes),
-                                    lease_now_ms(),
-                                )
-                                .map_err(slot_error_to_status)?;
-                            if let Err(e) = drain_runtime_detchannel_at_pause(runtime) {
-                                return Err(fault_runtime_after_pause_drain_error(
-                                    manager.as_ref(),
-                                    runtime,
-                                    lease.slot_id,
-                                    e,
-                                ));
-                            }
-                            let capture = capture_at_boundary(
-                                &mut runtime.bus,
-                                capture.as_ref(),
-                                runtime.position.frame_counter,
-                            )?;
-                            Ok(proto::RunResponse {
-                                reason: proto_stop_reason(outcome.reason),
-                                icount: cumulative_icount,
-                                vns: cumulative_vns,
-                                state_hash: Some(proto::StateHash {
-                                    hash: outcome.state_hash.to_vec(),
-                                }),
-                                frames_elapsed: outcome.frames_elapsed,
-                                sdk_event: if outcome.reason
-                                    == dh_vmm::runctl::StopReason::NextSdkEvent
-                                {
-                                    first_matching_sdk_event.map(drained_guest_event_to_proto)
-                                } else {
-                                    None
-                                },
-                                feature_bytes: capture.feature_bytes,
-                                fb_lz4: capture.fb_lz4,
-                                fb_info: capture.fb_info,
-                            })
-                        }
-                        Err(e) => {
-                            runtime.thread = RuntimeThreadState::Faulted(e.to_string());
-                            let _ = manager.mark_faulted(lease.slot_id);
-                            Err(run_error_to_status(e))
-                        }
-                    }
+                    drive_recorded_run(
+                        runtime,
+                        &actor_manager,
+                        &actor_metrics,
+                        bisection_checkpoints,
+                        checkpoint_store,
+                        &lease,
+                        run_until,
+                        capture,
+                        None::<fn(proto::CapturedFrame) -> dh_vmm::runctl::FrameSinkFlow>,
+                    )
                 })?
             })
             .await?;
@@ -4708,9 +4969,161 @@ impl HypervisorWorker for WorkerService {
 
     async fn run_with_frame_capture(
         &self,
-        _request: Request<proto::RunWithFrameCaptureRequest>,
+        request: Request<proto::RunWithFrameCaptureRequest>,
     ) -> Result<Response<Self::RunWithFrameCaptureStream>, Status> {
-        Err(unimplemented_status("RunWithFrameCapture"))
+        #[cfg(target_arch = "x86_64")]
+        {
+            let request = request.into_inner();
+            let lease = lease_from_proto(request.lease.clone())?;
+            let run_until = until_from_frame_capture_request(&request)?;
+            let manager = self.inner.manager.clone();
+            let runtimes = self.inner.runtimes.clone();
+            let metrics = self.inner.metrics.clone();
+            let bisection_checkpoints = self.inner.bisection_checkpoints;
+            let checkpoint_store = if bisection_checkpoints.enabled {
+                Some(self.store()?)
+            } else {
+                None
+            };
+
+            let (tx, rx) = tokio::sync::mpsc::channel(FRAME_STREAM_CHANNEL_CAPACITY);
+            let thread_metrics = metrics.clone();
+            let spawn = std::thread::Builder::new()
+                .name(format!("dh-frames-{}", lease.slot_id))
+                .spawn(move || {
+                    // Set by the emit hook when IT ended the run; the
+                    // terminal StopReason is PAUSED either way, so this is
+                    // the only place cancel and watchdog stay distinct.
+                    let stop_cause: Arc<Mutex<Option<&'static str>>> =
+                        Arc::new(Mutex::new(None));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        manager
+                            .checkout_write(&lease, "RunWithFrameCapture", lease_now_ms())
+                            .map_err(slot_error_to_status)?;
+                        let frames_tx = tx.clone();
+                        let emit_metrics = metrics.clone();
+                        let emit_stop_cause = stop_cause.clone();
+                        let hook = move |frame: proto::CapturedFrame| {
+                            use tokio::sync::mpsc::error::TrySendError;
+                            let emit_start = Instant::now();
+                            let mut event = Ok(proto::FrameCaptureEvent {
+                                msg: Some(proto::frame_capture_event::Msg::Frame(frame)),
+                            });
+                            let mut hold_started: Option<Instant> = None;
+                            // Blocking here holds the vCPU at the FRAME_MARK
+                            // boundary — this loop IS the backpressure. The
+                            // run occupies the slot's dedicated actor thread,
+                            // never a shared async runtime.
+                            loop {
+                                match frames_tx.try_send(event) {
+                                    Ok(()) => {
+                                        if let Some(started) = hold_started {
+                                            emit_metrics.frame_hold_finished(started.elapsed());
+                                        }
+                                        emit_metrics.record_streamed_frame(emit_start.elapsed());
+                                        return dh_vmm::runctl::FrameSinkFlow::Continue;
+                                    }
+                                    Err(TrySendError::Full(returned)) => {
+                                        event = returned;
+                                        let started = *hold_started.get_or_insert_with(|| {
+                                            emit_metrics.frame_hold_started();
+                                            Instant::now()
+                                        });
+                                        if started.elapsed() >= FRAME_STREAM_STALL_WATCHDOG {
+                                            emit_metrics.frame_hold_finished(started.elapsed());
+                                            *emit_stop_cause
+                                                .lock()
+                                                .expect("stop cause mutex poisoned") =
+                                                Some("watchdog");
+                                            return dh_vmm::runctl::FrameSinkFlow::Stop;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
+                                    Err(TrySendError::Closed(_)) => {
+                                        if let Some(started) = hold_started {
+                                            emit_metrics.frame_hold_finished(started.elapsed());
+                                        }
+                                        *emit_stop_cause
+                                            .lock()
+                                            .expect("stop cause mutex poisoned") = Some("cancel");
+                                        return dh_vmm::runctl::FrameSinkFlow::Stop;
+                                    }
+                                }
+                            }
+                        };
+                        let actor_manager = manager.clone();
+                        let actor_metrics = metrics.clone();
+                        let actor_lease = lease.clone();
+                        with_runtime_mut(runtimes.as_ref(), lease.slot_id, move |runtime| {
+                            drive_recorded_run(
+                                runtime,
+                                &actor_manager,
+                                &actor_metrics,
+                                bisection_checkpoints,
+                                checkpoint_store,
+                                &actor_lease,
+                                run_until,
+                                None,
+                                Some(hook),
+                            )
+                        })?
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Status::internal("RunWithFrameCapture thread panicked"))
+                    });
+                    let cause = *stop_cause.lock().expect("stop cause mutex poisoned");
+                    let termination = match (&result, cause) {
+                        (_, Some(cause)) => cause,
+                        (Ok(done), None) => {
+                            if done.reason
+                                == proto_stop_reason(dh_vmm::runctl::StopReason::BudgetReached)
+                            {
+                                "budget"
+                            } else if done.reason
+                                == proto_stop_reason(dh_vmm::runctl::StopReason::HardCap)
+                            {
+                                "hard_cap"
+                            } else if done.reason
+                                == proto_stop_reason(dh_vmm::runctl::StopReason::Paused)
+                            {
+                                "paused"
+                            } else if done.reason
+                                == proto_stop_reason(dh_vmm::runctl::StopReason::GuestHalted)
+                            {
+                                "halted"
+                            } else {
+                                "other"
+                            }
+                        }
+                        (Err(_), None) => "fault",
+                    };
+                    thread_metrics.record_frame_stream_termination(termination);
+                    match result {
+                        Ok(done) => {
+                            let _ = tx.blocking_send(Ok(proto::FrameCaptureEvent {
+                                msg: Some(proto::frame_capture_event::Msg::Done(done)),
+                            }));
+                        }
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                        }
+                    }
+                });
+            if let Err(e) = spawn {
+                return Err(Status::internal(format!(
+                    "start RunWithFrameCapture thread: {e}"
+                )));
+            }
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            Ok(Response::new(
+                Box::pin(stream) as Self::RunWithFrameCaptureStream
+            ))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = request;
+            Err(unimplemented_status("RunWithFrameCapture"))
+        }
     }
 
     async fn get_worker_info(
@@ -4723,6 +5136,7 @@ impl HypervisorWorker for WorkerService {
             slots_free: self.slots_free(),
             class: Some(self.inner.class.clone()),
             version: self.inner.version.clone(),
+            build_profile: build_profile().to_string(),
         }))
     }
 
