@@ -1,5 +1,15 @@
 # Plan: Fix The Per-Run Memory Accumulation Behind The RunWithFrameCapture OOM
 
+> **EXECUTED 2026-07-07** — fix commit `c0337ab`. Root cause: agenda
+> materialization (`agenda::compile` built the whole budget's StopPoint
+> Vec up front), NOT any of 01's ranked hypotheses — the profile really
+> was the finding. Resolutions:
+> `.agents/requests/run-with-frame-capture-memory-leak-oom/01-resolution.md`
+> and `.agents/requests/phase4-oom-fix-and-capture-engine-proving/04-resolution.md`;
+> evidence `target/oom-evidence-2026-07-07/`; guard
+> `crates/dh-worker/tests/rss_regression.rs`; bead `9f3x` (open pending
+> bridge redeploy confirmation), follow-ups `iar8`, `i74w`.
+
 Plan for `.agents/requests/run-with-frame-capture-memory-leak-oom/`
 (the bridge's incident filing, 2026-07-07) as adopted into executable
 shape by `.agents/requests/phase4-oom-fix-and-capture-engine-proving/`
