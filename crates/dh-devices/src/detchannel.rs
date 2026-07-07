@@ -1604,6 +1604,34 @@ mod tests {
         assert!(pushes[0].1.len() > 16, "record bytes must follow");
     }
 
+    /// Ring-I analogue of the C-id test above: a workload-control push
+    /// (quiesce relay) must log exactly one RING_PUSH DEV_EVENT whose
+    /// ring id byte is I=1 — per-ring DHILOG coverage for the guest-sdk
+    /// ext-hyp contract ("ring C and I pushes"), which the C/A/W tests
+    /// already pin at 0/2/3.
+    #[test]
+    fn push_workload_ctrl_logs_ring_push_with_ring_i_id() {
+        let mut l = log();
+        let mut host = attached(channel_page(), &mut l);
+        with_ctx(&mut l, 51, |ctx| {
+            host.push_workload_ctrl(&detguest_wire::WorkloadCtrl::QuiesceReq { token: 9 }, ctx)
+                .unwrap();
+        });
+        let recs = records(&seal(l));
+        let pushes: Vec<_> = recs
+            .iter()
+            .filter(|(k, p)| {
+                *k == KIND_DEV_EVENT
+                    && u16::from_le_bytes(p[2..4].try_into().unwrap()) == EVENT_RING_PUSH
+            })
+            .collect();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].1[8], 1, "ring id byte must be I=1");
+        let new_prod = u32::from_le_bytes(pushes[0].1[12..16].try_into().unwrap());
+        assert!(new_prod > 0);
+        assert!(pushes[0].1.len() > 16, "record bytes must follow");
+    }
+
     #[test]
     fn pause_drain_equals_doorbell_drain() {
         let mut l = log();
