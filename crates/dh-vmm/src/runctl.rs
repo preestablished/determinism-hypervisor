@@ -2150,6 +2150,7 @@ mod event_until_tests {
                         marks.push(mark);
                         Ok(FrameSinkFlow::Continue)
                     },
+                    &mut |_, _| Ok(()),
                 )
                 .unwrap()
             } else {
@@ -2222,6 +2223,7 @@ mod event_until_tests {
                         FrameSinkFlow::Continue
                     })
                 },
+                &mut |_, _| Ok(()),
             )
             .unwrap();
             assert_eq!(out.reason, StopReason::Paused);
