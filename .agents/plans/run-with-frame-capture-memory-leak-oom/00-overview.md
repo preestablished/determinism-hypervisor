@@ -14,7 +14,7 @@ First live streaming Play session (2026-07-07 ~03:29Z): one long
 `dh-workerd` anon RSS at ~300–500 MB/s to ~26 GB and the kernel OOM
 killer fired from a `dh-slot-0` thread, taking an unrelated k8s pod
 first. The frame-stream channel is exonerated (capacity-2 backpressure,
-`FRAME_STREAM_CHANNEL_CAPACITY` in `crates/dh-worker/src/service.rs:1486`;
+`FRAME_STREAM_CHANNEL_CAPACITY` in `crates/dh-worker/src/service.rs:1491`;
 ~14 MB/s of frames over ~75 s ≈ 1 GB, nowhere near 26 GB). The signature
 fits something retained per epoch/exit inside one long Run and freed only
 at Run teardown — invisible in the old `Run{frame_budget=1}` era, where
@@ -39,8 +39,10 @@ on our green light to raise it.
    format/value change). If a fix *requires* a format change, that is a
    declared, versioned break with a migration story — stop and surface it,
    never land it silently.
-3. **Track it in beads.** File the internal bead (P1) before writing code,
-   linking the bridge request dir and phase4's items 1–4. The request dir
+3. **Track it in beads.** The internal bead is FILED:
+   `determinism-hypervisor-9f3x` (P1, links the bridge request dir and
+   bridge beads `l1w`/`9bx`). Claim it (`bd update determinism-hypervisor-9f3x --claim`)
+   before writing code and keep root-cause/evidence notes on it. The request dir
    is not a tracker. Also annotate bead `38b6` (deferred epoch-hash M4
    pipeline) with the fix's relationship to that design — absorbed,
    partially absorbed, or untouched (see `02-fix-design.md`).

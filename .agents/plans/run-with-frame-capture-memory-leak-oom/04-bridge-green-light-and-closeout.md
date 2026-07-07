@@ -20,9 +20,17 @@ seconds-to-minutes of play. The answer they need has two parts:
   number, its derivation, and what it assumes (slot count, guest size,
   host RAM).
 - **The build.** The exact worker commit/build carrying the fix, and
-  confirmation it is deployed (or the deploy is scheduled). The bridge
-  owns the restart procedure (`rom-bridge-o73` runbook) — coordinate the
-  window with them; do not restart their worker unilaterally.
+  confirmation it is deployed (or the deploy is scheduled). Actor
+  split: this repo stages the fixed release binary per
+  `docs/ops/rom-bridge-o73-ready-snapshot.md`; the bridge owns the
+  restart procedure and the deploy window (their `72o` lease caveat) —
+  coordinate the window with them; do not restart their worker
+  unilaterally, and never under their live sessions.
+
+Also flag to reference-workload (per phase4's sequencing note): if
+their capture/corpus session starts before the fix deploys to the lab
+worker, they must use segment-bounded Runs (the bridge's `fbd38d1`
+pattern) — one note to their request dir or bead prevents incident #2.
 
 Note the caveat that stands regardless: the sealed-DHILOG size and
 seal/teardown cost still scale with segment length even after the RSS
@@ -41,10 +49,22 @@ granularity grounds, not stale OOM fear.
   (the retainer 01 actually found, with file:line), the fix commit, the
   before/after profile evidence path, the regression guard's location
   and invocation, and the `9bx` answer.
-- `.agents/requests/phase4-oom-fix-and-capture-engine-proving/`: resolve
-  items 1–4 the same way. Item 5 (capture-engine proving) is NOT this
-  plan's scope — resolve it as explicitly-waiting-on-`refwork-gp9` if it
-  hasn't been picked up separately, per that request's own instruction.
+- `.agents/requests/phase4-oom-fix-and-capture-engine-proving/`: the
+  handback shape is PRESCRIBED by that request's
+  `03-verification-offer.md` — append `04-resolution.md` there
+  containing: bead id, fix commits, profile evidence path, guard
+  location + bound derivation, and the `9bx` answer (plus the
+  waiting-on-`refwork-gp9` note for item 5, which is NOT this plan's
+  scope). The phases track responds with `05-verification.md` and will
+  re-run the RSS guard from a clean checkout — make sure the guard's
+  invocation line works from a fresh clone.
+- **The bridge-confirmation leg is part of acceptance** (phase4 AC3):
+  after the fix deploys, the bridge re-runs the incident's streaming
+  session at the green-lit budget and files observations back into the
+  OOM request dir, closing their `l1w` if it holds. This plan's
+  closeout is not fully done until that confirmation (or handback
+  note) exists — track it on the bead rather than blocking the session
+  on their timeline.
 
 ## 3. Beads Bookkeeping
 

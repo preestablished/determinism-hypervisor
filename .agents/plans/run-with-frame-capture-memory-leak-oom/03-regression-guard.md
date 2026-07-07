@@ -9,10 +9,14 @@ long enough to kill a 4-hour Phase-5 soak.
 
 ## Test Shape
 
-- **Where:** `crates/determinism-tests/tests/` alongside the other
-  long-running `--ignored` lab-lane tests (follow the `linux_ready`
-  pattern: `#[ignore]`, release profile, gated on artifact availability
-  via the `DH_M9_*` env vars, with a documented invocation line). If a
+- **Where:** `crates/dh-worker/tests/` alongside the other
+  long-running `--ignored` lab-lane tests (exemplars:
+  `m9_ready_handoff.rs`, `frame_capture_stream.rs`,
+  `play_perf_smoke.rs` — follow their pattern: `#[ignore]`, release
+  profile, gated on artifact availability via the `DH_M9_*` env vars
+  per `docs/phase-2-exit-gate.md`, with a documented invocation line).
+  Note: there is no `determinism-tests` crate despite older session
+  notes referencing one — `dh-worker` is the integration-test home. If a
   synthetic workload (tight guest loop dirtying pages + FRAME_COUNTER
   increments) reproduces the growth in 01, prefer it — it removes the
   M9-artifact dependency and can run un-ignored in CI at a shorter
@@ -49,13 +53,19 @@ long enough to kill a 4-hour Phase-5 soak.
    bound must NOT scale with run duration or epoch count — that is the
    entire point.
 
-2. **Plateau.** Let `rss_1m` = RSS at the one-minute mark and
-   `rss_final` = max RSS over the final third of the run. Assert
-   `rss_final <= rss_1m × (1 + P)` with `P` a stated small percentage
-   (propose 10%; tune against the post-fix profile from 01 so the test
-   is not flaky, and record the observed post-fix drift that justified
-   the choice). One minute of warm-up is deliberate: page-cache warm-up,
-   lazy allocations, and lz4/stream buffers should all be paid by then.
+2. **Plateau.** Parameterize by run duration `T`: warm-up window ends
+   at `max(60 s, T/3)`; let `rss_warm` = windowed median of RSS over
+   the last 10 s of the warm-up window, and `rss_final` = windowed
+   median (or p90 — pick one, state it) over the final third of the
+   run. Assert `rss_final <= rss_warm × (1 + P)` with `P` a stated
+   small percentage (propose 10%; tune against the post-fix profile
+   from 01 so the test is not flaky, and record the observed post-fix
+   drift that justified the choice). Medians-of-windows, not single
+   samples or a raw max — one transient allocator spike must not fail
+   the run. If a short-CI variant runs under ~2 minutes, apply only
+   the ceiling assertion there and leave the plateau to the lab lane;
+   the warm-up is deliberate — page-cache warm-up, lazy allocations,
+   and lz4/stream buffers should all be paid before it ends.
 
 ## Determinism Cross-Check (Do Not Skip)
 
@@ -72,8 +82,8 @@ check from `02-fix-design.md`. Concretely, at the fix commit:
 
 RSS is host-noisy. Mitigations, in order of preference: assert on
 `VmRSS` deltas from the test's own baseline rather than absolutes where
-possible; sample at 1 s and compare medians-of-windows rather than
-single samples for the plateau check; and if the lab host shares load,
-document a rerun policy on the bead rather than loosening `P` past 15%.
+possible (the plateau assertion above already uses windowed medians);
+and if the lab host shares load, document a rerun policy on the bead
+rather than loosening `P` past 15%.
 Do not paper over a failure by widening bounds without a profile showing
 the growth is benign and bounded.

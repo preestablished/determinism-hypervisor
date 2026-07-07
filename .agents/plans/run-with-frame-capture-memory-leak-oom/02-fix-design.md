@@ -5,19 +5,20 @@ take, the two invariants from `00-overview.md` hold: the epoch hash
 chain and sealed DHILOG format stay bit-identical, and the proof is a
 pre-fix recording replayed on the post-fix build.
 
-## Branch H1: Bisection Checkpoints Were Enabled On The Deployed Worker
+## Branch H1: Bisection Checkpoints Were Somehow Enabled (Unlikely — See 01)
 
-Two sub-problems — fix both, not just the config:
+01's sweep found the stock binary has no enablement path, so this
+branch only fires if the deployed build turns out to be patched or a
+future config surface appears. The hardening below is worth doing
+regardless of which hypothesis confirmed, as follow-up if not now:
 
-1. **The config surprise.** If the deployment enabled `every_epoch()`
-   (or an interval) without the operator intending it for play
-   sessions, make enablement loud and legible: log the effective
+1. **Make enablement loud.** Log the effective
    `BisectionCheckpointConfig` at worker startup AND at each Run start
    when enabled (it multiplies per-Run memory churn and snapstore
-   traffic by ~128 MiB/epoch); consider a startup warning when
-   `enabled` is combined with a streaming-scale default. Fix the
-   deployment config itself in coordination with ops (the play-60fps
-   measurements doc records the deployment; the bridge owns restarts).
+   traffic by ~128 MiB/epoch). If deployment config work is needed,
+   coordinate with ops: this repo stages the fixed release binary per
+   `docs/ops/rom-bridge-o73-ready-snapshot.md`; the bridge owns the
+   restart window (see `04-bridge-green-light-and-closeout.md`).
 2. **The mechanism should survive being enabled.** Even intentional
    bisection checkpointing must not OOM the host:
    - `read_pages` (`crates/dh-worker/src/snapshot_engine.rs:278-288`)
@@ -59,10 +60,39 @@ Fix the churn at its sources, prefer pooling over allocator tuning:
   worker side. Prefer the pooled-buffer fixes; use the backstop only
   if pooling leaves residual growth.
 - None of these touch hash preimages or DHILOG bytes — the bit-identity
-  check should pass trivially, but run it anyway (buffer-reuse bugs
-  that leak stale bytes into a hash are exactly what it would catch —
-  e.g. a reused framebuffer scratch must be fully overwritten or
-  length-clamped per frame).
+  check should pass trivially, but run it anyway: it DOES cover
+  `device_sections`/vCPU-blob pooling (those are hash preimages).
+  **It does NOT cover the framebuffer scratch** — fb bytes never enter
+  any hash or DHILOG record (`fb_lz4` is host output only), so a
+  stale-bytes bug in a pooled region-read or pixel buffer would
+  silently corrupt frames delivered to the bridge while every
+  determinism gate stays green. The frame-sink pooling change
+  therefore needs its own content check: a test driving two
+  consecutive frames with different content (and a short-then-long
+  region sequence) asserting each decoded `fb_lz4` matches an
+  independent framebuffer read of the same frame.
+
+## Fixes For The C1/C2 Retainers (Cheap — Do Them In Any Branch)
+
+01's sweep found two genuine grow-until-teardown buffers. Whether or
+not they are the incident's driver, bound them while you're here:
+
+- **C1:** apply the guest-event retention cap incrementally during the
+  run (trim inside or alongside the `on_exit` accumulation at
+  `service.rs:3646`) instead of only after the run returns
+  (`service.rs:3836`). Check first whether anything consumes the full
+  in-run event list at Run end (e.g. SDK-event responses) before
+  trimming — preserve observable behavior; the cap semantics should
+  match what post-run trimming produces today.
+- **C2:** `DebugSerial.out` (`crates/dh-devices/src/serial.rs:39`) is
+  never drained in production. Either bound it (ring buffer / cap with
+  drop-oldest and a dropped-bytes counter) or actually wire the drain
+  the module doc claims exists. If serial output feeds no consumer
+  today, the bound is the safe minimal fix; file the follow-up bead
+  for the doc-vs-reality discrepancy either way. Caution: DebugSerial
+  is a device — confirm its `snapshot()` section (if any) does not
+  include `out` before changing its shape, so device-section hash
+  preimages are untouched.
 
 ## Branch H3: Something Else
 
@@ -89,6 +119,13 @@ that M4's shadow copy should reuse the same pool discipline.
 
 - Full workspace test suite, 3+ consecutive runs (hash-adjacent change
   — repo standing rule), merge gated on exit code (never `;`-chained).
-- The pre-fix recording bit-identity replay (produce the recording
-  BEFORE the fix lands — see `03-regression-guard.md`).
+- The pre-fix recording bit-identity replay. The recording comes from
+  01's exit criterion (produced BEFORE the fix). Mechanism: the replay
+  engine already verifies recorded EPOCH_HASH chain values during
+  replay (`VerifyReplay` surface / `crates/dh-worker/src/verify_replay.rs`
+  path used by `m5_record_replay.rs`-style tests) — replay the pre-fix
+  sealed DHILOG on the post-fix build and require zero divergence; if
+  no existing harness fits, write a small comparer that reads the
+  sealed DHILOG's epoch-hash records and diffs them against the
+  post-fix replay's chain values, and say so in the evidence dir.
 - Post-fix profile rerun into the same evidence dir as 01's baseline.
