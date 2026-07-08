@@ -1,5 +1,15 @@
 # Plan: Phase-4 OOM Fix And Capture-Engine Proving — Remaining Scope
 
+> **EXECUTED 2026-07-08** — item 5 (capture-engine proof) DONE. Bead
+> `ncn7`; proving test `crates/dh-worker/tests/capture_engine_real_image.rs`
+> ran green against the real image (`test result: ok. 1 passed`, all
+> checks a–d). Evidence:
+> `.agents/requests/phase4-oom-fix-and-capture-engine-proving/evidence/`;
+> resolution addendum `04a-item5-resolution.md`; refwork pointer
+> `../reference-workload/.agents/requests/phase4-real-capture-corpus-fast-follow/04-engine-proof-available.md`;
+> cost follow-up `uyhu`. Items 1–4 were already done (fix `c0337ab`);
+> `9f3x` stays open pending the bridge's redeploy confirmation.
+
 Plan for `.agents/requests/phase4-oom-fix-and-capture-engine-proving/`.
 Written 2026-07-08 for a coding agent to execute.
 
