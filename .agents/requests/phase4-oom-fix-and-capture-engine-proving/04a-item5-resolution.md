@@ -13,7 +13,11 @@ is **DONE**. Items 1–4 remain as handed back in `04-resolution.md`
 - **Proof commit / test:** `crates/dh-worker/tests/capture_engine_real_image.rs`
   — an `--ignored` M9 lab-lane test (staging + invocation in its module
   doc). Ran green against the real image on 2026-07-08:
-  `test result: ok. 1 passed`, 16.93 s, worker `b1eba73`.
+  `test result: ok. 1 passed`, 16.93 s. Ran with worker HEAD at
+  `b1eba73` (carries OOM fix `c0337ab`); the test + evidence were
+  committed at `4ac66b5`, with a follow-up review-fix commit — a
+  re-verifier should check out `4ac66b5`+ to find the test, not
+  `b1eba73`.
 - **No engine change was needed** — the Phase-3 capture engine works
   end-to-end against the real image as built. This item is a proof, and
   it passed.
@@ -26,10 +30,11 @@ Both capture surfaces proven — `Run`-with-capture and
 
 - **(a)** a 12-range compiled extraction list (9 `demo-game.yaml`
   features + 3 edge probes; 591 packed bytes) returned `feature_bytes`
-  bit-identical to independent `ReadGuestMemory`/`read_region` reads of
-  the same `(region, offset, len)` at the same paused boundary; packing
-  is request order (proven by a reversed-order re-capture on the
-  TakeSnapshot surface whose per-range bytes still matched).
+  bit-identical to a `ReadGuestMemory` read of the same
+  `(region, offset, len)` at the same paused boundary; packing is
+  request order (proven by a reversed-order re-capture on the
+  TakeSnapshot surface whose per-range bytes still matched). **Not an
+  independent read** — see the independence-scope caveat below.
 - **(b)** `fb_lz4` decoded to exactly 229,376 bytes (D7 geometry
   confirmed via `fb_info`), non-black, and equalled an independent
   full-region read of `framebuffer`.
@@ -39,6 +44,22 @@ Both capture surfaces proven — `Run`-with-capture and
 - **(d)** a mismatched `layout_version = 2` was rejected
   `FAILED_PRECONDITION` on **both** surfaces; **proven good version = 1**
   (the guard protecting scorer M1 from a stale layout).
+
+## Independence scope (disclosed, per the plan's own clause)
+
+The (a)/(b) cross-checks are **common-mode, not independent**: the
+capture engine, `ReadGuestMemory.region_ranges`, and `GetFramebuffer`
+all funnel through the same `detguest-host` `Channel::read_region`
+primitive, so a bug inside `read_region` would pass both sides. This
+proof establishes that the capture engine correctly *uses* the
+primitive (packing order, offsets/lengths, layout gating, geometry +
+lz4, surface equivalence, restore identity); `read_region`'s own
+correctness is covered by detguest-host's tests, not re-proven here.
+The plan's step-4 second independent read (raw-GPA, bypassing
+`read_region`) was **not** implemented — there is no manifest RPC to
+source a region's GPA, so it would need fragile hardcoded addresses.
+Recorded here per the plan's "if neither second path is practical, say
+so in the evidence" clause. (Surfaced by dual review, 2026-07-08.)
 
 ## Cost (advisory, not a bar)
 

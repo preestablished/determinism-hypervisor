@@ -11,18 +11,34 @@
 //! `TakeSnapshot`-with-capture — against the real guest-sdk region
 //! manifest, proving:
 //!
-//!   (a) `feature_bytes` match independent `detguest-host` reads
-//!       (`ReadGuestMemory` by-name, which delegates to
-//!       `Channel::read_region`) of the same (region, offset, len)
-//!       ranges bit-for-bit, plus a snapshot-file second read for at
-//!       least one range so a common-mode reader bug can't self-confirm;
+//!   (a) `feature_bytes` match a `ReadGuestMemory` by-name read of the
+//!       same (region, offset, len) ranges bit-for-bit;
 //!   (b) `fb_lz4` decodes to the D7 229,376-byte framebuffer frame and
-//!       equals an independent read of the framebuffer region;
+//!       equals a `ReadGuestMemory` read of the framebuffer region;
 //!   (c) the same spec over a restored/forked child returns identical
 //!       bytes for unchanged state;
 //!   (d) a mismatched `layout_version` is rejected FAILED_PRECONDITION
 //!       on both surfaces (the guard protecting scorer M1 from decoding
 //!       a stale layout).
+//!
+//! INDEPENDENCE SCOPE — read before citing (a)/(b) as a "proof". Every
+//! region-name read surface in the worker — the capture engine
+//! (`capture_at_boundary`), `ReadGuestMemory.region_ranges`, and
+//! `GetFramebuffer` — funnels through the SAME `detguest-host`
+//! `Channel::read_region` primitive. So the (a)/(b) cross-checks are
+//! common-mode, NOT independent: a bug inside `read_region` itself
+//! (wrong region base, off-by-one, stale manifest) would corrupt both
+//! sides identically and still pass. What this test DOES prove is that
+//! the capture engine correctly USES that primitive: request-order
+//! packing, per-range offsets/lengths, layout_version gating, framebuffer
+//! geometry + lz4 round-trip, cross-surface equivalence, and restore
+//! identity. `read_region`'s own correctness is covered by
+//! detguest-host's tests (e.g. `read_region_stitches_three_discontiguous_extents`),
+//! not re-proven here. A genuinely independent second read (raw-GPA
+//! `ReadGuestMemory.ranges`, which reads `guest_mem` directly) was NOT
+//! implemented: the test has no out-of-band source for a region's GPA
+//! (there is no manifest RPC), so it would require fragile hardcoded
+//! addresses. This scoping is disclosed in the evidence README too.
 //!
 //! It also records per-capture cost (spec-compile + extract + pack) and
 //! writes a durable sample-evidence set (spec, byte-hash table, revs)
@@ -274,6 +290,13 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
                 mem.icount, run.icount
             ));
         }
+        if mem.chunks.len() != ranges.len() {
+            return Err(format!(
+                "ReadGuestMemory returned {} chunks, expected {} (one per range)",
+                mem.chunks.len(),
+                ranges.len()
+            ));
+        }
         let packed = unpack(&run.feature_bytes, &ranges);
         for (i, r) in ranges.iter().enumerate() {
             if mem.chunks[i] != packed[i] {
@@ -287,7 +310,9 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
                 ));
             }
         }
-        eprintln!("capture-proof: (a) all {} feature ranges bit-match independent reads", ranges.len());
+        // "bit-match" only — see the module docstring's INDEPENDENCE SCOPE:
+        // both sides share the read_region primitive (common-mode).
+        eprintln!("capture-proof: (a) all {} feature ranges bit-match ReadGuestMemory (shared read_region)", ranges.len());
 
         // --- (b) framebuffer: cross-check decoded fb vs an independent
         // read of the whole framebuffer region ---
@@ -305,22 +330,21 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
             .await
             .map_err(|e| format!("ReadGuestMemory framebuffer: {e}"))?
             .into_inner();
-        if fb_read.chunks[0] != fb {
+        if fb_read.chunks.len() != 1 || fb_read.chunks[0] != fb {
             return Err(format!(
-                "decoded fb_lz4 (blake3 {}) != independent framebuffer read (blake3 {})",
+                "decoded fb_lz4 (blake3 {}) != framebuffer read (blake3 {})",
                 blake3_hex(&fb),
-                blake3_hex(&fb_read.chunks[0]),
+                blake3_hex(fb_read.chunks.first().map(|c| c.as_slice()).unwrap_or(&[])),
             ));
         }
-        eprintln!("capture-proof: (b) framebuffer decodes to {FB_BYTES}B and matches independent read");
+        eprintln!("capture-proof: (b) framebuffer decodes to {FB_BYTES}B and matches ReadGuestMemory (shared read_region)");
 
-        // --- (a') independence hardening: read one range a SECOND way,
-        // out of the sealed snapshot file, so a bug in the shared
-        // read_region primitive can't self-confirm. Take a capture-free
-        // snapshot at this boundary and pull the guest-RAM section. ---
-        // (Best-effort: if the snapshot-section tag/layout differs on the
-        // real image we log and rely on the two RPC-level reads. The
-        // framebuffer semantic check above is the common-mode canary.)
+        // NOTE: a genuinely independent second read (out-of-band of
+        // read_region) is NOT performed here — see the module docstring's
+        // INDEPENDENCE SCOPE for why (no manifest RPC to source a region
+        // GPA, so a raw-GPA read would need fragile hardcoded addresses).
+        // The (a)/(b) cross-checks are common-mode; read_region's own
+        // correctness is covered by detguest-host's tests.
 
         // === Surface 2: TakeSnapshot-with-capture, PERMUTED order ===
         // Captures without advancing icount, so it observes the same
@@ -430,7 +454,10 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
                 }
             }
         }
-        // TakeSnapshot surface: failed capture publishes NO snapshot.
+        // TakeSnapshot surface: the RPC is rejected, so the client
+        // receives no SnapshotRef and has nothing to restore (this is the
+        // observable guarantee; we assert the error, not the absence of a
+        // store-side entry, which the test can't address without a hash).
         let snap_neg = svc
             .take_snapshot(Request::new(proto::TakeSnapshotRequest {
                 lease: Some(lease.clone()),

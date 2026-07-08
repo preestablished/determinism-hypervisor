@@ -1,5 +1,22 @@
 # 02 — The Capture-Engine Proof: Harness, Surfaces, Checks
 
+> **POST-EXECUTION CORRECTION (2026-07-08, dual review):** Step 2's
+> independence plan was over-optimistic in two ways. (1) The proposed
+> "second independent read path" (snapshot-file section read) was NOT
+> implemented — the test has no out-of-band source for a region GPA
+> (there is no manifest RPC), so a raw-GPA read would need fragile
+> hardcoded addresses; this was disclosed in the evidence per the "if
+> neither second path is practical, say so" clause below. (2) The
+> fallback of "rely on the framebuffer semantic check as the common-mode
+> canary" is WRONG: `GetFramebuffer`/the capture framebuffer read ALSO
+> go through `Channel::read_region`, so the framebuffer check is not
+> independent of `read_region` either. The delivered proof is therefore
+> a *common-mode* proof that the engine correctly USES `read_region`
+> (packing, offsets, layout gating, geometry+lz4, surface equivalence,
+> restore identity); `read_region`'s own correctness rests on
+> detguest-host's tests. This is stated plainly in the test docstring
+> and evidence README.
+
 The deliverable is a lab-lane integration test (plus its evidence
 output) proving the Phase-3 capture engine end-to-end against the real
 workload image. The engine already has *fixture-level* unit coverage in
