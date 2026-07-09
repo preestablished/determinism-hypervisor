@@ -408,6 +408,17 @@ fn pad_burst(index: usize) -> Vec<proto::ScheduledEvent> {
         .collect()
 }
 
+fn mutated_pad_burst(index: usize) -> Vec<proto::ScheduledEvent> {
+    let mut events = pad_burst(index);
+    if let Some(proto::scheduled_event::Event::PadSet(pad)) =
+        events.first_mut().and_then(|event| event.event.as_mut())
+    {
+        pad.buttons ^= 0x8000_0000;
+        pad.buttons |= 1;
+    }
+    events
+}
+
 fn expected_pad_records(index: usize) -> Vec<(u64, u8, u32)> {
     pad_burst(index)
         .into_iter()
@@ -706,24 +717,35 @@ async fn run_nanokernel_child(
     index: usize,
     lease: proto::Lease,
 ) -> TestResult<ChildRecord> {
+    run_nanokernel_child_with_events(svc, index, lease, pad_burst(index), "child").await
+}
+
+async fn run_nanokernel_child_with_events(
+    svc: WorkerService,
+    index: usize,
+    lease: proto::Lease,
+    events: Vec<proto::ScheduledEvent>,
+    label: &str,
+) -> TestResult<ChildRecord> {
     let slot_id = lease.slot_id;
+    let expected_events = events.len();
     let scheduled = match svc
         .inject_inputs(Request::new(proto::InjectInputsRequest {
             lease: Some(lease.clone()),
-            events: pad_burst(index),
+            events,
         }))
         .await
     {
         Ok(response) => response.into_inner().scheduled,
         Err(e) => {
             destroy_best_effort(&svc, Some(lease)).await;
-            return Err(format!("child {index} InjectInputs: {e}"));
+            return Err(format!("{label} {index} InjectInputs: {e}"));
         }
     };
-    if scheduled as usize != BURST_EVENTS {
+    if scheduled as usize != expected_events {
         destroy_best_effort(&svc, Some(lease)).await;
         return Err(format!(
-            "child {index} scheduled {scheduled}, expected {BURST_EVENTS}"
+            "{label} {index} scheduled {scheduled}, expected {expected_events}"
         ));
     }
 
@@ -739,20 +761,20 @@ async fn run_nanokernel_child(
         Ok(response) => response.into_inner(),
         Err(e) => {
             destroy_best_effort(&svc, Some(lease)).await;
-            return Err(format!("child {index} Run: {e}"));
+            return Err(format!("{label} {index} Run: {e}"));
         }
     };
     if run.reason != i32::from(proto::StopReason::BudgetReached) {
         destroy_best_effort(&svc, Some(lease)).await;
         return Err(format!(
-            "child {index} Run stopped with {}, expected BUDGET_REACHED",
+            "{label} {index} Run stopped with {}, expected BUDGET_REACHED",
             run.reason
         ));
     }
     if run.icount != RUN_BUDGET || run.vns != VNS_PER_SECOND {
         destroy_best_effort(&svc, Some(lease)).await;
         return Err(format!(
-            "child {index} ended at icount={} vns={}, expected {RUN_BUDGET}/{VNS_PER_SECOND}",
+            "{label} {index} ended at icount={} vns={}, expected {RUN_BUDGET}/{VNS_PER_SECOND}",
             run.icount, run.vns
         ));
     }
@@ -768,7 +790,7 @@ async fn run_nanokernel_child(
         Ok(response) => response.into_inner(),
         Err(e) => {
             destroy_best_effort(&svc, Some(lease)).await;
-            return Err(format!("child {index} TakeSnapshot: {e}"));
+            return Err(format!("{label} {index} TakeSnapshot: {e}"));
         }
     };
     destroy_best_effort(&svc, Some(lease)).await;
@@ -1203,13 +1225,25 @@ struct M8EvidenceRun {
     jobs: usize,
     store_root: PathBuf,
     store_root_qualified: bool,
+    semantic_negative: bool,
 }
 
 impl M8EvidenceRun {
     fn new(jobs: usize, store_root: &Path) -> TestResult<Self> {
-        let root = std::env::var(M8_EVIDENCE_ROOT_ENV)
+        Self::new_inner(jobs, store_root, false)
+    }
+
+    fn new_semantic_negative(store_root: &Path) -> TestResult<Self> {
+        Self::new_inner(1, store_root, true)
+    }
+
+    fn new_inner(jobs: usize, store_root: &Path, semantic_negative: bool) -> TestResult<Self> {
+        let mut root = std::env::var(M8_EVIDENCE_ROOT_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("target/m8-joint-fork-integrity-live"));
+        if semantic_negative {
+            root = root.join("semantic-negative");
+        }
         std::fs::create_dir_all(root.join("logs"))
             .map_err(|e| format!("create M8 evidence logs dir: {e}"))?;
         std::fs::create_dir_all(root.join("raw"))
@@ -1231,6 +1265,7 @@ impl M8EvidenceRun {
             jobs,
             store_root: store_root.to_path_buf(),
             store_root_qualified: std::env::var(M8_STORE_ROOT_QUALIFIED_ENV).as_deref() == Ok("1"),
+            semantic_negative,
         })
     }
 
@@ -1277,6 +1312,57 @@ impl M8EvidenceRun {
         Ok(())
     }
 
+    fn append_semantic_negative(
+        &mut self,
+        harness: &AcceptanceHarness,
+        original: &ChildRecord,
+        replay: &ChildRecord,
+    ) -> TestResult<()> {
+        let (shared_page_ratio, manifest_kind, chain_depth) =
+            shared_page_ratio(harness.store(), harness.root_snapshot(), &replay.snapshot)?;
+        let result = if replay.snapshot.hash != original.snapshot.hash {
+            "ref_mismatch"
+        } else if replay.state_hash != original.state_hash {
+            "state_mismatch"
+        } else {
+            "error"
+        };
+        let row = serde_json::json!({
+            "child_index": original.index,
+            "seed_hex": child_seed_hex(original.index),
+            "original_ref_hex": snapshot_ref_hex(&original.snapshot),
+            "replay_ref_hex": snapshot_ref_hex(&replay.snapshot),
+            "input_log_id_hex": hex_bytes(&original.input_log_id),
+            "state_hash_original_hex": state_hash_hex(&original.state_hash),
+            "state_hash_replay_hex": state_hash_hex(&replay.state_hash),
+            "restore_mode": "full",
+            "baseline_ref_hex": serde_json::Value::Null,
+            "manifest_kind": manifest_kind,
+            "chain_depth": chain_depth,
+            "dirty_pages": replay.dirty_pages,
+            "shared_page_ratio": shared_page_ratio,
+            "timing_ms": {
+                "fork": 0.0,
+                "run": 0.0,
+                "original_commit": 0.0,
+                "restore": 0.0,
+                "replay": 0.0,
+                "replay_commit": 0.0,
+            },
+            "result": result,
+            "original_slot_id": original.slot_id,
+            "replay_slot_id": replay.slot_id,
+            "mutated_input": "first pad event buttons xor 0x80000000",
+        });
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.child_table_jsonl)
+            .map_err(|e| format!("open M8 semantic-negative child-ref-table.jsonl: {e}"))?;
+        writeln!(file, "{row}").map_err(|e| format!("write M8 semantic-negative row: {e}"))?;
+        self.rows.push(row);
+        Ok(())
+    }
+
     fn finish(&self, guest: AcceptanceGuest) -> TestResult<()> {
         self.write_child_csv()?;
         let aggregate_shared = if self.rows.is_empty() {
@@ -1300,7 +1386,13 @@ impl M8EvidenceRun {
             row.get("original_ref_hex") == row.get("replay_ref_hex")
                 && row.get("state_hash_original_hex") == row.get("state_hash_replay_hex")
         });
-        let run_kind = if self.jobs == DEFAULT_JOBS {
+        let semantic_red = self.rows.iter().any(|row| {
+            row.get("result").and_then(|value| value.as_str()) == Some("ref_mismatch")
+                && row.get("original_ref_hex") != row.get("replay_ref_hex")
+        });
+        let run_kind = if self.semantic_negative {
+            "semantic_negative"
+        } else if self.jobs == DEFAULT_JOBS {
             "full_acceptance"
         } else {
             "bounded_ci"
@@ -1322,7 +1414,7 @@ impl M8EvidenceRun {
             {"name": "m8_shared_page_ratio_aggregate", "ok": aggregate_shared >= 0.94},
             {"name": "m8_restore_delta_used", "ok": saw_delta_restore},
             {"name": "m8_full_manifest_cadence", "ok": full_cadence_seen},
-            {"name": "m8_semantic_negative_red", "ok": false},
+            {"name": "m8_semantic_negative_red", "ok": semantic_red},
             {"name": "m8_store_root_qualified", "ok": self.store_root_qualified},
             {"name": "m8_fork_commit_p99", "ok": false},
             {"name": "m8_restore_delta_p99", "ok": false}
@@ -1374,15 +1466,15 @@ impl M8EvidenceRun {
                 {"path": "child-ref-table.csv", "kind": "child_table_csv"}
             ],
             "semantic_negative": {
-                "command": "",
-                "mutated_input": "",
+                "command": "cargo test -p dh-worker --test m7_fork_verify m8_accept_semantic_negative_replay_commit_ref_mismatch -- --ignored --nocapture --test-threads=1",
+                "mutated_input": "first pad event buttons xor 0x80000000",
                 "expected_red_result": true,
-                "actual_red_result": false
+                "actual_red_result": semantic_red
             },
             "deviations": [
                 {
                     "id": "live_harness_partial",
-                    "reason": "Replay-commit evidence is emitted, but baseline-delta restore, semantic negative, and latency bars are not complete yet."
+                    "reason": "Replay-commit evidence is emitted, but baseline-delta restore and latency bars are not complete yet."
                 }
             ]
         });
@@ -1971,6 +2063,62 @@ async fn replay_commit_batch(
     Ok(replayed)
 }
 
+async fn semantic_negative_replay_commit_child(
+    harness: &AcceptanceHarness,
+    original: &ChildRecord,
+) -> TestResult<ChildRecord> {
+    if harness.guest() != AcceptanceGuest::Nanokernel {
+        return Err(
+            "semantic-negative replay-commit currently requires nanokernel pad input".into(),
+        );
+    }
+    let restored = harness
+        .svc()
+        .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+            snapshot: Some(harness.root_snapshot().clone()),
+            entropy_seed: child_seed(original.index),
+        }))
+        .await
+        .map_err(|e| {
+            format!(
+                "semantic-negative child {} RestoreSnapshot: {e}",
+                original.index
+            )
+        })?
+        .into_inner();
+    let lease = restored.lease.ok_or_else(|| {
+        format!(
+            "semantic-negative child {} returned no lease",
+            original.index
+        )
+    })?;
+    if restored.frame_counter != harness.root_frame_counter() {
+        destroy_best_effort(harness.svc(), Some(lease)).await;
+        return Err(format!(
+            "semantic-negative child {} restored frame_counter {}, expected root {}",
+            original.index,
+            restored.frame_counter,
+            harness.root_frame_counter()
+        ));
+    }
+    let replay = run_nanokernel_child_with_events(
+        harness.svc().clone(),
+        original.index,
+        lease,
+        mutated_pad_burst(original.index),
+        "semantic-negative child",
+    )
+    .await?;
+    if replay.snapshot.hash == original.snapshot.hash {
+        return Err(format!(
+            "semantic-negative child {} replay ref unexpectedly matched original {}",
+            original.index,
+            snapshot_ref_hex(&original.snapshot)
+        ));
+    }
+    Ok(replay)
+}
+
 async fn cross_check_child_on_distinct_slots(
     harness: &AcceptanceHarness,
     index: usize,
@@ -2441,6 +2589,92 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
                 );
             }
         }
+    });
+}
+
+#[test]
+#[ignore = "M8 semantic negative: commit a mutated replay and require replay_ref mismatch"]
+fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
+    let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
+        return;
+    };
+    let child_capacity = slot_cores.len() - 1;
+    assert!(
+        child_capacity > 0,
+        "one slot is reserved for the reusable root parent"
+    );
+
+    let Some(harness) = AcceptanceHarness::new(
+        AcceptanceGuest::Nanokernel,
+        "m7_fork_verify::m8_accept_semantic_negative_replay_commit_ref_mismatch",
+        slot_cores.clone(),
+    )
+    .expect("acceptance harness") else {
+        return;
+    };
+    let mut evidence =
+        M8EvidenceRun::new_semantic_negative(harness.store_root()).expect("M8 evidence root");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async {
+        let index = 0usize;
+        let forked = harness
+            .svc()
+            .fork(Request::new(proto::ForkRequest {
+                parent: Some(harness.root_lease().clone()),
+                count: 1,
+                entropy_seeds: vec![child_seed(index)],
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("M8 semantic-negative Fork: {e}"))
+            .into_inner()
+            .children;
+        assert_eq!(forked.len(), 1);
+
+        let original = run_child_batch(&harness, index, forked)
+            .await
+            .unwrap_or_else(|e| panic!("M8 semantic-negative original child: {e}"))
+            .into_iter()
+            .next()
+            .expect("one original child");
+        let log = tokio::task::block_in_place(|| {
+            fetch_log_payload(harness.store(), &original.input_log_id)
+        });
+        let parsed = validate_single_edge_lineage(&harness, &original, &log)
+            .unwrap_or_else(|e| panic!("M8 semantic-negative original DHILOG: {e}"));
+        let verified = verify_batch(&harness, vec![(original, parsed)])
+            .await
+            .unwrap_or_else(|e| panic!("M8 semantic-negative VerifyReplay: {e}"))
+            .into_iter()
+            .next()
+            .expect("one verified original child");
+
+        let replay = semantic_negative_replay_commit_child(&harness, &verified)
+            .await
+            .unwrap_or_else(|e| panic!("M8 semantic-negative replay commit: {e}"));
+        assert_ne!(
+            replay.snapshot.hash, verified.snapshot.hash,
+            "mutated replay must commit a different snapshot ref"
+        );
+        evidence
+            .append_semantic_negative(&harness, &verified, &replay)
+            .unwrap_or_else(|e| panic!("M8 semantic-negative evidence: {e}"));
+
+        harness.destroy_root().await;
+        let info = harness
+            .svc()
+            .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
+            .await
+            .expect("GetWorkerInfo after cleanup")
+            .into_inner();
+        assert_eq!(info.slots_free as usize, slot_cores.len());
+        evidence
+            .finish(AcceptanceGuest::Nanokernel)
+            .expect("write M8 semantic-negative evidence summary");
     });
 }
 
