@@ -905,6 +905,7 @@ async fn restore_ready_snapshot(
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(ready.snapshot_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .map_err(|e| HandoffError::new("RestoreSnapshot", e.to_string()))?

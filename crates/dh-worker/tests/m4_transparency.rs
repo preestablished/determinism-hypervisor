@@ -158,6 +158,7 @@ fn linux_m4_post_ready_snapshot_restore_and_fork_are_transparent() {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(mid_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .expect("RestoreSnapshot mid post-Ready")
@@ -236,6 +237,7 @@ fn linux_m4_post_ready_snapshot_restore_and_fork_are_transparent() {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(mid_ref),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .expect("RestoreSnapshot fork parent")

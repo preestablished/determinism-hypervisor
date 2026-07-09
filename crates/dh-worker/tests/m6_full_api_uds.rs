@@ -99,6 +99,7 @@ fn worker_config(
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
+        max_delta_chain: dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
     }
 }
 
@@ -371,6 +372,7 @@ async fn restore_slot(
         .restore_snapshot(proto::RestoreSnapshotRequest {
             snapshot: Some(snapshot),
             entropy_seed: Vec::new(),
+            baseline: None,
         })
         .await
         .map_err(|e| format!("slot {index} RestoreSnapshot: {e}"))?

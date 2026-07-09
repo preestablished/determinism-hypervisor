@@ -76,6 +76,22 @@ pub enum RestoreError {
     Store(String),
 }
 
+/// Page materialization mode for a restore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreSource {
+    /// Resolve a full flattened page set and write every guest RAM page.
+    Full,
+    /// The slot already contains `baseline_ref` RAM. Resolve and overlay
+    /// only pages changed between `baseline_ref` and the target snapshot.
+    BaselineDelta { baseline_ref: SnapshotRef },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreMode {
+    Full,
+    BaselineDelta { baseline_ref: SnapshotRef },
+}
+
 /// What the caller (run control / the slot table) needs to resume the
 /// segment: the boundary position, the resumed hash chain, and the slot's
 /// new VMM-owned PRNG. Segment-relative icount is 0 by definition;
@@ -85,6 +101,10 @@ pub struct RestoreOutcome {
     /// (the server-flattened set covers every page), NOT a wire/delta
     /// count; compare `TakeSnapshotOutcome::pages_shipped`.
     pub pages_loaded: u64,
+    /// Pages returned by `ResolvePages`. Equals `pages_loaded` for full
+    /// restore; equals the overlay/delta page count for baseline-delta.
+    pub pages_resolved: u64,
+    pub restore_mode: RestoreMode,
     pub cumulative_icount: u64,
     pub vns: u64,
     pub epoch_index: u64,
@@ -135,6 +155,38 @@ pub fn restore_snapshot(
     dirty: Option<&mut DirtyPageSet>,
     store: &SnapstoreClient,
 ) -> Result<RestoreOutcome, RestoreError> {
+    restore_snapshot_with_source(
+        slot,
+        slot_state,
+        bus,
+        machine_config,
+        snapshot_ref,
+        RestoreSource::Full,
+        counter,
+        dirty,
+        store,
+    )
+}
+
+/// Restore `snapshot_ref` using either full flattened coverage or a
+/// baseline-resident delta overlay.
+///
+/// For [`RestoreSource::BaselineDelta`], the caller must ensure the slot's
+/// guest RAM already contains exactly `baseline_ref`; this function validates
+/// that the baseline manifest exists, matches the machine shape, and is an
+/// ancestor accepted by snapshot-store before applying returned delta pages.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_snapshot_with_source(
+    slot: &SlotVm,
+    slot_state: SlotState,
+    bus: &mut dh_devices::MmioBus,
+    machine_config: &dh_vmm::config::MachineConfig,
+    snapshot_ref: SnapshotRef,
+    source: RestoreSource,
+    counter: Option<&InstRetired>,
+    dirty: Option<&mut DirtyPageSet>,
+    store: &SnapstoreClient,
+) -> Result<RestoreOutcome, RestoreError> {
     if slot_state != SlotState::Paused {
         return Err(RestoreError::NotPaused { state: slot_state });
     }
@@ -154,13 +206,38 @@ pub fn restore_snapshot(
     let blob = &manifest.device_blob;
     validate_dhsnap_blob(blob)?;
 
+    let baseline_ref = match &source {
+        RestoreSource::Full => None,
+        RestoreSource::BaselineDelta { baseline_ref } => {
+            let baseline_bytes = store
+                .get_snapshot(baseline_ref.clone())
+                .map_err(|e| RestoreError::Store(format!("get baseline snapshot: {e}")))?;
+            let baseline_manifest = snapstore_manifest::Manifest::decode(&baseline_bytes)
+                .map_err(|e| RestoreError::Codec(format!("baseline manifest: {e}")))?;
+            if baseline_manifest.guest_ram_bytes != manifest.guest_ram_bytes {
+                return Err(RestoreError::ConfigMismatch(format!(
+                    "baseline guest RAM is {} bytes, snapshot has {}",
+                    baseline_manifest.guest_ram_bytes, manifest.guest_ram_bytes
+                )));
+            }
+            let baseline_config = recover_machine_config_from_blob(&baseline_manifest.device_blob)?;
+            if &baseline_config != machine_config {
+                return Err(RestoreError::ConfigMismatch(
+                    "baseline MCFG does not match the slot's MachineConfig".into(),
+                ));
+            }
+            Some(baseline_ref.clone())
+        }
+    };
+
     // ── 2. RAM (§8.3 step 2): flattened pages → the live mapping ─────────
     // mem_bytes is page-multiple by SlotVm construction; keep the
     // truncating division's invariant loud (mirrors snapshot_engine).
     debug_assert!(slot.mem_bytes.is_multiple_of(PAGE_SIZE));
     let total_pages = slot.mem_bytes / PAGE_SIZE;
+    let baseline_arg = baseline_ref.as_ref();
     let resolved = store
-        .resolve_pages(snapshot_ref, None, false)
+        .resolve_pages(snapshot_ref, baseline_arg.cloned(), false)
         .map_err(|e| RestoreError::Store(format!("resolve_pages: {e}")))?;
     let mut covered = vec![false; total_pages as usize];
     for (idx, _hash, payload) in &resolved {
@@ -183,7 +260,8 @@ pub fn restore_snapshot(
             .map_err(|e| RestoreError::Kvm(format!("page {idx} write: {e}")))?;
         covered[*idx as usize] = true;
     }
-    if covered.iter().any(|c| !c) {
+    let pages_resolved = covered.iter().filter(|covered| **covered).count() as u64;
+    if baseline_ref.is_none() && covered.iter().any(|c| !c) {
         // A flattened chain bottoms out in a FULL manifest, which covers
         // every page by invariant — a hole means a broken store, not a
         // sparse snapshot.
@@ -196,6 +274,11 @@ pub fn restore_snapshot(
     let applied = apply_dhsnap(slot, bus, machine_config, &blob.bytes, counter, dirty)?;
     Ok(RestoreOutcome {
         pages_loaded: total_pages,
+        pages_resolved,
+        restore_mode: match baseline_ref {
+            Some(baseline_ref) => RestoreMode::BaselineDelta { baseline_ref },
+            None => RestoreMode::Full,
+        },
         cumulative_icount: applied.cumulative_icount,
         vns: applied.vns,
         epoch_index: applied.epoch_index,

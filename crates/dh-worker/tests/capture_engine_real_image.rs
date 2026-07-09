@@ -107,18 +107,73 @@ const WRAM_LEN: u64 = 131072;
 fn extraction_ranges() -> Vec<Range> {
     vec![
         // demo-game.yaml features (offset = map offset, len = type width)
-        Range { label: "room_id", region: "wram", offset: 0x079B, len: 2 },
-        Range { label: "area_id", region: "wram", offset: 0x079F, len: 1 },
-        Range { label: "player_x", region: "wram", offset: 0x0AF6, len: 2 },
-        Range { label: "player_y", region: "wram", offset: 0x0AFA, len: 2 },
-        Range { label: "health", region: "wram", offset: 0x09C2, len: 2 },
-        Range { label: "upgrade_flags", region: "wram", offset: 0x09A4, len: 2 },
-        Range { label: "boss_flags", region: "wram", offset: 0x7829, len: 1 },
-        Range { label: "game_mode", region: "wram", offset: 0x0998, len: 1 },
-        Range { label: "credits_flag", region: "wram", offset: 0x09DA, len: 1 },
+        Range {
+            label: "room_id",
+            region: "wram",
+            offset: 0x079B,
+            len: 2,
+        },
+        Range {
+            label: "area_id",
+            region: "wram",
+            offset: 0x079F,
+            len: 1,
+        },
+        Range {
+            label: "player_x",
+            region: "wram",
+            offset: 0x0AF6,
+            len: 2,
+        },
+        Range {
+            label: "player_y",
+            region: "wram",
+            offset: 0x0AFA,
+            len: 2,
+        },
+        Range {
+            label: "health",
+            region: "wram",
+            offset: 0x09C2,
+            len: 2,
+        },
+        Range {
+            label: "upgrade_flags",
+            region: "wram",
+            offset: 0x09A4,
+            len: 2,
+        },
+        Range {
+            label: "boss_flags",
+            region: "wram",
+            offset: 0x7829,
+            len: 1,
+        },
+        Range {
+            label: "game_mode",
+            region: "wram",
+            offset: 0x0998,
+            len: 1,
+        },
+        Range {
+            label: "credits_flag",
+            region: "wram",
+            offset: 0x09DA,
+            len: 1,
+        },
         // edge probes the feature map won't give us:
-        Range { label: "probe_zero", region: "wram", offset: 0, len: 1 },
-        Range { label: "probe_large", region: "wram", offset: 0x1000, len: 512 },
+        Range {
+            label: "probe_zero",
+            region: "wram",
+            offset: 0,
+            len: 1,
+        },
+        Range {
+            label: "probe_large",
+            region: "wram",
+            offset: 0x1000,
+            len: 512,
+        },
         Range {
             label: "probe_tail",
             region: "wram",
@@ -204,8 +259,8 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
     std::fs::create_dir_all(&evidence_dir).map_err(|e| format!("evidence dir: {e}"))?;
     let mut samples = std::fs::File::create(evidence_dir.join("capture-samples.jsonl"))
         .map_err(|e| format!("samples file: {e}"))?;
-    let mut readme =
-        std::fs::File::create(evidence_dir.join("README.md")).map_err(|e| format!("readme: {e}"))?;
+    let mut readme = std::fs::File::create(evidence_dir.join("README.md"))
+        .map_err(|e| format!("readme: {e}"))?;
 
     let ranges = extraction_ranges();
     let feature_total: usize = ranges.iter().map(|r| r.len as usize).sum();
@@ -398,6 +453,7 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(snapshot_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .map_err(|e| format!("RestoreSnapshot child: {e}"))?

@@ -125,6 +125,8 @@ message CreateVmResponse {
 message RestoreSnapshotRequest {
   SnapshotRef snapshot   = 1;        // resolved via snapshot-store by the worker
   bytes entropy_seed     = 2;        // 32 bytes; empty ⇒ continue snapshot's PRNG stream
+  SnapshotRef baseline   = 3;        // optional ancestor: materialize baseline first, then
+                                     //   overlay ResolvePages(snapshot, baseline_ref=baseline)
 }
 message RestoreSnapshotResponse {
   Lease lease            = 1;

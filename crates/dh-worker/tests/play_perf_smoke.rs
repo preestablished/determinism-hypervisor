@@ -41,10 +41,8 @@ fn ms(d: Duration) -> f64 {
 #[test]
 #[ignore = "M9 Linux perf smoke: requires KVM dirty-ring support and staged DH_M9_* artifacts; use --release"]
 fn linux_play_path_perf_smoke() -> TestResult<()> {
-    let Some(ready) = common::m9_linux_ready_snapshot(
-        "play_perf_smoke::linux_play_path_perf_smoke",
-        2,
-    )?
+    let Some(ready) =
+        common::m9_linux_ready_snapshot("play_perf_smoke::linux_play_path_perf_smoke", 2)?
     else {
         return Ok(());
     };
@@ -107,6 +105,7 @@ fn linux_play_path_perf_smoke() -> TestResult<()> {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(ready.ready_snapshot_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .map_err(|e| format!("RestoreSnapshot: {e}"))?

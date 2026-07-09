@@ -605,6 +605,7 @@ pub fn m9_worker_config_with_slot_cores(
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
+        max_delta_chain: dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
     }
 }
 

@@ -28,7 +28,10 @@ use dh_vmm::dirty::{enable_dirty_logging, DirtyPageSet, DirtyRing, PAGE_SIZE};
 use dh_vmm::kvm::{classify_exit, ExitEvent, KvmSystem};
 use dh_vmm::{vcpu_state, SlotState};
 use dh_worker::proto_map::machine_config_from_proto;
-use dh_worker::restore_engine::{recover_machine_config, restore_snapshot, RestoreError};
+use dh_worker::restore_engine::{
+    recover_machine_config, restore_snapshot, restore_snapshot_with_source, RestoreError,
+    RestoreMode, RestoreSource,
+};
 use dh_worker::service::boot_observer;
 use dh_worker::snapshot_engine::{
     take_snapshot, BoundaryState, PageSource, DEVICE_BLOB_FORMAT_DHSNAP,
@@ -517,6 +520,72 @@ fn delta_chain_restore_materializes_the_full_state() {
     )
     .expect("full B");
     assert_eq!(full_b.snapshot_ref, full_a.snapshot_ref);
+
+    // Baseline-resident mode: first materialize the root into a slot, then
+    // overlay only pages changed between root and child. This is the M8
+    // RestorePages(child, baseline_ref=root) shape; a fresh-slot delta
+    // overlay would leave holes, so the root restore is load-bearing.
+    let slot_c = sys.create_slot_vm(MEM).unwrap();
+    let mut bus_c = test_bus();
+    let baseline = restore_snapshot(
+        &slot_c,
+        SlotState::Paused,
+        &mut bus_c,
+        &config,
+        root.snapshot_ref.clone(),
+        None,
+        None,
+        &store,
+    )
+    .expect("restore baseline root");
+    assert_eq!(baseline.restore_mode, RestoreMode::Full);
+    assert_eq!(baseline.pages_resolved, MEM / PAGE_SIZE);
+
+    let delta_overlay = restore_snapshot_with_source(
+        &slot_c,
+        SlotState::Paused,
+        &mut bus_c,
+        &config,
+        delta.snapshot_ref.clone(),
+        RestoreSource::BaselineDelta {
+            baseline_ref: root.snapshot_ref.clone(),
+        },
+        counter.as_ref(),
+        None,
+        &store,
+    )
+    .expect("restore delta over resident baseline");
+    assert_eq!(
+        delta_overlay.restore_mode,
+        RestoreMode::BaselineDelta {
+            baseline_ref: root.snapshot_ref.clone()
+        }
+    );
+    assert_eq!(delta_overlay.pages_loaded, MEM / PAGE_SIZE);
+    assert_eq!(delta_overlay.pages_resolved, delta.pages_shipped);
+    assert!(
+        delta_overlay.pages_resolved < delta_overlay.pages_loaded,
+        "baseline delta must not resolve full RAM coverage"
+    );
+
+    let full_c = take_snapshot(
+        &slot_c,
+        SlotState::Paused,
+        &bus_c,
+        &delta_overlay.entropy,
+        &config,
+        BoundaryState {
+            icount: delta_overlay.cumulative_icount,
+            vns: delta_overlay.vns,
+            epoch_index: delta_overlay.epoch_index,
+            hash_chain: delta_overlay.chain.value(),
+            agenda_empty: true,
+        },
+        PageSource::Full,
+        &store,
+    )
+    .expect("full C");
+    assert_eq!(full_c.snapshot_ref, full_a.snapshot_ref);
 }
 
 #[test]
@@ -913,6 +982,7 @@ fn linux_boot_once() {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(ready.ready_snapshot_ref.clone()),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .map_err(|e| format!("RestoreSnapshot READY: {e}"))?

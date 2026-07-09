@@ -143,6 +143,7 @@ fn linux_m5_frame_budget_records_post_ready_frame_marks() -> TestResult<()> {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(first_ref),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .map_err(|e| format!("RestoreSnapshot first frame boundary: {e}"))?
@@ -469,6 +470,7 @@ fn detchannel_frame_budget_drains_sdk_frame_marks_across_restore() -> TestResult
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(first_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .map_err(|e| format!("RestoreSnapshot detchannel frame boundary: {e}"))?

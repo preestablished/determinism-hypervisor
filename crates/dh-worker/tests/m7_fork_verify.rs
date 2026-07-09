@@ -493,6 +493,7 @@ fn worker_config(
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
+        max_delta_chain: dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
     }
 }
 
@@ -1450,6 +1451,7 @@ impl M8EvidenceRun {
             },
             "config": {
                 "jobs": self.jobs,
+                "max_delta_chain": dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
                 "slot_cores_env": std::env::var(SLOT_CORES_ENV).unwrap_or_default(),
                 "restore_mode": "full",
                 "child_batch_size": serde_json::Value::Null,
@@ -1474,7 +1476,7 @@ impl M8EvidenceRun {
             "deviations": [
                 {
                     "id": "live_harness_partial",
-                    "reason": "Replay-commit evidence is emitted, but baseline-delta restore and latency bars are not complete yet."
+                    "reason": "Replay-commit evidence is emitted, and worker baseline-delta/FULL cadence has a service smoke; full acceptance evidence still needs baseline-delta aggregation and latency bars."
                 }
             ]
         });
@@ -1979,6 +1981,7 @@ async fn replay_commit_child(
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
             snapshot: Some(root_snapshot),
             entropy_seed: child_seed(original.index),
+            baseline: None,
         }))
         .await
         .map_err(|e| {
@@ -2077,6 +2080,7 @@ async fn semantic_negative_replay_commit_child(
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
             snapshot: Some(harness.root_snapshot().clone()),
             entropy_seed: child_seed(original.index),
+            baseline: None,
         }))
         .await
         .map_err(|e| {

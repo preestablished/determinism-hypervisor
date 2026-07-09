@@ -118,6 +118,8 @@ pub const DEFAULT_SNAPSTORE_TCP: &str = "http://127.0.0.1:7410";
 const VERIFY_REPLAY_INLINE_LOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const VERIFY_REPLAY_PROGRESS_BUFFER: usize = 16;
+#[cfg(target_arch = "x86_64")]
+pub const DEFAULT_MAX_DELTA_CHAIN: u32 = 64;
 
 pub const ARCH_S9_METRIC_FAMILIES: &[&str] = &[
     "dh_worker_slot_icount",
@@ -197,6 +199,8 @@ pub struct WorkerConfig {
     pub snapstore: Option<snapstore_client::Transport>,
     #[cfg(target_arch = "x86_64")]
     pub bisection_checkpoints: BisectionCheckpointConfig,
+    #[cfg(target_arch = "x86_64")]
+    pub max_delta_chain: u32,
 }
 
 impl WorkerConfig {
@@ -217,6 +221,8 @@ impl WorkerConfig {
             )),
             #[cfg(target_arch = "x86_64")]
             bisection_checkpoints: BisectionCheckpointConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            max_delta_chain: DEFAULT_MAX_DELTA_CHAIN,
         })
     }
 }
@@ -321,14 +327,7 @@ struct WorkerMetrics {
 /// outside it would be invisible. Keep in sync with the reasons
 /// `run_with_frame_capture` records.
 const FRAME_STREAM_TERMINATION_LABELS: &[&str] = &[
-    "budget",
-    "hard_cap",
-    "paused",
-    "halted",
-    "cancel",
-    "watchdog",
-    "fault",
-    "other",
+    "budget", "hard_cap", "paused", "halted", "cancel", "watchdog", "fault", "other",
 ];
 
 /// Fold an unlisted termination label into `"other"` so a future
@@ -814,6 +813,8 @@ struct WorkerInner {
     snapstore_transport: Option<snapstore_client::Transport>,
     #[cfg(target_arch = "x86_64")]
     bisection_checkpoints: BisectionCheckpointConfig,
+    #[cfg(target_arch = "x86_64")]
+    max_delta_chain: u32,
     worker_id: String,
     class: proto::DeterminismClass,
     version: String,
@@ -850,6 +851,8 @@ impl WorkerService {
                 snapstore_transport: config.snapstore,
                 #[cfg(target_arch = "x86_64")]
                 bisection_checkpoints: config.bisection_checkpoints,
+                #[cfg(target_arch = "x86_64")]
+                max_delta_chain: config.max_delta_chain.max(1),
                 worker_id: config.worker_id,
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -1303,6 +1306,34 @@ fn snapshot_ref_from_proto(
         .try_into()
         .map_err(|_| Status::invalid_argument("snapshot hash must be 32 bytes"))?;
     Ok(snapstore_types::SnapshotRef::from_bytes(hash))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn snapshot_chain_depth(
+    snapshot_ref: &snapstore_types::SnapshotRef,
+    store: &snapstore_client::blocking::SnapstoreClient,
+) -> Result<u32, Status> {
+    const MAX_CHAIN_WALK: u32 = 4096;
+
+    let mut cursor = snapshot_ref.clone();
+    let mut depth = 0u32;
+    loop {
+        if depth > MAX_CHAIN_WALK {
+            return Err(Status::data_loss("snapshot delta chain exceeds walk limit"));
+        }
+        let container = store
+            .get_snapshot(cursor.clone())
+            .map_err(|e| store_error_to_status("get_snapshot", e))?;
+        let manifest = snapstore_manifest::Manifest::decode(&container)
+            .map_err(|e| Status::data_loss(format!("decode snapshot manifest: {e}")))?;
+        if !manifest.delta {
+            return Ok(depth);
+        }
+        depth = depth.saturating_add(1);
+        cursor = manifest
+            .parent
+            .ok_or_else(|| Status::data_loss("DELTA manifest missing parent"))?;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3511,14 +3542,12 @@ where
     let start_cumulative_icount = runtime.position.cumulative_icount;
     let start_vns = runtime.position.vns;
     let start_cumulative_epoch = runtime.position.epoch_index;
-    let start_segment_vns =
-        segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
+    let start_segment_vns = segment_vns_from_icount(&runtime.machine_config, start_segment_icount)?;
     let sdk_event_filter = run_until.sdk_event_filter;
     let epoch_len = runtime.machine_config.epoch_len.max(1);
     let start_segment_epoch = start_segment_icount / epoch_len;
     if bisection_checkpoints.enabled
-        && runtime.machine_config.hash_epochs
-            != dh_vmm::config::HashEpochs::EpochsOn
+        && runtime.machine_config.hash_epochs != dh_vmm::config::HashEpochs::EpochsOn
     {
         return Err(Status::failed_precondition(
             "bisection checkpoint recording requires hash_epochs=EPOCHS_ON",
@@ -3527,17 +3556,17 @@ where
     let checkpoint_machine_config = bisection_checkpoints
         .enabled
         .then(|| runtime.machine_config.clone());
-    let mut checkpoint_anchor_icount =
-        runtime.bisection_checkpoint_anchor_icount;
+    let mut checkpoint_anchor_icount = runtime.bisection_checkpoint_anchor_icount;
     manager
         .mark_running(lease, lease_now_ms())
         .map_err(slot_error_to_status)?;
     runtime.thread = RuntimeThreadState::Running { tid };
     runtime.clear_pause_request();
     let pause = runtime.pause_flag();
-    let counter = runtime.counter.as_ref().ok_or_else(|| {
-        Status::failed_precondition("slot actor has no InstRetired counter")
-    })?;
+    let counter = runtime
+        .counter
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("slot actor has no InstRetired counter"))?;
 
     // Open the live-injection window (M3) before the bus moves into the
     // rail: the frame-scheduled-IRQ preconditions need the bus, and the
@@ -3568,9 +3597,10 @@ where
     }
 
     let mut goal = || false;
-    let log = runtime.log.take().ok_or_else(|| {
-        Status::failed_precondition("slot has no active DHILOG segment")
-    })?;
+    let log = runtime
+        .log
+        .take()
+        .ok_or_else(|| Status::failed_precondition("slot has no active DHILOG segment"))?;
     let bus = std::mem::take(&mut runtime.bus);
     let lapic = std::mem::take(&mut runtime.lapic);
     let entropy = std::mem::replace(
@@ -3595,13 +3625,7 @@ where
             QueuedInputAt::Icount(_) => None,
         })
         .collect();
-    let (
-        run_result,
-        consumed_input_orders,
-        drained_guest_events,
-        first_matching_sdk_event,
-        rail,
-    ) = {
+    let (run_result, consumed_input_orders, drained_guest_events, first_matching_sdk_event, rail) = {
         let mut rail_inner = dh_vmm::recording::DeviceRail::new(
             bus,
             entropy,
@@ -3618,21 +3642,12 @@ where
         let mut on_exit = |exit: kvm_ioctls::VcpuExit<'_>| {
             metrics.record_exit(lease.slot_id, vcpu_exit_reason_label(&exit));
             let icount = counter_ref.read().map_err(|e| {
-                dh_vmm::boundary::BoundaryError::Exit(format!(
-                    "counter read: {e:?}"
-                ))
+                dh_vmm::boundary::BoundaryError::Exit(format!("counter read: {e:?}"))
             })?;
-            let event_icount = cumulative_event_icount(
-                start_segment_icount,
-                start_cumulative_icount,
-                icount,
-            );
-            let events = service_exit_with_detchannel(
-                &mut rail.borrow_mut(),
-                icount,
-                event_icount,
-                exit,
-            )?;
+            let event_icount =
+                cumulative_event_icount(start_segment_icount, start_cumulative_icount, icount);
+            let events =
+                service_exit_with_detchannel(&mut rail.borrow_mut(), icount, event_icount, exit)?;
             if let Some(filter) = sdk_event_filter {
                 for event in &events {
                     if sdk_event_matches(filter, event) {
@@ -3656,8 +3671,7 @@ where
                     "scheduled input index {idx} out of range"
                 ))
             })?;
-            let vectors =
-                apply_queued_input(&mut *rail.borrow_mut(), input, boundary)?;
+            let vectors = apply_queued_input(&mut *rail.borrow_mut(), input, boundary)?;
             consumed_input_orders.push(input.order);
             Ok(vectors)
         };
@@ -3701,15 +3715,10 @@ where
                 rail.borrow_mut()
                     .log_epoch_hash(epoch_index, icount, chain_value)
                     .map_err(|e| {
-                        dh_vmm::boundary::BoundaryError::Exit(format!(
-                            "epoch log: {e:?}"
-                        ))
+                        dh_vmm::boundary::BoundaryError::Exit(format!("epoch log: {e:?}"))
                     })?;
-                if let Some((
-                    checkpoint_snapshot_ref,
-                    checkpoint_vns,
-                    max_covered_gap,
-                )) = pending_checkpoint
+                if let Some((checkpoint_snapshot_ref, checkpoint_vns, max_covered_gap)) =
+                    pending_checkpoint
                 {
                     rail.borrow_mut()
                         .log_bisection_checkpoint(
@@ -3727,7 +3736,7 @@ where
                     checkpoint_anchor_icount = icount;
                 }
                 Ok(())
-        };
+            };
         let hash_device_sections = || {
             let rail_ref = rail.borrow();
             runtime_hash_device_sections(&rail_ref.bus, &rail_ref.lapic)
@@ -3837,10 +3846,7 @@ where
     runtime.lapic = rail.lapic;
     runtime.entropy = rail.entropy;
     runtime.log = Some(rail.log);
-    append_guest_events_with_retention_cap(
-        &mut runtime.guest_events,
-        drained_guest_events,
-    );
+    append_guest_events_with_retention_cap(&mut runtime.guest_events, drained_guest_events);
     // Close the live-injection window; accepted events the run never
     // reached re-queue on the (now idle) runtime with fresh orders so
     // they still apply on the next run. Semantics note: as static
@@ -3873,16 +3879,13 @@ where
         Ok(outcome) => {
             runtime.thread = RuntimeThreadState::Parked;
             runtime.clear_pause_request();
-            let segment_delta =
-                outcome.boundary.icount.saturating_sub(start_segment_icount);
+            let segment_delta = outcome.boundary.icount.saturating_sub(start_segment_icount);
             let vns_delta = outcome.vns.saturating_sub(start_segment_vns);
             let segment_epoch = outcome.boundary.icount / epoch_len;
             let epoch_delta = segment_epoch.saturating_sub(start_segment_epoch);
-            let cumulative_icount =
-                start_cumulative_icount.saturating_add(segment_delta);
+            let cumulative_icount = start_cumulative_icount.saturating_add(segment_delta);
             let cumulative_vns = start_vns.saturating_add(vns_delta);
-            let cumulative_epoch =
-                runtime.position.epoch_index.saturating_add(epoch_delta);
+            let cumulative_epoch = runtime.position.epoch_index.saturating_add(epoch_delta);
             runtime.set_boundary(
                 cumulative_icount,
                 outcome.boundary.icount,
@@ -3890,10 +3893,8 @@ where
                 cumulative_epoch,
                 runtime.chain.clone(),
             );
-            runtime.bisection_checkpoint_anchor_icount =
-                checkpoint_anchor_icount;
-            runtime.position.frame_counter =
-                frame_counter_from_bus(&mut runtime.bus);
+            runtime.bisection_checkpoint_anchor_icount = checkpoint_anchor_icount;
+            runtime.position.frame_counter = frame_counter_from_bus(&mut runtime.bus);
             if !consumed_input_orders.is_empty() {
                 runtime
                     .queued_inputs
@@ -3931,9 +3932,7 @@ where
                     hash: outcome.state_hash.to_vec(),
                 }),
                 frames_elapsed: outcome.frames_elapsed,
-                sdk_event: if outcome.reason
-                    == dh_vmm::runctl::StopReason::NextSdkEvent
-                {
+                sdk_event: if outcome.reason == dh_vmm::runctl::StopReason::NextSdkEvent {
                     first_matching_sdk_event.map(drained_guest_event_to_proto)
                 } else {
                     None
@@ -3950,7 +3949,6 @@ where
         }
     }
 }
-
 
 #[cfg(target_arch = "x86_64")]
 fn with_paused_runtime_mut<R>(
@@ -4432,6 +4430,10 @@ impl HypervisorWorker for WorkerService {
             let started = Instant::now();
             let request = request.into_inner();
             let snapshot_ref = snapshot_ref_from_proto(request.snapshot)?;
+            let baseline_ref = request
+                .baseline
+                .map(|baseline| snapshot_ref_from_proto(Some(baseline)))
+                .transpose()?;
             let requested_seed =
                 entropy_seed_from_proto("entropy_seed", &request.entropy_seed, true)?;
             if requested_seed == Some([0; 32]) {
@@ -4463,7 +4465,7 @@ impl HypervisorWorker for WorkerService {
                     let mut bus =
                         build_bus(&config, base_image, RuntimeVmMem(slot.guest_mem.clone()))?;
                     let mut dirty = dh_vmm::dirty::DirtyPageSet::new(slot.mem_bytes);
-                    let outcome = {
+                    if let Some(baseline_ref) = baseline_ref.clone() {
                         let store = store.lock().map_err(|_| {
                             Status::internal("snapshot-store client mutex poisoned")
                         })?;
@@ -4472,11 +4474,44 @@ impl HypervisorWorker for WorkerService {
                             dh_vmm::SlotState::Paused,
                             &mut bus,
                             &config,
-                            snapshot_ref.clone(),
+                            baseline_ref.clone(),
                             None,
                             Some(&mut dirty),
                             &store,
                         )
+                        .map_err(restore_engine_error_to_status)?;
+                    }
+                    let outcome = {
+                        let store = store.lock().map_err(|_| {
+                            Status::internal("snapshot-store client mutex poisoned")
+                        })?;
+                        match baseline_ref {
+                            Some(baseline_ref) => {
+                                crate::restore_engine::restore_snapshot_with_source(
+                                    &slot,
+                                    dh_vmm::SlotState::Paused,
+                                    &mut bus,
+                                    &config,
+                                    snapshot_ref.clone(),
+                                    crate::restore_engine::RestoreSource::BaselineDelta {
+                                        baseline_ref,
+                                    },
+                                    None,
+                                    Some(&mut dirty),
+                                    &store,
+                                )
+                            }
+                            None => crate::restore_engine::restore_snapshot(
+                                &slot,
+                                dh_vmm::SlotState::Paused,
+                                &mut bus,
+                                &config,
+                                snapshot_ref.clone(),
+                                None,
+                                Some(&mut dirty),
+                                &store,
+                            ),
+                        }
                         .map_err(restore_engine_error_to_status)?
                     };
                     let entropy = requested_seed
@@ -4808,6 +4843,7 @@ impl HypervisorWorker for WorkerService {
             let manager = self.inner.manager.clone();
             let runtimes = self.inner.runtimes.clone();
             let class = self.inner.class.clone();
+            let max_delta_chain = self.inner.max_delta_chain;
             let snapshot = blocking_lifecycle("TakeSnapshot", move || {
                 let now_ms = lease_now_ms();
                 manager
@@ -4834,11 +4870,18 @@ impl HypervisorWorker for WorkerService {
                         .config_hash()
                         .map_err(|e| Status::internal(format!("MachineConfig hash: {e:?}")))?;
                     let source = match runtime.base_snapshot.clone() {
-                        Some(parent) => crate::snapshot_engine::PageSource::Incremental {
-                            parent,
-                            ring: &mut runtime.dirty_ring,
-                            dirty: &mut runtime.dirty,
-                        },
+                        Some(parent) => {
+                            let parent_depth = snapshot_chain_depth(&parent, &store)?;
+                            if parent_depth >= max_delta_chain {
+                                crate::snapshot_engine::PageSource::Full
+                            } else {
+                                crate::snapshot_engine::PageSource::Incremental {
+                                    parent,
+                                    ring: &mut runtime.dirty_ring,
+                                    dirty: &mut runtime.dirty,
+                                }
+                            }
+                        }
                         None => crate::snapshot_engine::PageSource::Full,
                     };
                     let out = crate::snapshot_engine::take_snapshot_with_lapic(
@@ -5353,8 +5396,7 @@ impl HypervisorWorker for WorkerService {
                     // Set by the emit hook when IT ended the run; the
                     // terminal StopReason is PAUSED either way, so this is
                     // the only place cancel and watchdog stay distinct.
-                    let stop_cause: Arc<Mutex<Option<&'static str>>> =
-                        Arc::new(Mutex::new(None));
+                    let stop_cause: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         manager
                             .checkout_write(&lease, "RunWithFrameCapture", lease_now_ms())
@@ -5375,9 +5417,8 @@ impl HypervisorWorker for WorkerService {
                                 frame,
                             );
                             if let Some(cause) = cause {
-                                *emit_stop_cause
-                                    .lock()
-                                    .expect("stop cause mutex poisoned") = Some(cause);
+                                *emit_stop_cause.lock().expect("stop cause mutex poisoned") =
+                                    Some(cause);
                             }
                             flow
                         };
@@ -5439,11 +5480,7 @@ impl HypervisorWorker for WorkerService {
                         }),
                         Err(e) => Err(e),
                     };
-                    let _ = send_terminal_frame_event(
-                        &tx,
-                        terminal,
-                        FRAME_STREAM_STALL_WATCHDOG,
-                    );
+                    let _ = send_terminal_frame_event(&tx, terminal, FRAME_STREAM_STALL_WATCHDOG);
                 });
             if let Err(e) = spawn {
                 return Err(Status::internal(format!(
@@ -5624,8 +5661,7 @@ mod tests {
                 let second = rx.blocking_recv();
                 (first.is_some(), second.is_some())
             });
-            let delivered =
-                send_terminal_frame_event(&tx, done_event(), Duration::from_secs(5));
+            let delivered = send_terminal_frame_event(&tx, done_event(), Duration::from_secs(5));
             assert!(delivered, "a live consumer must receive the terminal event");
             drop(tx);
             let (first, second) = drainer.join().expect("drainer thread");
@@ -5666,6 +5702,8 @@ mod tests {
             snapstore: None,
             #[cfg(target_arch = "x86_64")]
             bisection_checkpoints: BisectionCheckpointConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            max_delta_chain: DEFAULT_MAX_DELTA_CHAIN,
         }
     }
 
@@ -6501,6 +6539,7 @@ mod tests {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(base_snapshot),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .unwrap()
@@ -6566,6 +6605,7 @@ mod tests {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(base_snapshot),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .unwrap()
@@ -7449,6 +7489,116 @@ mod tests {
                     .base_snapshot_id,
                 Some(snapshot.hash.try_into().unwrap())
             );
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn take_snapshot_rolls_full_manifest_and_restore_accepts_baseline_delta() {
+        if !runtime_tests_available() {
+            return;
+        }
+        let image_cache = tempfile::TempDir::new().unwrap();
+        let base_hash = write_cache_blob(image_cache.path(), &vec![0u8; 4096]);
+        let kernel_hash = write_cache_blob(image_cache.path(), nanokernel::landing_loop_elf());
+        let (_store_rt, _handle, _store_dir, transport) = spawn_store_for_service_test();
+        let mut config =
+            test_config_with_resources(2, image_cache.path().to_path_buf(), Some(transport));
+        config.max_delta_chain = 1;
+        let svc = WorkerService::new(config).unwrap();
+
+        let manifest_for = |snapshot: &proto::SnapshotRef| {
+            let ref_bytes: [u8; 32] = snapshot.hash.clone().try_into().unwrap();
+            tokio::task::block_in_place(|| {
+                let store = svc.store().unwrap();
+                let store = store.lock().unwrap();
+                let container = store
+                    .get_snapshot(snapstore_types::SnapshotRef::from_bytes(ref_bytes))
+                    .unwrap();
+                snapstore_manifest::Manifest::decode(&container).unwrap()
+            })
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(service_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xB8; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let lease = created.lease.unwrap();
+
+            let root = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(false),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let root_ref = root.snapshot.clone().unwrap();
+            let root_manifest = manifest_for(&root_ref);
+            assert!(!root_manifest.delta);
+
+            let delta = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(false),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let delta_ref = delta.snapshot.clone().unwrap();
+            let delta_manifest = manifest_for(&delta_ref);
+            assert!(delta_manifest.delta);
+            assert_eq!(
+                delta_manifest.parent,
+                Some(snapstore_types::SnapshotRef::from_bytes(
+                    root_ref.hash.clone().try_into().unwrap()
+                ))
+            );
+
+            let rollover = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(false),
+                    capture: None,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let rollover_ref = rollover.snapshot.clone().unwrap();
+            let rollover_manifest = manifest_for(&rollover_ref);
+            assert!(!rollover_manifest.delta);
+            assert_eq!(rollover_manifest.parent, None);
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
+
+            let restored = svc
+                .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+                    snapshot: Some(delta_ref),
+                    entropy_seed: Vec::new(),
+                    baseline: Some(root_ref),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                restored.state_hash.unwrap().hash,
+                delta.state_hash.unwrap().hash
+            );
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: restored.lease,
+            }))
+            .await
+            .unwrap();
         });
     }
 
@@ -8434,6 +8584,7 @@ mod tests {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(base_snapshot.clone()),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .unwrap()
@@ -8458,6 +8609,7 @@ mod tests {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(base_snapshot),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .unwrap()
@@ -8701,6 +8853,7 @@ mod tests {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(base_snapshot.clone()),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .unwrap()
@@ -8824,6 +8977,7 @@ mod tests {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(base_snapshot.clone()),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .unwrap()
@@ -8939,6 +9093,7 @@ mod tests {
                 .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                     snapshot: Some(base_snapshot.clone()),
                     entropy_seed: Vec::new(),
+                    baseline: None,
                 }))
                 .await
                 .unwrap()
@@ -9724,6 +9879,7 @@ mod tests {
                     hash: vec![0x11; 32],
                 }),
                 entropy_seed: vec![0; 32],
+                baseline: None,
             }))
             .await
             .unwrap_err();

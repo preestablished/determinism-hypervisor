@@ -495,6 +495,7 @@ fn worker_config(image_cache_dir: PathBuf, snapstore: snapstore_client::Transpor
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::every_epoch(),
+        max_delta_chain: dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
     }
 }
 
@@ -1301,6 +1302,7 @@ fn run_pvblk_dev_vdb(verify_replay: bool) {
             .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
                 snapshot: Some(ready_snapshot_ref.clone()),
                 entropy_seed: Vec::new(),
+                baseline: None,
             }))
             .await
             .expect("RestoreSnapshot Ready")

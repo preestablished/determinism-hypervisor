@@ -131,6 +131,7 @@ async fn restore_lease(
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
             snapshot: Some(snapshot.clone()),
             entropy_seed: Vec::new(),
+            baseline: None,
         }))
         .await
         .map_err(|e| format!("RestoreSnapshot: {e}"))?
@@ -451,7 +452,10 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
                                         frame.frame_index,
                                     )),
                                     event: Some(proto::scheduled_event::Event::PadSet(
-                                        proto::PadSet { port: 0, buttons: 1 },
+                                        proto::PadSet {
+                                            port: 0,
+                                            buttons: 1,
+                                        },
                                     )),
                                 }],
                             }))
@@ -460,8 +464,8 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
                             Err(status) if status.code() == tonic::Code::InvalidArgument => {}
                             other => {
                                 return Err(format!(
-                                    "past-frame live inject must fail INVALID_ARGUMENT, got {other:?}"
-                                ))
+                                "past-frame live inject must fail INVALID_ARGUMENT, got {other:?}"
+                            ))
                             }
                         }
                         let at_icount = ready
@@ -471,7 +475,10 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
                                 events: vec![proto::ScheduledEvent {
                                     at: Some(proto::scheduled_event::At::AtIcount(u64::MAX)),
                                     event: Some(proto::scheduled_event::Event::PadSet(
-                                        proto::PadSet { port: 0, buttons: 1 },
+                                        proto::PadSet {
+                                            port: 0,
+                                            buttons: 1,
+                                        },
                                     )),
                                 }],
                             }))
@@ -480,8 +487,8 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
                             Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
                             other => {
                                 return Err(format!(
-                                    "icount live inject must fail FAILED_PRECONDITION, got {other:?}"
-                                ))
+                                "icount live inject must fail FAILED_PRECONDITION, got {other:?}"
+                            ))
                             }
                         }
                         injected_at_frame = Some(target);
@@ -494,16 +501,13 @@ fn linux_live_injected_inputs_at_frame_holds_replay_identically() -> TestResult<
                 None => return Err("FrameCaptureEvent without msg".into()),
             }
         }
-        let done =
-            done.ok_or_else(|| "stream ended without terminal RunResponse".to_string())?;
+        let done = done.ok_or_else(|| "stream ended without terminal RunResponse".to_string())?;
         let injected_at_frame =
             injected_at_frame.ok_or_else(|| "run too short to inject".to_string())?;
         if u64::from(frames_seen) != done.frames_elapsed {
             return Err("frame count mismatch".into());
         }
-        if u64::from(injected_at_frame - ready.ready_snapshot.frame_counter)
-            > done.frames_elapsed
-        {
+        if u64::from(injected_at_frame - ready.ready_snapshot.frame_counter) > done.frames_elapsed {
             return Err(format!(
                 "budget ended before the injected frame {injected_at_frame} was reached; \
                  raise the test budget"
@@ -597,8 +601,7 @@ fn linux_stalled_consumer_watchdog_ends_the_run_paused() -> TestResult<()> {
                 None => return Err("FrameCaptureEvent without msg".into()),
             }
         }
-        let done =
-            done.ok_or_else(|| "stream ended without terminal RunResponse".to_string())?;
+        let done = done.ok_or_else(|| "stream ended without terminal RunResponse".to_string())?;
         if done.reason != i32::from(proto::StopReason::Paused) {
             return Err(format!(
                 "watchdog stop must report PAUSED, got reason {}",
