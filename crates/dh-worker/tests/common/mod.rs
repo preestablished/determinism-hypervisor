@@ -60,6 +60,8 @@ pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [
 #[allow(dead_code)]
 pub const DH_M9_ALLOW_SKIP: &str = "DH_M9_ALLOW_SKIP";
 #[allow(dead_code)]
+pub const M8_STORE_ROOT: &str = "M8_STORE_ROOT";
+#[allow(dead_code)]
 pub const M9_LINUX_MEM_BYTES: u64 = 128 * 1024 * 1024;
 #[allow(dead_code)]
 pub const M9_READY_HARD_CAP: u64 = 10_000_000_000;
@@ -154,7 +156,8 @@ pub struct M9CachedHashes {
 pub struct M9LinuxReady {
     pub _store_rt: tokio::runtime::Runtime,
     pub _store_handle: ServerHandle,
-    pub _store_dir: TempDir,
+    pub _store_dir: Option<TempDir>,
+    pub store_root: PathBuf,
     pub store: BlockingClient,
     pub svc: dh_worker::service::WorkerService,
     pub config_hash: [u8; 32],
@@ -673,11 +676,26 @@ where
         .config_hash()
         .map_err(|e| format!("MachineConfig hash: {e:?}"))?;
 
-    let store_dir = TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+    let (store_root, store_dir) = if test_name.contains("m8_accept") {
+        match std::env::var(M8_STORE_ROOT) {
+            Ok(path) if !path.is_empty() => {
+                let root = PathBuf::from(path);
+                std::fs::create_dir_all(&root)
+                    .map_err(|e| format!("{test_name}: create M8_STORE_ROOT: {e}"))?;
+                (root, None)
+            }
+            _ => {
+                let dir = TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+                (dir.path().to_path_buf(), Some(dir))
+            }
+        }
+    } else {
+        let dir = TempDir::new().map_err(|e| format!("snapstore tempdir: {e}"))?;
+        (dir.path().to_path_buf(), Some(dir))
+    };
     let store_sock = "snapstore.sock";
-    let (_store_rt, _store_handle, store) =
-        spawn_store_at(store_dir.path().to_path_buf(), store_sock);
-    let snapstore = snapstore_client::Transport::Uds(store_dir.path().join(store_sock));
+    let (_store_rt, _store_handle, store) = spawn_store_at(store_root.clone(), store_sock);
+    let snapstore = snapstore_client::Transport::Uds(store_root.join(store_sock));
     let svc = dh_worker::service::WorkerService::new(m9_worker_config_with_slot_cores(
         test_name,
         slot_cores,
@@ -776,6 +794,7 @@ where
         _store_rt,
         _store_handle,
         _store_dir: store_dir,
+        store_root,
         store,
         svc,
         config_hash,

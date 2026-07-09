@@ -45,6 +45,7 @@ hyper-util.workspace = true
 kvm-bindings = "0.14.0"
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml = "0.8"
