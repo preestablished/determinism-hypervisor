@@ -227,8 +227,8 @@ jobs:
       DH_M7_ACCEPT_JOBS: ${{ inputs.m8_fork_jobs || '100' }}
       DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m8_slot_cores || '2-5' }}
       DH_M7_ACCEPT_ALLOW_SKIP: "0"
-      M8_STORE_ROOT: ${{ runner.temp }}/m8-store-${{ github.run_id }}
-      M8_EVIDENCE_ROOT: ${{ runner.temp }}/m8-evidence-${{ github.run_id }}
+      M8_STORE_ROOT: ${{ github.workspace }}/m8-store-${{ github.run_id }}
+      M8_EVIDENCE_ROOT: ${{ github.workspace }}/m8-evidence-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
