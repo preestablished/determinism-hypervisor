@@ -135,6 +135,7 @@ struct ReplayCommitRecord {
     snapshot: proto::SnapshotRef,
     state_hash: [u8; 32],
     input_log_id: Vec<u8>,
+    baseline_delta_restore_ms: f64,
     timing: ReplayCommitTiming,
 }
 
@@ -1540,6 +1541,12 @@ impl M8EvidenceRun {
         (sum > 0.0).then_some(sum)
     }
 
+    fn replay_restore_timing(row: &serde_json::Value) -> Option<f64> {
+        Self::timing_component(row, "replay_restore")
+            .or_else(|| Self::timing_component(row, "restore"))
+            .filter(|value| *value > 0.0)
+    }
+
     fn latency_stats(values: &[f64]) -> serde_json::Value {
         if values.is_empty() {
             return serde_json::json!({
@@ -1564,6 +1571,28 @@ impl M8EvidenceRun {
         })
     }
 
+    fn linked_semantic_negative_red(root: &Path) -> TestResult<bool> {
+        let path = root.join("semantic-negative").join("evidence.json");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read linked M8 semantic-negative evidence: {e}"))?;
+        let evidence: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("parse linked M8 semantic-negative evidence: {e}"))?;
+        if evidence.get("run_kind").and_then(|value| value.as_str()) != Some("semantic_negative") {
+            return Err(format!(
+                "linked M8 semantic-negative evidence {} has wrong run_kind",
+                path.display()
+            ));
+        }
+        Ok(evidence
+            .get("semantic_negative")
+            .and_then(|value| value.get("actual_red_result"))
+            .and_then(|value| value.as_bool())
+            == Some(true))
+    }
+
     fn append_child(
         &mut self,
         harness: &AcceptanceHarness,
@@ -1580,8 +1609,8 @@ impl M8EvidenceRun {
             "input_log_id_hex": hex_bytes(&child.input_log_id),
             "state_hash_original_hex": state_hash_hex(&child.state_hash),
             "state_hash_replay_hex": state_hash_hex(&replay.state_hash),
-            "restore_mode": "full",
-            "baseline_ref_hex": serde_json::Value::Null,
+            "restore_mode": "baseline_delta",
+            "baseline_ref_hex": snapshot_ref_hex(harness.root_snapshot()),
             "manifest_kind": manifest_kind,
             "chain_depth": chain_depth,
             "dirty_pages": child.dirty_pages,
@@ -1590,7 +1619,8 @@ impl M8EvidenceRun {
                 "fork": child.timing.fork_ms,
                 "run": child.timing.run_ms,
                 "original_commit": child.timing.original_commit_ms,
-                "restore": replay.timing.restore_ms,
+                "restore": replay.baseline_delta_restore_ms,
+                "replay_restore": replay.timing.restore_ms,
                 "replay": replay.timing.replay_ms,
                 "replay_commit": replay.timing.replay_commit_ms,
             },
@@ -1676,18 +1706,25 @@ impl M8EvidenceRun {
             .rows
             .iter()
             .any(|row| row.get("restore_mode").and_then(|v| v.as_str()) == Some("baseline_delta"));
-        let full_cadence_seen = self
-            .rows
-            .iter()
-            .any(|row| row.get("manifest_kind").and_then(|v| v.as_str()) == Some("FULL"));
+        let full_cadence_seen = self.jobs <= dh_worker::service::DEFAULT_MAX_DELTA_CHAIN as usize
+            || self
+                .rows
+                .iter()
+                .any(|row| row.get("manifest_kind").and_then(|v| v.as_str()) == Some("FULL"));
         let ref_identity = self.rows.iter().all(|row| {
             row.get("original_ref_hex") == row.get("replay_ref_hex")
                 && row.get("state_hash_original_hex") == row.get("state_hash_replay_hex")
         });
-        let semantic_red = self.rows.iter().any(|row| {
+        let row_semantic_red = self.rows.iter().any(|row| {
             row.get("result").and_then(|value| value.as_str()) == Some("ref_mismatch")
                 && row.get("original_ref_hex") != row.get("replay_ref_hex")
         });
+        let linked_semantic_red = if self.semantic_negative {
+            false
+        } else {
+            Self::linked_semantic_negative_red(&self.root)?
+        };
+        let semantic_red = row_semantic_red || linked_semantic_red;
         let fork_commit_values: Vec<_> = self
             .rows
             .iter()
@@ -1711,7 +1748,11 @@ impl M8EvidenceRun {
             .rows
             .iter()
             .filter_map(|row| {
-                Self::positive_timing_sum(row, &["restore", "replay", "replay_commit"])
+                Some(
+                    Self::replay_restore_timing(row)?
+                        + Self::timing_component(row, "replay")?
+                        + Self::timing_component(row, "replay_commit")?,
+                )
             })
             .collect();
         let latency = serde_json::json!({
@@ -1724,6 +1765,24 @@ impl M8EvidenceRun {
         let fork_commit_latency_complete =
             !self.rows.is_empty() && fork_commit_values.len() == self.rows.len();
         let restore_delta_latency_present = !restore_delta_values.is_empty();
+        let semantic_negative_summary = serde_json::json!({
+            "command": "cargo test -p dh-worker --test m7_fork_verify m8_accept_semantic_negative_replay_commit_ref_mismatch -- --ignored --nocapture --test-threads=1",
+            "mutated_input": "first pad event buttons xor 0x80000000",
+            "expected_red_result": true,
+            "actual_red_result": semantic_red,
+            "evidence_json": if self.semantic_negative {
+                "evidence.json"
+            } else {
+                "semantic-negative/evidence.json"
+            },
+            "aggregation": if row_semantic_red {
+                "current_run"
+            } else if linked_semantic_red {
+                "linked_semantic_negative"
+            } else {
+                "missing"
+            }
+        });
         let run_kind = if self.semantic_negative {
             "semantic_negative"
         } else if self.jobs == DEFAULT_JOBS {
@@ -1786,7 +1845,7 @@ impl M8EvidenceRun {
                 "jobs": self.jobs,
                 "max_delta_chain": dh_worker::service::DEFAULT_MAX_DELTA_CHAIN,
                 "slot_cores_env": std::env::var(SLOT_CORES_ENV).unwrap_or_default(),
-                "restore_mode": "full",
+                "restore_mode": "baseline_delta",
                 "child_batch_size": serde_json::Value::Null,
             },
             "child_table": {
@@ -1806,16 +1865,11 @@ impl M8EvidenceRun {
                 {"path": "child-ref-table.jsonl", "kind": "child_table"},
                 {"path": "child-ref-table.csv", "kind": "child_table_csv"}
             ],
-            "semantic_negative": {
-                "command": "cargo test -p dh-worker --test m7_fork_verify m8_accept_semantic_negative_replay_commit_ref_mismatch -- --ignored --nocapture --test-threads=1",
-                "mutated_input": "first pad event buttons xor 0x80000000",
-                "expected_red_result": true,
-                "actual_red_result": semantic_red
-            },
+            "semantic_negative": semantic_negative_summary,
             "deviations": [
                 {
                     "id": "live_harness_partial",
-                    "reason": "Replay-commit evidence is emitted with measured latencies, and worker baseline-delta/FULL cadence has a service smoke; full acceptance evidence still needs baseline-delta and semantic-negative aggregation."
+                    "reason": "Replay-commit evidence is emitted with measured latencies and baseline-delta restore probes; full closeout still needs the qualified hardware run and linked semantic-negative evidence when this positive evidence is generated."
                 }
             ]
         });
@@ -2308,6 +2362,53 @@ fn assert_replay_commit_matches(original: &ChildRecord, replay: &ChildRecord) ->
     Ok(())
 }
 
+async fn baseline_delta_restore_probe(
+    svc: &WorkerService,
+    root_snapshot: proto::SnapshotRef,
+    child: &ChildRecord,
+) -> TestResult<f64> {
+    let started = Instant::now();
+    let restored = svc
+        .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+            snapshot: Some(child.snapshot.clone()),
+            entropy_seed: Vec::new(),
+            baseline: Some(root_snapshot),
+        }))
+        .await
+        .map_err(|e| format!("child {} baseline-delta RestoreSnapshot: {e}", child.index))?
+        .into_inner();
+    let restore_ms = elapsed_ms(started.elapsed());
+    let lease = restored
+        .lease
+        .ok_or_else(|| format!("child {} baseline-delta returned no lease", child.index))?;
+    let restored_state_hash = restored
+        .state_hash
+        .as_ref()
+        .map(|hash| arr32(&hash.hash, "baseline-delta RestoreSnapshot state_hash"))
+        .ok_or_else(|| {
+            format!(
+                "child {} baseline-delta RestoreSnapshot returned no state_hash",
+                child.index
+            )
+        })?;
+    if restored_state_hash != child.state_hash {
+        destroy_best_effort(svc, Some(lease)).await;
+        return Err(format!(
+            "child {} baseline-delta state hash mismatch",
+            child.index
+        ));
+    }
+    if restored.frame_counter != child.frame_counter {
+        destroy_best_effort(svc, Some(lease)).await;
+        return Err(format!(
+            "child {} baseline-delta frame_counter {}, expected {}",
+            child.index, restored.frame_counter, child.frame_counter
+        ));
+    }
+    destroy_best_effort(svc, Some(lease)).await;
+    Ok(restore_ms)
+}
+
 async fn replay_commit_child(
     svc: WorkerService,
     guest: AcceptanceGuest,
@@ -2317,6 +2418,8 @@ async fn replay_commit_child(
     root_frame_counter: u32,
     original: ChildRecord,
 ) -> TestResult<ReplayCommitRecord> {
+    let baseline_delta_restore_ms =
+        baseline_delta_restore_probe(&svc, root_snapshot.clone(), &original).await?;
     let restore_started = Instant::now();
     let restored = svc
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
@@ -2363,6 +2466,7 @@ async fn replay_commit_child(
         snapshot: replay.snapshot,
         state_hash: replay.state_hash,
         input_log_id: replay.input_log_id,
+        baseline_delta_restore_ms,
         timing: ReplayCommitTiming {
             restore_ms,
             replay_ms: replay.timing.run_ms,
@@ -2751,6 +2855,26 @@ fn m8_resume_rows_reject_gap_or_identity_mismatch() {
         error.contains("replay_ref_hex must equal"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn m8_semantic_negative_link_reads_red_result() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let semantic_dir = dir.path().join("semantic-negative");
+    std::fs::create_dir_all(&semantic_dir).expect("semantic-negative dir");
+    std::fs::write(
+        semantic_dir.join("evidence.json"),
+        serde_json::json!({
+            "run_kind": "semantic_negative",
+            "semantic_negative": {
+                "actual_red_result": true
+            }
+        })
+        .to_string(),
+    )
+    .expect("semantic-negative evidence");
+
+    assert!(M8EvidenceRun::linked_semantic_negative_red(dir.path()).expect("read linked red"));
 }
 
 #[test]
