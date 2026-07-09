@@ -27,6 +27,16 @@
 //! By default it samples 10 indices from the 1000-job universe. Override
 //! `DH_M7_ACCEPT_JOBS` to change the universe size and `DH_M7_CROSS_CHECKS`
 //! to change the number of sampled indices.
+//!
+//! The M8 replay-commit gate replays each child by restoring the root snapshot,
+//! re-driving the same deterministic child, taking a new snapshot, and requiring
+//! byte-identical refs/logs:
+//!
+//!   DH_M9_ALLOW_SKIP=0 DH_M7_ACCEPT_GUEST=linux \
+//!   DH_M7_ACCEPT_SLOT_CORES=2-5 DH_M7_ACCEPT_JOBS=1000 \
+//!     cargo test -p dh-worker --test m7_fork_verify --release \
+//!       m8_accept_1000_seeded_forks_replay_commit_ref_identity \
+//!       -- --ignored --nocapture --test-threads=1
 
 #![cfg(target_arch = "x86_64")]
 
@@ -104,6 +114,16 @@ struct ChildRecord {
     frames_elapsed: u64,
     frame_counter: u32,
     meta_pvblk_checksum: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayCommitRecord {
+    child_index: usize,
+    original_slot_id: u64,
+    replay_slot_id: u64,
+    snapshot: proto::SnapshotRef,
+    state_hash: [u8; 32],
+    input_log_id: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -1396,6 +1416,173 @@ async fn verify_batch(
     Ok(verified)
 }
 
+fn assert_replay_commit_matches(original: &ChildRecord, replay: &ChildRecord) -> TestResult<()> {
+    if replay.index != original.index {
+        return Err(format!(
+            "replay-commit child index mismatch: original {} replay {}",
+            original.index, replay.index
+        ));
+    }
+    if replay.snapshot.hash != original.snapshot.hash {
+        return Err(format!(
+            "replay-commit child {} snapshot ref mismatch",
+            original.index
+        ));
+    }
+    if replay.state_hash != original.state_hash {
+        return Err(format!(
+            "replay-commit child {} state hash mismatch",
+            original.index
+        ));
+    }
+    if replay.input_log_id != original.input_log_id {
+        return Err(format!(
+            "replay-commit child {} input log id mismatch",
+            original.index
+        ));
+    }
+    if replay.segment_end_icount != original.segment_end_icount {
+        return Err(format!(
+            "replay-commit child {} segment icount mismatch: original {} replay {}",
+            original.index, original.segment_end_icount, replay.segment_end_icount
+        ));
+    }
+    if replay.segment_end_vns != original.segment_end_vns {
+        return Err(format!(
+            "replay-commit child {} segment vns mismatch: original {} replay {}",
+            original.index, original.segment_end_vns, replay.segment_end_vns
+        ));
+    }
+    if replay.cumulative_icount != original.cumulative_icount {
+        return Err(format!(
+            "replay-commit child {} cumulative icount mismatch: original {} replay {}",
+            original.index, original.cumulative_icount, replay.cumulative_icount
+        ));
+    }
+    if replay.cumulative_vns != original.cumulative_vns {
+        return Err(format!(
+            "replay-commit child {} cumulative vns mismatch: original {} replay {}",
+            original.index, original.cumulative_vns, replay.cumulative_vns
+        ));
+    }
+    if replay.frames_elapsed != original.frames_elapsed {
+        return Err(format!(
+            "replay-commit child {} frames_elapsed mismatch: original {} replay {}",
+            original.index, original.frames_elapsed, replay.frames_elapsed
+        ));
+    }
+    if replay.frame_counter != original.frame_counter {
+        return Err(format!(
+            "replay-commit child {} frame_counter mismatch: original {} replay {}",
+            original.index, original.frame_counter, replay.frame_counter
+        ));
+    }
+    if replay.meta_pvblk_checksum != original.meta_pvblk_checksum {
+        return Err(format!(
+            "replay-commit child {} Linux meta IO checksum mismatch",
+            original.index
+        ));
+    }
+    Ok(())
+}
+
+async fn replay_commit_child(
+    svc: WorkerService,
+    guest: AcceptanceGuest,
+    root_snapshot: proto::SnapshotRef,
+    root_cumulative_icount: u64,
+    root_cumulative_vns: u64,
+    root_frame_counter: u32,
+    original: ChildRecord,
+) -> TestResult<ReplayCommitRecord> {
+    let restored = svc
+        .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
+            snapshot: Some(root_snapshot),
+            entropy_seed: child_seed(original.index),
+        }))
+        .await
+        .map_err(|e| {
+            format!(
+                "child {} replay-commit RestoreSnapshot: {e}",
+                original.index
+            )
+        })?
+        .into_inner();
+    let lease = restored
+        .lease
+        .ok_or_else(|| format!("child {} replay-commit returned no lease", original.index))?;
+    if restored.frame_counter != root_frame_counter {
+        destroy_best_effort(&svc, Some(lease)).await;
+        return Err(format!(
+            "child {} replay-commit restored frame_counter {}, expected root {}",
+            original.index, restored.frame_counter, root_frame_counter
+        ));
+    }
+
+    let replay_slot_id = lease.slot_id;
+    let replay = run_child(
+        svc,
+        guest,
+        original.index,
+        lease,
+        root_cumulative_icount,
+        root_cumulative_vns,
+        root_frame_counter,
+    )
+    .await?;
+    assert_replay_commit_matches(&original, &replay)?;
+    Ok(ReplayCommitRecord {
+        child_index: original.index,
+        original_slot_id: original.slot_id,
+        replay_slot_id,
+        snapshot: replay.snapshot,
+        state_hash: replay.state_hash,
+        input_log_id: replay.input_log_id,
+    })
+}
+
+async fn replay_commit_batch(
+    harness: &AcceptanceHarness,
+    children: Vec<ChildRecord>,
+) -> TestResult<Vec<ReplayCommitRecord>> {
+    let mut tasks = Vec::with_capacity(children.len());
+    for child in children {
+        let svc = harness.svc().clone();
+        let guest = harness.guest();
+        let root_snapshot = harness.root_snapshot().clone();
+        let root_cumulative_icount = harness.root_cumulative_icount();
+        let root_cumulative_vns = harness.root_cumulative_vns();
+        let root_frame_counter = harness.root_frame_counter();
+        tasks.push(tokio::spawn(async move {
+            replay_commit_child(
+                svc,
+                guest,
+                root_snapshot,
+                root_cumulative_icount,
+                root_cumulative_vns,
+                root_frame_counter,
+                child,
+            )
+            .await
+        }));
+    }
+
+    let mut replayed = Vec::with_capacity(tasks.len());
+    let mut errors = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(Ok(record)) => replayed.push(record),
+            Ok(Err(e)) => errors.push(e),
+            Err(e) => errors.push(format!("replay-commit task join: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    replayed.sort_by_key(|record| record.child_index);
+    Ok(replayed)
+}
+
 async fn cross_check_child_on_distinct_slots(
     harness: &AcceptanceHarness,
     index: usize,
@@ -1554,6 +1741,40 @@ fn cross_check_indices_cover_the_1000_job_universe() {
     assert_eq!(cross_check_indices(1, 10), vec![0]);
 }
 
+fn sample_child_record(index: usize, tag: u8) -> ChildRecord {
+    ChildRecord {
+        index,
+        slot_id: u64::from(tag),
+        snapshot: proto::SnapshotRef {
+            hash: vec![tag; 32],
+        },
+        state_hash: [tag; 32],
+        input_log_id: vec![tag.wrapping_add(1); 32],
+        segment_end_icount: 10,
+        segment_end_vns: 20,
+        cumulative_icount: 30,
+        cumulative_vns: 40,
+        frames_elapsed: 1,
+        frame_counter: 2,
+        meta_pvblk_checksum: Some(u64::from(tag)),
+    }
+}
+
+#[test]
+fn replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift() {
+    let original = sample_child_record(7, 0x42);
+    let mut replay = original.clone();
+    replay.slot_id = original.slot_id + 1;
+    assert_replay_commit_matches(&original, &replay).expect("slot drift is permitted");
+
+    replay.snapshot.hash[0] ^= 1;
+    let error = assert_replay_commit_matches(&original, &replay).unwrap_err();
+    assert!(
+        error.contains("snapshot ref mismatch"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 #[ignore = "M7 acceptance gate: 1000 forked children; run with --release -- --ignored --nocapture"]
 fn m7_accept_1000_seeded_forks_verify_replay_all() {
@@ -1662,6 +1883,162 @@ fn m7_accept_1000_seeded_forks_verify_replay_all() {
                 eprintln!(
                     "M7 Linux fork/verify done: verified={verified} divergence=0 unique_hashes={} epoch_hashes={epoch_hashes}",
                     unique_hashes.len()
+                );
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "M8 acceptance gate: replay each child and require committed snapshot ref identity"]
+fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
+    let guest = AcceptanceGuest::configured();
+    let Some(slot_cores) = acceptance_slot_cores_or_skip() else {
+        return;
+    };
+    let jobs = configured_jobs();
+    let child_capacity = slot_cores.len() - 1;
+    assert!(
+        child_capacity > 0,
+        "one slot is reserved for the reusable root parent"
+    );
+
+    let Some(harness) = AcceptanceHarness::new(
+        guest,
+        "m7_fork_verify::m8_accept_1000_seeded_forks_replay_commit_ref_identity",
+        slot_cores.clone(),
+    )
+    .expect("acceptance harness") else {
+        return;
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async {
+        let mut accepted = 0usize;
+        let mut replay_commits = 0usize;
+        let mut unique_hashes = BTreeSet::new();
+        let mut unique_replay_hashes = BTreeSet::new();
+        let mut unique_replay_refs = BTreeSet::new();
+        let mut unique_replay_slots = BTreeSet::new();
+        let mut epoch_hashes = 0usize;
+
+        while accepted < jobs {
+            let batch_count = child_capacity.min(jobs - accepted);
+            let seeds: Vec<_> = (accepted..accepted + batch_count).map(child_seed).collect();
+            let forked = harness
+                .svc()
+                .fork(Request::new(proto::ForkRequest {
+                    parent: Some(harness.root_lease().clone()),
+                    count: batch_count as u32,
+                    entropy_seeds: seeds,
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("M8 Fork batch starting at {accepted}: {e}"))
+                .into_inner()
+                .children;
+            assert_eq!(forked.len(), batch_count);
+
+            let children = run_child_batch(&harness, accepted, forked)
+                .await
+                .unwrap_or_else(|e| panic!("M8 Run/Snapshot batch starting at {accepted}: {e}"));
+            let mut validated = Vec::with_capacity(children.len());
+            for child in children {
+                let log = tokio::task::block_in_place(|| {
+                    fetch_log_payload(harness.store(), &child.input_log_id)
+                });
+                let parsed = validate_single_edge_lineage(&harness, &child, &log)
+                    .unwrap_or_else(|e| panic!("M8 Validate child {} DHILOG: {e}", child.index));
+                epoch_hashes += parsed.epoch_hashes.len();
+                validated.push((child, parsed));
+            }
+
+            let children = verify_batch(&harness, validated)
+                .await
+                .unwrap_or_else(|e| panic!("M8 VerifyReplay batch starting at {accepted}: {e}"));
+            let replayed = replay_commit_batch(&harness, children.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("M8 replay-commit batch starting at {accepted}: {e}")
+                });
+            assert_eq!(replayed.len(), children.len());
+            for (offset, replay) in replayed.into_iter().enumerate() {
+                assert_eq!(replay.child_index, accepted + offset);
+                assert_eq!(replay.snapshot.hash.len(), 32);
+                assert_eq!(replay.input_log_id.len(), 32);
+                unique_replay_hashes.insert(replay.state_hash);
+                unique_replay_refs.insert(arr32(&replay.snapshot.hash, "M8 replay snapshot"));
+                unique_replay_slots.insert(replay.replay_slot_id);
+                if replay.original_slot_id == replay.replay_slot_id {
+                    eprintln!(
+                        "M8 replay-commit child {} reused slot {}",
+                        replay.child_index, replay.replay_slot_id
+                    );
+                }
+            }
+            for child in children {
+                unique_hashes.insert(child.state_hash);
+            }
+
+            accepted += batch_count;
+            replay_commits += batch_count;
+            match guest {
+                AcceptanceGuest::Nanokernel => {
+                    eprintln!("M8 replay-commit progress: {accepted}/{jobs}");
+                }
+                AcceptanceGuest::Linux => {
+                    eprintln!("M8 Linux replay-commit progress: {accepted}/{jobs}");
+                }
+            }
+        }
+
+        assert_eq!(accepted, jobs);
+        assert_eq!(replay_commits, jobs);
+        if guest == AcceptanceGuest::Nanokernel {
+            assert_eq!(
+                unique_hashes.len(),
+                jobs,
+                "distinct seeded pad bursts should produce distinct child hashes"
+            );
+            assert_eq!(
+                unique_replay_refs.len(),
+                jobs,
+                "distinct replay commits should produce distinct snapshot refs"
+            );
+            assert_eq!(
+                unique_replay_hashes.len(),
+                jobs,
+                "distinct replay commits should produce distinct state hashes"
+            );
+        }
+
+        harness.destroy_root().await;
+        let info = harness
+            .svc()
+            .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
+            .await
+            .expect("GetWorkerInfo after cleanup")
+            .into_inner();
+        assert_eq!(info.slots_free as usize, slot_cores.len());
+
+        match guest {
+            AcceptanceGuest::Nanokernel => {
+                eprintln!(
+                    "M8 replay-commit done: replay_commits={replay_commits} unique_refs={} unique_hashes={} replay_slots={}",
+                    unique_replay_refs.len(),
+                    unique_replay_hashes.len(),
+                    unique_replay_slots.len()
+                );
+            }
+            AcceptanceGuest::Linux => {
+                eprintln!(
+                    "M8 Linux replay-commit done: replay_commits={replay_commits} unique_refs={} unique_hashes={} replay_slots={} epoch_hashes={epoch_hashes}",
+                    unique_replay_refs.len(),
+                    unique_replay_hashes.len(),
+                    unique_replay_slots.len()
                 );
             }
         }
