@@ -86,6 +86,7 @@ const M8_STORE_ROOT_ENV: &str = "M8_STORE_ROOT";
 const M8_STORE_ROOT_QUALIFIED_ENV: &str = "M8_STORE_ROOT_QUALIFIED";
 const M8_STORE_ROOT_DISK_CLASS_ENV: &str = "M8_STORE_ROOT_DISK_CLASS";
 const M8_EVIDENCE_ROOT_ENV: &str = "M8_EVIDENCE_ROOT";
+const M8_EVIDENCE_RESUME_ENV: &str = "M8_EVIDENCE_RESUME";
 
 type TestResult<T> = Result<T, String>;
 
@@ -1096,6 +1097,28 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn parse_hex32(value: &str) -> Option<[u8; 32]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        out[index] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn snapshot_ref_hex(snapshot: &proto::SnapshotRef) -> String {
     hex_bytes(&snapshot.hash)
 }
@@ -1227,6 +1250,8 @@ struct M8EvidenceRun {
     store_root: PathBuf,
     store_root_qualified: bool,
     semantic_negative: bool,
+    resume_enabled: bool,
+    resumed_rows: usize,
 }
 
 impl M8EvidenceRun {
@@ -1256,17 +1281,197 @@ impl M8EvidenceRun {
         std::fs::create_dir_all(root.join("hardware"))
             .map_err(|e| format!("create M8 evidence hardware dir: {e}"))?;
         let child_table_jsonl = root.join("child-ref-table.jsonl");
-        std::fs::write(&child_table_jsonl, "")
-            .map_err(|e| format!("truncate M8 child-ref-table.jsonl: {e}"))?;
+        let resume_enabled =
+            !semantic_negative && std::env::var(M8_EVIDENCE_RESUME_ENV).as_deref() == Ok("1");
+        let rows = if resume_enabled && child_table_jsonl.exists() {
+            Self::load_resume_rows(&child_table_jsonl, jobs)?
+        } else {
+            Vec::new()
+        };
+        if resume_enabled {
+            Self::rewrite_child_table(&child_table_jsonl, &rows)?;
+        } else {
+            std::fs::write(&child_table_jsonl, "")
+                .map_err(|e| format!("truncate M8 child-ref-table.jsonl: {e}"))?;
+        }
+        let resumed_rows = rows.len();
         Ok(Self {
             root,
             child_table_jsonl,
-            rows: Vec::new(),
+            rows,
             started_at: m8_now_string(),
             jobs,
             store_root: store_root.to_path_buf(),
             store_root_qualified: std::env::var(M8_STORE_ROOT_QUALIFIED_ENV).as_deref() == Ok("1"),
             semantic_negative,
+            resume_enabled,
+            resumed_rows,
+        })
+    }
+
+    fn load_resume_rows(path: &Path, jobs: usize) -> TestResult<Vec<serde_json::Value>> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("read M8 resume child-ref-table.jsonl: {e}"))?;
+        let mut rows = Vec::new();
+        for (line_no, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut row: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("parse M8 resume row {}: {e}", line_no + 1))?;
+            Self::validate_resume_row(&row, rows.len(), jobs, line_no + 1)?;
+            row.as_object_mut()
+                .expect("validated M8 resume row is an object")
+                .insert("row_source".into(), serde_json::json!("resumed"));
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn validate_resume_row(
+        row: &serde_json::Value,
+        expected_index: usize,
+        jobs: usize,
+        line_no: usize,
+    ) -> TestResult<()> {
+        let object = row
+            .as_object()
+            .ok_or_else(|| format!("M8 resume row {line_no}: must be an object"))?;
+        let child_index = object
+            .get("child_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                format!("M8 resume row {line_no}: child_index must be a non-negative integer")
+            })?;
+        if child_index != expected_index {
+            return Err(format!(
+                "M8 resume row {line_no}: child_index {child_index} is not contiguous prefix index {expected_index}"
+            ));
+        }
+        if child_index >= jobs {
+            return Err(format!(
+                "M8 resume row {line_no}: child_index {child_index} exceeds configured jobs {jobs}"
+            ));
+        }
+        let seed = Self::resume_row_str(row, "seed_hex", line_no)?;
+        let expected_seed = child_seed_hex(child_index);
+        if seed != expected_seed {
+            return Err(format!(
+                "M8 resume row {line_no}: seed_hex does not match child_index {child_index}"
+            ));
+        }
+        if Self::resume_row_str(row, "result", line_no)? != "pass" {
+            return Err(format!("M8 resume row {line_no}: result must be pass"));
+        }
+        let original_ref = Self::resume_hex32_value(row, "original_ref_hex", line_no)?;
+        let replay_ref = Self::resume_hex32_value(row, "replay_ref_hex", line_no)?;
+        if original_ref != replay_ref {
+            return Err(format!(
+                "M8 resume row {line_no}: replay_ref_hex must equal original_ref_hex"
+            ));
+        }
+        let original_state = Self::resume_hex32_value(row, "state_hash_original_hex", line_no)?;
+        let replay_state = Self::resume_hex32_value(row, "state_hash_replay_hex", line_no)?;
+        if original_state != replay_state {
+            return Err(format!(
+                "M8 resume row {line_no}: state_hash_replay_hex must equal state_hash_original_hex"
+            ));
+        }
+        Self::resume_hex32_value(row, "input_log_id_hex", line_no)?;
+        match Self::resume_row_str(row, "restore_mode", line_no)? {
+            "full" | "baseline_delta" => {}
+            value => {
+                return Err(format!(
+                    "M8 resume row {line_no}: invalid restore_mode {value}"
+                ))
+            }
+        }
+        match Self::resume_row_str(row, "manifest_kind", line_no)? {
+            "FULL" | "DELTA" => {}
+            value => {
+                return Err(format!(
+                    "M8 resume row {line_no}: invalid manifest_kind {value}"
+                ))
+            }
+        }
+        object
+            .get("chain_depth")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| format!("M8 resume row {line_no}: chain_depth must be non-negative"))?;
+        let shared_page_ratio = object
+            .get("shared_page_ratio")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| {
+                format!("M8 resume row {line_no}: shared_page_ratio must be a number")
+            })?;
+        if !(0.0..=1.0).contains(&shared_page_ratio) {
+            return Err(format!(
+                "M8 resume row {line_no}: shared_page_ratio must be in [0, 1]"
+            ));
+        }
+        if !object
+            .get("timing_ms")
+            .and_then(|value| value.as_object())
+            .is_some_and(|timing| !timing.is_empty())
+        {
+            return Err(format!(
+                "M8 resume row {line_no}: timing_ms must be a non-empty object"
+            ));
+        }
+        if let Some(row_source) = object.get("row_source").and_then(|value| value.as_str()) {
+            if row_source != "fresh" && row_source != "resumed" {
+                return Err(format!(
+                    "M8 resume row {line_no}: row_source must be fresh or resumed"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_child_table(path: &Path, rows: &[serde_json::Value]) -> TestResult<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("rewrite M8 child-ref-table.jsonl: {e}"))?;
+        for row in rows {
+            writeln!(file, "{row}").map_err(|e| format!("rewrite M8 resume row: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn next_child_index(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn resume_hex32_set(&self, field: &str) -> TestResult<BTreeSet<[u8; 32]>> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| Self::resume_hex32_value(row, field, index + 1))
+            .collect()
+    }
+
+    fn resume_row_str<'a>(
+        row: &'a serde_json::Value,
+        field: &str,
+        line_no: usize,
+    ) -> TestResult<&'a str> {
+        row.get(field)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("M8 resume row {line_no}: {field} must be a string"))
+    }
+
+    fn resume_hex32_value(
+        row: &serde_json::Value,
+        field: &str,
+        line_no: usize,
+    ) -> TestResult<[u8; 32]> {
+        let value = Self::resume_row_str(row, field, line_no)?;
+        parse_hex32(value).ok_or_else(|| {
+            format!("M8 resume row {line_no}: {field} must be 32-byte lowercase hex")
         })
     }
 
@@ -1303,6 +1508,7 @@ impl M8EvidenceRun {
             "result": "pass",
             "original_slot_id": child.slot_id,
             "replay_slot_id": replay.replay_slot_id,
+            "row_source": "fresh",
         });
         let mut file = OpenOptions::new()
             .append(true)
@@ -1354,6 +1560,7 @@ impl M8EvidenceRun {
             "original_slot_id": original.slot_id,
             "replay_slot_id": replay.slot_id,
             "mutated_input": "first pad event buttons xor 0x80000000",
+            "row_source": "fresh",
         });
         let mut file = OpenOptions::new()
             .append(true)
@@ -1460,6 +1667,11 @@ impl M8EvidenceRun {
                 "jsonl": "child-ref-table.jsonl",
                 "csv": "child-ref-table.csv",
             },
+            "resume": {
+                "enabled": self.resume_enabled,
+                "resumed_child_count": self.resumed_rows,
+                "fresh_child_count": self.rows.len().saturating_sub(self.resumed_rows),
+            },
             "bars": bars,
             "commands": ["cargo test -p dh-worker --test m7_fork_verify m8_accept_1000_seeded_forks_replay_commit_ref_identity -- --ignored --nocapture --test-threads=1"],
             "artifacts": [
@@ -1490,11 +1702,11 @@ impl M8EvidenceRun {
 
     fn write_child_csv(&self) -> TestResult<()> {
         let mut csv = String::from(
-            "child_index,original_ref_hex,replay_ref_hex,input_log_id_hex,restore_mode,manifest_kind,chain_depth,shared_page_ratio,result\n",
+            "child_index,original_ref_hex,replay_ref_hex,input_log_id_hex,restore_mode,manifest_kind,chain_depth,shared_page_ratio,result,row_source\n",
         );
         for row in &self.rows {
             csv.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{}\n",
                 row["child_index"],
                 row["original_ref_hex"].as_str().unwrap_or(""),
                 row["replay_ref_hex"].as_str().unwrap_or(""),
@@ -1504,6 +1716,7 @@ impl M8EvidenceRun {
                 row["chain_depth"],
                 row["shared_page_ratio"],
                 row["result"].as_str().unwrap_or(""),
+                row["row_source"].as_str().unwrap_or(""),
             ));
         }
         std::fs::write(self.root.join("child-ref-table.csv"), csv)
@@ -2307,6 +2520,45 @@ fn sample_child_record(index: usize, tag: u8) -> ChildRecord {
     }
 }
 
+fn sample_m8_resume_row(index: usize, tag: u8) -> serde_json::Value {
+    serde_json::json!({
+        "child_index": index,
+        "seed_hex": child_seed_hex(index),
+        "original_ref_hex": hex_bytes(&[tag; 32]),
+        "replay_ref_hex": hex_bytes(&[tag; 32]),
+        "input_log_id_hex": hex_bytes(&[tag.wrapping_add(1); 32]),
+        "state_hash_original_hex": hex_bytes(&[tag.wrapping_add(2); 32]),
+        "state_hash_replay_hex": hex_bytes(&[tag.wrapping_add(2); 32]),
+        "restore_mode": "baseline_delta",
+        "baseline_ref_hex": hex_bytes(&[tag.wrapping_add(3); 32]),
+        "manifest_kind": "DELTA",
+        "chain_depth": 1,
+        "dirty_pages": 7,
+        "shared_page_ratio": 0.98,
+        "timing_ms": {
+            "fork": 1.0,
+            "run": 2.0,
+            "original_commit": 3.0,
+            "restore": 4.0,
+            "replay": 5.0,
+            "replay_commit": 6.0,
+        },
+        "result": "pass",
+        "original_slot_id": tag,
+        "replay_slot_id": tag.wrapping_add(10),
+        "row_source": "fresh",
+    })
+}
+
+fn write_m8_resume_rows(path: &Path, rows: &[serde_json::Value]) {
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&row.to_string());
+        body.push('\n');
+    }
+    std::fs::write(path, body).expect("write M8 resume rows");
+}
+
 #[test]
 fn replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift() {
     let original = sample_child_record(7, 0x42);
@@ -2318,6 +2570,48 @@ fn replay_commit_matcher_allows_slot_drift_but_rejects_ref_drift() {
     let error = assert_replay_commit_matches(&original, &replay).unwrap_err();
     assert!(
         error.contains("snapshot ref mismatch"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn m8_resume_rows_accept_contiguous_prefix_and_mark_resumed() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("child-ref-table.jsonl");
+    write_m8_resume_rows(
+        &path,
+        &[sample_m8_resume_row(0, 0x10), sample_m8_resume_row(1, 0x20)],
+    );
+
+    let rows = M8EvidenceRun::load_resume_rows(&path, 3).expect("resume rows");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row.get("row_source").and_then(|value| value.as_str()) == Some("resumed")));
+
+    M8EvidenceRun::rewrite_child_table(&path, &rows).expect("rewrite resumed table");
+    let rewritten = std::fs::read_to_string(path).expect("read rewritten resume table");
+    assert_eq!(rewritten.lines().count(), 2);
+    assert!(rewritten.contains("\"row_source\":\"resumed\""));
+}
+
+#[test]
+fn m8_resume_rows_reject_gap_or_identity_mismatch() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("child-ref-table.jsonl");
+    write_m8_resume_rows(&path, &[sample_m8_resume_row(1, 0x10)]);
+    let error = M8EvidenceRun::load_resume_rows(&path, 3).unwrap_err();
+    assert!(
+        error.contains("contiguous prefix"),
+        "unexpected error: {error}"
+    );
+
+    let mut mismatch = sample_m8_resume_row(0, 0x10);
+    mismatch["replay_ref_hex"] = serde_json::Value::String(hex_bytes(&[0x11; 32]));
+    write_m8_resume_rows(&path, &[mismatch]);
+    let error = M8EvidenceRun::load_resume_rows(&path, 3).unwrap_err();
+    assert!(
+        error.contains("replay_ref_hex must equal"),
         "unexpected error: {error}"
     );
 }
@@ -2465,13 +2759,22 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
         .build()
         .expect("test runtime");
     rt.block_on(async {
-        let mut accepted = 0usize;
-        let mut replay_commits = 0usize;
-        let mut unique_hashes = BTreeSet::new();
-        let mut unique_replay_hashes = BTreeSet::new();
-        let mut unique_replay_refs = BTreeSet::new();
+        let mut accepted = evidence.next_child_index();
+        let mut replay_commits = accepted;
+        let mut unique_hashes = evidence
+            .resume_hex32_set("state_hash_original_hex")
+            .expect("seed M8 resumed original state hashes");
+        let mut unique_replay_hashes = evidence
+            .resume_hex32_set("state_hash_replay_hex")
+            .expect("seed M8 resumed replay state hashes");
+        let mut unique_replay_refs = evidence
+            .resume_hex32_set("replay_ref_hex")
+            .expect("seed M8 resumed replay refs");
         let mut unique_replay_slots = BTreeSet::new();
         let mut epoch_hashes = 0usize;
+        if accepted > 0 {
+            eprintln!("M8 replay-commit resume: accepted={accepted}/{jobs}");
+        }
 
         while accepted < jobs {
             let batch_count = child_capacity.min(jobs - accepted);
