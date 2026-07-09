@@ -35,6 +35,14 @@ on:
         description: "M7 nightly slot cores on the kvm-intel runner"
         required: false
         default: "2-5"
+      m8_fork_jobs:
+        description: "M8 nightly replay-commit ref-identity child count"
+        required: false
+        default: "100"
+      m8_slot_cores:
+        description: "M8 nightly slot cores on the kvm-intel runner"
+        required: false
+        default: "2-5"
 
 # Queue hygiene on the single kvm-intel runner; never cancel in flight —
 # this is the measurement workflow (docs/ops/github-runner.md caveat).
@@ -207,6 +215,56 @@ jobs:
             -- --ignored --nocapture
         working-directory: repo
 
+  m8-ref-identity-100:
+    # Bounded M8 canary: fork seeded children, VerifyReplay their logs, then
+    # restore/re-drive each child and require the committed replay snapshot ref
+    # to match the original child ref. The full 1000x M8 acceptance remains an
+    # operator-run hardware-gated command.
+    needs: determinism-class
+    runs-on: [self-hosted, kvm-intel]
+    timeout-minutes: 90
+    env:
+      DH_M7_ACCEPT_JOBS: ${{ inputs.m8_fork_jobs || '100' }}
+      DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m8_slot_cores || '2-5' }}
+      DH_M7_ACCEPT_ALLOW_SKIP: "0"
+      M8_STORE_ROOT: ${{ runner.temp }}/m8-store-${{ github.run_id }}
+      M8_EVIDENCE_ROOT: ${{ runner.temp }}/m8-evidence-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/guest-sdk
+          path: guest-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/snapshot-store
+          path: snapshot-store
+      - uses: dtolnay/rust-toolchain@stable
+      - run: test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not available/rw"; exit 1; }
+      - run: which nasm || { echo "::error::nasm missing (provisioning drift)"; exit 1; }
+      - name: nightly 100-fork M8 replay-commit ref-identity canary
+        run: |
+          set -euo pipefail
+          echo "M8 replay-commit ref-identity canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES"
+          rm -rf "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          mkdir -p "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
+            m8_accept_1000_seeded_forks_replay_commit_ref_identity \
+            -- --ignored --nocapture --test-threads=1
+        working-directory: repo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m8-ref-identity-100-${{ github.run_id }}
+          path: ${{ env.M8_EVIDENCE_ROOT }}
+          if-no-files-found: ignore
+
   # 1h libFuzzer budget over the DHILOG read and splice paths (beads
   # 1j4, 6zm): arbitrary bytes -> LogReader::parse / Lineage
   # composition; the invariant is no panics / no unbounded allocation on
@@ -287,8 +345,8 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}"
-          TITLE="nightly-drift FAILED: determinism class, corpus, canary, M7 fork verify, Linux M7 fork verify, or DHILOG fuzz"
-          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary/M7 fork-verify/Linux M7 fork-verify failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
+          TITLE="nightly-drift FAILED: determinism class, corpus, canary, M7/M8 fork verify, Linux M7 fork verify, or DHILOG fuzz"
+          BODY="Nightly failure: $RUN_URL — host drift means the re-baseline procedure (docs/ops/host-config-intel-box.md); a corpus/canary/M7 or M8 fork-verify/Linux M7 fork-verify failure is a P0 determinism divergence; a dhilog-fuzz failure has its crashing input in the run's dhilog-fuzz-artifacts upload."
           EXISTING=$(gh issue list --repo "$REPO" --state open --search "in:title nightly-drift FAILED" --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"

@@ -116,3 +116,24 @@ jobs:
         working-directory: repo
       - run: cargo test --workspace
         working-directory: repo
+      - name: M8 bounded replay-commit ref identity
+        env:
+          DH_M7_ACCEPT_JOBS: "8"
+          DH_M7_ACCEPT_SLOT_CORES: "2-5"
+          DH_M7_ACCEPT_ALLOW_SKIP: "0"
+          M8_STORE_ROOT: ${{ runner.temp }}/m8-store-${{ github.run_id }}
+          M8_EVIDENCE_ROOT: ${{ runner.temp }}/m8-evidence-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          rm -rf "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          mkdir -p "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
+            m8_accept_1000_seeded_forks_replay_commit_ref_identity \
+            -- --ignored --nocapture --test-threads=1
+        working-directory: repo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m8-ref-identity-bounded-${{ github.run_id }}
+          path: ${{ runner.temp }}/m8-evidence-${{ github.run_id }}
+          if-no-files-found: ignore
