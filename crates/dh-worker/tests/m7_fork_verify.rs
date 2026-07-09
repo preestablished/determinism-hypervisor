@@ -46,7 +46,7 @@ use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dh_inputlog::reader::{LogReader, RecordBody};
 use dh_inputlog::splice::Lineage;
@@ -124,6 +124,7 @@ struct ChildRecord {
     frame_counter: u32,
     dirty_pages: u64,
     meta_pvblk_checksum: Option<u64>,
+    timing: ChildTiming,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +135,21 @@ struct ReplayCommitRecord {
     snapshot: proto::SnapshotRef,
     state_hash: [u8; 32],
     input_log_id: Vec<u8>,
+    timing: ReplayCommitTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChildTiming {
+    fork_ms: f64,
+    run_ms: f64,
+    original_commit_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplayCommitTiming {
+    restore_ms: f64,
+    replay_ms: f64,
+    replay_commit_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -670,6 +686,7 @@ fn snapshot_record(
     cumulative_vns: u64,
     frames_elapsed: u64,
     meta_pvblk_checksum: Option<u64>,
+    timing: ChildTiming,
 ) -> TestResult<ChildRecord> {
     let snapshot_ref = snapshot
         .snapshot
@@ -711,6 +728,7 @@ fn snapshot_record(
         frame_counter: snapshot.frame_counter,
         dirty_pages: u64::from(snapshot.dirty_pages),
         meta_pvblk_checksum,
+        timing,
     })
 }
 
@@ -751,6 +769,7 @@ async fn run_nanokernel_child_with_events(
         ));
     }
 
+    let run_started = Instant::now();
     let run = match svc
         .run(Request::new(proto::RunRequest {
             lease: Some(lease.clone()),
@@ -766,6 +785,7 @@ async fn run_nanokernel_child_with_events(
             return Err(format!("{label} {index} Run: {e}"));
         }
     };
+    let run_ms = elapsed_ms(run_started.elapsed());
     if run.reason != i32::from(proto::StopReason::BudgetReached) {
         destroy_best_effort(&svc, Some(lease)).await;
         return Err(format!(
@@ -781,6 +801,7 @@ async fn run_nanokernel_child_with_events(
         ));
     }
 
+    let snapshot_started = Instant::now();
     let snapshot = match svc
         .take_snapshot(Request::new(proto::TakeSnapshotRequest {
             lease: Some(lease.clone()),
@@ -795,6 +816,7 @@ async fn run_nanokernel_child_with_events(
             return Err(format!("{label} {index} TakeSnapshot: {e}"));
         }
     };
+    let original_commit_ms = elapsed_ms(snapshot_started.elapsed());
     destroy_best_effort(&svc, Some(lease)).await;
     snapshot_record(
         AcceptanceGuest::Nanokernel,
@@ -807,6 +829,11 @@ async fn run_nanokernel_child_with_events(
         run.vns,
         run.frames_elapsed,
         None,
+        ChildTiming {
+            run_ms,
+            original_commit_ms,
+            ..ChildTiming::default()
+        },
     )
 }
 
@@ -861,6 +888,7 @@ async fn run_linux_child(
     root_frame_counter: u32,
 ) -> TestResult<ChildRecord> {
     let slot_id = lease.slot_id;
+    let run_started = Instant::now();
     let run = match svc
         .run(Request::new(proto::RunRequest {
             lease: Some(lease.clone()),
@@ -878,6 +906,7 @@ async fn run_linux_child(
             return Err(format!("child {index} Linux Run: {e}"));
         }
     };
+    let run_ms = elapsed_ms(run_started.elapsed());
     if run.reason != i32::from(proto::StopReason::BudgetReached) {
         destroy_best_effort(&svc, Some(lease)).await;
         return Err(format!(
@@ -927,6 +956,7 @@ async fn run_linux_child(
         }
     };
 
+    let snapshot_started = Instant::now();
     let snapshot = match svc
         .take_snapshot(Request::new(proto::TakeSnapshotRequest {
             lease: Some(lease.clone()),
@@ -941,6 +971,7 @@ async fn run_linux_child(
             return Err(format!("child {index} Linux TakeSnapshot: {e}"));
         }
     };
+    let original_commit_ms = elapsed_ms(snapshot_started.elapsed());
     let expected_frame_counter = match root_frame_counter.checked_add(M9_LINUX_CHILD_FRAMES) {
         Some(frame) => frame,
         None => {
@@ -970,6 +1001,11 @@ async fn run_linux_child(
         run.vns,
         run.frames_elapsed,
         Some(meta_pvblk_checksum),
+        ChildTiming {
+            run_ms,
+            original_commit_ms,
+            ..ChildTiming::default()
+        },
     )
 }
 
@@ -1117,6 +1153,20 @@ fn hex_nibble(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         _ => None,
     }
+}
+
+fn elapsed_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    assert!(
+        !sorted_values.is_empty(),
+        "percentile requires at least one value"
+    );
+    let clamped = percentile.clamp(0.0, 1.0);
+    let rank = ((sorted_values.len() - 1) as f64 * clamped).round() as usize;
+    sorted_values[rank]
 }
 
 fn snapshot_ref_hex(snapshot: &proto::SnapshotRef) -> String {
@@ -1475,6 +1525,45 @@ impl M8EvidenceRun {
         })
     }
 
+    fn timing_component(row: &serde_json::Value, key: &str) -> Option<f64> {
+        row.get("timing_ms")
+            .and_then(|timing| timing.get(key))
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    }
+
+    fn positive_timing_sum(row: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+        let mut sum = 0.0;
+        for key in keys {
+            sum += Self::timing_component(row, key)?;
+        }
+        (sum > 0.0).then_some(sum)
+    }
+
+    fn latency_stats(values: &[f64]) -> serde_json::Value {
+        if values.is_empty() {
+            return serde_json::json!({
+                "count": 0,
+                "p50": serde_json::Value::Null,
+                "p95": serde_json::Value::Null,
+                "p99": serde_json::Value::Null,
+                "max": serde_json::Value::Null,
+            });
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| {
+            a.partial_cmp(b)
+                .expect("M8 latency values are finite before sorting")
+        });
+        serde_json::json!({
+            "count": sorted.len(),
+            "p50": percentile(&sorted, 0.50),
+            "p95": percentile(&sorted, 0.95),
+            "p99": percentile(&sorted, 0.99),
+            "max": sorted[sorted.len() - 1],
+        })
+    }
+
     fn append_child(
         &mut self,
         harness: &AcceptanceHarness,
@@ -1498,12 +1587,12 @@ impl M8EvidenceRun {
             "dirty_pages": child.dirty_pages,
             "shared_page_ratio": shared_page_ratio,
             "timing_ms": {
-                "fork": 0.0,
-                "run": 0.0,
-                "original_commit": 0.0,
-                "restore": 0.0,
-                "replay": 0.0,
-                "replay_commit": 0.0,
+                "fork": child.timing.fork_ms,
+                "run": child.timing.run_ms,
+                "original_commit": child.timing.original_commit_ms,
+                "restore": replay.timing.restore_ms,
+                "replay": replay.timing.replay_ms,
+                "replay_commit": replay.timing.replay_commit_ms,
             },
             "result": "pass",
             "original_slot_id": child.slot_id,
@@ -1524,6 +1613,7 @@ impl M8EvidenceRun {
         harness: &AcceptanceHarness,
         original: &ChildRecord,
         replay: &ChildRecord,
+        replay_restore_ms: f64,
     ) -> TestResult<()> {
         let (shared_page_ratio, manifest_kind, chain_depth) =
             shared_page_ratio(harness.store(), harness.root_snapshot(), &replay.snapshot)?;
@@ -1549,12 +1639,12 @@ impl M8EvidenceRun {
             "dirty_pages": replay.dirty_pages,
             "shared_page_ratio": shared_page_ratio,
             "timing_ms": {
-                "fork": 0.0,
-                "run": 0.0,
-                "original_commit": 0.0,
-                "restore": 0.0,
-                "replay": 0.0,
-                "replay_commit": 0.0,
+                "fork": original.timing.fork_ms,
+                "run": original.timing.run_ms,
+                "original_commit": original.timing.original_commit_ms,
+                "restore": replay_restore_ms,
+                "replay": replay.timing.run_ms,
+                "replay_commit": replay.timing.original_commit_ms,
             },
             "result": result,
             "original_slot_id": original.slot_id,
@@ -1598,6 +1688,42 @@ impl M8EvidenceRun {
             row.get("result").and_then(|value| value.as_str()) == Some("ref_mismatch")
                 && row.get("original_ref_hex") != row.get("replay_ref_hex")
         });
+        let fork_commit_values: Vec<_> = self
+            .rows
+            .iter()
+            .filter_map(|row| Self::positive_timing_sum(row, &["fork", "run", "original_commit"]))
+            .collect();
+        let restore_delta_values: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.get("restore_mode").and_then(|v| v.as_str()) == Some("baseline_delta")
+            })
+            .filter_map(|row| Self::timing_component(row, "restore").filter(|value| *value > 0.0))
+            .collect();
+        let restore_full_values: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| row.get("restore_mode").and_then(|v| v.as_str()) == Some("full"))
+            .filter_map(|row| Self::timing_component(row, "restore").filter(|value| *value > 0.0))
+            .collect();
+        let replay_commit_values: Vec<_> = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                Self::positive_timing_sum(row, &["restore", "replay", "replay_commit"])
+            })
+            .collect();
+        let latency = serde_json::json!({
+            "policy": "telemetry; storage latency is recorded for M8 evidence and compared during closeout sign-off",
+            "fork_to_original_commit": Self::latency_stats(&fork_commit_values),
+            "restore_delta": Self::latency_stats(&restore_delta_values),
+            "restore_full": Self::latency_stats(&restore_full_values),
+            "replay_restore_to_commit": Self::latency_stats(&replay_commit_values),
+        });
+        let fork_commit_latency_complete =
+            !self.rows.is_empty() && fork_commit_values.len() == self.rows.len();
+        let restore_delta_latency_present = !restore_delta_values.is_empty();
         let run_kind = if self.semantic_negative {
             "semantic_negative"
         } else if self.jobs == DEFAULT_JOBS {
@@ -1624,8 +1750,8 @@ impl M8EvidenceRun {
             {"name": "m8_full_manifest_cadence", "ok": full_cadence_seen},
             {"name": "m8_semantic_negative_red", "ok": semantic_red},
             {"name": "m8_store_root_qualified", "ok": self.store_root_qualified},
-            {"name": "m8_fork_commit_p99", "ok": false},
-            {"name": "m8_restore_delta_p99", "ok": false}
+            {"name": "m8_fork_commit_p99", "ok": fork_commit_latency_complete},
+            {"name": "m8_restore_delta_p99", "ok": restore_delta_latency_present}
         ]);
         let evidence = serde_json::json!({
             "schema_version": 1,
@@ -1672,6 +1798,7 @@ impl M8EvidenceRun {
                 "resumed_child_count": self.resumed_rows,
                 "fresh_child_count": self.rows.len().saturating_sub(self.resumed_rows),
             },
+            "latency_ms": latency,
             "bars": bars,
             "commands": ["cargo test -p dh-worker --test m7_fork_verify m8_accept_1000_seeded_forks_replay_commit_ref_identity -- --ignored --nocapture --test-threads=1"],
             "artifacts": [
@@ -1688,7 +1815,7 @@ impl M8EvidenceRun {
             "deviations": [
                 {
                     "id": "live_harness_partial",
-                    "reason": "Replay-commit evidence is emitted, and worker baseline-delta/FULL cadence has a service smoke; full acceptance evidence still needs baseline-delta aggregation and latency bars."
+                    "reason": "Replay-commit evidence is emitted with measured latencies, and worker baseline-delta/FULL cadence has a service smoke; full acceptance evidence still needs baseline-delta and semantic-negative aggregation."
                 }
             ]
         });
@@ -2190,6 +2317,7 @@ async fn replay_commit_child(
     root_frame_counter: u32,
     original: ChildRecord,
 ) -> TestResult<ReplayCommitRecord> {
+    let restore_started = Instant::now();
     let restored = svc
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
             snapshot: Some(root_snapshot),
@@ -2204,6 +2332,7 @@ async fn replay_commit_child(
             )
         })?
         .into_inner();
+    let restore_ms = elapsed_ms(restore_started.elapsed());
     let lease = restored
         .lease
         .ok_or_else(|| format!("child {} replay-commit returned no lease", original.index))?;
@@ -2234,6 +2363,11 @@ async fn replay_commit_child(
         snapshot: replay.snapshot,
         state_hash: replay.state_hash,
         input_log_id: replay.input_log_id,
+        timing: ReplayCommitTiming {
+            restore_ms,
+            replay_ms: replay.timing.run_ms,
+            replay_commit_ms: replay.timing.original_commit_ms,
+        },
     })
 }
 
@@ -2282,12 +2416,13 @@ async fn replay_commit_batch(
 async fn semantic_negative_replay_commit_child(
     harness: &AcceptanceHarness,
     original: &ChildRecord,
-) -> TestResult<ChildRecord> {
+) -> TestResult<(ChildRecord, f64)> {
     if harness.guest() != AcceptanceGuest::Nanokernel {
         return Err(
             "semantic-negative replay-commit currently requires nanokernel pad input".into(),
         );
     }
+    let restore_started = Instant::now();
     let restored = harness
         .svc()
         .restore_snapshot(Request::new(proto::RestoreSnapshotRequest {
@@ -2303,6 +2438,7 @@ async fn semantic_negative_replay_commit_child(
             )
         })?
         .into_inner();
+    let restore_ms = elapsed_ms(restore_started.elapsed());
     let lease = restored.lease.ok_or_else(|| {
         format!(
             "semantic-negative child {} returned no lease",
@@ -2333,7 +2469,7 @@ async fn semantic_negative_replay_commit_child(
             snapshot_ref_hex(&original.snapshot)
         ));
     }
-    Ok(replay)
+    Ok((replay, restore_ms))
 }
 
 async fn cross_check_child_on_distinct_slots(
@@ -2517,6 +2653,7 @@ fn sample_child_record(index: usize, tag: u8) -> ChildRecord {
         frame_counter: 2,
         dirty_pages: 7,
         meta_pvblk_checksum: Some(u64::from(tag)),
+        timing: ChildTiming::default(),
     }
 }
 
@@ -2779,6 +2916,7 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
         while accepted < jobs {
             let batch_count = child_capacity.min(jobs - accepted);
             let seeds: Vec<_> = (accepted..accepted + batch_count).map(child_seed).collect();
+            let fork_started = Instant::now();
             let forked = harness
                 .svc()
                 .fork(Request::new(proto::ForkRequest {
@@ -2790,11 +2928,15 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
                 .unwrap_or_else(|e| panic!("M8 Fork batch starting at {accepted}: {e}"))
                 .into_inner()
                 .children;
+            let fork_ms_per_child = elapsed_ms(fork_started.elapsed()) / forked.len().max(1) as f64;
             assert_eq!(forked.len(), batch_count);
 
-            let children = run_child_batch(&harness, accepted, forked)
+            let mut children = run_child_batch(&harness, accepted, forked)
                 .await
                 .unwrap_or_else(|e| panic!("M8 Run/Snapshot batch starting at {accepted}: {e}"));
+            for child in &mut children {
+                child.timing.fork_ms = fork_ms_per_child;
+            }
             let mut validated = Vec::with_capacity(children.len());
             for child in children {
                 let log = tokio::task::block_in_place(|| {
@@ -2929,6 +3071,7 @@ fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
         .expect("test runtime");
     rt.block_on(async {
         let index = 0usize;
+        let fork_started = Instant::now();
         let forked = harness
             .svc()
             .fork(Request::new(proto::ForkRequest {
@@ -2942,12 +3085,13 @@ fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
             .children;
         assert_eq!(forked.len(), 1);
 
-        let original = run_child_batch(&harness, index, forked)
+        let mut original = run_child_batch(&harness, index, forked)
             .await
             .unwrap_or_else(|e| panic!("M8 semantic-negative original child: {e}"))
             .into_iter()
             .next()
             .expect("one original child");
+        original.timing.fork_ms = elapsed_ms(fork_started.elapsed());
         let log = tokio::task::block_in_place(|| {
             fetch_log_payload(harness.store(), &original.input_log_id)
         });
@@ -2960,15 +3104,16 @@ fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
             .next()
             .expect("one verified original child");
 
-        let replay = semantic_negative_replay_commit_child(&harness, &verified)
-            .await
-            .unwrap_or_else(|e| panic!("M8 semantic-negative replay commit: {e}"));
+        let (replay, replay_restore_ms) =
+            semantic_negative_replay_commit_child(&harness, &verified)
+                .await
+                .unwrap_or_else(|e| panic!("M8 semantic-negative replay commit: {e}"));
         assert_ne!(
             replay.snapshot.hash, verified.snapshot.hash,
             "mutated replay must commit a different snapshot ref"
         );
         evidence
-            .append_semantic_negative(&harness, &verified, &replay)
+            .append_semantic_negative(&harness, &verified, &replay, replay_restore_ms)
             .unwrap_or_else(|e| panic!("M8 semantic-negative evidence: {e}"));
 
         harness.destroy_root().await;
