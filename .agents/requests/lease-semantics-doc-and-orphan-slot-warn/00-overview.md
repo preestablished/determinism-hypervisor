@@ -1,5 +1,8 @@
 # Request: Say What Lease Reclamation Actually Is, WARN On The Orphan Signature — And Decide The Reaper Deliberately
 
+> **CURRENT STATUS (2026-07-10):** Still open, but no longer third behind the
+> Phase 3/OOM requests. Read `04-current-status-2026-07-10.md`.
+
 ## Who Is Asking
 
 The phases track, round 3 (2026-07-07), on behalf of two waiting
