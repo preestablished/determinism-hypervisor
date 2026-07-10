@@ -21,11 +21,12 @@ use crate::runtime::{
     RuntimeActorError, RuntimeError, RuntimeThreadState, SlotActor, SlotRuntime,
     WorkerRuntimeTable,
 };
-use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotManager};
+use crate::slot_manager::{parse_core_list, Lease, LeasePolicy, SlotError, SlotInfo, SlotManager};
 use dh_proto::v1 as proto;
 use dh_proto::v1::hypervisor_worker_server::{HypervisorWorker, HypervisorWorkerServer};
 #[cfg(target_arch = "x86_64")]
 use dh_verify::verify::{BisectionMode, VerifyProgress};
+use dh_vmm::SlotState;
 use prost::Message;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -1126,6 +1127,88 @@ pub fn slot_error_to_status(e: SlotError) -> Status {
             Status::with_details(Code::FailedPrecondition, message, details)
         }
     }
+}
+
+/// Token-free diagnostic context for the advisory uniform-paused signature.
+struct PossibleOrphanSlots {
+    shared_icount: u64,
+    slots: Vec<PossibleOrphanSlot>,
+}
+
+struct PossibleOrphanSlot {
+    slot_id: u64,
+    base_snapshot_id: Option<[u8; 32]>,
+}
+
+/// This shape can also be legitimate same-boundary fan-out, so it is evidence
+/// for operators rather than proof of a leak or a reason to mutate slot state.
+fn possible_orphan_slots(error: &SlotError, slots: &[SlotInfo]) -> Option<PossibleOrphanSlots> {
+    if !matches!(error, SlotError::NoFreeSlot) {
+        return None;
+    }
+    let first = slots.first()?;
+    if slots
+        .iter()
+        .any(|slot| slot.state != SlotState::Paused || slot.icount != first.icount)
+    {
+        return None;
+    }
+    Some(PossibleOrphanSlots {
+        shared_icount: first.icount,
+        slots: slots
+            .iter()
+            .map(|slot| PossibleOrphanSlot {
+                slot_id: slot.slot_id,
+                base_snapshot_id: slot.base_snapshot_id,
+            })
+            .collect(),
+    })
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn possible_orphan_warning(signature: PossibleOrphanSlots) -> String {
+    let slots = signature
+        .slots
+        .iter()
+        .map(|slot| {
+            let base = slot
+                .base_snapshot_id
+                .as_ref()
+                .map(|id| lowercase_hex(id))
+                .unwrap_or_else(|| "none".into());
+            format!("{{slot_id={},base_snapshot_id={base}}}", slot.slot_id)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "WARN: possible orphaned slots after NoFreeSlot: shared_icount={} slots=[{slots}]; advisory signature may also be legitimate same-boundary fan-out; leak_class=rom-operator-bridge-72o",
+        signature.shared_icount
+    )
+}
+
+fn allocation_error_to_status_with_sink(
+    manager: &SlotManager,
+    error: SlotError,
+    mut sink: impl FnMut(&str),
+) -> Status {
+    if let Some(signature) = possible_orphan_slots(&error, &manager.list()) {
+        let warning = possible_orphan_warning(signature);
+        sink(&warning);
+    }
+    slot_error_to_status(error)
+}
+
+fn allocation_error_to_status(manager: &SlotManager, error: SlotError) -> Status {
+    allocation_error_to_status_with_sink(manager, error, |line| eprintln!("{line}"))
 }
 
 fn slot_error_id(e: &SlotError) -> Option<u64> {
@@ -4104,7 +4187,7 @@ impl WorkerService {
             let allocated_at_ms = lease_now_ms();
             let lease = manager
                 .allocate(allocated_at_ms)
-                .map_err(slot_error_to_status)?;
+                .map_err(|error| allocation_error_to_status(manager.as_ref(), error))?;
             let runtime = match build_runtime(lease.clone()) {
                 Ok(runtime) => runtime,
                 Err(e) => {
@@ -4198,13 +4281,13 @@ impl WorkerService {
             let forked_at_ms = lease_now_ms();
             manager
                 .check_fork(&parent, count, forked_at_ms)
-                .map_err(slot_error_to_status)?;
+                .map_err(|error| allocation_error_to_status(manager.as_ref(), error))?;
             runtimes
                 .ensure_occupied(parent.slot_id)
                 .map_err(runtime_error_to_status)?;
             let child_leases = manager
                 .fork(&parent, count, forked_at_ms)
-                .map_err(slot_error_to_status)?;
+                .map_err(|error| allocation_error_to_status(manager.as_ref(), error))?;
 
             let child_runtimes = match build_runtimes(runtimes.as_ref(), &child_leases) {
                 Ok(child_runtimes) if child_runtimes.len() == child_leases.len() => child_runtimes,
@@ -5284,7 +5367,7 @@ impl HypervisorWorker for WorkerService {
             let reserved_at_ms = lease_now_ms();
             let verify_lease = manager
                 .allocate(reserved_at_ms)
-                .map_err(slot_error_to_status)?;
+                .map_err(|error| allocation_error_to_status(manager.as_ref(), error))?;
             let core = match runtime_core(manager.as_ref(), verify_lease.slot_id) {
                 Ok(core) => core,
                 Err(e) => {
@@ -7381,6 +7464,91 @@ mod tests {
             slot_error_to_status(SlotError::StaleLease { slot_id: 3 }).code(),
             tonic::Code::FailedPrecondition
         );
+    }
+
+    fn full_paused_manager(icounts: &[u64]) -> (SlotManager, Vec<Lease>) {
+        let manager = SlotManager::new(
+            icounts.len(),
+            (0..u32::try_from(icounts.len()).unwrap()).collect(),
+            LeasePolicy::default(),
+        )
+        .unwrap();
+        let mut leases = Vec::new();
+        for (index, icount) in icounts.iter().copied().enumerate() {
+            let lease = manager.allocate(0).unwrap();
+            let base = (index == 0).then_some([0xB7; 32]);
+            manager.set_position(&lease, icount, base, 0).unwrap();
+            leases.push(lease);
+        }
+        (manager, leases)
+    }
+
+    #[test]
+    fn possible_orphan_warning_emits_once_without_tokens_and_preserves_status() {
+        let (manager, leases) = full_paused_manager(&[641_343_512; 3]);
+        let mut warnings = Vec::new();
+        let status =
+            allocation_error_to_status_with_sink(&manager, SlotError::NoFreeSlot, |line| {
+                warnings.push(line.to_owned())
+            });
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert!(warning.contains("WARN: possible orphaned slots"));
+        assert!(warning.contains("shared_icount=641343512"));
+        assert!(warning.contains("slot_id=0"));
+        assert!(warning.contains("slot_id=1"));
+        assert!(warning.contains("slot_id=2"));
+        assert!(warning.contains(&lowercase_hex(&[0xB7; 32])));
+        assert!(warning.contains("base_snapshot_id=none"));
+        assert!(warning.contains("rom-operator-bridge-72o"));
+        for lease in leases {
+            assert!(!warning.contains(&lowercase_hex(&lease.token)));
+        }
+    }
+
+    #[test]
+    fn possible_orphan_warning_is_silent_for_differing_icounts() {
+        let (manager, _) = full_paused_manager(&[10, 11]);
+        let mut warnings = Vec::new();
+        let status =
+            allocation_error_to_status_with_sink(&manager, SlotError::NoFreeSlot, |line| {
+                warnings.push(line.to_owned())
+            });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn possible_orphan_warning_is_silent_unless_every_slot_is_paused() {
+        let (manager, leases) = full_paused_manager(&[10, 10]);
+        manager.mark_running(&leases[1], 0).unwrap();
+        let mut warnings = Vec::new();
+        let status =
+            allocation_error_to_status_with_sink(&manager, SlotError::NoFreeSlot, |line| {
+                warnings.push(line.to_owned())
+            });
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn possible_orphan_warning_is_silent_for_empty_tables_and_other_errors() {
+        let manager = SlotManager::new(0, Vec::new(), LeasePolicy::default()).unwrap();
+        let mut warnings = Vec::new();
+        allocation_error_to_status_with_sink(&manager, SlotError::NoFreeSlot, |line| {
+            warnings.push(line.to_owned())
+        });
+        assert!(warnings.is_empty());
+
+        let (manager, _) = full_paused_manager(&[10]);
+        allocation_error_to_status_with_sink(
+            &manager,
+            SlotError::StaleLease { slot_id: 0 },
+            |line| warnings.push(line.to_owned()),
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]

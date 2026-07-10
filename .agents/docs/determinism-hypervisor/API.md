@@ -173,6 +173,21 @@ message DestroyVmRequest  { Lease lease = 1; }
 message DestroyVmResponse { }        // freeing the last child unfreezes/frees the parent
 ```
 
+#### Lease lifecycle policy
+
+The worker validates the slot/token pair on every mutating RPC. A wrong or
+replaced token (`StaleLease`) and a matching token expired under an enabled TTL
+(`LeaseExpired`) both map to `FAILED_PRECONDITION`.
+
+The deployed service currently uses no TTL, exposes no renewal RPC, and does not
+reclaim leases when a transport connection closes. Tokened `DestroyVm` is the
+only client-invoked normal release path for a retained VM lease; internal
+rollback, temporary verification cleanup, and host-integrity teardown are not
+client lease-reclamation guarantees. Optional reaper internals do not extend the
+wire contract. See [INTEGRATION.md §1](INTEGRATION.md#1-slot-leasing-protocol-orchestrator-contract)
+and the accepted
+[lease-reclamation activation decision](../../../docs/decisions/lease-reclamation-activation.md).
+
 ### 2.3 Input injection
 
 ```proto

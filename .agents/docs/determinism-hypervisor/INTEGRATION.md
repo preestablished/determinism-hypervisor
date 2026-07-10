@@ -21,9 +21,29 @@ work — it is a passive pool of slots driven by RPCs.
 
 ## 1. Slot leasing protocol (orchestrator contract)
 
-- `Fork`/`RestoreSnapshot`/`CreateVm` return a `Lease{slot_id, token}`. Every mutating
-  RPC echoes it; a stale token gets `FAILED_PRECONDITION`. Leases have no timeout in
-  v1 (trusted single orchestrator); `DestroyVm` releases.
+- `Fork`/`RestoreSnapshot`/`CreateVm` mint a random 16-byte token and return a
+  `Lease{slot_id, token}`. Every mutating RPC validates the slot/token pair. A wrong
+  or replaced token is `StaleLease`; a matching token past an enabled TTL is
+  `LeaseExpired`. Both map to gRPC `FAILED_PRECONDITION`.
+- Optional expiry mechanics exist and are unit tested. `LeasePolicy::with_ttl`
+  enables renewal bookkeeping, and `reclaim_expired(now_ms)` accepts caller-injected
+  time, making its result deterministic for a given table and time. The sweep is
+  deliberately single-pass: expired `Running` slots first become `Faulted`, and a
+  `Frozen` parent thawed when its last expired child is released becomes reclaimable
+  only on a later sweep. The parent-thaw transition is published.
+- Those mechanics are inactive in the production daemon. It installs
+  `LeasePolicy::default()` (no TTL), has no housekeeping caller, exposes no renewal
+  RPC, and performs no disconnect-triggered reclamation. Tokened `DestroyVm` is
+  therefore the only client-invoked normal release path for retained VM leases.
+  Internal rollback, `VerifyReplay` temporary-work cleanup, and host-integrity
+  teardown are separate active release paths.
+- If an allocation returns `NoFreeSlot` while every configured slot is `Paused` at
+  one shared icount, the service emits a token-free `WARN:` with slot and base
+  snapshot identifiers. This is advisory: legitimate same-boundary deterministic
+  fan-out can have the same shape.
+- The choice to defer TTL, disconnect/session teardown, and privileged tokenless
+  reconciliation for this release is recorded in
+  [`docs/decisions/lease-reclamation-activation.md`](../../../docs/decisions/lease-reclamation-activation.md).
 - Jobs are pure functions of `(snapshot_ref, burst, seed)` — on worker failure the
   orchestrator may blindly re-run the job on any other slot/host (same determinism
   class) and will get the identical child snapshot ref.

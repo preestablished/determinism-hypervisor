@@ -19,12 +19,14 @@
 //! timeout (trusted single orchestrator) — `LeasePolicy::default()`
 //! encodes that. The bead's grant/renew/expire mechanics are still
 //! implemented behind `LeasePolicy::with_ttl`, so turning expiry on is a
-//! config change, not a code change; `reclaim_expired` is the reaper.
+//! policy change plus daemon integration, not merely a configuration
+//! flip; `reclaim_expired` supplies the currently inactive reaper mechanics.
 //!
 //! TIME: expiry needs a clock, and host wall-clock must never leak into
 //! guest-visible state — so the manager never reads one. Callers pass
-//! `now_ms` explicitly (the daemon's housekeeping loop owns the read),
-//! which also makes every unit test deterministic.
+//! `now_ms` explicitly, which also makes every unit test deterministic.
+//! Production currently enables no TTL and has no housekeeping caller; any
+//! future caller must own the clock read and runtime-teardown coordination.
 //!
 //! FORK ACCOUNTING (R9): `fork` freezes the parent (Paused → Frozen)
 //! and registers each tier-A CoW child as Paused with
