@@ -1,3 +1,5 @@
+#![cfg(target_arch = "x86_64")]
+
 //! RunWithFrameCapture acceptance (play-60fps plan, M2): the streaming
 //! capture RPC is capture-neutral (identical terminal state hash to a
 //! plain Run over the same budget — the chain is cumulative, so terminal

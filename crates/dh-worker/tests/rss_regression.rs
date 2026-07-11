@@ -1,3 +1,5 @@
+#![cfg(target_arch = "x86_64")]
+
 //! Bounded-RSS regression guard for long streaming Runs (bead
 //! determinism-hypervisor-9f3x; plan
 //! `.agents/plans/run-with-frame-capture-memory-leak-oom/03`).

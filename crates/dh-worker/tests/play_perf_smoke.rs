@@ -1,3 +1,5 @@
+#![cfg(target_arch = "x86_64")]
+
 //! M0 play-path perf attribution + relative regression guard
 //! (play-60fps plan, 01/04).
 //!

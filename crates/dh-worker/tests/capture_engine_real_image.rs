@@ -1,3 +1,5 @@
+#![cfg(target_arch = "x86_64")]
+
 //! Capture-engine end-to-end proof against the REAL workload image
 //! (bead determinism-hypervisor-ncn7; Phase-4 request item 5,
 //! `.agents/requests/phase4-oom-fix-and-capture-engine-proving/`;
