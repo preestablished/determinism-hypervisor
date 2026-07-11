@@ -80,6 +80,8 @@ const M9_LINUX_CHILD_EPOCH_LEN: u64 = 745_000;
 // keep more than 2x headroom without slowing every production/test machine.
 const M8_LINUX_SKID_MARGIN: u32 = 131_072;
 const M8_LINUX_MEASURED_MAX_SKID: u32 = 41_075;
+const _: () = assert!(M8_LINUX_SKID_MARGIN > 2 * M8_LINUX_MEASURED_MAX_SKID);
+const _: () = assert!(M8_LINUX_SKID_MARGIN > dh_vmm::config::DEFAULT_SKID_MARGIN);
 const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
 const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
 const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
@@ -3177,12 +3179,6 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
             }
         }
     });
-}
-
-#[test]
-fn m8_linux_skid_margin_keeps_loaded_host_headroom() {
-    assert!(M8_LINUX_SKID_MARGIN > 2 * M8_LINUX_MEASURED_MAX_SKID);
-    assert!(M8_LINUX_SKID_MARGIN > dh_vmm::config::DEFAULT_SKID_MARGIN);
 }
 
 #[test]
