@@ -7634,7 +7634,7 @@ mod tests {
 
             let snap = svc
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease),
+                    lease: Some(lease.clone()),
                     seal_input_log: Some(true),
                     capture: None,
                 }))

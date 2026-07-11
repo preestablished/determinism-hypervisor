@@ -3090,7 +3090,7 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
                     panic!("M8 replay-commit batch starting at {accepted}: {e}")
                 });
             assert_eq!(replayed.len(), children.len());
-            for (child, replay) in children.iter().zip(replayed.into_iter()) {
+            for (child, replay) in children.iter().zip(replayed) {
                 assert_eq!(replay.child_index, child.index);
                 assert_eq!(replay.snapshot.hash.len(), 32);
                 assert_eq!(replay.input_log_id.len(), 32);

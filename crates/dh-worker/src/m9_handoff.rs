@@ -1391,19 +1391,19 @@ fn validate_created_private_layout(args: &HandoffArgs) -> HandoffResult<()> {
             "snapstore UDS parent",
             args.snapstore_uds
                 .parent()
-                .unwrap_or_else(|| args.snapstore_uds.as_path()),
+                .unwrap_or(args.snapstore_uds.as_path()),
         ),
         (
             "handoff env parent",
             args.handoff_env
                 .parent()
-                .unwrap_or_else(|| args.handoff_env.as_path()),
+                .unwrap_or(args.handoff_env.as_path()),
         ),
         (
             "snapstore config parent",
             args.snapstore_config
                 .parent()
-                .unwrap_or_else(|| args.snapstore_config.as_path()),
+                .unwrap_or(args.snapstore_config.as_path()),
         ),
     ] {
         let canonical = fs::canonicalize(path).map_err(|e| {
