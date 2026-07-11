@@ -750,7 +750,7 @@ fn run_segment_inner(
                         timer_fired,
                         frames_seen,
                         options.hash_final_stop,
-                    )
+                    );
                 }
                 Err(_) if event_stop => {
                     return finish_at_counter(
@@ -2173,7 +2173,11 @@ mod event_until_tests {
         };
         assert_eq!(
             (plain.boundary, plain.state_hash, plain.frames_elapsed),
-            (captured.boundary, captured.state_hash, captured.frames_elapsed),
+            (
+                captured.boundary,
+                captured.state_hash,
+                captured.frames_elapsed
+            ),
             "a sink-observed run must be indistinguishable from a plain run"
         );
         assert!(captured.frames_elapsed > 0, "fixture must emit frames");

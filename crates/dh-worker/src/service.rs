@@ -8325,11 +8325,9 @@ mod tests {
             );
             assert_eq!(fb_info.frame_counter, 0);
 
-            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
-                lease: Some(lease),
-            }))
-            .await
-            .unwrap();
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest { lease: Some(lease) }))
+                .await
+                .unwrap();
 
             // The bridge's per-frame fallback combines FrameBudget(1) with the
             // same CaptureSpec. Pin that combination against the established

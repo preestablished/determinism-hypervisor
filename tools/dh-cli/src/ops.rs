@@ -178,6 +178,7 @@ async fn execute_to_writer<W: std::io::Write + ?Sized>(
                 .restore_snapshot(proto::RestoreSnapshotRequest {
                     snapshot: Some(proto::SnapshotRef { hash: snapshot }),
                     entropy_seed,
+                    baseline: None,
                 })
                 .await
                 .map_err(OpError::Rpc)?
