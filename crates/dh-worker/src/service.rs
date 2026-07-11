@@ -7608,6 +7608,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[tokio::test]
     async fn create_vm_rejects_missing_config_before_engine_work() {
         let svc = WorkerService::new(test_config(1)).unwrap();
