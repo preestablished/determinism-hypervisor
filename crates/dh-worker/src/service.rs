@@ -33,12 +33,20 @@ use std::convert::TryFrom;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
-#[cfg(target_arch = "x86_64")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
+
+#[cfg(target_arch = "x86_64")]
+fn landing_single_steps_total() -> u64 {
+    dh_vmm::boundary::landing_single_steps_total()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn landing_single_steps_total() -> u64 {
+    0
+}
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone)]
@@ -491,7 +499,7 @@ impl WorkerMetrics {
         );
         out.push_str(&format!(
             "dh_worker_landing_single_steps_total {}\n",
-            dh_vmm::boundary::landing_single_steps_total()
+            landing_single_steps_total()
         ));
 
         self.snapshot_ms
