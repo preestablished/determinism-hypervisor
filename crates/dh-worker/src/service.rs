@@ -7634,7 +7634,7 @@ mod tests {
 
             let snap = svc
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease.clone()),
+                    lease: Some(lease),
                     seal_input_log: Some(true),
                     capture: None,
                 }))
@@ -8247,7 +8247,7 @@ mod tests {
 
             let snap = svc
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease),
+                    lease: Some(lease.clone()),
                     seal_input_log: None,
                     capture: None,
                 }))
@@ -8288,7 +8288,7 @@ mod tests {
 
             let run = svc
                 .run(Request::new(proto::RunRequest {
-                    lease: Some(lease),
+                    lease: Some(lease.clone()),
                     until: Some(proto::run_request::Until::IcountBudget(10_000_000)),
                     hard_icount_cap: 0,
                     capture: Some(proto::CaptureSpec {
@@ -8324,6 +8324,56 @@ mod tests {
                 proto_pixel_format(proto::PixelFormat::Xrgb8888)
             );
             assert_eq!(fb_info.frame_counter, 0);
+
+            svc.destroy_vm(Request::new(proto::DestroyVmRequest {
+                lease: Some(lease),
+            }))
+            .await
+            .unwrap();
+
+            // The bridge's per-frame fallback combines FrameBudget(1) with the
+            // same CaptureSpec. Pin that combination against the established
+            // icount-budget capture path so the stop selector cannot silently
+            // suppress feature or framebuffer output.
+            let frame_budget_created = svc
+                .create_vm(Request::new(proto::CreateVmRequest {
+                    config: Some(capture_fixture_machine_config(base_hash, kernel_hash)),
+                    entropy_seed: vec![0xC6; 32],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let frame_budget_run = svc
+                .run(Request::new(proto::RunRequest {
+                    lease: frame_budget_created.lease,
+                    until: Some(proto::run_request::Until::FrameBudget(1)),
+                    hard_icount_cap: 10_000_000,
+                    capture: Some(proto::CaptureSpec {
+                        ranges: vec![proto::ExtractRange {
+                            region: "framebuffer".into(),
+                            layout_version: nanokernel::CAPTURE_FIXTURE_DEFAULT_LAYOUT_VERSION,
+                            offset: 8,
+                            len: 24,
+                        }],
+                        framebuffer: true,
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(frame_budget_run.feature_bytes, capture_fixture_bytes(8, 24));
+            let frame_budget_pixels =
+                lz4_flex::decompress_size_prepended(&frame_budget_run.fb_lz4).unwrap();
+            assert_eq!(
+                frame_budget_pixels,
+                capture_fixture_bytes(0, nanokernel::CAPTURE_FIXTURE_FB_BYTES as usize)
+            );
+            let frame_budget_info = frame_budget_run.fb_info.unwrap();
+            assert_eq!(frame_budget_info.width, fb_info.width);
+            assert_eq!(frame_budget_info.height, fb_info.height);
+            assert_eq!(frame_budget_info.stride, fb_info.stride);
+            assert_eq!(frame_budget_info.format, fb_info.format);
+            assert_eq!(frame_budget_info.frame_counter, fb_info.frame_counter);
         });
     }
 
