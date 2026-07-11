@@ -1715,7 +1715,7 @@ impl M8EvidenceRun {
             .rows
             .iter()
             .any(|row| row.get("restore_mode").and_then(|v| v.as_str()) == Some("baseline_delta"));
-        let full_cadence_seen = self.jobs <= dh_worker::service::DEFAULT_MAX_DELTA_CHAIN as usize
+        let full_cadence_seen = self.root.join("full-cadence-smoke.ok").is_file()
             || self
                 .rows
                 .iter()

@@ -254,9 +254,17 @@ jobs:
           echo "M8 replay-commit ref-identity canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES"
           rm -rf "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
           mkdir -p "$M8_STORE_ROOT" "$M8_EVIDENCE_ROOT"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --lib \
+            take_snapshot_rolls_full_manifest_and_restore_accepts_baseline_delta \
+            -- --nocapture --test-threads=1
+          touch "$M8_EVIDENCE_ROOT/full-cadence-smoke.ok"
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
+            m8_accept_semantic_negative_replay_commit_ref_mismatch \
+            -- --ignored --nocapture --test-threads=1
           taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release \
             m8_accept_1000_seeded_forks_replay_commit_ref_identity \
             -- --ignored --nocapture --test-threads=1
+          python3 ../snapshot-store/scripts/m8_joint_fork_integrity_evidence.py "$M8_EVIDENCE_ROOT"
         working-directory: repo
       - uses: actions/upload-artifact@v4
         if: always()
