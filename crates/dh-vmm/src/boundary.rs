@@ -148,10 +148,14 @@ pub fn land_at(
             });
         }
         let d = target - c;
-        if !stepping && d > margins.skid_margin + margins.resync_slack {
-            // Far approach: one arm per approach, then run.
+        if !stepping && d > 2 * margins.skid_margin + margins.resync_slack {
+            // Far approach: one arm per approach, then run. Reserve one
+            // margin for PMU overflow skid and a second for async signal ->
+            // immediate_exit delivery. Linux READY boot on the reference
+            // host measured the latter at roughly one default margin under
+            // load; arming only one margin early overshot systematically.
             counter
-                .arm_period(d - margins.skid_margin)
+                .arm_period(d - 2 * margins.skid_margin)
                 .map_err(BoundaryError::Counter)?;
             match guard.run() {
                 Ok(exit) => on_exit(exit)?,
