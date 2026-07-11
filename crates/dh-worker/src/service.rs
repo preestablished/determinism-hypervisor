@@ -342,6 +342,7 @@ const FRAME_STREAM_TERMINATION_LABELS: &[&str] = &[
 /// Fold an unlisted termination label into `"other"` so a future
 /// mislabel is still exposed by `render` (which iterates the fixed list)
 /// instead of being recorded invisibly.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn canonical_termination_label(reason: &'static str) -> &'static str {
     if FRAME_STREAM_TERMINATION_LABELS.contains(&reason) {
         reason
@@ -630,6 +631,7 @@ struct MetricHistogram {
 }
 
 impl MetricHistogram {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn observe(&mut self, value: f64, buckets: &[f64]) {
         self.count += 1;
         self.sum += value;
@@ -1138,11 +1140,13 @@ pub fn slot_error_to_status(e: SlotError) -> Status {
 }
 
 /// Token-free diagnostic context for the advisory uniform-paused signature.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct PossibleOrphanSlots {
     shared_icount: u64,
     slots: Vec<PossibleOrphanSlot>,
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct PossibleOrphanSlot {
     slot_id: u64,
     base_snapshot_id: Option<[u8; 32]>,
@@ -1150,6 +1154,7 @@ struct PossibleOrphanSlot {
 
 /// This shape can also be legitimate same-boundary fan-out, so it is evidence
 /// for operators rather than proof of a leak or a reason to mutate slot state.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn possible_orphan_slots(error: &SlotError, slots: &[SlotInfo]) -> Option<PossibleOrphanSlots> {
     if !matches!(error, SlotError::NoFreeSlot) {
         return None;
@@ -1173,6 +1178,7 @@ fn possible_orphan_slots(error: &SlotError, slots: &[SlotInfo]) -> Option<Possib
     })
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn lowercase_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
 
@@ -1183,6 +1189,7 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn possible_orphan_warning(signature: PossibleOrphanSlots) -> String {
     let slots = signature
         .slots
@@ -1203,6 +1210,7 @@ fn possible_orphan_warning(signature: PossibleOrphanSlots) -> String {
     )
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn allocation_error_to_status_with_sink(
     manager: &SlotManager,
     error: SlotError,
@@ -1215,6 +1223,7 @@ fn allocation_error_to_status_with_sink(
     slot_error_to_status(error)
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn allocation_error_to_status(manager: &SlotManager, error: SlotError) -> Status {
     allocation_error_to_status_with_sink(manager, error, |line| eprintln!("{line}"))
 }
