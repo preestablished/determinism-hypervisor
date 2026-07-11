@@ -56,8 +56,8 @@ pub struct Margins {
 impl Default for Margins {
     fn default() -> Self {
         Margins {
-            skid_margin: 8192,
-            resync_slack: 1024,
+            skid_margin: u64::from(crate::config::DEFAULT_SKID_MARGIN),
+            resync_slack: u64::from(crate::config::DEFAULT_RESYNC_SLACK),
         }
     }
 }

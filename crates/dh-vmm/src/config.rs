@@ -82,7 +82,10 @@ pub enum HashEpochs {
 pub const CONFIG_VERSION: u32 = 1;
 pub const MEM_ALIGN: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_EPOCH_LEN: u64 = 50_000_000;
-pub const DEFAULT_SKID_MARGIN: u32 = 8192;
+/// Reference-host PMU delivery can skid just over 9k instructions while a
+/// Linux guest is booting under host load. Keep the default at more than
+/// twice that measured maximum so the R1 margin assertion remains meaningful.
+pub const DEFAULT_SKID_MARGIN: u32 = 32_768;
 pub const DEFAULT_RESYNC_SLACK: u32 = 1024;
 /// Bounds on variable-length parts — keeps every length far from the u32
 /// cast and gives the forever-frozen format hard decode limits.
