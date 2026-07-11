@@ -351,6 +351,7 @@ fn canonical_termination_label(reason: &'static str) -> &'static str {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 impl WorkerMetrics {
     fn record_exit(&self, slot_id: u64, reason: &'static str) {
         let mut exits = self.exits.lock().expect("metrics mutex poisoned");
