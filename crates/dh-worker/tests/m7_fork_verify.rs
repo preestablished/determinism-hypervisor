@@ -184,6 +184,7 @@ enum AcceptanceHarness {
         _store_handle: snapstore_server::build_server::ServerHandle,
         store_root: PathBuf,
         _store_dir: Option<tempfile::TempDir>,
+        _store_socket_dir: tempfile::TempDir,
         _image_cache: tempfile::TempDir,
     },
     Linux {
@@ -217,10 +218,17 @@ impl AcceptanceHarness {
         let (config, machine_config_hash) = pad_echo_config(base_hash, kernel_hash, cpuid_table);
 
         let (store_root, store_dir) = configured_m8_store_root()?;
+        let store_socket_dir = tempfile::Builder::new()
+            .prefix("dh-m8-store-")
+            .tempdir()
+            .map_err(|e| format!("snapstore socket tempdir: {e}"))?;
         let store_sock = "snapstore.sock";
-        let (_store_rt, _store_handle, store) =
-            common::spawn_store_at(store_root.clone(), store_sock);
-        let snapstore = snapstore_client::Transport::Uds(store_root.join(store_sock));
+        let (_store_rt, _store_handle, store) = common::spawn_store_at_with_socket_root(
+            store_root.clone(),
+            store_socket_dir.path().to_path_buf(),
+            store_sock,
+        );
+        let snapstore = snapstore_client::Transport::Uds(store_socket_dir.path().join(store_sock));
         let svc = WorkerService::new(worker_config(
             slot_cores,
             image_cache.path().to_path_buf(),
@@ -252,6 +260,7 @@ impl AcceptanceHarness {
             _store_handle,
             store_root,
             _store_dir: store_dir,
+            _store_socket_dir: store_socket_dir,
             _image_cache: image_cache,
         })
     }
@@ -3085,8 +3094,7 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
                 assert_eq!(replay.child_index, child.index);
                 assert_eq!(replay.snapshot.hash.len(), 32);
                 assert_eq!(replay.input_log_id.len(), 32);
-                evidence
-                    .append_child(&harness, child, &replay)
+                tokio::task::block_in_place(|| evidence.append_child(&harness, child, &replay))
                     .unwrap_or_else(|e| panic!("M8 evidence child {}: {e}", child.index));
                 unique_replay_hashes.insert(replay.state_hash);
                 unique_replay_refs.insert(arr32(&replay.snapshot.hash, "M8 replay snapshot"));
@@ -3236,9 +3244,10 @@ fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
             replay.snapshot.hash, verified.snapshot.hash,
             "mutated replay must commit a different snapshot ref"
         );
-        evidence
-            .append_semantic_negative(&harness, &verified, &replay, replay_restore_ms)
-            .unwrap_or_else(|e| panic!("M8 semantic-negative evidence: {e}"));
+        tokio::task::block_in_place(|| {
+            evidence.append_semantic_negative(&harness, &verified, &replay, replay_restore_ms)
+        })
+        .unwrap_or_else(|e| panic!("M8 semantic-negative evidence: {e}"));
 
         harness.destroy_root().await;
         let info = harness

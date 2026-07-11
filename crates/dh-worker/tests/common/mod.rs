@@ -998,7 +998,22 @@ pub fn spawn_store_at(
     data_root: std::path::PathBuf,
     sock_name: &str,
 ) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
-    spawn_store_at_inner(data_root, sock_name, false)
+    let socket_root = data_root.clone();
+    spawn_store_at_inner(data_root, socket_root, sock_name, false)
+}
+
+/// Spawn a server with its persistent data under `data_root` while keeping
+/// Unix-domain sockets under a separately owned, short-lived directory.
+///
+/// CI workspaces can be deep enough that placing sockets beside the store data
+/// exceeds Unix `SUN_LEN` before the test reaches guest execution.
+#[allow(dead_code)]
+pub fn spawn_store_at_with_socket_root(
+    data_root: std::path::PathBuf,
+    socket_root: std::path::PathBuf,
+    sock_name: &str,
+) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
+    spawn_store_at_inner(data_root, socket_root, sock_name, false)
 }
 
 #[allow(dead_code)]
@@ -1006,17 +1021,19 @@ pub fn spawn_store_at_with_corrupt_page_channel(
     data_root: std::path::PathBuf,
     sock_name: &str,
 ) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
-    spawn_store_at_inner(data_root, sock_name, true)
+    let socket_root = data_root.clone();
+    spawn_store_at_inner(data_root, socket_root, sock_name, true)
 }
 
 fn spawn_store_at_inner(
     data_root: std::path::PathBuf,
+    socket_root: std::path::PathBuf,
     sock_name: &str,
     corrupt_page_channel: bool,
 ) -> (tokio::runtime::Runtime, ServerHandle, BlockingClient) {
     let rt = tokio::runtime::Runtime::new().expect("rt");
-    let uds_path = data_root.join(sock_name);
-    let page_channel_path = data_root.join(format!("{sock_name}.pages"));
+    let uds_path = socket_root.join(sock_name);
+    let page_channel_path = socket_root.join(format!("{sock_name}.pages"));
     let config = ServerConfig {
         data_root: data_root.clone(),
         grpc_tcp_addr: "127.0.0.1:0".parse().expect("addr"),
