@@ -211,7 +211,7 @@ mod tests {
             }),
             epoch_len: 50_000_000,
             hash_epochs: v1::HashEpochs::EpochsOn as i32,
-            skid_margin: 32_768,
+            skid_margin: 131_072,
             cpuid_table: vec![v1::CpuidLeaf {
                 function: 1,
                 index: 0,
