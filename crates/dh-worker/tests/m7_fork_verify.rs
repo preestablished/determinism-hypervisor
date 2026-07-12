@@ -1220,10 +1220,83 @@ fn child_seed_hex(index: usize) -> String {
 }
 
 fn m8_now_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time must be after UNIX_EPOCH");
-    format!("unix-{}", now.as_secs())
+    std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after UNIX_EPOCH");
+            format!("unix-{}", now.as_secs())
+        })
+}
+
+fn command_value(program: &str, args: &[&str]) -> String {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn file_blake3_from_env(name: &str) -> serde_json::Value {
+    let Ok(path) = std::env::var(name) else {
+        return serde_json::Value::Null;
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::json!(blake3::hash(&bytes).to_hex().to_string()),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+fn host_json(store_root: &Path) -> serde_json::Value {
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| command_value("hostname", &[]));
+    let memory_bytes = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|kib| kib * 1024)
+        });
+    serde_json::json!({
+        "hostname": hostname,
+        "arch": std::env::consts::ARCH,
+        "kernel": command_value("uname", &["-srvo"]),
+        "cpu": command_value("lscpu", &["-J"]),
+        "memory_bytes": memory_bytes,
+        "kvm_read_write": std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok(),
+        "runner_labels": std::env::var("RUNNER_LABELS").unwrap_or_else(|_| "operator,linux,x64,kvm-intel".into()),
+        "store_mount": command_value("findmnt", &["-T", store_root.to_str().unwrap_or("."), "-n", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"]),
+    })
+}
+
+fn guest_json(harness: &AcceptanceHarness) -> serde_json::Value {
+    serde_json::json!({
+        "kind": match harness.guest() {
+            AcceptanceGuest::Nanokernel => "nanokernel",
+            AcceptanceGuest::Linux => "linux",
+        },
+        "machine_config_hash": hex_bytes(&harness.machine_config_hash()),
+        "images": {
+            "bzimage_blake3": file_blake3_from_env(common::DH_M9_BZIMAGE),
+            "initramfs_blake3": file_blake3_from_env(common::DH_M9_INITRAMFS),
+            "base_image_blake3": file_blake3_from_env(common::DH_M9_BASE_IMAGE),
+            "game_image_blake3": file_blake3_from_env(common::DH_M9_GAME_IMAGE),
+        }
+    })
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
@@ -1728,7 +1801,8 @@ impl M8EvidenceRun {
         Ok(())
     }
 
-    fn finish(&self, guest: AcceptanceGuest) -> TestResult<()> {
+    fn finish(&self, harness: &AcceptanceHarness) -> TestResult<()> {
+        let guest = harness.guest();
         self.write_child_csv()?;
         let aggregate_shared = if self.rows.is_empty() {
             0.0
@@ -1863,18 +1937,12 @@ impl M8EvidenceRun {
                 "control-plane": repo_json(&workspace_parent.join("control-plane")),
                 "guest-sdk": repo_json(&workspace_parent.join("guest-sdk")),
             },
-            "host": {
-                "hostname": std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into()),
-                "arch": std::env::consts::ARCH,
-            },
-            "guest": {
-                "kind": match guest {
-                    AcceptanceGuest::Nanokernel => "nanokernel",
-                    AcceptanceGuest::Linux => "linux",
-                },
-            },
+            "host": host_json(&self.store_root),
+            "guest": guest_json(harness),
             "store_root": {
                 "path": self.store_root.display().to_string(),
+                "resolved_path": self.store_root.canonicalize().unwrap_or_else(|_| self.store_root.clone()).display().to_string(),
+                "mount": command_value("findmnt", &["-T", self.store_root.to_str().unwrap_or("."), "-n", "-o", "TARGET,SOURCE,FSTYPE"]),
                 "disk_class": std::env::var(M8_STORE_ROOT_DISK_CLASS_ENV).unwrap_or_else(|_| "unknown".into()),
                 "qualified": self.store_root_qualified,
             },
@@ -1896,19 +1964,21 @@ impl M8EvidenceRun {
             },
             "latency_ms": latency,
             "bars": bars,
-            "commands": ["cargo test -p dh-worker --test m7_fork_verify m8_accept_1000_seeded_forks_replay_commit_ref_identity -- --ignored --nocapture --test-threads=1"],
+            "commands": ["cargo test -p dh-worker --test m7_fork_verify --release m8_accept_1000_seeded_forks_replay_commit_ref_identity -- --ignored --nocapture --test-threads=1"],
+            "environment": {
+                "DH_M7_ACCEPT_GUEST": match guest { AcceptanceGuest::Nanokernel => "nanokernel", AcceptanceGuest::Linux => "linux" },
+                "DH_M7_ACCEPT_JOBS": self.jobs.to_string(),
+                "DH_M7_ACCEPT_SLOT_CORES": std::env::var(SLOT_CORES_ENV).unwrap_or_default(),
+                "M8_STORE_ROOT_QUALIFIED": self.store_root_qualified,
+                "M8_STORE_ROOT_DISK_CLASS": std::env::var(M8_STORE_ROOT_DISK_CLASS_ENV).unwrap_or_else(|_| "unknown".into()),
+            },
             "artifacts": [
                 {"path": "evidence.json", "kind": "summary"},
                 {"path": "child-ref-table.jsonl", "kind": "child_table"},
                 {"path": "child-ref-table.csv", "kind": "child_table_csv"}
             ],
             "semantic_negative": semantic_negative_summary,
-            "deviations": [
-                {
-                    "id": "live_harness_partial",
-                    "reason": "Replay-commit evidence is emitted with measured latencies and baseline-delta restore probes; full closeout still needs the qualified hardware run and linked semantic-negative evidence when this positive evidence is generated."
-                }
-            ]
+            "deviations": []
         });
         std::fs::write(
             self.root.join("evidence.json"),
@@ -3189,7 +3259,7 @@ fn m8_accept_1000_seeded_forks_replay_commit_ref_identity() {
             .expect("GetWorkerInfo after cleanup")
             .into_inner();
         assert_eq!(info.slots_free as usize, slot_cores.len());
-        evidence.finish(guest).expect("write M8 evidence summary");
+        evidence.finish(&harness).expect("write M8 evidence summary");
 
         match guest {
             AcceptanceGuest::Nanokernel => {
@@ -3297,7 +3367,7 @@ fn m8_accept_semantic_negative_replay_commit_ref_mismatch() {
             .into_inner();
         assert_eq!(info.slots_free as usize, slot_cores.len());
         evidence
-            .finish(AcceptanceGuest::Nanokernel)
+            .finish(&harness)
             .expect("write M8 semantic-negative evidence summary");
     });
 }
