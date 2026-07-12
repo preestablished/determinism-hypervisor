@@ -160,7 +160,7 @@ fn full_snapshot_round_trips_through_the_real_store() {
 }
 
 #[test]
-fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
+fn incremental_snapshot_canonicalizes_dirty_supersets_and_clears() {
     if !kvm_available() {
         eprintln!("skipping: /dev/kvm not usable");
         return;
@@ -192,6 +192,10 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
     enable_dirty_logging(&slot).expect("logging on");
     run_guest_byte_writes(&mut slot, &[(0x2000, 0x42), (0x5000, 0x43), (0x9000, 0x44)]);
 
+    // KVM dirty tracking is conservative. Inject two unchanged pages to
+    // model different dirty-ring supersets produced by fork and restore.
+    dirty.insert(0x10).unwrap();
+    dirty.insert(0x20).unwrap();
     let outcome = take_snapshot(
         &slot,
         SlotState::Paused,
@@ -208,8 +212,8 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
     )
     .expect("incremental snapshot");
 
-    // The delta is small (the guest-written pages, possibly plus a page or
-    // two of KVM-internal dirtying) and the set was cleared post-ack.
+    // Only pages whose content differs from the flattened parent are
+    // shipped; conservative unchanged candidates do not affect the ref.
     assert!(outcome.pages_shipped >= 3, "{}", outcome.pages_shipped);
     assert!(
         outcome.pages_shipped < 32,
@@ -221,6 +225,30 @@ fn incremental_snapshot_ships_exactly_the_dirty_pages_and_clears() {
         "dirty set cleared only after the store ack"
     );
     assert_ne!(outcome.snapshot_ref, root.snapshot_ref);
+
+    let mut second_ring = DirtyRing::map(&slot).expect("second ring");
+    let mut second_dirty = DirtyPageSet::new(slot.mem_bytes);
+    for page in [0, 0x2, 0x5, 0x9] {
+        second_dirty.insert(page).unwrap();
+    }
+    second_dirty.insert(0x30).unwrap();
+    let second = take_snapshot(
+        &slot,
+        SlotState::Paused,
+        &bus,
+        &entropy,
+        &config,
+        boundary(),
+        PageSource::Incremental {
+            parent: root.snapshot_ref.clone(),
+            ring: &mut second_ring,
+            dirty: &mut second_dirty,
+        },
+        &store,
+    )
+    .expect("same memory from a different dirty superset");
+    assert_eq!(second.pages_shipped, outcome.pages_shipped);
+    assert_eq!(second.snapshot_ref, outcome.snapshot_ref);
 
     // The incremental container exists and is a DELTA (carries the parent).
     let container = store.get_snapshot(outcome.snapshot_ref).expect("get");

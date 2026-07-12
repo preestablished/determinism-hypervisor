@@ -39,7 +39,8 @@ use dh_vmm::kvm::SlotVm;
 use dh_vmm::{vcpu_state, SlotState};
 use snapstore_client::blocking::SnapstoreClient;
 use snapstore_manifest::DeviceBlob;
-use snapstore_types::SnapshotRef;
+use snapstore_types::{PageHash, SnapshotRef};
+use std::collections::HashMap;
 use vm_memory::{Bytes, GuestAddress};
 
 /// `DeviceBlob.format` tag for DHSNAP containers (caller-defined per the
@@ -173,7 +174,16 @@ pub fn take_snapshot_with_lapic(
     };
 
     // ── 2. Read pages from the live mapping (paused: no shadow copy) ──────
-    let pages = read_pages(slot, &page_indices)?;
+    let mut pages = read_pages(slot, &page_indices)?;
+    if let Some(parent_ref) = parent.as_ref() {
+        let parent_pages = store
+            .resolve_pages(parent_ref.clone(), None, true)
+            .map_err(|e| EngineError::Store(format!("resolve parent pages: {e}")))?
+            .into_iter()
+            .map(|(page_idx, page_hash, _)| (page_idx, page_hash))
+            .collect();
+        pages = retain_pages_changed_from_parent(pages, parent_pages)?;
+    }
     let pages_shipped = pages.len() as u64;
 
     // ── 3. Assemble DHSNAP ────────────────────────────────────────────────
@@ -285,6 +295,24 @@ fn read_pages(slot: &SlotVm, page_indices: &[u64]) -> Result<Vec<(u64, Vec<u8>)>
         pages.push((*idx, buf));
     }
     Ok(pages)
+}
+
+fn retain_pages_changed_from_parent(
+    pages: Vec<(u64, Vec<u8>)>,
+    parent_pages: Vec<(u64, PageHash)>,
+) -> Result<Vec<(u64, Vec<u8>)>, EngineError> {
+    let parent_hashes: HashMap<u64, PageHash> = parent_pages.into_iter().collect();
+    let mut changed = Vec::with_capacity(pages.len());
+    for (page_idx, page) in pages {
+        let parent_hash = parent_hashes.get(&page_idx).ok_or_else(|| {
+            EngineError::Store(format!("resolved parent is missing guest page {page_idx}"))
+        })?;
+        let live_hash = PageHash::from_bytes(*blake3::hash(&page).as_bytes());
+        if &live_hash != parent_hash {
+            changed.push((page_idx, page));
+        }
+    }
+    Ok(changed)
 }
 
 fn include_device_guest_ram_pages(

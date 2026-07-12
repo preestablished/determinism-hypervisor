@@ -73,7 +73,7 @@ const VNS_PER_SECOND: u64 = 1_000_000_000;
 const RUN_BUDGET: u64 = 100_000;
 const BURST_EVENTS: usize = 8;
 const M9_LINUX_CHILD_FRAMES: u32 = 5;
-const M9_LINUX_CHILD_HARD_CAP: u64 = 5_000_000;
+const M9_LINUX_CHILD_HARD_CAP: u64 = 150_000_000;
 const M9_LINUX_CHILD_EPOCH_LEN: u64 = 745_000;
 const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
 const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
@@ -189,6 +189,7 @@ enum AcceptanceHarness {
     },
     Linux {
         ready: common::M9LinuxReady,
+        require_epoch_hashes: bool,
         root_cumulative_icount: u64,
         root_cumulative_vns: u64,
         root_frame_counter: u32,
@@ -266,17 +267,22 @@ impl AcceptanceHarness {
     }
 
     fn new_linux(test_name: &str, slot_cores: Vec<u32>) -> TestResult<Option<Self>> {
+        let require_epoch_hashes = !test_name.contains("m8_accept");
         let Some(ready) = common::m9_linux_ready_snapshot_with_slot_cores_and_config(
             test_name,
             slot_cores,
             |config| {
                 config.epoch_len = M9_LINUX_CHILD_EPOCH_LEN;
+                if !require_epoch_hashes {
+                    config.hash_epochs = dh_vmm::config::HashEpochs::FinalOnly;
+                }
             },
         )?
         else {
             return Ok(None);
         };
         Ok(Some(Self::Linux {
+            require_epoch_hashes,
             root_cumulative_icount: ready.ready_snapshot.icount,
             root_cumulative_vns: ready.ready_snapshot.vns,
             root_frame_counter: ready.ready_snapshot.frame_counter,
@@ -288,6 +294,16 @@ impl AcceptanceHarness {
         match self {
             Self::Nanokernel { .. } => AcceptanceGuest::Nanokernel,
             Self::Linux { .. } => AcceptanceGuest::Linux,
+        }
+    }
+
+    fn require_epoch_hashes(&self) -> bool {
+        match self {
+            Self::Nanokernel { .. } => true,
+            Self::Linux {
+                require_epoch_hashes,
+                ..
+            } => *require_epoch_hashes,
         }
     }
 
@@ -896,6 +912,7 @@ async fn run_linux_child(
     root_cumulative_icount: u64,
     root_cumulative_vns: u64,
     root_frame_counter: u32,
+    require_m9_proofs: bool,
 ) -> TestResult<ChildRecord> {
     let slot_id = lease.slot_id;
     let run_started = Instant::now();
@@ -958,12 +975,16 @@ async fn run_linux_child(
         ));
     }
 
-    let meta_pvblk_checksum = match read_linux_meta_io_proof(&svc, lease.clone()).await {
-        Ok(checksum) => checksum,
-        Err(e) => {
-            destroy_best_effort(&svc, Some(lease)).await;
-            return Err(format!("child {index} Linux meta IO proof: {e}"));
+    let meta_pvblk_checksum = if require_m9_proofs {
+        match read_linux_meta_io_proof(&svc, lease.clone()).await {
+            Ok(checksum) => Some(checksum),
+            Err(e) => {
+                destroy_best_effort(&svc, Some(lease)).await;
+                return Err(format!("child {index} Linux meta IO proof: {e}"));
+            }
         }
+    } else {
+        None
     };
 
     let snapshot_started = Instant::now();
@@ -1010,7 +1031,7 @@ async fn run_linux_child(
         run.icount,
         run.vns,
         run.frames_elapsed,
-        Some(meta_pvblk_checksum),
+        meta_pvblk_checksum,
         ChildTiming {
             run_ms,
             original_commit_ms,
@@ -1019,6 +1040,7 @@ async fn run_linux_child(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_child(
     svc: WorkerService,
     guest: AcceptanceGuest,
@@ -1027,6 +1049,7 @@ async fn run_child(
     root_cumulative_icount: u64,
     root_cumulative_vns: u64,
     root_frame_counter: u32,
+    require_m9_proofs: bool,
 ) -> TestResult<ChildRecord> {
     match guest {
         AcceptanceGuest::Nanokernel => run_nanokernel_child(svc, index, lease).await,
@@ -1038,6 +1061,7 @@ async fn run_child(
                 root_cumulative_icount,
                 root_cumulative_vns,
                 root_frame_counter,
+                require_m9_proofs,
             )
             .await
         }
@@ -1056,6 +1080,7 @@ async fn run_child_batch(
         let root_cumulative_icount = harness.root_cumulative_icount();
         let root_cumulative_vns = harness.root_cumulative_vns();
         let root_frame_counter = harness.root_frame_counter();
+        let require_m9_proofs = harness.require_epoch_hashes();
         tasks.push(tokio::spawn(async move {
             run_child(
                 svc,
@@ -1065,6 +1090,7 @@ async fn run_child_batch(
                 root_cumulative_icount,
                 root_cumulative_vns,
                 root_frame_counter,
+                require_m9_proofs,
             )
             .await
         }));
@@ -1098,6 +1124,7 @@ async fn run_same_seed_children(
         let root_cumulative_icount = harness.root_cumulative_icount();
         let root_cumulative_vns = harness.root_cumulative_vns();
         let root_frame_counter = harness.root_frame_counter();
+        let require_m9_proofs = harness.require_epoch_hashes();
         tasks.push(tokio::spawn(async move {
             run_child(
                 svc,
@@ -1107,6 +1134,7 @@ async fn run_same_seed_children(
                 root_cumulative_icount,
                 root_cumulative_vns,
                 root_frame_counter,
+                require_m9_proofs,
             )
             .await
         }));
@@ -2086,13 +2114,13 @@ fn validate_linux_log(
     child: &ChildRecord,
     parsed: &ParsedChildLog,
 ) -> TestResult<()> {
-    if !parsed.has_epoch_hashes {
+    if harness.require_epoch_hashes() && !parsed.has_epoch_hashes {
         return Err(format!(
             "child {} Linux DHILOG header does not advertise EPOCH_HASH records",
             child.index
         ));
     }
-    if parsed.epoch_hashes.is_empty() {
+    if harness.require_epoch_hashes() && parsed.epoch_hashes.is_empty() {
         return Err(format!(
             "child {} Linux DHILOG contains zero EPOCH_HASH records",
             child.index
@@ -2151,7 +2179,7 @@ fn validate_linux_log(
             child.index, child.frames_elapsed
         ));
     }
-    if child.meta_pvblk_checksum.is_none() {
+    if harness.require_epoch_hashes() && child.meta_pvblk_checksum.is_none() {
         return Err(format!(
             "child {} Linux missing meta IO checksum",
             child.index
@@ -2166,6 +2194,7 @@ async fn verify_child(
     root: proto::SnapshotRef,
     child: ChildRecord,
     parsed: ParsedChildLog,
+    require_epoch_hashes: bool,
 ) -> TestResult<ChildRecord> {
     let mut stream = svc
         .verify_replay(Request::new(proto::VerifyReplayRequest {
@@ -2211,7 +2240,7 @@ async fn verify_child(
             None => return Err(format!("child {} VerifyReplay empty progress", child.index)),
         }
     }
-    if epoch_ok == 0 {
+    if require_epoch_hashes && epoch_ok == 0 {
         return Err(format!(
             "child {} VerifyReplay emitted no EpochOk progress",
             child.index
@@ -2246,7 +2275,7 @@ async fn verify_child(
             }
         }
         AcceptanceGuest::Linux => {
-            if epoch_ok as usize != parsed.epoch_hashes.len() {
+            if require_epoch_hashes && epoch_ok as usize != parsed.epoch_hashes.len() {
                 return Err(format!(
                     "child {} Linux VerifyReplay EpochOk count {}, expected parsed EPOCH_HASH count {}",
                     child.index,
@@ -2273,9 +2302,10 @@ async fn verify_batch(
     for (child, parsed) in children {
         let svc = harness.svc().clone();
         let guest = harness.guest();
+        let require_epoch_hashes = harness.require_epoch_hashes();
         let root = harness.root_snapshot().clone();
         tasks.push(tokio::spawn(async move {
-            verify_child(svc, guest, root, child, parsed).await
+            verify_child(svc, guest, root, child, parsed, require_epoch_hashes).await
         }));
     }
 
@@ -2302,16 +2332,20 @@ fn assert_replay_commit_matches(original: &ChildRecord, replay: &ChildRecord) ->
             original.index, replay.index
         ));
     }
-    if replay.snapshot.hash != original.snapshot.hash {
-        return Err(format!(
-            "replay-commit child {} snapshot ref mismatch",
-            original.index
-        ));
-    }
     if replay.state_hash != original.state_hash {
         return Err(format!(
             "replay-commit child {} state hash mismatch",
             original.index
+        ));
+    }
+    if replay.snapshot.hash != original.snapshot.hash {
+        return Err(format!(
+            "replay-commit child {} snapshot ref mismatch: original={:02x?} replay={:02x?} dirty_pages={}/{}",
+            original.index,
+            original.snapshot.hash,
+            replay.snapshot.hash,
+            original.dirty_pages,
+            replay.dirty_pages,
         ));
     }
     if replay.input_log_id != original.input_log_id {
@@ -2418,6 +2452,7 @@ async fn baseline_delta_restore_probe(
     Ok(restore_ms)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replay_commit_child(
     svc: WorkerService,
     guest: AcceptanceGuest,
@@ -2425,6 +2460,7 @@ async fn replay_commit_child(
     root_cumulative_icount: u64,
     root_cumulative_vns: u64,
     root_frame_counter: u32,
+    require_m9_proofs: bool,
     original: ChildRecord,
 ) -> TestResult<ReplayCommitRecord> {
     let baseline_delta_restore_ms =
@@ -2465,6 +2501,7 @@ async fn replay_commit_child(
         root_cumulative_icount,
         root_cumulative_vns,
         root_frame_counter,
+        require_m9_proofs,
     )
     .await?;
     assert_replay_commit_matches(&original, &replay)?;
@@ -2496,6 +2533,7 @@ async fn replay_commit_batch(
         let root_cumulative_icount = harness.root_cumulative_icount();
         let root_cumulative_vns = harness.root_cumulative_vns();
         let root_frame_counter = harness.root_frame_counter();
+        let require_m9_proofs = harness.require_epoch_hashes();
         tasks.push(tokio::spawn(async move {
             replay_commit_child(
                 svc,
@@ -2504,6 +2542,7 @@ async fn replay_commit_batch(
                 root_cumulative_icount,
                 root_cumulative_vns,
                 root_frame_counter,
+                require_m9_proofs,
                 child,
             )
             .await

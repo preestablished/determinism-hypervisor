@@ -138,21 +138,13 @@ impl InstRetired {
     /// PERF_EVENT_IOC_PERIOD). The boundary engine sets period =
     /// (target icount - current icount) - skid_margin.
     pub fn arm_period(&self, period: u64) -> Result<(), CounterError> {
-        // The Intel reference host does not reliably reload an enabled,
-        // guest-filtered hardware event on PERIOD alone: Linux READY epoch
-        // landings repeatedly delivered the previous overflow about one
-        // margin past the new target. We are out of guest mode here, so a
-        // disable/period/enable cycle preserves the count while forcing the
-        // hardware threshold to reload before the next KVM entry.
-        self.disable()?;
         let mut p = period;
         // SAFETY: valid perf fd; PERF_EVENT_IOC_PERIOD reads a u64 through
         // the pointer passed as the ioctl arg (the sys wrapper forwards the
         // u64 verbatim, so we pass the address).
         #[allow(unsafe_code)]
         let rc = unsafe { sys::ioctls::PERIOD(self.fd.as_raw_fd(), &mut p as *mut u64 as u64) };
-        ioctl_result("PERIOD", rc)?;
-        self.enable()
+        ioctl_result("PERIOD", rc)
     }
 
     /// Route overflow signals to the vCPU thread (§3.1): F_SETOWN_EX with
