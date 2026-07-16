@@ -540,14 +540,20 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
         eprintln!("capture-proof: (d) layout_version=2 rejected FAILED_PRECONDITION on both surfaces (proven good version = {LAYOUT_V1})");
 
         // === Per-capture cost (spec-compile + extract + pack) ===
-        // Isolate capture cost as the delta between TakeSnapshot WITH and
-        // WITHOUT capture at a fixed boundary (seal_input_log=false to
-        // minimize unrelated work). Client-side RPC time; method stated
-        // in the evidence. Not an acceptance bar — scorer M4's 1.5 ms p50
-        // budget sits downstream; one number now prevents a surprise.
+        // Isolate capture cost as deltas between TakeSnapshot variants at a
+        // fixed boundary (seal_input_log=false to minimize unrelated work):
+        // (1) no capture, (2) features-only (framebuffer=false; the packed
+        // feature payload is 591 bytes), (3) full capture (features +
+        // framebuffer lz4 over the 229,376-byte region). Client-side RPC
+        // time; method stated in the evidence. Not an acceptance bar —
+        // scorer M4's 1.5 ms p50 budget sits downstream, and the
+        // features-only delta is the number that budget actually depends
+        // on (bead uyhu).
         let mut with_us = Vec::with_capacity(COST_ITERS);
+        let mut feat_us = Vec::with_capacity(COST_ITERS);
         let mut without_us = Vec::with_capacity(COST_ITERS);
         let cost_spec = spec_from(&ranges, true, LAYOUT_V1);
+        let feat_spec = spec_from(&ranges, false, LAYOUT_V1);
         for _ in 0..COST_ITERS {
             let t = std::time::Instant::now();
             let _ = svc
@@ -565,23 +571,43 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
                 .take_snapshot(Request::new(proto::TakeSnapshotRequest {
                     lease: Some(lease.clone()),
                     seal_input_log: Some(false),
+                    capture: Some(feat_spec.clone()),
+                }))
+                .await
+                .map_err(|e| format!("cost features-only: {e}"))?;
+            feat_us.push(t.elapsed().as_micros() as u64);
+
+            let t = std::time::Instant::now();
+            let _ = svc
+                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                    lease: Some(lease.clone()),
+                    seal_input_log: Some(false),
                     capture: None,
                 }))
                 .await
                 .map_err(|e| format!("cost baseline: {e}"))?;
             without_us.push(t.elapsed().as_micros() as u64);
         }
-        let pct = |mut v: Vec<u64>, p: usize| -> u64 {
-            v.sort_unstable();
-            v[(v.len() * p / 100).min(v.len() - 1)]
-        };
-        let with_p50 = pct(with_us.clone(), 50);
-        let with_p95 = pct(with_us.clone(), 95);
-        let base_p50 = pct(without_us.clone(), 50);
-        let delta_p50 = with_p50.saturating_sub(base_p50);
+        let pct = |v: &[u64], p: usize| -> u64 { v[(v.len() * p / 100).min(v.len() - 1)] };
+        with_us.sort_unstable();
+        feat_us.sort_unstable();
+        without_us.sort_unstable();
+        let with_p50 = pct(&with_us, 50);
+        let with_p95 = pct(&with_us, 95);
+        let feat_p50 = pct(&feat_us, 50);
+        let feat_p95 = pct(&feat_us, 95);
+        let base_p50 = pct(&without_us, 50);
+        let base_p95 = pct(&without_us, 95);
+        // Signed deltas: medians of separately-timed populations can invert
+        // under host noise; a clamped 0 would masquerade as "zero cost"
+        // when the honest reading is "below the noise floor".
+        let delta_p50 = with_p50 as i64 - base_p50 as i64;
+        let feat_delta_p50 = feat_p50 as i64 - base_p50 as i64;
+        let fb_delta_p50 = with_p50 as i64 - feat_p50 as i64;
         eprintln!(
-            "capture-proof: cost over {COST_ITERS} iters — with-capture p50={with_p50}us p95={with_p95}us; \
-             no-capture p50={base_p50}us; capture-attributable delta p50~{delta_p50}us"
+            "capture-proof: cost over {COST_ITERS} iters — full-capture p50={with_p50}us p95={with_p95}us; \
+             features-only p50={feat_p50}us p95={feat_p95}us; no-capture p50={base_p50}us p95={base_p95}us; \
+             deltas p50: features-only~{feat_delta_p50}us, full~{delta_p50}us, fb-lz4~{fb_delta_p50}us"
         );
 
         // === Durable sample evidence ===
@@ -647,9 +673,10 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
              - (b) fb_lz4 decodes to {} bytes and equals an independent framebuffer read.\n\
              - (c) restored child returns bit-identical feature_bytes and framebuffer for unchanged state.\n\
              - (d) layout_version=2 rejected FAILED_PRECONDITION on both surfaces; proven good version = 1.\n\n\
-             ## Cost (method: TakeSnapshot with-vs-without capture delta, seal_input_log=false, {} iters, client-side RPC time)\n\
-             with-capture p50={}us p95={}us; no-capture p50={}us; capture-attributable delta p50~{}us.\n\
-             NOT a gate; scorer M4's 1.5 ms p50 budget is downstream.\n\n\
+             ## Cost (method: TakeSnapshot variant deltas, seal_input_log=false, {} iters, client-side RPC time)\n\
+             full-capture p50={}us p95={}us; features-only p50={}us p95={}us; no-capture p50={}us p95={}us.\n\
+             Deltas p50: features-only~{}us, full~{}us, fb-lz4-attributable~{}us.\n\
+             NOT a gate; scorer M4's 1.5 ms p50 budget is downstream (features-only delta is the relevant number).\n\n\
              ## Scope\n\
              Capture under a concurrent RunWithFrameCapture stream is OUT OF SCOPE and unproven.\n\n\
              See capture-samples.jsonl for the per-capture hash table.\n",
@@ -657,7 +684,8 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
             ranges.len(),
             FB_BYTES,
             COST_ITERS,
-            with_p50, with_p95, base_p50, delta_p50,
+            with_p50, with_p95, feat_p50, feat_p95, base_p50, base_p95,
+            feat_delta_p50, delta_p50, fb_delta_p50,
         ).map_err(|e| format!("readme: {e}"))?;
 
         // Tidy up the restored child slot.
