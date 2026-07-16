@@ -1,0 +1,3 @@
+- `crates/dh-worker/src/runtime.rs`: avoid long-running closure execution under the table-wide runtime mutex.
+- `crates/dh-worker/src/slot_manager.rs`: use overflow-safe lease TTL arithmetic.
+- `crates/dh-worker/src/service.rs`: keep lifecycle success blocked until runtime ownership and the lossless public `MachineConfig` wire shape are resolved.

@@ -1,0 +1,11 @@
+# Findings
+
+## High: acceptance can pass without proving service-level epoch-hash neutrality
+
+The service-level child legs compare extracted DHILOG epoch vectors at `crates/dh-worker/src/service.rs:4058`, but nothing asserts that those vectors contain any records. `capture_neutrality_leg` parses the sealed service log at `crates/dh-worker/src/service.rs:3277`, and `m6_accept_capture_neutrality_and_layout_precondition` accepts `captured.epoch_hashes == plain.epoch_hashes`; `[] == []` is enough.
+
+That is not hypothetical. The service leg creates the fixture with `capture_fixture_machine_config(...)` at `crates/dh-worker/src/service.rs:4011`, which uses `DEFAULT_EPOCH_LEN` at `crates/dh-worker/src/service.rs:2997` through `crates/dh-worker/src/service.rs:3000`; `DEFAULT_EPOCH_LEN` is `50_000_000` at `crates/dh-vmm/src/config.rs:84`, while the service run budget in the helper is only `10_000_000` at `crates/dh-worker/src/service.rs:3240`. In addition, the production service path calls `run_segment_with_scheduled_inputs_and_frames` at `crates/dh-worker/src/service.rs:2449`, and that wrapper supplies a no-op epoch sink at `crates/dh-vmm/src/runctl.rs:296` through `crates/dh-vmm/src/runctl.rs:317`.
+
+The non-empty epoch assertion at `crates/dh-worker/src/service.rs:3984` through `crates/dh-worker/src/service.rs:3993` does not close the gap. It uses the standalone `capture_epoch_leg` helper, which calls `run_segment_with_epochs` directly at `crates/dh-worker/src/service.rs:3172`, then performs `capture_at_boundary` only after the run and epoch collection have already finished at `crates/dh-worker/src/service.rs:3197` through `crates/dh-worker/src/service.rs:3208`. A regression where service `Run` fails to record epoch hashes, records them through the wrong sink, or capture perturbs later service-visible epoch output can still pass this acceptance.
+
+Suggested correction: make the service acceptance itself produce and assert non-empty epoch records, for both capture and no-capture legs, before comparing equality. That likely means using a small epoch length in the service fixture and routing `WorkerService::run` through an epoch-logging scheduled-inputs entry point, or adding a follow-on restore/run segment after the captured snapshot that proves capture did not perturb subsequent epoch hashes.

@@ -1,0 +1,4 @@
+- `crates/dh-worker/src/runtime.rs`: `RuntimeTable::with` and `with_mut` execute closures while holding the global table mutex. Keep them metadata-only or replace them with per-slot locking before real KVM work uses them.
+- `crates/dh-worker/src/slot_manager.rs`: reject duplicate core ids such as `2,2` or `2-3,3` so the dedicated-core invariant is enforced.
+- `crates/dh-worker/tests/slot_manager_live.rs`: choose a currently allowed CPU dynamically instead of assuming CPU 1 exists in every cpuset.
+- `crates/dh-worker/src/service.rs`: `prepare_uds_path` should remove only stale socket files, never arbitrary files.

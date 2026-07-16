@@ -172,7 +172,9 @@ fn linux_streaming_run_rss_stays_bounded_and_plateaus() -> TestResult<()> {
                 let _ = csv.flush();
                 series.push((t, rss));
                 if rss >= bound_kb {
-                    eprintln!("rss-guard: CEILING crossed at {t:.1}s: VmRSS={rss} kB >= {bound_kb} kB");
+                    eprintln!(
+                        "rss-guard: CEILING crossed at {t:.1}s: VmRSS={rss} kB >= {bound_kb} kB"
+                    );
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -208,8 +210,7 @@ fn linux_streaming_run_rss_stays_bounded_and_plateaus() -> TestResult<()> {
         // Paced ~60 Hz consumer, frames dropped after counting (retaining
         // them would be a harness-side leak).
         loop {
-            if started.elapsed() >= Duration::from_secs(guard_secs)
-                || stop.load(Ordering::Relaxed)
+            if started.elapsed() >= Duration::from_secs(guard_secs) || stop.load(Ordering::Relaxed)
             {
                 break; // drop the stream: cancel lands Paused at a frame boundary
             }

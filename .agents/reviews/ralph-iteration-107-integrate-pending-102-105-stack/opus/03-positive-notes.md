@@ -1,0 +1,5 @@
+- `crates/dh-worker/src/slot_manager.rs`: lease tokens are redacted in `Debug`, avoiding accidental credential leakage.
+- `crates/dh-worker/src/slot_manager.rs`: fork handling is all-or-nothing and explicitly tracks live CoW children.
+- `crates/dh-vmm/src/config.rs`: canonical MCFG decode is bounded, rejects trailing bytes, and validates before returning a config.
+- `crates/dh-worker/src/restore_engine.rs`: MCFG is decoded before canonical-byte comparison, so malformed sections fail loudly.
+- `crates/dh-worker/src/service.rs`: mutating RPCs remain `UNIMPLEMENTED` until real runtime/store ownership exists.

@@ -1,0 +1,5 @@
+# 01-critical-and-important.md
+
+No critical findings.
+
+Important: `crates/dh-worker/tests/m5_net_loopback.rs:543` and `crates/dh-worker/tests/m5_net_loopback.rs:565` split the pv-blk replacement into two unrelated checks. `exercise_linux_pvblk_overlay()` writes/reads a standalone `PvBlk` with `VecGuestMem`, but it never seals a worker DHILOG, enters replay, or contributes to the `ready.ready_state_hash` checked later. The replay verification at lines 565-578 only replays the Linux boot-to-READY log. Risk: the Linux acceptance command can pass while no replayed DHILOG record or final state hash covers the deterministic pv-blk overlay write/read required by the bead. Recommended fix: make the replacement one connected record/replay scenario: drive the pv-blk overlay through the worker/VMM recording path, seal that segment, replay it, and assert replay `end_state_hash`, record counts/reseal, and BLKO contents for the same overlay operation. If the current Linux guest cannot initiate the pv-blk I/O, name that limitation explicitly and keep the standalone device check separate from the bead acceptance claim.

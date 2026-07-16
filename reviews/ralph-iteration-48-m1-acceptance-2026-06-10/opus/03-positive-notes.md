@@ -1,0 +1,19 @@
+# Positive Notes
+
+- **The IN-FILL seam is correct and the live pass proves it.** `on_exit` writes IN answers (serial LSR, detcall status, doorbell) directly into the `VcpuExit::IoIn(_, data)` slice, which kvm-ioctls borrows from the live `kvm_run` IO buffer; the next `KVM_RUN` reads guest EAX from there. The guest reaching 'X' (vs lowercase 'd') is end-to-end proof that the CHANNEL_INIT status (0) and doorbell (0) answers actually landed in the guest's register — a wrong fill would branch to `.fail_d`. boundary.rs forwards the unmodified exit from `guard.run()` straight into the handler, so the slice is never copied/staled.
+
+- **Status 0 is REAL, not coincidental garbage.** Verified by reading the chain: `channel_init` only returns `InitStatus::Ok` after `Channel::attach` validates the live channel header at the latched GPA; the doorbell drain returns events only when `self.channel` is `Some`. The test's `beacons.len() == 1` with the exact beacon id is reachable only through a genuine attach + ring decode. (Strengthening this into a direct assertion is IMPORTANT-2, but the current logic is sound.)
+
+- **MMIO width handling is correct across the whole guest access matrix.** I checked every guest access width in device_exercise.asm against the device handlers: 8-byte SECTOR/BUF_GPA (blk), 8-byte BUF_GPA (entropy), 8-byte VNS/ICOUNT reads (clock) all hit explicit `(REG, 8)` arms; 4-byte COUNT/CMD/STATUS/LEN/DOORBELL hit `(REG, 4)` arms. `MmioBus::check_access` enforces 4-or-8-byte natural alignment and rejects an 8-byte read spanning MAGIC+VERSION. No device silently zero-fills a width it should serve — size mismatches deterministically read zeros / ignore writes, never host state. The bus forwards `data.len()` faithfully.
+
+- **The overlay-write proof chain is airtight for this guest.** The blk 'B' stage writes a 512-byte pattern to sector 0, reads it back into a separate buffer, and compares all 64 qwords; reaching 'B' means the overlay served the write back (the base is never mutated). The test then independently asserts the base file's blake3 AND mtime are unchanged — so "write went to overlay, base immutable" is proven from both the guest side (read-back) and the host side (file bytes). dirty_clusters being unreachable once boxed is fine; the read-back is the stronger proof.
+
+- **Entropy determinism is genuinely exercised.** `DetEntropy::from_seed([0x4D;32])` fixed seed + the guest's not-all-zero OR-reduction (lands in hashed RAM) + the ENTROPY AUX digest record (in the count) + run-twice equality together pin the ChaCha20 draw. The word-granularity invariant (37 bytes → 10 words) is documented and unit-tested in entropy.rs.
+
+- **Loud-failure discipline throughout.** `ctx.log_fault()` checked after EVERY dispatch and converted to a run failure; unexpected exits are hard errors; `GuestHalted` is required (not just "ran out of budget"); a wrong serial byte names the failed stage (lowercase). The 10M icount budget is generous but the guest halts at icount 739, so the run is tight.
+
+- **Cross-arch hygiene holds.** The new x86-gated dev-deps (blake3, detguest-host, dh-devices, dh-inputlog) are correctly under `[target.'cfg(target_arch = "x86_64")'.dev-dependencies]`; aarch64 clippy of `determinism-tests` and the full workspace is clean with the lab cross env. The whole test target compiles to empty off-x86 (`#![cfg(target_arch = "x86_64")]`).
+
+- **Stability is excellent.** 6 M1 runs, zero variance; record count, icount, beacon count all bit-stable. The dh-devices/dh-vmm suites and the full workspace test pass; x86 clippy clean.
+
+- **MachineConfig is plumbed end-to-end with the REAL base-image hash** (`BASE_IMAGE_BLAKE3`), and `config_hash()` feeds both the DHILOG segment header and the H_0 of the state-hash chain — the acceptance exercises the real config path, not a stub.

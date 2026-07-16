@@ -1,0 +1,5 @@
+- `crates/dh-vmm/src/config.rs`: `canonical_decode` mirrors the frozen MCFG preimage, rejects malformed encodings, and recovers landing-only knobs to defaults.
+- `crates/dh-worker/src/restore_engine.rs`: machine config is recovered from the stored snapshot rather than trusting caller memory.
+- `crates/dh-worker/src/slot_manager.rs`: fork validation preserves stale-lease ordering and carries parent position into children.
+- `crates/dh-worker/src/slot_manager.rs`: expiry reclaim snapshots sweep-start state to preserve staged visibility.
+- `crates/dh-worker/src/proto_map.rs`: enum crossings are hand-written and pinned by tests.
