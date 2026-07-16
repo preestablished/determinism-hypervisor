@@ -3,9 +3,9 @@
 Date: 2026-07-16. Host: `infra-control` (Intel i5-8400, 6 cores, determinism
 class verified). Method of record: the three-variant TakeSnapshot delta block
 in `crates/dh-worker/tests/capture_engine_real_image.rs` (client-side RPC
-time, `seal_input_log=false`, 100 iterations per variant, interleaved
-full → features-only → no-capture per iteration, p50/p95 percentiles, signed
-p50 deltas), run `--release` under `taskset -c 2-5` against the real workload
+time, `seal_input_log=false`, 100 iterations per variant, interleaved per
+iteration, p50/p95 percentiles, signed p50 deltas), run `--release` under
+`taskset -c 2-5` against the real workload
 image (`reference-workload/dist/workload-image-0.1.0`, initramfs blake3
 `36f50484…`, 12-range spec, 591-byte packed feature payload, 229,376-byte
 framebuffer).
@@ -53,13 +53,17 @@ Derived p50 deltas (signed):
 
 ## Verdict
 
-**Feature-only capture cost is ≈ 50–250 µs p50 — comfortably inside scorer
-M4's 1.5 ms p50 budget** (≥ 6× headroom even on the worst loaded-host
-replicate, ~30× on the quiet-host primary run). The full-capture delta is
-consistently an order of magnitude larger than the feature-only delta and is
-framebuffer-lz4-attributable, matching the payload asymmetry: 591 packed
-feature bytes vs a 229,376-byte compress. No follow-up optimization request
-is needed for the feature path.
+**Feature-only capture cost is +50 µs p50 on the quiet primary run — ~30×
+inside scorer M4's 1.5 ms p50 budget.** The verdict rests on run 3 alone: the
+loaded replicates are directionally consistent (+242 µs / noise-inverted) but
+non-probative against a 1.5 ms budget, because run 2's −3,995 µs inversion
+shows their median-of-medians noise is on the order of ±4 ms — larger than
+the budget itself. Run 3 is resolving real signal at the ~100 µs scale: its
+fb-lz4 delta of +462 µs is physically plausible for a 229 KB lz4 compress,
+and its full-capture delta is an order of magnitude above the feature-only
+delta, matching the payload asymmetry (591 packed feature bytes vs a
+229,376-byte compress). No follow-up optimization request is needed for the
+feature path.
 
 ## Caveats
 
@@ -70,8 +74,22 @@ is needed for the feature path.
   can go negative under load (run 2's feature delta) — that reads as "below
   the noise floor", not as negative cost. p95s are contamination-prone and
   must not be quoted as capture cost.
-- fb-lz4 absolute cost is load-sensitive (462 µs quiet vs ~3 ms loaded);
-  scorer M4 sizing should use the quiet-host figures.
+- Recorded runs 1–3 used a fixed intra-iteration order
+  (full → features-only → no-capture), which biases deltas *downward*: the
+  predecessor warms caches for the next variant, and the always-last baseline
+  sits latest in any delta-chain drift. The committed instrument now rotates
+  the order per iteration (review finding, landed after these runs). The bias
+  cannot threaten the verdict — even an order-of-magnitude understatement of
+  +50 µs clears the 1.5 ms budget.
+- A post-rotation validation run came back green (instrument works) but its
+  numbers were noise-dominated by concurrent host load (features-only median
+  above full capture, negative fb-lz4 delta — unphysical) and are recorded as
+  validation only, not evidence. It is a live demonstration of the median-
+  noise caveat above.
+- fb-lz4 absolute cost is load-sensitive: 462 µs quiet vs ~3–7 ms loaded
+  (run 2's 7.1 ms is inflated by the same noise that inverted its feature
+  delta — the two deltas share `feat_p50`, so noise moves them in opposite
+  directions). Scorer M4 sizing should use the quiet-host figures.
 - Runner-reservation caveat: the `kvm-intel` actions runner service could
   not be paused (no passwordless sudo in this session); verified no queued
   or in-progress GitHub runs during the measurement windows.

@@ -554,40 +554,36 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
         let mut without_us = Vec::with_capacity(COST_ITERS);
         let cost_spec = spec_from(&ranges, true, LAYOUT_V1);
         let feat_spec = spec_from(&ranges, false, LAYOUT_V1);
-        for _ in 0..COST_ITERS {
-            let t = std::time::Instant::now();
-            let _ = svc
-                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease.clone()),
-                    seal_input_log: Some(false),
-                    capture: Some(cost_spec.clone()),
-                }))
-                .await
-                .map_err(|e| format!("cost capture: {e}"))?;
-            with_us.push(t.elapsed().as_micros() as u64);
-
-            let t = std::time::Instant::now();
-            let _ = svc
-                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease.clone()),
-                    seal_input_log: Some(false),
-                    capture: Some(feat_spec.clone()),
-                }))
-                .await
-                .map_err(|e| format!("cost features-only: {e}"))?;
-            feat_us.push(t.elapsed().as_micros() as u64);
-
-            let t = std::time::Instant::now();
-            let _ = svc
-                .take_snapshot(Request::new(proto::TakeSnapshotRequest {
-                    lease: Some(lease.clone()),
-                    seal_input_log: Some(false),
-                    capture: None,
-                }))
-                .await
-                .map_err(|e| format!("cost baseline: {e}"))?;
-            without_us.push(t.elapsed().as_micros() as u64);
+        for i in 0..COST_ITERS {
+            // Rotate the intra-iteration variant order: a fixed order biases
+            // deltas downward (the predecessor warms caches for the next
+            // variant, and the always-last baseline sits latest in the
+            // delta-chain drift).
+            for v in 0..3usize {
+                let variant = (i + v) % 3;
+                let capture = match variant {
+                    0 => Some(cost_spec.clone()),
+                    1 => Some(feat_spec.clone()),
+                    _ => None,
+                };
+                let t = std::time::Instant::now();
+                let _ = svc
+                    .take_snapshot(Request::new(proto::TakeSnapshotRequest {
+                        lease: Some(lease.clone()),
+                        seal_input_log: Some(false),
+                        capture,
+                    }))
+                    .await
+                    .map_err(|e| format!("cost variant {variant}: {e}"))?;
+                let us = t.elapsed().as_micros() as u64;
+                match variant {
+                    0 => with_us.push(us),
+                    1 => feat_us.push(us),
+                    _ => without_us.push(us),
+                }
+            }
         }
+        // Upper-median convention: index len*p/100 (51st of 100 for p50).
         let pct = |v: &[u64], p: usize| -> u64 { v[(v.len() * p / 100).min(v.len() - 1)] };
         with_us.sort_unstable();
         feat_us.sort_unstable();

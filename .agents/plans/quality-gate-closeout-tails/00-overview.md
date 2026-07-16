@@ -13,9 +13,11 @@
 >   by `dd49ebf`. Packages 01–03: no code change, determinism obligation
 >   vacuous.
 > - **Pkg 04 `uyhu` CLOSED** — three-variant cost isolation landed
->   (test-side only, 8-angle review pass applied); feature-only delta
->   +50 µs p50 (quiet primary run; ≤ ~242 µs loaded) vs the 1.5 ms scorer-M4
->   budget. Evidence:
+>   (test-side only, two review rounds applied); feature-only delta
+>   +50 µs p50 (quiet primary run; loaded replicates directionally
+>   consistent but non-probative) vs the 1.5 ms scorer-M4 budget.
+>   Post-commit CI corroboration: run 29519130362 green at bdd60c3.
+>   Evidence:
 >   `.agents/docs/determinism-hypervisor/capture-cost-isolation.md`. Gates
 >   re-run green on the changed tree (771/0/32, clippy 0, fmt 0).
 > - **Pkg 05 `i74w` OPEN, gate documented** — real dist fixture staged but

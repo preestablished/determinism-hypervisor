@@ -8,11 +8,12 @@ on `infra-control` at HEAD `b4358a7`.
 The capture cost was isolated per the bead: the cost block in
 `capture_engine_real_image.rs` now measures three variants (no-capture /
 features-only / full). Primary quiet-host run: **feature-only delta
-+50 µs p50** (loaded-host replicates bound it ≤ ~242 µs), full-capture
-+512 µs, fb-lz4-attributable +462 µs. The ~1.9 ms figure from the 2026-07-08
-proof was framebuffer-lz4-dominated, as suspected. **Feature-only cost clears
-scorer M4's 1.5 ms p50 budget with ≥ 6× headroom; no optimization follow-up
-filed.** Full method, tables, and caveats:
++50 µs p50**, full-capture +512 µs, fb-lz4-attributable +462 µs
+(loaded-host replicates directionally consistent but non-probative — their
+median noise is ±~4 ms). The ~1.9 ms figure from the 2026-07-08 proof was
+framebuffer-lz4-dominated, as suspected. **Feature-only cost clears scorer
+M4's 1.5 ms p50 budget by ~30× on the quiet primary run; no optimization
+follow-up filed.** Full method, tables, and caveats:
 `.agents/docs/determinism-hypervisor/capture-cost-isolation.md`.
 
 ## `i74w` (04-resolution corpus item) — OPEN, gate re-confirmed at HEAD

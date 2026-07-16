@@ -143,10 +143,23 @@ branch inside a test-local copy of the flow — but do not instrument production
   against the measurement itself.
 - Three accepted pinned runs (`taskset -c 2-5`); primary quiet-host run:
   features-only delta **+50 µs p50**, full **+512 µs**, fb-lz4 **+462 µs**
-  (baseline p50 36,917 µs). Loaded-host replicates bound feature-only cost
-  ≤ ~242 µs. **Verdict: feature-only cost clears scorer M4's 1.5 ms p50
-  budget with ≥ 6× headroom (≈ 30× on the primary run) — close `uyhu`, no
-  optimization follow-up.**
+  (baseline p50 36,917 µs). Loaded-host replicates are directionally
+  consistent (+242 µs / noise-inverted) but non-probative against a 1.5 ms
+  budget (their median noise is ±~4 ms). **Verdict rests on the quiet
+  primary run: feature-only cost clears scorer M4's 1.5 ms p50 budget by
+  ~30× — close `uyhu`, no optimization follow-up.**
 - Evidence note: `.agents/docs/determinism-hypervisor/capture-cost-isolation.md`.
 - Runner-reservation caveat recorded there (no passwordless sudo; no
   queued/in-progress runs during windows).
+- Second review round (user-requested, two subagents, 2026-07-16): verdict
+  overclaim fixed (loaded runs no longer presented as budget bounds), the
+  cost loop now rotates the intra-iteration variant order (fixed order
+  biased deltas downward; recorded runs predate rotation and carry that
+  caveat in the note), and a rotated-order validation run came back green
+  (numbers noise-dominated by concurrent load — recorded as validation
+  only). Process note: the review pass used the 8-angle `/code-review`
+  harness rather than the `/review` skill named in Deliverables — same
+  intent (independent multi-angle review with findings dispositioned);
+  deviation recorded here.
+- Post-commit CI corroboration: push run 29519130362 green at `bdd60c3`
+  (both hosted lanes + kvm-intel), covering the f06050c measurement change.
