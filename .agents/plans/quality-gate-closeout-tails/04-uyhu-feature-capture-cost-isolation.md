@@ -125,3 +125,28 @@ branch inside a test-local copy of the flow — but do not instrument production
   host-unavailable branch and 00-overview's "Where To Execute" — this test
   runs nowhere else; document the block in the plan dir, annotate the bead,
   and stop. Do not close the bead from a host that cannot run the real image.
+
+---
+
+## EXECUTED — 2026-07-16, infra-control, HEAD b4358a7 + this measurement change
+
+- Extended the cost block in `capture_engine_real_image.rs` to three variants
+  (no-capture / features-only / full), interleaved per iteration, signed p50
+  deltas (review finding: `saturating_sub` clamped noise-inverted deltas to 0
+  — observed live on the first, unpinned run), percentile helper now takes a
+  sorted slice. Test-side only; no production source touched, determinism
+  obligation vacuous.
+- Review pass: 8-angle /code-review (medium) on the diff; 2 findings applied
+  (signed deltas, pct-by-slice), 2 declined with reasons (timing-block helper
+  extraction — async-closure churn in a proof test; comment restating payload
+  sizes — matches module-doc convention). No correctness findings survived
+  against the measurement itself.
+- Three accepted pinned runs (`taskset -c 2-5`); primary quiet-host run:
+  features-only delta **+50 µs p50**, full **+512 µs**, fb-lz4 **+462 µs**
+  (baseline p50 36,917 µs). Loaded-host replicates bound feature-only cost
+  ≤ ~242 µs. **Verdict: feature-only cost clears scorer M4's 1.5 ms p50
+  budget with ≥ 6× headroom (≈ 30× on the primary run) — close `uyhu`, no
+  optimization follow-up.**
+- Evidence note: `.agents/docs/determinism-hypervisor/capture-cost-isolation.md`.
+- Runner-reservation caveat recorded there (no passwordless sudo; no
+  queued/in-progress runs during windows).

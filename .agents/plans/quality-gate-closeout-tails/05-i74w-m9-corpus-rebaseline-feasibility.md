@@ -152,3 +152,36 @@ very fixture `i74w` complains about — fake progress). Instead:
 - **Reference host unavailable**: the package cannot run anywhere else
   (README: "Refresh the manifest only on the reference host"). Document and
   stop.
+
+---
+
+## EXECUTED — 2026-07-16, infra-control, HEAD b4358a7 (Case C-variant: gate documented, bead left open)
+
+Feasibility decided empirically; outcome is the **gated case**, with one
+correction to the drafted expectation: the real dist fixture IS staged, but
+the re-baseline is still blocked — on `jyo7`, not on fixture absence.
+
+- Host preflight: determinism class matches the lock (7 keys), kernel
+  6.8.0-124-generic, i5-8400, microcode 0xfa. Runner-reservation caveat: the
+  kvm-intel runner service could not be paused (no passwordless sudo); no
+  queued/in-progress GitHub runs during the window.
+- Staged `~/.cache/dh-m9/reference-workload/` artifacts hash-match
+  `expected.txt` **exactly** (all four b3sums, initramfs `87edf64…` = old
+  contract fixture). Reverify against them fails pre-boot:
+  `boot.toml autostart exec must be /usr/bin/refwork-harness, got "/opt/m9-refwork-contract"`.
+- Real dist bundle staged at `~/.cache/dh-m9/staged-dist-0.1.0/` (initramfs
+  `36f5048…` matches `dist/workload-image-0.1.0/initramfs.cpio.zst`
+  decompressed; accepted by the contract assert). Reverify against it fails
+  during Run-until-READY after ~380 s:
+  `DataLoss "boundary: OVERSHOOT: counted 642206698 past target 642190000 (skid margin too small)"`
+  — byte-identical to `jyo7`'s 2026-07-07 observation; the PVBLKIO1
+  meta-proof gap sits behind it.
+- Conclusion: **no artifact set can pass; a regen against dist would fail the
+  same OVERSHOOT**, so no regen was attempted (prohibited fake progress).
+  `i74w` stays OPEN; dependency `i74w → jyo7` was already recorded on
+  2026-07-07 (plan step 2's `bd dep add` is satisfied). Both beads annotated
+  with this evidence (bd comments, 2026-07-16).
+- `jyo7` overlap disposition: `i74w` tracks only the `expected.txt`
+  re-baseline; `jyo7` remains the P1 blocker (cross-repo PVBLKIO1 contract +
+  epoch_len OVERSHOOT). Nightly-drift M7 fork-verify canaries fail nightly
+  (≥ 2026-07-13, e.g. run 29474862905), consistent with `jyo7`.

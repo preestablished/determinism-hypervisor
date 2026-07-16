@@ -1,5 +1,33 @@
 # Quality-Gate Closeout Tails
 
+> **EXECUTED — 2026-07-16** on gate host `infra-control` (tier 2), HEAD
+> `b4358a7`. Toolchain: rustc 1.97.1 / clippy 0.1.97 / rustfmt 1.9.0-stable
+> (2026-07-14). Tier-1 corroboration: CI push run 29472974677 green at HEAD.
+>
+> - **Pkg 01 `mmra` CLOSED** — no longer reproduced: `cargo check` +
+>   `cargo test --workspace --all-targets` green (67 suites, 771 passed,
+>   0 failed, 32 ignored KVM lab-lane `--ignored`); fixed by `dd49ebf`.
+> - **Pkg 02 `lynb` CLOSED** — clippy `--all-targets -D warnings` exit 0;
+>   fixed by `2bca5d8`.
+> - **Pkg 03 `jyp4` CLOSED** — CI-shaped `cargo fmt --check` exit 0; fixed
+>   by `dd49ebf`. Packages 01–03: no code change, determinism obligation
+>   vacuous.
+> - **Pkg 04 `uyhu` CLOSED** — three-variant cost isolation landed
+>   (test-side only, 8-angle review pass applied); feature-only delta
+>   +50 µs p50 (quiet primary run; ≤ ~242 µs loaded) vs the 1.5 ms scorer-M4
+>   budget. Evidence:
+>   `.agents/docs/determinism-hypervisor/capture-cost-isolation.md`. Gates
+>   re-run green on the changed tree (771/0/32, clippy 0, fmt 0).
+> - **Pkg 05 `i74w` OPEN, gate documented** — real dist fixture staged but
+>   reverify fails at HEAD on both artifact sets (old fixture: pre-boot
+>   autostart contract; dist: epoch_len OVERSHOOT `642206698 > 642190000`,
+>   identical to `jyo7`); blocked on `jyo7` (dependency already recorded).
+>   EXECUTED note in `05-*.md`; both beads annotated.
+> - Scope checks: `9f3x` untouched (waiting on bridge `l1w`); `jyo7` open,
+>   annotated as the blocker; `38b6` open, deferred M4 pipeline, out of
+>   scope. Runner-reservation caveat: kvm-intel runner service not pausable
+>   (no passwordless sudo); no queued/in-progress runs during KVM windows.
+
 Plan name: `quality-gate-closeout-tails`
 Drafted: 2026-07-15 against HEAD `776a80f` ("Capture complete M8 acceptance
 identity", clean, pushed).
