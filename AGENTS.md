@@ -1,15 +1,14 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This project uses **bn** for issue tracking. Run `bn prime` for the authoritative workflow.
 
 ## Quick Reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+bn ready              # Find available work
+bn show <id>          # View issue details
+bn update <id> --claim  # Claim work atomically
+bn close <id> -r "reason"         # Complete work
 ```
 
 ## Non-Interactive Shell Commands
@@ -36,25 +35,26 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+<!-- BEGIN BEANS INTEGRATION -->
+## Beans Issue Tracker
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses **bn** for issue tracking. Run `bn prime` for the authoritative workflow.
 
 ### Quick Reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+bn ready              # Find available work
+bn show <id>          # View issue details
+bn update <id> --claim  # Claim work
+bn close <id> -r "reason"         # Complete work
 ```
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `bn` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bn prime` for detailed command reference and session close protocol
+- Use `bn remember` for persistent knowledge — do NOT use MEMORY.md files
+- Mutating `bn` commands commit and push the separate shared hub; never edit or commit hub files by hand.
 
 ## Session Completion
 
@@ -68,9 +68,10 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
+   bn status --json # shared hub must be synchronized
    git push
    git status  # MUST show "up to date with origin"
+   bn status --json  # shared hub must be synchronized
    ```
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
@@ -81,4 +82,4 @@ bd close <id>         # Complete work
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
+<!-- END BEANS INTEGRATION -->
