@@ -602,6 +602,7 @@ pub fn m9_worker_config_with_slot_cores(
         preflight: dh_worker::service::PreflightHealth::skipped(format!(
             "{test_name} acceptance harness"
         )),
+        image_identity: String::new(),
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),

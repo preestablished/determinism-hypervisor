@@ -6,6 +6,7 @@ pub mod bisection_index;
 #[cfg(target_arch = "x86_64")]
 pub mod fork_engine;
 pub mod image_resolver;
+pub mod m9_epoch;
 #[cfg(target_arch = "x86_64")]
 pub mod m9_handoff;
 pub mod preflight;

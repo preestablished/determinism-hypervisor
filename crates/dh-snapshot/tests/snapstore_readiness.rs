@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // tonic::Status in test Results (clippy 0.1.98)
+
 //! M4 store-integration readiness gate (bead 4nj, risk R12; bead qwx).
 //!
 //! Pins, at compile time, that the sibling `snapstore-client` crate

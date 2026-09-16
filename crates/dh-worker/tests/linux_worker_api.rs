@@ -492,6 +492,7 @@ fn worker_config(image_cache_dir: PathBuf, snapstore: snapstore_client::Transpor
             vmm_version: "m9-test-vmm".into(),
         },
         preflight: PreflightHealth::skipped("m9 Linux worker API acceptance harness"),
+        image_identity: String::new(),
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::every_epoch(),

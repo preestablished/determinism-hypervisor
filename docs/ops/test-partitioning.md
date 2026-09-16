@@ -76,17 +76,38 @@ DH_M9_ALLOW_SKIP=0 \
 cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture
 ```
 
-Recommended staging layout on the `kvm-intel` box:
+Recommended staging layout on the `kvm-intel` box (epoch 0.2.3, bundle
+`workload-image-0.2.0`; the versioned root replaces the old unversioned
+`~/.cache/dh-m9/reference-workload/{bzImage,initramfs.cpio}` pair, which now
+holds only the operator-cached `base.img`/`game.img`):
 
 ```bash
+dist_version=0.2.0                      # reference-workload manifest meta.version
+bundle="<reference-workload bundle dir>/workload-image-$dist_version"
+dist_root="$HOME/.cache/dh-m9/dist-$dist_version"
+install -d -m 0755 "$dist_root"
+cp "$bundle/bzImage" "$bundle/initramfs.cpio.zst" "$bundle/workload-image.yaml" "$dist_root/"
+( cd "$dist_root" && zstd -d -k initramfs.cpio.zst )        # DH_M9_INITRAMFS must be the DECOMPRESSED cpio
+cpio -it < "$dist_root/initramfs.cpio" | grep -q usr/bin/refwork-harness   # reference-workload guest, not a smoke image
+# staging-stamp.txt: manifest identity + per-file BLAKE3s (read by the image guard)
 m9_artifact_root="$HOME/.cache/dh-m9/reference-workload"
-export DH_M9_BZIMAGE="$m9_artifact_root/bzImage"
-export DH_M9_INITRAMFS="$m9_artifact_root/initramfs.cpio"
+export DH_M9_BZIMAGE="$dist_root/bzImage"
+export DH_M9_INITRAMFS="$dist_root/initramfs.cpio"
 export DH_M9_BASE_IMAGE="$m9_artifact_root/base.img"
 export DH_M9_GAME_IMAGE="$m9_artifact_root/game.img"
 export DH_M9_IMAGE_CACHE="$HOME/.cache/dh-m9/image-cache"
 mkdir -p "$DH_M9_IMAGE_CACHE"
 ```
+
+`staging-stamp.txt` (key=value, mode 0644, no private values) records
+`bundle_version`, `manifest_git_rev`, `manifest_emu_version`,
+`manifest_kernel_blake3`, `manifest_initramfs_zst_blake3`,
+`staged_bzimage_blake3`, `staged_initramfs_cpio_blake3`,
+`staged_initramfs_zst_blake3`, `staged_at`, `staged_by_host` (manifest values
+via `grep` on `workload-image.yaml`, hashes via `b3sum`). `dh-m9-ready-handoff`
+compares it and the four staged hashes against the corpus `expected.txt`
+before any KVM work; `dh-workerd serve --staging-stamp` re-checks it at start
+(`docs/ops/rom-bridge-o73-ready-snapshot.md`).
 
 M9 test helpers in `tests/determinism/tests/common/mod.rs` and
 `crates/dh-worker/tests/common/mod.rs` fail loudly when a Linux acceptance test

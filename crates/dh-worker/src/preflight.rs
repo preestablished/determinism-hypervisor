@@ -11,6 +11,9 @@
 
 use std::fmt;
 use std::fs;
+use std::path::Path;
+
+use crate::m9_epoch;
 
 /// The slot cores the §7.4 config pins (single source for the service; the
 /// ops script's SLOT_CORES is the shell-side mirror of the same decision).
@@ -325,6 +328,43 @@ pub fn kvm_checks() -> Vec<CheckResult> {
     }]
 }
 
+/// Re-checks a `--staging-stamp` at worker start: loads the stamp beside the
+/// given path and re-hashes the staged artifacts against it (plan epoch-023).
+/// A load failure (missing/unreadable/malformed stamp) is reported as a
+/// single failing `image.staging_stamp` row; otherwise the leading row is a
+/// passing `image.staging_stamp` row carrying the identity string, followed
+/// by one row per `m9_epoch::verify_staged_files` check.
+pub fn image_identity_check(stamp_path: &Path) -> Vec<CheckResult> {
+    let loaded = match m9_epoch::load_staging_stamp(stamp_path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return vec![CheckResult {
+                name: "image.staging_stamp",
+                ok: false,
+                got: e,
+                want: "readable staging-stamp.txt".to_string(),
+            }]
+        }
+    };
+    let mut out = vec![CheckResult {
+        name: "image.staging_stamp",
+        ok: true,
+        got: loaded.identity(),
+        want: "readable staging-stamp.txt".to_string(),
+    }];
+    out.extend(
+        m9_epoch::verify_staged_files(&loaded)
+            .into_iter()
+            .map(|(name, ok, detail)| CheckResult {
+                name,
+                ok,
+                got: detail,
+                want: "matches staging-stamp.txt".to_string(),
+            }),
+    );
+    out
+}
+
 /// The full preflight: §7.4 host + §2.1 KVM. Returns all results; the
 /// binary prints them and exits nonzero if any failed.
 pub fn run_preflight() -> (Vec<CheckResult>, bool) {
@@ -394,6 +434,38 @@ mod tests {
         let err = dirty_ring_check(Err::<bool, &str>("open failed"));
         assert!(!err.ok);
         assert_eq!(err.got, "\"open failed\"");
+    }
+
+    #[test]
+    fn image_identity_check_detects_tampering_and_missing_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bz = b"kernel bytes";
+        let ir = b"initramfs bytes";
+        fs::write(dir.path().join("bzImage"), bz).unwrap();
+        fs::write(dir.path().join("initramfs.cpio"), ir).unwrap();
+        let bz_hex = blake3::hash(bz).to_hex().to_string();
+        let ir_hex = blake3::hash(ir).to_hex().to_string();
+        let text = format!(
+            "bundle_version=0.2.0\nmanifest_git_rev=x\nmanifest_emu_version=refwork-emu 0.2.3\nmanifest_kernel_blake3={bz_hex}\nstaged_bzimage_blake3={bz_hex}\nstaged_initramfs_cpio_blake3={ir_hex}\n"
+        );
+        let stamp_path = dir.path().join("staging-stamp.txt");
+        fs::write(&stamp_path, &text).unwrap();
+
+        let rows = image_identity_check(&stamp_path);
+        assert!(rows.iter().all(|r| r.ok));
+        assert!(rows
+            .iter()
+            .any(|r| r.name == "image.staging_stamp" && r.got.starts_with("0.2.0@")));
+
+        fs::write(dir.path().join("initramfs.cpio"), b"tampered").unwrap();
+        let rows = image_identity_check(&stamp_path);
+        let bad: Vec<_> = rows.iter().filter(|r| !r.ok).map(|r| r.name).collect();
+        assert_eq!(bad, ["image.initramfs.cpio"]);
+
+        let missing = image_identity_check(&dir.path().join("nope.txt"));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "image.staging_stamp");
+        assert!(!missing[0].ok);
     }
 
     /// HARDWARE-GATED acceptance: the full preflight passes on the §7.4

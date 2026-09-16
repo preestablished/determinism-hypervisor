@@ -533,6 +533,7 @@ fn worker_config(
             vmm_version: "m7-test-vmm".into(),
         },
         preflight: PreflightHealth::skipped("m7 acceptance harness"),
+        image_identity: String::new(),
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),
@@ -1177,7 +1178,7 @@ fn parse_hex32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
         out[index] = (high << 4) | low;

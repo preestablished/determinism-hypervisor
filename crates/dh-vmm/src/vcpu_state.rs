@@ -218,8 +218,8 @@ pub fn restore(slot: &SlotVm, st: &VcpuState, vns: u64) -> Result<(), KvmError> 
     // would re-init enabled components.
     vcpu.set_xcrs(&st.xcrs).map_err(kvm_err("KVM_SET_XCRS"))?;
     let mut xs = kvm_bindings::kvm_xsave::default();
-    for (i, chunk) in st.xsave.chunks_exact(4).enumerate() {
-        xs.region[i] = u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)"));
+    for (i, chunk) in st.xsave.as_chunks::<4>().0.iter().enumerate() {
+        xs.region[i] = u32::from_le_bytes(*chunk);
     }
     // SAFETY: plain kvm_xsave (no FAM tail in this kvm-bindings version); the area
     // is the canonical form whose clear bits XRSTOR treats as init.

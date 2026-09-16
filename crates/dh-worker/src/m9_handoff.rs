@@ -106,6 +106,17 @@ pub struct M9CachedHashes {
     pub game_image: [u8; 32],
 }
 
+impl M9CachedHashes {
+    pub fn as_staged(&self) -> crate::m9_epoch::StagedArtifactHashes {
+        crate::m9_epoch::StagedArtifactHashes {
+            bzimage: self.bzimage,
+            initramfs: self.initramfs,
+            base_image: self.base_image,
+            game_image: self.game_image,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffArgs {
     pub private_root: PathBuf,
@@ -121,6 +132,41 @@ pub struct HandoffArgs {
     pub snapstore_config: PathBuf,
     pub public_summary: PathBuf,
     pub slot_cores: Option<Vec<u32>>,
+    /// Corpus manifest the staged artifacts must match (image guard,
+    /// plan epoch-023 WP2). Defaults to the checked-in M9 corpus
+    /// `expected.txt`; a missing file fails closed.
+    pub corpus_manifest: PathBuf,
+    /// `staging-stamp.txt` written beside the staged `bzImage` by the
+    /// operator staging step. Defaults to `<DH_M9_BZIMAGE dir>/staging-stamp.txt`
+    /// when `None`; a missing file fails closed.
+    pub staging_stamp: Option<PathBuf>,
+    /// Loud bypass: continue on mismatch and report `mismatch-allowed`.
+    pub allow_image_change: bool,
+    /// Explicit operator opt-out; summary reports `SKIPPED`.
+    pub skip_image_guard: bool,
+}
+
+/// Default corpus manifest: the binary always runs from the source checkout
+/// (`cargo run -p dh-worker --bin dh-m9-ready-handoff`), so the fixture path
+/// is derivable at compile time.
+pub const DEFAULT_CORPUS_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/record_replay_corpus/m9_linux_post_ready/expected.txt"
+);
+pub const STAGING_STAMP_FILE_NAME: &str = "staging-stamp.txt";
+
+impl HandoffArgs {
+    /// The stamp path the guard reads: explicit flag or beside the bzImage.
+    pub fn staging_stamp_path(&self, artifacts: &M9LinuxArtifacts) -> PathBuf {
+        match &self.staging_stamp {
+            Some(path) => path.clone(),
+            None => artifacts
+                .bzimage
+                .parent()
+                .map(|dir| dir.join(STAGING_STAMP_FILE_NAME))
+                .unwrap_or_else(|| PathBuf::from(STAGING_STAMP_FILE_NAME)),
+        }
+    }
 }
 
 impl HandoffArgs {
@@ -145,6 +191,8 @@ impl HandoffArgs {
             artifacts.base_image.display().to_string(),
             artifacts.game_image.display().to_string(),
             artifacts.image_cache.display().to_string(),
+            self.corpus_manifest.display().to_string(),
+            self.staging_stamp_path(artifacts).display().to_string(),
         ];
         if let Some(snapshot_ref) = snapshot_ref {
             values.push(snapshot_ref.to_owned());
@@ -162,6 +210,10 @@ pub struct HandoffReport {
     pub slots_total: usize,
     pub slots_free_before: usize,
     pub slots_free_after: usize,
+    /// `match` | `mismatch-allowed` | `SKIPPED` (image guard state).
+    pub image_guard: &'static str,
+    /// Key names only (never hash values) when the guard was bypassed.
+    pub image_mismatch_keys: Vec<&'static str>,
 }
 
 #[derive(Debug)]
@@ -230,6 +282,10 @@ where
     let mut snapstore_config = None;
     let mut public_summary = None;
     let mut slot_cores = None;
+    let mut corpus_manifest = None;
+    let mut staging_stamp = None;
+    let mut allow_image_change = false;
+    let mut skip_image_guard = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -261,6 +317,10 @@ where
             "--handoff-env" => set_path_once(&mut handoff_env, flag, value()?)?,
             "--snapstore-config" => set_path_once(&mut snapstore_config, flag, value()?)?,
             "--public-summary" => set_path_once(&mut public_summary, flag, value()?)?,
+            "--corpus-manifest" => set_path_once(&mut corpus_manifest, flag, value()?)?,
+            "--staging-stamp" => set_path_once(&mut staging_stamp, flag, value()?)?,
+            "--allow-image-change" => allow_image_change = true,
+            "--skip-image-guard" => skip_image_guard = true,
             "--slot-cores" => {
                 let value = value()?;
                 if slot_cores.is_some() {
@@ -310,6 +370,10 @@ where
         snapstore_config: required_path(snapstore_config, "--snapstore-config")?,
         public_summary: required_path(public_summary, "--public-summary")?,
         slot_cores,
+        corpus_manifest: corpus_manifest.unwrap_or_else(|| PathBuf::from(DEFAULT_CORPUS_MANIFEST)),
+        staging_stamp,
+        allow_image_change,
+        skip_image_guard,
     };
     validate_no_newline(
         "bridge hypervisor endpoint",
@@ -380,6 +444,7 @@ async fn run_handoff_with_artifacts(
         return Err(HandoffError::new("probe KVM", "KVM dirty ring unavailable"));
     };
     let hashes = populate_m9_image_cache(&artifacts)?;
+    let (image_guard, image_mismatch_keys) = run_image_guard(args, &artifacts, &hashes)?;
     let config = m9_linux_machine_config(&hashes, cpuid_table);
     let config_hash = config
         .config_hash()
@@ -420,7 +485,57 @@ async fn run_handoff_with_artifacts(
         slots_total: ready.slots_total,
         slots_free_before: ready.slots_free_before,
         slots_free_after,
+        image_guard,
+        image_mismatch_keys,
     })
+}
+
+/// Fail-closed image guard (plan epoch-023 WP2, contract S2): runs after the
+/// staged artifacts are hashed and before any snapstore/KVM side effect.
+/// Returns the public guard state and the mismatching key names.
+fn run_image_guard(
+    args: &HandoffArgs,
+    artifacts: &M9LinuxArtifacts,
+    hashes: &M9CachedHashes,
+) -> HandoffResult<(&'static str, Vec<&'static str>)> {
+    use crate::m9_epoch::{
+        check_image_identity, load_staging_stamp, parse_corpus_pins, ImageIdentityVerdict,
+    };
+    if args.skip_image_guard {
+        return Ok(("SKIPPED", Vec::new()));
+    }
+    let manifest_text = fs::read_to_string(&args.corpus_manifest).map_err(|e| {
+        HandoffError::new(
+            "image guard",
+            format!(
+                "corpus manifest missing: {}: {e}",
+                args.corpus_manifest.display()
+            ),
+        )
+    })?;
+    let pins = parse_corpus_pins(&manifest_text).map_err(|e| {
+        HandoffError::new(
+            "image guard",
+            format!("corpus manifest {}: {e}", args.corpus_manifest.display()),
+        )
+    })?;
+    let stamp_path = args.staging_stamp_path(artifacts);
+    let loaded = load_staging_stamp(&stamp_path)
+        .map_err(|e| HandoffError::new("image guard", format!("staging stamp: {e}")))?;
+    let verdict = check_image_identity(&pins, &hashes.as_staged(), Some(&loaded.stamp));
+    match verdict {
+        ImageIdentityVerdict::Match => Ok(("match", Vec::new())),
+        ImageIdentityVerdict::Mismatch(keys) if args.allow_image_change => {
+            Ok(("mismatch-allowed", keys))
+        }
+        ImageIdentityVerdict::Mismatch(keys) => Err(HandoffError::new(
+            "image guard",
+            format!(
+                "staged artifacts differ from corpus manifest {}: {keys:?} (rerun with --allow-image-change only for a sanctioned re-baseline)",
+                args.corpus_manifest.display()
+            ),
+        )),
+    }
 }
 
 fn validate_reference_workload(args: &HandoffArgs) -> HandoffResult<()> {
@@ -1045,10 +1160,21 @@ fn write_handoff_env(
 }
 
 fn public_summary(report: &HandoffReport) -> String {
-    format!(
-        "M9 artifacts present: yes\nimage cache populated: yes\nsnapstore durable data root populated: yes\nREADY TakeSnapshot succeeded: yes\nRestoreSnapshot verification succeeded: yes\nsource/restored leases destroyed: yes\nprivate handoff written: yes\nsnapstore config written: yes\nworker slots before/after: {}/{}\n",
+    let mut out = format!(
+        "M9 artifacts present: yes\nimage cache populated: yes\nimage guard: {}\n",
+        report.image_guard
+    );
+    if !report.image_mismatch_keys.is_empty() {
+        out.push_str(&format!(
+            "image mismatch keys: {}\n",
+            report.image_mismatch_keys.join(",")
+        ));
+    }
+    out.push_str(&format!(
+        "snapstore durable data root populated: yes\nREADY TakeSnapshot succeeded: yes\nRestoreSnapshot verification succeeded: yes\nsource/restored leases destroyed: yes\nprivate handoff written: yes\nsnapstore config written: yes\nworker slots before/after: {}/{}\n",
         report.slots_free_before, report.slots_free_after
-    )
+    ));
+    out
 }
 
 fn ensure_no_private_literals(
@@ -1511,7 +1637,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 pub fn usage() -> &'static str {
-    "usage: dh-m9-ready-handoff --private-root PATH --snapstore-data-root PATH --snapstore-uds PATH --reference-workload-checkout PATH --workload-manifest PATH --bridge-hypervisor-endpoint ENDPOINT --bridge-private-root PATH --bridge-workload-image-ref REF --bridge-capture-spec-ref REF --handoff-env PATH --snapstore-config PATH --public-summary PATH [--slot-cores LIST]"
+    "usage: dh-m9-ready-handoff --private-root PATH --snapstore-data-root PATH --snapstore-uds PATH --reference-workload-checkout PATH --workload-manifest PATH --bridge-hypervisor-endpoint ENDPOINT --bridge-private-root PATH --bridge-workload-image-ref REF --bridge-capture-spec-ref REF --handoff-env PATH --snapstore-config PATH --public-summary PATH [--slot-cores LIST] [--corpus-manifest PATH] [--staging-stamp PATH] [--allow-image-change] [--skip-image-guard]\n\nimage guard: the staged DH_M9_* hashes and the staging stamp's manifest identity must match --corpus-manifest (default: the checked-in M9 corpus expected.txt); --staging-stamp defaults to staging-stamp.txt beside DH_M9_BZIMAGE. --allow-image-change is the only sanctioned bypass (re-baseline runs) and is reported loudly in the public summary."
 }
 
 #[cfg(test)]
@@ -1736,6 +1862,10 @@ mod tests {
             snapstore_config: private.join("snapstore/config.toml"),
             public_summary: dir.path().join("summary.txt"),
             slot_cores: None,
+            corpus_manifest: PathBuf::from(DEFAULT_CORPUS_MANIFEST),
+            staging_stamp: None,
+            allow_image_change: false,
+            skip_image_guard: false,
         };
 
         prepare_private_dirs(&args).unwrap();
@@ -1786,6 +1916,10 @@ mod tests {
             snapstore_config: private.join("snapstore/config.toml"),
             public_summary: dir.path().join("summary.txt"),
             slot_cores: None,
+            corpus_manifest: PathBuf::from(DEFAULT_CORPUS_MANIFEST),
+            staging_stamp: None,
+            allow_image_change: false,
+            skip_image_guard: false,
         };
 
         write_snapstore_config(&args).unwrap();
@@ -1818,6 +1952,10 @@ mod tests {
             snapstore_config: private.join("snapstore/config.toml"),
             public_summary: dir.path().join("summary.txt"),
             slot_cores: None,
+            corpus_manifest: PathBuf::from(DEFAULT_CORPUS_MANIFEST),
+            staging_stamp: None,
+            allow_image_change: false,
+            skip_image_guard: false,
         };
 
         write_handoff_env(&args, &private.join("image cache"), &"1".repeat(64)).unwrap();
@@ -1859,11 +1997,189 @@ mod tests {
             snapstore_config: private.join("snapstore/config.toml"),
             public_summary: dir.path().join("summary.txt"),
             slot_cores: None,
+            corpus_manifest: PathBuf::from(DEFAULT_CORPUS_MANIFEST),
+            staging_stamp: None,
+            allow_image_change: false,
+            skip_image_guard: false,
         };
         write_handoff_env(&args, &private.join("image-cache"), &"1".repeat(64)).unwrap();
         let body = fs::read_to_string(args.handoff_env).unwrap();
         assert!(body.contains("BRIDGE_REAL_SNAPSHOT_REF="));
         assert!(body.contains("DH_M9_IMAGE_CACHE="));
         assert!(!body.contains("BRIDGE_CREATE_VM_CONFIG_REF"));
+    }
+
+    #[test]
+    fn parse_args_accepts_epoch_flags_and_defaults_to_none_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let args = parse_args(full_args(dir.path())).unwrap();
+        assert_eq!(args.corpus_manifest, PathBuf::from(DEFAULT_CORPUS_MANIFEST));
+        assert_eq!(args.staging_stamp, None);
+        assert!(!args.allow_image_change);
+        assert!(!args.skip_image_guard);
+        assert!(args
+            .corpus_manifest
+            .ends_with("tests/fixtures/record_replay_corpus/m9_linux_post_ready/expected.txt"));
+
+        let mut raw = full_args(dir.path());
+        raw.extend([
+            "--corpus-manifest".to_owned(),
+            "/tmp/expected.txt".to_owned(),
+            "--staging-stamp".to_owned(),
+            "/tmp/dist/staging-stamp.txt".to_owned(),
+            "--allow-image-change".to_owned(),
+            "--skip-image-guard".to_owned(),
+        ]);
+        let args = parse_args(raw).unwrap();
+        assert_eq!(args.corpus_manifest, PathBuf::from("/tmp/expected.txt"));
+        assert_eq!(
+            args.staging_stamp,
+            Some(PathBuf::from("/tmp/dist/staging-stamp.txt"))
+        );
+        assert!(args.allow_image_change);
+        assert!(args.skip_image_guard);
+
+        let mut raw = full_args(dir.path());
+        raw.push("--staging-stamp".to_owned());
+        let err = parse_args(raw).unwrap_err();
+        assert!(err
+            .private_detail()
+            .contains("--staging-stamp requires a value"));
+    }
+
+    #[test]
+    fn staging_stamp_defaults_beside_bzimage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let args = parse_args(full_args(dir.path())).unwrap();
+        let artifacts = M9LinuxArtifacts {
+            bzimage: PathBuf::from("/lab/dist-0.2.0/bzImage"),
+            initramfs: PathBuf::from("/lab/dist-0.2.0/initramfs.cpio"),
+            base_image: PathBuf::from("/lab/base.img"),
+            game_image: PathBuf::from("/lab/game.img"),
+            image_cache: PathBuf::from("/lab/cache"),
+        };
+        assert_eq!(
+            args.staging_stamp_path(&artifacts),
+            PathBuf::from("/lab/dist-0.2.0/staging-stamp.txt")
+        );
+        assert!(args
+            .private_literals(&artifacts, None)
+            .contains(&"/lab/dist-0.2.0/staging-stamp.txt".to_owned()));
+    }
+
+    fn guard_fixture(
+        dir: &Path,
+        corpus_emu: Option<&str>,
+        initramfs_pin: u8,
+    ) -> (HandoffArgs, M9LinuxArtifacts, M9CachedHashes) {
+        let hex = |b: u8| -> String { [b; 32].iter().map(|x| format!("{x:02x}")).collect() };
+        let mut corpus = format!(
+            "name=m9_linux_post_ready\nbzimage_blake3={}\ninitramfs_blake3={}\nbase_image_blake3={}\ngame_image_blake3={}\n",
+            hex(1),
+            hex(initramfs_pin),
+            hex(3),
+            hex(4)
+        );
+        if let Some(emu) = corpus_emu {
+            corpus.push_str(&format!("emu_version={emu}\n"));
+        }
+        let corpus_path = dir.join("expected.txt");
+        fs::write(&corpus_path, corpus).unwrap();
+        let dist = dir.join("dist-0.2.0");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(
+            dist.join(STAGING_STAMP_FILE_NAME),
+            format!(
+                "bundle_version=0.2.0\nmanifest_git_rev=abc\nmanifest_emu_version=refwork-emu 0.2.3\nmanifest_kernel_blake3={}\n",
+                hex(1)
+            ),
+        )
+        .unwrap();
+        let mut args = parse_args(full_args(dir)).unwrap();
+        args.corpus_manifest = corpus_path;
+        let artifacts = M9LinuxArtifacts {
+            bzimage: dist.join("bzImage"),
+            initramfs: dist.join("initramfs.cpio"),
+            base_image: dir.join("base.img"),
+            game_image: dir.join("game.img"),
+            image_cache: dir.join("cache"),
+        };
+        let hashes = M9CachedHashes {
+            bzimage: [1; 32],
+            initramfs: [2; 32],
+            base_image: [3; 32],
+            game_image: [4; 32],
+        };
+        (args, artifacts, hashes)
+    }
+
+    #[test]
+    fn image_guard_matches_refuses_and_allows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (args, artifacts, hashes) = guard_fixture(dir.path(), Some("refwork-emu 0.2.3"), 2);
+        assert_eq!(
+            run_image_guard(&args, &artifacts, &hashes).unwrap(),
+            ("match", Vec::new())
+        );
+
+        // Pre-epoch manifest: initramfs pin and emu_version both disagree.
+        let (args, artifacts, hashes) = guard_fixture(dir.path(), None, 9);
+        let err = run_image_guard(&args, &artifacts, &hashes).unwrap_err();
+        assert_eq!(err.stage, "image guard");
+        assert!(err.private_detail().contains("initramfs_blake3"));
+        assert!(err.private_detail().contains("emu_version"));
+
+        let mut allowed = args.clone();
+        allowed.allow_image_change = true;
+        assert_eq!(
+            run_image_guard(&allowed, &artifacts, &hashes).unwrap(),
+            ("mismatch-allowed", vec!["initramfs_blake3", "emu_version"])
+        );
+
+        let mut skipped = args.clone();
+        skipped.skip_image_guard = true;
+        assert_eq!(
+            run_image_guard(&skipped, &artifacts, &hashes).unwrap(),
+            ("SKIPPED", Vec::new())
+        );
+
+        // Missing corpus manifest and missing stamp both fail closed.
+        let mut missing = args.clone();
+        missing.corpus_manifest = dir.path().join("nope.txt");
+        let err = run_image_guard(&missing, &artifacts, &hashes).unwrap_err();
+        assert_eq!(err.stage, "image guard");
+        assert!(err.private_detail().contains("corpus manifest missing"));
+        let mut no_stamp = args.clone();
+        no_stamp.staging_stamp = Some(dir.path().join("absent-stamp.txt"));
+        let err = run_image_guard(&no_stamp, &artifacts, &hashes).unwrap_err();
+        assert!(err.private_detail().contains("staging stamp"));
+    }
+
+    #[test]
+    fn public_summary_reports_image_guard_state_without_hashes() {
+        let report = HandoffReport {
+            snapshot_ref_hex: "a".repeat(64),
+            slots_total: 4,
+            slots_free_before: 4,
+            slots_free_after: 4,
+            image_guard: "mismatch-allowed",
+            image_mismatch_keys: vec!["initramfs_blake3", "emu_version"],
+        };
+        let summary = public_summary(&report);
+        assert!(summary.contains("image guard: mismatch-allowed\n"));
+        assert!(summary.contains("image mismatch keys: initramfs_blake3,emu_version\n"));
+        let has_hex64 = summary
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|run| run.len() >= 64);
+        assert!(!has_hex64, "summary leaked a hash: {summary}");
+
+        let report = HandoffReport {
+            image_guard: "match",
+            image_mismatch_keys: Vec::new(),
+            ..report
+        };
+        let summary = public_summary(&report);
+        assert!(summary.contains("image guard: match\n"));
+        assert!(!summary.contains("image mismatch keys"));
     }
 }

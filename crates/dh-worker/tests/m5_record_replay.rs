@@ -253,6 +253,9 @@ struct VerifyReplayEvidence {
 struct M9LinuxRecordReplayEvidence {
     host_id: String,
     artifact_hashes: common::M9CachedHashes,
+    /// `manifest_emu_version` from the `staging-stamp.txt` beside the staged
+    /// bzImage (epoch-023 image guard input; pinned as `emu_version`).
+    emu_version: String,
     config_hash: [u8; 32],
     ready_snapshot_ref: [u8; 32],
     post_snapshot_ref: [u8; 32],
@@ -385,6 +388,15 @@ fn m9_linux_record_replay_evidence(
         base_image: common::hash_file(&artifacts.base_image)?,
         game_image: common::hash_file(&artifacts.game_image)?,
     };
+    let stamp_path = artifacts
+        .bzimage
+        .parent()
+        .ok_or("DH_M9_BZIMAGE has no parent directory")?
+        .join(dh_worker::m9_handoff::STAGING_STAMP_FILE_NAME);
+    let emu_version = dh_worker::m9_epoch::load_staging_stamp(&stamp_path)
+        .map_err(|e| format!("M9 staging stamp beside DH_M9_BZIMAGE: {e}"))?
+        .stamp
+        .manifest_emu_version;
     let Some(ready) = common::m9_linux_ready_snapshot_with_config(test_name, 2, |config| {
         config.epoch_len = M9_LINUX_CORPUS_EPOCH_LEN;
     })?
@@ -529,6 +541,7 @@ fn m9_linux_record_replay_evidence(
     Ok(Some(M9LinuxRecordReplayEvidence {
         host_id: reference_host_id()?,
         artifact_hashes,
+        emu_version,
         config_hash: ready.config_hash,
         ready_snapshot_ref,
         post_snapshot_ref,
@@ -776,6 +789,7 @@ fn assert_m9_linux_expected_key_set(m: &BTreeMap<String, String>) {
         "initramfs_blake3",
         "base_image_blake3",
         "game_image_blake3",
+        "emu_version",
         "mem_bytes",
         "epoch_len",
         "machine_config_hash",
@@ -827,6 +841,7 @@ fn expected_m9_linux_text(evidence: &M9LinuxRecordReplayEvidence) -> String {
         "game_image_blake3={}\n",
         hex(&evidence.artifact_hashes.game_image)
     ));
+    out.push_str(&format!("emu_version={}\n", evidence.emu_version));
     out.push_str(&format!("mem_bytes={}\n", common::M9_LINUX_MEM_BYTES));
     out.push_str(&format!("epoch_len={M9_LINUX_CORPUS_EPOCH_LEN}\n"));
     out.push_str(&format!(
@@ -904,6 +919,10 @@ fn assert_m9_linux_expected_matches(
     assert_eq!(
         expected_value(expected, "game_image_blake3"),
         hex(&evidence.artifact_hashes.game_image)
+    );
+    assert_eq!(
+        expected_value(expected, "emu_version"),
+        evidence.emu_version
     );
     assert_eq!(
         expected_u64(expected, "mem_bytes"),

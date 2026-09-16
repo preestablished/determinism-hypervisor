@@ -172,8 +172,8 @@ jobs:
       DH_M7_ACCEPT_SLOT_CORES: ${{ inputs.m7_slot_cores || '2-5' }}
       DH_M7_ACCEPT_ALLOW_SKIP: "0"
       DH_M9_ALLOW_SKIP: "0"
-      DH_M9_BZIMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/bzImage
-      DH_M9_INITRAMFS: /home/infra-admin/.cache/dh-m9/reference-workload/initramfs.cpio
+      DH_M9_BZIMAGE: /home/infra-admin/.cache/dh-m9/dist-0.2.0/bzImage
+      DH_M9_INITRAMFS: /home/infra-admin/.cache/dh-m9/dist-0.2.0/initramfs.cpio
       DH_M9_BASE_IMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/base.img
       DH_M9_GAME_IMAGE: /home/infra-admin/.cache/dh-m9/reference-workload/game.img
       DH_M9_IMAGE_CACHE: /home/infra-admin/.cache/dh-m9/image-cache

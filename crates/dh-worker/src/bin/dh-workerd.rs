@@ -9,6 +9,9 @@ use dh_worker::service::{
 };
 use std::path::PathBuf;
 
+// A one-shot CLI value: the size gap between `Preflight` and `Serve` is
+// irrelevant (constructed once, never stored).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum Command {
     Preflight,
@@ -17,6 +20,7 @@ enum Command {
         http_addr: std::net::SocketAddr,
         uds_path: Option<PathBuf>,
         skip_preflight: bool,
+        staging_stamp: Option<PathBuf>,
         #[cfg(target_arch = "x86_64")]
         image_cache_dir: PathBuf,
         #[cfg(target_arch = "x86_64")]
@@ -43,6 +47,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             http_addr,
             uds_path,
             skip_preflight,
+            staging_stamp,
             #[cfg(target_arch = "x86_64")]
             image_cache_dir,
             #[cfg(target_arch = "x86_64")]
@@ -53,6 +58,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 run_preflight_or_exit()
             };
+            let image_identity = staging_stamp.as_deref().map(check_image_identity_or_exit);
             #[cfg(target_arch = "x86_64")]
             let mut config = {
                 let mut config = WorkerConfig::from_host_defaults()?;
@@ -63,11 +69,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(target_arch = "x86_64"))]
             let mut config = WorkerConfig::from_host_defaults()?;
             config.preflight = preflight;
+            config.image_identity = image_identity.clone().unwrap_or_default();
             // Build profile is load-bearing ops truth (play-60fps M1):
             // long-lived operator workers must run release builds, and the
             // runbooks assert this line before acceptance.
             eprintln!(
-                "dh-workerd (build_profile={}) serving gRPC TCP {tcp_addr}, HTTP {http_addr}{}",
+                "dh-workerd (build_profile={}) serving gRPC TCP {tcp_addr}, HTTP {http_addr}{} image_identity={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -76,7 +83,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 uds_path
                     .as_ref()
                     .map(|p| format!(" and UDS {}", p.display()))
-                    .unwrap_or_else(|| " without UDS".into())
+                    .unwrap_or_else(|| " without UDS".into()),
+                image_identity.as_deref().unwrap_or("none"),
             );
             dh_worker::service::serve(config, tcp_addr, uds_path, http_addr).await?;
             Ok(())
@@ -95,6 +103,25 @@ fn run_preflight_or_exit() -> PreflightHealth {
     }
     println!("preflight OK");
     PreflightHealth::passed(&results)
+}
+
+/// Runs the `--staging-stamp` re-check (plan epoch-023): prints each row
+/// like the preflight rows and exits nonzero on any mismatch. Returns the
+/// identity string on success.
+fn check_image_identity_or_exit(path: &std::path::Path) -> String {
+    let results = dh_worker::preflight::image_identity_check(path);
+    for r in &results {
+        println!("{r}");
+    }
+    if !results.iter().all(|r| r.ok) {
+        eprintln!("image identity check FAILED: staged artifacts do not match staging-stamp.txt");
+        std::process::exit(1);
+    }
+    results
+        .iter()
+        .find(|r| r.name == "image.staging_stamp")
+        .map(|r| r.got.clone())
+        .unwrap_or_default()
 }
 
 fn parse_args<I>(args: I) -> Result<Command, String>
@@ -117,6 +144,7 @@ where
         .map_err(|e| format!("invalid default HTTP addr {DEFAULT_HTTP_ADDR}: {e}"))?;
     let mut uds_path = Some(PathBuf::from(DEFAULT_UDS_PATH));
     let mut skip_preflight = false;
+    let mut staging_stamp: Option<PathBuf> = None;
     #[cfg(target_arch = "x86_64")]
     let mut image_cache_dir = PathBuf::from(DEFAULT_IMAGE_CACHE_DIR);
     #[cfg(target_arch = "x86_64")]
@@ -147,6 +175,11 @@ where
             }
             "--no-uds" => uds_path = None,
             "--skip-preflight" => skip_preflight = true,
+            "--staging-stamp" => {
+                i += 1;
+                let value = args.get(i).ok_or("--staging-stamp requires a path")?;
+                staging_stamp = Some(PathBuf::from(value));
+            }
             #[cfg(target_arch = "x86_64")]
             "--image-cache" => {
                 i += 1;
@@ -178,6 +211,7 @@ where
         http_addr,
         uds_path,
         skip_preflight,
+        staging_stamp,
         #[cfg(target_arch = "x86_64")]
         image_cache_dir,
         #[cfg(target_arch = "x86_64")]
@@ -188,14 +222,14 @@ where
 #[cfg(target_arch = "x86_64")]
 fn usage() -> String {
     format!(
-        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--image-cache PATH] [--snapstore-tcp URI|--snapstore-uds PATH|--no-snapstore] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH} --image-cache {DEFAULT_IMAGE_CACHE_DIR} --snapstore-tcp {DEFAULT_SNAPSTORE_TCP}"
+        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--image-cache PATH] [--snapstore-tcp URI|--snapstore-uds PATH|--no-snapstore] [--skip-preflight] [--staging-stamp PATH]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH} --image-cache {DEFAULT_IMAGE_CACHE_DIR} --snapstore-tcp {DEFAULT_SNAPSTORE_TCP}\n\n--staging-stamp PATH  re-hash staged artifacts beside PATH against staging-stamp.txt at start; refuses to serve on mismatch and exposes the identity via GetWorkerInfoResponse.image_identity"
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn usage() -> String {
     format!(
-        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--skip-preflight]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH}"
+        "usage:\n  dh-workerd --preflight\n  dh-workerd [serve] [--tcp ADDR] [--http ADDR] [--uds PATH|--no-uds] [--skip-preflight] [--staging-stamp PATH]\n\ndefaults: --tcp {DEFAULT_TCP_ADDR} --http {DEFAULT_HTTP_ADDR} --uds {DEFAULT_UDS_PATH}\n\n--staging-stamp PATH  re-hash staged artifacts beside PATH against staging-stamp.txt at start; refuses to serve on mismatch and exposes the identity via GetWorkerInfoResponse.image_identity"
     )
 }
 
@@ -211,6 +245,7 @@ mod tests {
             http_addr,
             uds_path,
             skip_preflight,
+            staging_stamp,
             #[cfg(target_arch = "x86_64")]
             image_cache_dir,
             #[cfg(target_arch = "x86_64")]
@@ -223,6 +258,7 @@ mod tests {
         assert_eq!(http_addr, DEFAULT_HTTP_ADDR.parse().unwrap());
         assert_eq!(uds_path, Some(PathBuf::from(DEFAULT_UDS_PATH)));
         assert!(!skip_preflight);
+        assert_eq!(staging_stamp, None);
         #[cfg(target_arch = "x86_64")]
         {
             assert_eq!(image_cache_dir, PathBuf::from(DEFAULT_IMAGE_CACHE_DIR));
@@ -256,6 +292,8 @@ mod tests {
             "--snapstore-uds".to_owned(),
             "/tmp/snapstore.sock".to_owned(),
             "--skip-preflight".to_owned(),
+            "--staging-stamp".to_owned(),
+            "/tmp/x/staging-stamp.txt".to_owned(),
         ])
         .unwrap();
         let Command::Serve {
@@ -263,6 +301,7 @@ mod tests {
             http_addr,
             uds_path,
             skip_preflight,
+            staging_stamp,
             image_cache_dir,
             snapstore,
         } = command
@@ -273,6 +312,10 @@ mod tests {
         assert_eq!(http_addr, "127.0.0.1:7501".parse().unwrap());
         assert_eq!(uds_path, None);
         assert!(skip_preflight);
+        assert_eq!(
+            staging_stamp,
+            Some(PathBuf::from("/tmp/x/staging-stamp.txt"))
+        );
         assert_eq!(image_cache_dir, PathBuf::from("/tmp/dh-images"));
         match snapstore {
             Some(snapstore_client::Transport::Uds(path)) => {
@@ -288,5 +331,7 @@ mod tests {
         assert_eq!(err, "--tcp requires an address");
         let err = parse_args(["--http".to_owned()]).unwrap_err();
         assert_eq!(err, "--http requires an address");
+        let err = parse_args(["--staging-stamp".to_owned()]).unwrap_err();
+        assert_eq!(err, "--staging-stamp requires a path");
     }
 }

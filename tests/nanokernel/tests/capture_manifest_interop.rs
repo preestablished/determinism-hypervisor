@@ -129,9 +129,9 @@ fn read_region_walks_the_extent_into_the_known_content() {
     // Full-region read reproduces the pattern...
     let mut buf = vec![0u8; CAPTURE_FIXTURE_FB_BYTES as usize];
     ch.read_region("framebuffer", 0, &mut buf).unwrap();
-    for (j, chunk) in buf.chunks_exact(8).enumerate() {
+    for (j, chunk) in buf.as_chunks::<8>().0.iter().enumerate() {
         assert_eq!(
-            u64::from_le_bytes(chunk.try_into().unwrap()),
+            u64::from_le_bytes(*chunk),
             CAPTURE_FIXTURE_FB_QWORD_BASE + j as u64,
             "framebuffer qword {j}"
         );

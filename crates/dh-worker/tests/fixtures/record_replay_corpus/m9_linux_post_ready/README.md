@@ -19,11 +19,19 @@ Refresh the manifest only on the reference host with:
 ```bash
 DH_WORKER_REGEN_M9_LINUX_RR_CORPUS=1 \
 DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux \
-DH_M9_BZIMAGE=/home/infra-admin/.cache/dh-m9/reference-workload/bzImage \
-DH_M9_INITRAMFS=/home/infra-admin/.cache/dh-m9/reference-workload/initramfs.cpio \
+DH_M9_BZIMAGE=/home/infra-admin/.cache/dh-m9/dist-0.2.0/bzImage \
+DH_M9_INITRAMFS=/home/infra-admin/.cache/dh-m9/dist-0.2.0/initramfs.cpio \
 DH_M9_BASE_IMAGE=/home/infra-admin/.cache/dh-m9/reference-workload/base.img \
 DH_M9_GAME_IMAGE=/home/infra-admin/.cache/dh-m9/reference-workload/game.img \
 DH_M9_IMAGE_CACHE=/home/infra-admin/.cache/dh-m9/image-cache \
 cargo test -p dh-worker --test m5_record_replay --release \
   regenerate_m9_rr_corpus_manifest_for_reference_host -- --ignored --nocapture
 ```
+
+`DH_M9_BZIMAGE`'s directory must hold the `staging-stamp.txt` written by the
+staging step in `docs/ops/test-partitioning.md`: the regen copies its
+`manifest_emu_version` into `expected.txt` as `emu_version`, and the reverify
+asserts the staged stamp still names that version. The pinned artifact hashes
+are the fail-closed input of `dh-m9-ready-handoff`'s image guard
+(`--corpus-manifest`); re-baselining is the only sanctioned use of that
+binary's `--allow-image-change`.

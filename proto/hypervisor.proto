@@ -420,6 +420,10 @@ message GetWorkerInfoResponse {
   string version = 5;                  // dh-workerd semver
   string build_profile = 6;            // "release" | "debug" (cfg!(debug_assertions));
                                        //   long-lived operator workers MUST be "release"
+  string image_identity = 7;           // "<bundle version>@<blake3 of staging-stamp.txt>" when
+                                       //   dh-workerd was started with --staging-stamp; empty
+                                       //   otherwise. Consumers assert the epoch at connect time
+                                       //   (plan epoch-023).
 }
 message DeterminismClass {             // ARCH §7.4; embedded in manifests too
   string cpu_model    = 1;             // e.g. family/model/stepping string

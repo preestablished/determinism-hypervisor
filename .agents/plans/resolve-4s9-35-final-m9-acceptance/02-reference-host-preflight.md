@@ -94,13 +94,16 @@ final determinism evidence.
 
 ## M9 Artifact Environment
 
-Use the documented reference layout unless a reviewed artifact move has
-landed.
+Use the versioned staging root (epoch-023 plan, 2026-09-16). The old
+unversioned `~/.cache/dh-m9/reference-workload/{bzImage,initramfs.cpio}` pair
+is pre-epoch history; only `base.img`/`game.img` are still read from it.
 
 ```bash
+dist_version=0.2.0
+dist_root="$HOME/.cache/dh-m9/dist-$dist_version"
 m9_artifact_root="$HOME/.cache/dh-m9/reference-workload"
-export DH_M9_BZIMAGE="$m9_artifact_root/bzImage"
-export DH_M9_INITRAMFS="$m9_artifact_root/initramfs.cpio"
+export DH_M9_BZIMAGE="$dist_root/bzImage"
+export DH_M9_INITRAMFS="$dist_root/initramfs.cpio"
 export DH_M9_BASE_IMAGE="$m9_artifact_root/base.img"
 export DH_M9_GAME_IMAGE="$m9_artifact_root/game.img"
 export DH_M9_IMAGE_CACHE="$HOME/.cache/dh-m9/image-cache"
@@ -110,27 +113,28 @@ test -f "$DH_M9_BZIMAGE"
 test -f "$DH_M9_INITRAMFS"
 test -f "$DH_M9_BASE_IMAGE"
 test -f "$DH_M9_GAME_IMAGE"
+test -f "$dist_root/staging-stamp.txt"
 test -d "$DH_M9_IMAGE_CACHE"
 ```
 
-Hash the live artifacts before running the suite:
+Hash the live artifacts and compare against the staging stamp and the
+checked-in corpus pins instead of a hardcoded list:
 
 ```bash
 b3sum "$DH_M9_BZIMAGE" "$DH_M9_INITRAMFS" "$DH_M9_BASE_IMAGE" "$DH_M9_GAME_IMAGE"
+grep -E '^(staged_bzimage_blake3|staged_initramfs_cpio_blake3)=' "$dist_root/staging-stamp.txt"
+grep -E '^(bzimage|initramfs|base_image|game_image)_blake3=' \
+  crates/dh-worker/tests/fixtures/record_replay_corpus/m9_linux_post_ready/expected.txt
 for f in "$DH_M9_BZIMAGE" "$DH_M9_INITRAMFS" "$DH_M9_BASE_IMAGE" "$DH_M9_GAME_IMAGE"; do
   h=$(b3sum "$f" | awk '{print $1}')
   test -f "$DH_M9_IMAGE_CACHE/$h" || echo "missing image-cache entry for $f: $h"
 done
 ```
 
-Expected current M4/M5/M7 artifact hashes:
-
-```text
-bzImage          595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9
-initramfs.cpio   87edf64db22dc85ef0c6b17fdc6e58a8f73391a6053e96f7a1056da7d08b9f57
-base.img         488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8
-game.img         e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac
-```
+The staged `bzImage`/`initramfs.cpio` hashes must equal the stamp's
+`staged_*` values, and all four must equal the `expected.txt` pins. A
+difference is an epoch/staging mismatch: stop, do not rebaseline silently
+(`dh-m9-ready-handoff` refuses the same mismatch fail-closed).
 
 The earlier Phase 1 producer evidence used `initramfs.cpio` hash
 `f130e1a329bf934651d89dccdec0a2dccd33862319cbbe95c30e0505382d12d4`.

@@ -51,15 +51,17 @@
 //! explicitly OUT OF SCOPE and unproven — do not infer it from this test.
 //!
 //! M9-gated lab-lane test like its siblings: requires KVM dirty-ring
-//! support and staged `DH_M9_*` artifacts pointing at the dist bundle
-//! `reference-workload/dist/workload-image-0.1.0/` (decompress
-//! `initramfs.cpio.zst`; it must carry `usr/bin/refwork-harness` — the
-//! old `~/.cache/dh-m9/reference-workload/initramfs.cpio` contract
-//! fixture is REJECTED). Run `--release`:
+//! support and staged `DH_M9_*` artifacts pointing at the versioned
+//! staging root `~/.cache/dh-m9/dist-<v>/` of the reference-workload
+//! bundle `workload-image-<v>` (decompressed `initramfs.cpio` beside
+//! `bzImage`; it must carry `usr/bin/refwork-harness` — the old
+//! `~/.cache/dh-m9/reference-workload/initramfs.cpio` contract fixture is
+//! REJECTED). Proven 2026-07-08 on 0.1.0 and re-run at epoch 0.2.3 on
+//! 0.2.0 (plan epoch-023 WP5). Run `--release`:
 //!
 //! ```text
-//! DH_M9_BZIMAGE=.../dist/workload-image-0.1.0/bzImage \
-//! DH_M9_INITRAMFS=~/.cache/dh-m9/staged-dist-0.1.0/initramfs.cpio \
+//! DH_M9_BZIMAGE=~/.cache/dh-m9/dist-0.2.0/bzImage \
+//! DH_M9_INITRAMFS=~/.cache/dh-m9/dist-0.2.0/initramfs.cpio \
 //! DH_M9_BASE_IMAGE=~/.cache/dh-m9/reference-workload/base.img \
 //! DH_M9_GAME_IMAGE=~/.cache/dh-m9/reference-workload/game.img \
 //! DH_M9_IMAGE_CACHE=~/.cache/dh-m9/image-cache \
@@ -695,5 +697,143 @@ fn capture_engine_real_image_proves_both_surfaces() -> TestResult<()> {
         Ok::<(), String>(())
     })?;
 
+    Ok(())
+}
+
+/// Exporter-shaped smoke (plan epoch-023 WP5): exactly the call
+/// reference-workload's capture exporter makes
+/// (`refwork-verify/src/phase4_capture_export.rs`) — one plain `Run` with
+/// `until: IcountBudget`, a two-range `CaptureSpec` over the v3 packed map
+/// width (`wram` offset 0 len 27) plus `meta` offset 0 len 16, expecting
+/// `BudgetReached`, 43 `feature_bytes`, and an `fb_lz4` that decodes to the
+/// D7 229,376-byte frame. Runs against the 0.2.x artifact so plan A's
+/// corpus capture is not the first exercise of this shape at the epoch.
+#[test]
+#[ignore = "epoch-023 exporter-shaped capture smoke: requires KVM dirty-ring support and staged DH_M9_* artifacts; use --release"]
+fn exporter_shaped_run_capture_smoke() -> TestResult<()> {
+    let Some(ready) = common::m9_linux_ready_snapshot(
+        "capture_engine_real_image::exporter_shaped_run_capture_smoke",
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    const PACKED_WIDTH_V3: u32 = 27;
+    const META_PROBE_LEN: u32 = 16;
+    let ranges = [
+        Range {
+            label: "packed_v3",
+            region: "wram",
+            offset: 0,
+            len: PACKED_WIDTH_V3,
+        },
+        Range {
+            label: "meta_head",
+            region: "meta",
+            offset: 0,
+            len: META_PROBE_LEN,
+        },
+    ];
+    let expected_len = (PACKED_WIDTH_V3 + META_PROBE_LEN) as usize;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("test runtime: {e}"))?;
+    rt.block_on(async {
+        let run = ready
+            .svc
+            .run(Request::new(proto::RunRequest {
+                lease: Some(ready.lease.clone()),
+                until: Some(proto::run_request::Until::IcountBudget(
+                    common::M9_INSTR_PER_FRAME_ESTIMATE,
+                )),
+                hard_icount_cap: 0,
+                capture: Some(spec_from(&ranges, true, LAYOUT_V1)),
+            }))
+            .await
+            .map_err(|e| format!("exporter-shaped Run with capture: {e}"))?
+            .into_inner();
+        if run.reason != i32::from(proto::StopReason::BudgetReached) {
+            return Err(format!(
+                "Run stopped with reason {}, expected BudgetReached",
+                run.reason
+            ));
+        }
+        if run.feature_bytes.len() != expected_len {
+            return Err(format!(
+                "feature_bytes len {} != {expected_len}",
+                run.feature_bytes.len()
+            ));
+        }
+        let fb = lz4_flex::decompress_size_prepended(&run.fb_lz4)
+            .map_err(|e| format!("fb_lz4 decode: {e}"))?;
+        if fb.len() != FB_BYTES {
+            return Err(format!(
+                "decoded framebuffer len {} != {FB_BYTES}",
+                fb.len()
+            ));
+        }
+        let chunks = unpack(&run.feature_bytes, &ranges);
+
+        // What actually runs vs what was staged (plan epoch-023 WP2
+        // grounding): refwork-harness writes `EMU_VERSION` into the meta page
+        // at offset 0x38 (24 bytes, NUL padded; `refwork-harness/src/meta.rs`).
+        // The worker itself never parses guest control messages, so this
+        // by-name read after READY is the cheapest independent check that the
+        // booted emulator is the epoch the staging stamp claims.
+        const META_EMU_VERSION_OFF: u64 = 0x38;
+        const META_EMU_VERSION_LEN: u64 = 24;
+        let meta = ready
+            .svc
+            .read_guest_memory(Request::new(proto::ReadGuestMemoryRequest {
+                lease: Some(ready.lease.clone()),
+                ranges: Vec::new(),
+                region_ranges: vec![proto::RegionRange {
+                    region: "meta".into(),
+                    layout_version: LAYOUT_V1,
+                    offset: META_EMU_VERSION_OFF,
+                    len: META_EMU_VERSION_LEN,
+                }],
+            }))
+            .await
+            .map_err(|e| format!("ReadGuestMemory meta emu_version: {e}"))?
+            .into_inner();
+        let guest_emu_version = meta
+            .chunks
+            .first()
+            .map(|c| String::from_utf8_lossy(c).trim_end_matches('\0').to_string())
+            .ok_or("ReadGuestMemory returned no meta chunk")?;
+        let bzimage = std::path::PathBuf::from(
+            std::env::var_os(common::DH_M9_BZIMAGE).ok_or("DH_M9_BZIMAGE unset")?,
+        );
+        let stamp_path = bzimage
+            .parent()
+            .ok_or("DH_M9_BZIMAGE has no parent directory")?
+            .join(dh_worker::m9_handoff::STAGING_STAMP_FILE_NAME);
+        let staged_emu_version = dh_worker::m9_epoch::load_staging_stamp(&stamp_path)
+            .map_err(|e| format!("staging stamp beside DH_M9_BZIMAGE: {e}"))?
+            .stamp
+            .manifest_emu_version;
+        if guest_emu_version != staged_emu_version {
+            return Err(format!(
+                "guest meta emu_version {guest_emu_version:?} != staged manifest_emu_version {staged_emu_version:?}"
+            ));
+        }
+        eprintln!("exporter-smoke: guest emu_version={guest_emu_version} (matches staging stamp)");
+        eprintln!(
+            "exporter-smoke: icount={} feature_bytes={}B ({}={}B, {}={}B) fb={}B fb_lz4={}B",
+            run.icount,
+            run.feature_bytes.len(),
+            ranges[0].label,
+            chunks[0].len(),
+            ranges[1].label,
+            chunks[1].len(),
+            fb.len(),
+            run.fb_lz4.len()
+        );
+        Ok::<(), String>(())
+    })?;
     Ok(())
 }

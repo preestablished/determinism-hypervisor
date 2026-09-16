@@ -96,6 +96,7 @@ fn worker_config(
             vmm_version: "m6-test-vmm".into(),
         },
         preflight: PreflightHealth::skipped("m6 acceptance harness"),
+        image_identity: String::new(),
         image_cache_dir,
         snapstore: Some(snapstore),
         bisection_checkpoints: dh_worker::service::BisectionCheckpointConfig::default(),

@@ -202,6 +202,10 @@ pub struct WorkerConfig {
     pub lease_policy: LeasePolicy,
     pub class: proto::DeterminismClass,
     pub preflight: PreflightHealth,
+    /// `<bundle version>@<blake3 of staging-stamp.txt>` when dh-workerd was
+    /// started with `--staging-stamp`; empty otherwise. Served verbatim as
+    /// `GetWorkerInfoResponse.image_identity` (plan epoch-023).
+    pub image_identity: String,
     #[cfg(target_arch = "x86_64")]
     pub image_cache_dir: PathBuf,
     #[cfg(target_arch = "x86_64")]
@@ -222,6 +226,7 @@ impl WorkerConfig {
             lease_policy: LeasePolicy::default(),
             class: detect_determinism_class(),
             preflight: PreflightHealth::skipped("preflight not run by this process"),
+            image_identity: String::new(),
             #[cfg(target_arch = "x86_64")]
             image_cache_dir: crate::image_resolver::DEFAULT_IMAGE_CACHE_DIR.into(),
             #[cfg(target_arch = "x86_64")]
@@ -831,6 +836,7 @@ struct WorkerInner {
     class: proto::DeterminismClass,
     version: String,
     preflight: PreflightHealth,
+    image_identity: String,
     metrics: Arc<WorkerMetrics>,
 }
 
@@ -869,6 +875,7 @@ impl WorkerService {
                 class: config.class,
                 version: env!("CARGO_PKG_VERSION").into(),
                 preflight: config.preflight,
+                image_identity: config.image_identity,
                 metrics: Arc::new(WorkerMetrics::default()),
             }),
         })
@@ -5611,6 +5618,7 @@ impl HypervisorWorker for WorkerService {
             class: Some(self.inner.class.clone()),
             version: self.inner.version.clone(),
             build_profile: build_profile().to_string(),
+            image_identity: self.inner.image_identity.clone(),
         }))
     }
 
@@ -5797,6 +5805,7 @@ mod tests {
                 vmm_version: "test-vmm".into(),
             },
             preflight: PreflightHealth::skipped("test config"),
+            image_identity: String::new(),
             #[cfg(target_arch = "x86_64")]
             image_cache_dir: std::env::temp_dir(),
             #[cfg(target_arch = "x86_64")]
@@ -7316,6 +7325,22 @@ mod tests {
         assert_eq!(info.slots_free, 4);
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.class.unwrap().cpu_model, "test-cpu");
+        assert_eq!(info.image_identity, "");
+    }
+
+    #[tokio::test]
+    async fn worker_info_reports_configured_image_identity() {
+        let config = WorkerConfig {
+            image_identity: "0.2.0@deadbeef".into(),
+            ..test_config(1)
+        };
+        let svc = WorkerService::new(config).unwrap();
+        let info = svc
+            .get_worker_info(Request::new(proto::GetWorkerInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.image_identity, "0.2.0@deadbeef");
     }
 
     #[tokio::test]

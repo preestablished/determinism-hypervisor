@@ -18,6 +18,10 @@
 /// snapshot-store's adopt-snapstore-proto-v1), this module body swaps to a
 /// re-export of that crate and nothing else in the workspace changes.
 pub mod v1 {
+    // tonic codegen returns `Result<_, tonic::Status>` from every service
+    // method; clippy 0.1.98 flags the 176-byte Err variant in that generated
+    // code. Not ours to shrink (dh-worker carries the same crate-level allow).
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("determinism.hypervisor.v1");
 }
 
@@ -335,6 +339,7 @@ mod tests {
             }),
             version: env!("CARGO_PKG_VERSION").into(),
             build_profile: "release".into(),
+            image_identity: String::new(),
         };
         assert_eq!(
             v1::GetWorkerInfoResponse::decode(info.encode_to_vec().as_slice()).unwrap(),

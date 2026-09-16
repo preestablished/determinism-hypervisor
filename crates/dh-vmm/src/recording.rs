@@ -660,7 +660,7 @@ mod tests {
             frames_elapsed: 0,
         };
         // (clone the rail pieces we need post-move via a rebuild)
-        let drained: Vec<_> = rail.irqs.drain(..).collect();
+        let drained: Vec<_> = std::mem::take(&mut rail.irqs);
         assert_eq!(drained[0].vector, 0x41);
 
         let sealed = rail.seal(&outcome, [0x33; 32]).unwrap();
