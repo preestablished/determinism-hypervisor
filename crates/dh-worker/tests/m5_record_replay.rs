@@ -108,10 +108,22 @@ const M9_LINUX_CORPUS_DIR: &str = concat!(
 );
 const M9_LINUX_CORPUS_EXPECTED: &str = "expected.txt";
 const M9_LINUX_CORPUS_FRAMES: u32 = 5;
-const M9_LINUX_CORPUS_HARD_CAP: u64 = 5_000_000;
-const M9_LINUX_CORPUS_EPOCH_LEN: u64 = 745_000;
-const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
-const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
+/// Icount budget for the 5-frame corpus segment (not a per-frame cap).
+/// Re-derived 2026-09-16 (plan epoch-023 WP3): 5 frames × 33M
+/// (`common::M9_INSTR_PER_FRAME_ESTIMATE`, measured 32.09M steady state on
+/// workload-image-0.2.0) ≈ 165M, × ~1.5 margin → 250M. The pre-epoch
+/// value (5M) sized the retired contract fixture's ~143K-instr frames.
+const M9_LINUX_CORPUS_HARD_CAP: u64 = 250_000_000;
+/// Epoch-hash grid for the M9 Linux corpus. Re-based 2026-09-16 (plan
+/// epoch-023 WP3) from the fixture-era 745,000 to the production default
+/// (`dh_vmm::config::DEFAULT_EPOCH_LEN`, 50M — the grid `dh-m9-ready-handoff`
+/// and every stack consumer run on): on the real reference-workload image
+/// the 745k grid lands one boot-time boundary (icount 641,445,000, ~1.8M
+/// before READY) where the PMI skid exceeds the 8192-instruction margin and
+/// the engine fails loudly with OVERSHOOT (cross-repo residue `jyo7`,
+/// reproduced on 0.1.0 in July and on 0.2.0 here). The 50M grid still
+/// verifies several epoch hashes across the 5-frame (~160M instr) segment.
+const M9_LINUX_CORPUS_EPOCH_LEN: u64 = dh_vmm::config::DEFAULT_EPOCH_LEN;
 const SPARSE_ROOT_MAGIC: &[u8; 8] = b"DHRRPG01";
 const DETERMINISM_CLASS_LOCK: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -141,13 +153,13 @@ fn linux_m5_record_replay_post_ready_corpus_reverifies() -> TestResult<()> {
         hex(&evidence.artifact_hashes.game_image)
     );
     eprintln!(
-        "m9-linux-rr frames={} hard_cap={} end_icount={} epochs={} end_state_hash={} checksum={:#x} dhilog={}",
+        "m9-linux-rr frames={} hard_cap={} end_icount={} epochs={} end_state_hash={} meta_frame={} dhilog={}",
         M9_LINUX_CORPUS_FRAMES,
         M9_LINUX_CORPUS_HARD_CAP,
         evidence.parsed.end_icount,
         evidence.parsed.epochs.len(),
         hex(&evidence.parsed.end_state_hash),
-        evidence.meta_pvblk_checksum,
+        evidence.meta_frame,
         evidence.parsed.dhilog_blake3
     );
     Ok(())
@@ -261,7 +273,7 @@ struct M9LinuxRecordReplayEvidence {
     post_snapshot_ref: [u8; 32],
     post_state_hash: [u8; 32],
     frame_counter: u32,
-    meta_pvblk_checksum: u64,
+    meta_frame: u64,
     log: Vec<u8>,
     parsed: ParsedM9LinuxLog,
     verify: VerifyReplayEvidence,
@@ -304,30 +316,6 @@ fn parse_m9_linux_log(log: &[u8]) -> TestResult<ParsedM9LinuxLog> {
         end_state_hash: header.end_state_hash,
         epochs,
     })
-}
-
-fn assert_m9_meta_io_proof(bytes: &[u8]) -> TestResult<u64> {
-    if bytes.len() != M9_LINUX_META_IO_PROOF_LEN as usize {
-        return Err(format!(
-            "M9 Linux meta IO proof length {}, expected {M9_LINUX_META_IO_PROOF_LEN}",
-            bytes.len()
-        ));
-    }
-    if &bytes[..8] != b"PVBLKIO1" {
-        return Err(format!(
-            "M9 Linux meta IO proof missing PVBLKIO1 magic: {:?}",
-            &bytes[..8]
-        ));
-    }
-    let frame = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if frame != 0 {
-        return Err(format!("M9 Linux meta IO proof frame {frame}, expected 0"));
-    }
-    let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    if checksum == 0 {
-        return Err("M9 Linux meta IO proof checksum must be nonzero".into());
-    }
-    Ok(checksum)
 }
 
 async fn verify_replay_evidence(
@@ -444,8 +432,8 @@ fn m9_linux_record_replay_evidence(
                 region_ranges: vec![proto::RegionRange {
                     region: "meta".into(),
                     layout_version: 1,
-                    offset: M9_LINUX_META_IO_MAGIC_OFF,
-                    len: M9_LINUX_META_IO_PROOF_LEN,
+                    offset: common::M9_LINUX_META_PROOF_OFF,
+                    len: common::M9_LINUX_META_PROOF_LEN,
                 }],
             }))
             .await
@@ -495,7 +483,7 @@ fn m9_linux_record_replay_evidence(
     if parsed.end_state_hash != post_state_hash {
         return Err("M9 Linux DHILOG END state hash does not match post snapshot".into());
     }
-    let meta_pvblk_checksum = assert_m9_meta_io_proof(&meta_proof)?;
+    let meta_frame = common::assert_m9_linux_meta_proof(&meta_proof)?;
 
     let verify = rt.block_on(async {
         let verify = verify_replay_evidence(
@@ -547,7 +535,7 @@ fn m9_linux_record_replay_evidence(
         post_snapshot_ref,
         post_state_hash,
         frame_counter: post_snapshot.frame_counter,
-        meta_pvblk_checksum,
+        meta_frame,
         log,
         parsed,
         verify,
@@ -805,7 +793,7 @@ fn assert_m9_linux_expected_key_set(m: &BTreeMap<String, String>) {
         "end_vns",
         "end_state_hash",
         "frame_counter",
-        "meta_pvblk_checksum",
+        "meta_frame",
     ]
     .into_iter()
     .map(str::to_string)
@@ -880,10 +868,7 @@ fn expected_m9_linux_text(evidence: &M9LinuxRecordReplayEvidence) -> String {
         hex(&evidence.parsed.end_state_hash)
     ));
     out.push_str(&format!("frame_counter={}\n", evidence.frame_counter));
-    out.push_str(&format!(
-        "meta_pvblk_checksum={}\n",
-        evidence.meta_pvblk_checksum
-    ));
+    out.push_str(&format!("meta_frame={}\n", evidence.meta_frame));
     for (epoch_index, icount, chain_value) in &evidence.parsed.epochs {
         out.push_str(&format!(
             "epoch_{epoch_index}={icount}:{}\n",
@@ -1013,10 +998,7 @@ fn assert_m9_linux_expected_matches(
         expected_u64(expected, "frame_counter"),
         u64::from(evidence.frame_counter)
     );
-    assert_eq!(
-        expected_u64(expected, "meta_pvblk_checksum"),
-        evidence.meta_pvblk_checksum
-    );
+    assert_eq!(expected_u64(expected, "meta_frame"), evidence.meta_frame);
     for (epoch_index, icount, chain_value) in &evidence.parsed.epochs {
         assert_eq!(
             format!("{icount}:{}", hex(chain_value)),

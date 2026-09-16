@@ -44,16 +44,23 @@ const HARD_CAP: u64 = 1_000_000;
 const EPOCH_LEN: u64 = 64;
 const NET_TX_DOORBELL_GPA: u64 = PV_NET_BASE + REG_TX_DOORBELL;
 const LINUX_IO_FRAMES: u32 = 1;
-/// Measured 2026-07-07 against reference-workload dist workload-image-0.1.0
-/// (built_from 7b0c7b2, refwork >= 40eaf4f): this test's one IO frame
-/// (the first post-READY frame) costs 7,768,576 instructions
-/// (`io_frame_cost` eprintln below, identical across two consecutive
-/// runs). Cap = 7.77M × 1 frame (LINUX_IO_FRAMES) × ~3.9 margin ≈ 30M —
-/// within the ≤4× acceptance bound while still covering a
-/// steady-state-cost frame (~27.7M, the m5_frame_scheduling figure) if
-/// the harness ever moves the IO past the cheap warmup frame. A safety
-/// net, not a perf assertion; the normal stop is BUDGET_REACHED. Retune
-/// by re-running this test with --nocapture and reading io_frame_cost.
+/// Measured 2026-09-16 against reference-workload dist workload-image-0.2.0
+/// (emulator epoch refwork-emu 0.2.3; initramfs blake3 941fff70…): this
+/// test's one IO frame (the first post-READY frame) costs 7,748,368
+/// instructions (`io_frame_cost` eprintln below, identical across two
+/// consecutive runs; 2026-07-07 on 0.1.0: 7,768,576). Cap = 7.75M × 1
+/// frame (LINUX_IO_FRAMES) × ~3.9 margin ≈ 30M — within the ≤4× acceptance
+/// bound while still nearly covering a steady-state-cost frame (~32.1M,
+/// the m5_frame_scheduling figure) if the harness ever moves the IO past
+/// the cheap warmup frame. A safety net, not a perf assertion; the normal
+/// stop is BUDGET_REACHED. Retune by re-running this test with
+/// --nocapture and reading io_frame_cost.
+///
+/// KNOWN GAP (epoch 0.2.x, tracked as `jyo7`): the real refwork-harness does
+/// no guest-driven post-READY pv-blk IO and never writes the fixture-era
+/// `PVBLKIO1` meta proof, so this Linux leg fails at "meta IO proof missing
+/// magic" on the real image. The Run leg itself reaches BUDGET_REACHED
+/// under this cap (the io_frame_cost figure above comes from that run).
 const LINUX_FRAME_HARD_CAP: u64 = 30_000_000;
 const META_IO_MAGIC_OFF: u64 = 32;
 const META_IO_PROOF_LEN: u64 = 24;

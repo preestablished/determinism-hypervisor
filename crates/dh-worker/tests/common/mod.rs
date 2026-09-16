@@ -39,14 +39,73 @@ pub const DH_M9_IMAGE_CACHE: &str = "DH_M9_IMAGE_CACHE";
 #[allow(dead_code)]
 pub const DH_M9_GUEST: &str = "DH_M9_GUEST";
 
-/// Measured instructions-per-frame of the M9 reference workload
-/// (play-60fps M0, 2026-07-07: ~27.8M on the real-emulator image).
+/// Measured instructions-per-frame of the M9 reference workload, rounded
+/// up to the next million. Re-measured 2026-09-16 (plan epoch-023 WP3)
+/// against reference-workload dist `workload-image-0.2.0` (emulator epoch
+/// `refwork-emu 0.2.3`, initramfs blake3 `941fff70…`): steady-state
+/// 32,087,477–32,088,347 instr/frame (`m5_frame_scheduling` frames 2–5),
+/// `play_perf_smoke` 240-frame mean 31,953,178, identical across two
+/// consecutive runs. History: 2026-07-07 on 0.1.0 ≈ 27.8M (APU clock fix
+/// at 0.2.3 raised the per-frame cost ~15%). Measurement commands:
+///   DH_M9_ALLOW_SKIP=0 cargo test -p dh-worker --test play_perf_smoke --release -- --ignored --nocapture
+///   DH_M9_ALLOW_SKIP=0 DH_M9_GUEST=linux cargo test -p dh-worker --test m5_frame_scheduling --release linux -- --ignored --nocapture
 /// M9 frame/budget constants derive from this ONE number so workload
 /// drift is adjusted in one place; tests that consume it must fail
 /// loudly (assert BUDGET_REACHED / frames observed), never skew
 /// silently, when the estimate goes stale.
 #[allow(dead_code)]
-pub const M9_INSTR_PER_FRAME_ESTIMATE: u64 = 28_000_000;
+pub const M9_INSTR_PER_FRAME_ESTIMATE: u64 = 33_000_000;
+
+/// Real reference-workload meta page contract (`refwork-harness/src/meta.rs`):
+/// `version: u32 @0x00`, `status: u32 @0x04` (0 Init, 1 Ready, 2 Running,
+/// 3 Faulted), `frame: u64 @0x08`, `last_pad: u16 @0x10`, `reserved: u16
+/// @0x12`, `fault_code: u32 @0x14`; the private cart hash follows at 0x18
+/// and must never be pinned in public files. The fixture-era `PVBLKIO1`
+/// pv-blk proof (offset 32) was written only by the retired M9 contract
+/// initramfs; the real harness does no post-READY guest-driven pv-blk IO,
+/// so M9 Linux gates read this header as their meta proof instead
+/// (plan epoch-023 WP3; cross-repo residue tracked as `jyo7`).
+#[allow(dead_code)]
+pub const M9_LINUX_META_PROOF_OFF: u64 = 0;
+#[allow(dead_code)]
+pub const M9_LINUX_META_PROOF_LEN: u64 = 24;
+#[allow(dead_code)]
+pub const M9_LINUX_META_VERSION: u32 = 1;
+#[allow(dead_code)]
+pub const M9_LINUX_META_STATUS_READY: u32 = 1;
+#[allow(dead_code)]
+pub const M9_LINUX_META_STATUS_RUNNING: u32 = 2;
+
+/// Validates the real meta header and returns the guest-published frame
+/// counter (`frame: u64 @0x08`), the value M9 Linux corpora pin as
+/// `meta_frame`.
+#[allow(dead_code)]
+pub fn assert_m9_linux_meta_proof(bytes: &[u8]) -> TestResult<u64> {
+    if bytes.len() != M9_LINUX_META_PROOF_LEN as usize {
+        return Err(format!(
+            "M9 Linux meta proof length {}, expected {M9_LINUX_META_PROOF_LEN}",
+            bytes.len()
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if version != M9_LINUX_META_VERSION {
+        return Err(format!(
+            "M9 Linux meta version {version}, expected {M9_LINUX_META_VERSION}"
+        ));
+    }
+    let status = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if status != M9_LINUX_META_STATUS_READY && status != M9_LINUX_META_STATUS_RUNNING {
+        return Err(format!(
+            "M9 Linux meta status {status}, expected Ready(1) or Running(2)"
+        ));
+    }
+    let frame = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let fault_code = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    if fault_code != 0 {
+        return Err(format!("M9 Linux meta fault_code {fault_code}, expected 0"));
+    }
+    Ok(frame)
+}
 
 #[allow(dead_code)]
 pub const M9_LINUX_ARTIFACT_ENV_VARS: [&str; 5] = [

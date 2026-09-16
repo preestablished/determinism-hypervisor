@@ -95,3 +95,9 @@ gate sweep dispositions all three beads.)
 - **No Linux gate host reachable**: follow 00-overview's "Where To Execute" —
   lean on the HEAD CI run as first-line evidence, or record advisory macOS
   results in the plan dir and stop without closing the bead.
+
+
+## RE-VERIFIED — 2026-09-16, infra-control, HEAD ece5d87 (epoch-023 plan B hygiene line)
+
+`cargo test --workspace` (rustc/cargo 1.98.1): 786 passed, 0 failed, 33
+ignored (KVM lab-lane `--ignored` suites). Still green; nothing to reopen.

@@ -10,9 +10,12 @@ and verifies replay from `(READY snapshot, input_log_id)`.
 The full Linux READY snapshot and recorded log are generated live because the
 M9 artifacts are external staged inputs and the Linux snapshot is too large for
 a normal source fixture. The manifest pins the staged artifact hashes,
-determinism-class lock hash, machine config hash, READY and END snapshot refs,
-DHILOG hash, END state hash, frame counter, pv-blk proof checksum, and every
-recorded `EPOCH_HASH`.
+the emulator epoch (`emu_version`, from the staging stamp), determinism-class
+lock hash, machine config hash, READY and END snapshot refs, DHILOG hash, END
+state hash, frame counter, the guest-published meta-page frame counter
+(`meta_frame`, the real refwork-harness meta header at offset 0 — the
+fixture-era `PVBLKIO1` pv-blk proof was retired with the contract initramfs
+at epoch 0.2.x), and every recorded `EPOCH_HASH`.
 
 Refresh the manifest only on the reference host with:
 

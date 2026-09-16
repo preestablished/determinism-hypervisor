@@ -84,3 +84,9 @@ Plus `cargo test -p determinism-tests` if 2b actually reformatted `runctl.rs`.
 - **No Linux gate host reachable**: follow 00-overview's "Where To Execute" —
   the HEAD CI run's fmt lane is first-line evidence; otherwise record
   advisory macOS results in the plan dir and stop without closing the bead.
+
+
+## RE-VERIFIED — 2026-09-16, infra-control, HEAD ece5d87 (epoch-023 plan B hygiene line)
+
+CI-shaped `cargo fmt --check --package <members>` exit 0 (rustfmt
+1.9.0-stable). Green.

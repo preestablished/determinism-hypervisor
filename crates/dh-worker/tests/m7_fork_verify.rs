@@ -75,8 +75,6 @@ const BURST_EVENTS: usize = 8;
 const M9_LINUX_CHILD_FRAMES: u32 = 5;
 const M9_LINUX_CHILD_HARD_CAP: u64 = 150_000_000;
 const M9_LINUX_CHILD_EPOCH_LEN: u64 = 745_000;
-const M9_LINUX_META_IO_MAGIC_OFF: u64 = 32;
-const M9_LINUX_META_IO_PROOF_LEN: u64 = 24;
 const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
 const SLOT_CORES_ENV: &str = "DH_M7_ACCEPT_SLOT_CORES";
 const ALLOW_SKIP_ENV: &str = "DH_M7_ACCEPT_ALLOW_SKIP";
@@ -123,7 +121,7 @@ struct ChildRecord {
     frames_elapsed: u64,
     frame_counter: u32,
     dirty_pages: u64,
-    meta_pvblk_checksum: Option<u64>,
+    meta_frame_proof: Option<u64>,
     timing: ChildTiming,
 }
 
@@ -712,7 +710,7 @@ fn snapshot_record(
     cumulative_icount: u64,
     cumulative_vns: u64,
     frames_elapsed: u64,
-    meta_pvblk_checksum: Option<u64>,
+    meta_frame_proof: Option<u64>,
     timing: ChildTiming,
 ) -> TestResult<ChildRecord> {
     let snapshot_ref = snapshot
@@ -754,7 +752,7 @@ fn snapshot_record(
         frames_elapsed,
         frame_counter: snapshot.frame_counter,
         dirty_pages: u64::from(snapshot.dirty_pages),
-        meta_pvblk_checksum,
+        meta_frame_proof,
         timing,
     })
 }
@@ -872,8 +870,8 @@ async fn read_linux_meta_io_proof(svc: &WorkerService, lease: proto::Lease) -> T
             region_ranges: vec![proto::RegionRange {
                 region: "meta".into(),
                 layout_version: 1,
-                offset: M9_LINUX_META_IO_MAGIC_OFF,
-                len: M9_LINUX_META_IO_PROOF_LEN,
+                offset: common::M9_LINUX_META_PROOF_OFF,
+                len: common::M9_LINUX_META_PROOF_LEN,
             }],
         }))
         .await
@@ -883,27 +881,7 @@ async fn read_linux_meta_io_proof(svc: &WorkerService, lease: proto::Lease) -> T
         .chunks
         .first()
         .ok_or_else(|| "ReadGuestMemory returned no Linux meta IO proof".to_string())?;
-    assert_m9_meta_io_proof(chunk)
-}
-
-fn assert_m9_meta_io_proof(bytes: &[u8]) -> TestResult<u64> {
-    if bytes.len() != M9_LINUX_META_IO_PROOF_LEN as usize {
-        return Err(format!(
-            "M9 Linux meta IO proof length {}, expected {M9_LINUX_META_IO_PROOF_LEN}",
-            bytes.len()
-        ));
-    }
-    if &bytes[..8] != b"PVBLKIO1" {
-        return Err(format!(
-            "M9 Linux meta IO proof missing PVBLKIO1 magic: {:?}",
-            &bytes[..8]
-        ));
-    }
-    let checksum = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    if checksum == 0 {
-        return Err("M9 Linux meta IO proof checksum must be nonzero".into());
-    }
-    Ok(checksum)
+    common::assert_m9_linux_meta_proof(chunk)
 }
 
 async fn run_linux_child(
@@ -976,7 +954,7 @@ async fn run_linux_child(
         ));
     }
 
-    let meta_pvblk_checksum = if require_m9_proofs {
+    let meta_frame_proof = if require_m9_proofs {
         match read_linux_meta_io_proof(&svc, lease.clone()).await {
             Ok(checksum) => Some(checksum),
             Err(e) => {
@@ -1032,7 +1010,7 @@ async fn run_linux_child(
         run.icount,
         run.vns,
         run.frames_elapsed,
-        meta_pvblk_checksum,
+        meta_frame_proof,
         ChildTiming {
             run_ms,
             original_commit_ms,
@@ -2250,7 +2228,7 @@ fn validate_linux_log(
             child.index, child.frames_elapsed
         ));
     }
-    if harness.require_epoch_hashes() && child.meta_pvblk_checksum.is_none() {
+    if harness.require_epoch_hashes() && child.meta_frame_proof.is_none() {
         return Err(format!(
             "child {} Linux missing meta IO checksum",
             child.index
@@ -2467,7 +2445,7 @@ fn assert_replay_commit_matches(original: &ChildRecord, replay: &ChildRecord) ->
             original.index, original.dirty_pages, replay.dirty_pages
         ));
     }
-    if replay.meta_pvblk_checksum != original.meta_pvblk_checksum {
+    if replay.meta_frame_proof != original.meta_frame_proof {
         return Err(format!(
             "replay-commit child {} Linux meta IO checksum mismatch",
             original.index
@@ -2801,7 +2779,7 @@ async fn cross_check_child_on_distinct_slots(
                     first.slot_id, other.slot_id
                 ));
             }
-            if first.meta_pvblk_checksum != other.meta_pvblk_checksum {
+            if first.meta_frame_proof != other.meta_frame_proof {
                 return Err(format!(
                     "cross-slot child {index} meta IO checksum diverged between slots {} and {}",
                     first.slot_id, other.slot_id
@@ -2875,7 +2853,7 @@ fn sample_child_record(index: usize, tag: u8) -> ChildRecord {
         frames_elapsed: 1,
         frame_counter: 2,
         dirty_pages: 7,
-        meta_pvblk_checksum: Some(u64::from(tag)),
+        meta_frame_proof: Some(u64::from(tag)),
         timing: ChildTiming::default(),
     }
 }

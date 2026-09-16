@@ -80,3 +80,15 @@ clause is vacuous — state that explicitly in the closure.
   the HEAD CI run's clippy lane (`--all-targets`) is first-line evidence;
   otherwise record advisory macOS results in the plan dir and stop without
   closing the bead.
+
+
+## RE-VERIFIED — 2026-09-16, infra-control, HEAD ece5d87 (epoch-023 plan B hygiene line)
+
+`cargo clippy --workspace --all-targets -- -D warnings` was RED at HEAD
+2c290f3 on clippy 0.1.98 (toolchain drift, not code drift): new lints
+`chunks_exact_to_as_chunks` (dh-vmm `vcpu_state.rs`, m7_fork_verify,
+nanokernel `capture_manifest_interop`), `drain_collect` (dh-vmm
+`recording.rs`), and `result_large_err` on tonic-generated code in dh-proto
+plus test `Result<_, tonic::Status>` in dh-snapshot. Fixed in ece5d87
+(mechanical rewrites; crate-level allow for the generated code, mirroring
+dh-worker's existing allow). Exit 0 after the fix.

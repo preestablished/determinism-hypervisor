@@ -118,3 +118,20 @@ depends on Milestone M2 here.
 
 Create beads per milestone before implementation (see 04 for suggested
 titles and dependency edges).
+
+## M4 re-assessment — 2026-09-16 (epoch-023 plan B, WP5; history `38b6`)
+
+Re-measured on reference-workload `workload-image-0.2.0` (emulator epoch
+`refwork-emu 0.2.3`) with `play_perf_smoke --release`, two identical runs:
+31,953,178 instr/frame (240-frame mean; steady-state frames 32.09M in
+`m5_frame_scheduling`), 153 epoch links in the 240-frame span (~0.64 per
+frame), per-frame Run avg 279–283 ms, streaming 6.8 fps
+(streamed/per-frame ratio 1.93×). The M4 trigger condition in
+`03-input-and-epoch-hash-decoupling.md` ("~10M+ instr/frame → a stall every
+few frames → 60fps unreachable") therefore STILL HOLDS, and more strongly
+than at 0.1.0 (27.8M): at the 50M epoch grid an epoch hash lands roughly
+every 1.6 frames, and the frame cost itself (~32M instr ≈ 280 ms wall on
+this host) is far above the 16.7 ms frame budget independent of hashing.
+M4 alone cannot reach 60 fps on this workload; it remains deferred, and any
+revival should be scoped together with a per-frame emulation-cost target on
+the reference-workload side. No code changed here.
