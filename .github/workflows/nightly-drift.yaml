@@ -156,7 +156,11 @@ jobs:
       - name: nightly 100-fork M7 VerifyReplay canary
         run: |
           echo "M7 fork/VerifyReplay canary: jobs=$DH_M7_ACCEPT_JOBS slot_cores=$DH_M7_ACCEPT_SLOT_CORES allow_skip=$DH_M7_ACCEPT_ALLOW_SKIP"
-          cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
+          # The runner service's affinity excludes the isolated slot cores;
+          # the harness fails closed unless the process is pinned to them
+          # (same wrapper as the Linux and M8 jobs below).
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" true || { echo "::error::slot cores unavailable: $DH_M7_ACCEPT_SLOT_CORES"; exit 1; }
+          taskset -c "$DH_M7_ACCEPT_SLOT_CORES" cargo test -p dh-worker --test m7_fork_verify --release -- --ignored --nocapture
         working-directory: repo
 
   m7-linux-fork-verify-100:
