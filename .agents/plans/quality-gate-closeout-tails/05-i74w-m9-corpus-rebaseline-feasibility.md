@@ -185,3 +185,31 @@ the re-baseline is still blocked — on `jyo7`, not on fixture absence.
   re-baseline; `jyo7` remains the P1 blocker (cross-repo PVBLKIO1 contract +
   epoch_len OVERSHOOT). Nightly-drift M7 fork-verify canaries fail nightly
   (≥ 2026-07-13, e.g. run 29474862905), consistent with `jyo7`.
+
+## EXECUTED (Case B) — 2026-09-16, infra-control, HEAD 8a97875 (epoch-023 plan B, WP3)
+
+The re-baseline this package gated on is now done, as Case B of this
+package executed under `~/.agents/projects/determinism-hypervisor/plans/epoch-023-rebaseline-and-intel-box-stack-redeploy/`
+(bn issue `determinism-hypervisor-73ca`; `i74w`/`jyo7` are July-era ids kept
+as history only).
+
+- Artifacts: reference-workload `workload-image-0.2.0` (emulator epoch
+  `refwork-emu 0.2.3`) staged at `~/.cache/dh-m9/dist-0.2.0/` with a
+  `staging-stamp.txt`; initramfs `941fff70…` (old pin `87edf64d…`),
+  kernel/base/game unchanged. Hash diff: 1 of 4 changed.
+- The two July failure legs were re-encountered and resolved in the tests,
+  not by weakening: (1) the `PVBLKIO1` meta proof was a contract-fixture
+  artefact overlapping the real harness's private cart hash — the corpus
+  and M7 Linux gates now pin the real meta header (`meta_frame`); (2) the
+  745,000 epoch grid overshoots at boot-time icount 641,445,000 on this
+  image (PMI skid > 8192 margin; `OVERSHOOT counted 641460740 past target
+  641445000`, the July observation at a neighbouring target) — the corpus
+  now uses the production 50M grid; the landing engine is untouched and the
+  jyo7 landing item stays open as a cross-repo/engine follow-up.
+- Regen: `regenerate_m9_rr_corpus_manifest_for_reference_host` green;
+  reverify `linux_m5_record_replay_post_ready_corpus_reverifies` green
+  twice in a row (7.5 s / 6.7 s), `epochs=2`, `frames=5`, `meta_frame=5`,
+  `end_icount=136099546`. Evidence: `$PR/evidence/hv-epoch-023-acceptance/`.
+- Caps re-derived from the measured 32.09M instr/frame (see commit
+  8a97875). `m5_net_loopback` Linux leg remains fixture-era (needs guest
+  post-READY pv-blk IO); recorded as a known gap, not run green.

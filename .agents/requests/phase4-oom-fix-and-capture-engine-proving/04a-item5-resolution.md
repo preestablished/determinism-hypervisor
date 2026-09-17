@@ -99,3 +99,22 @@ proved only the engine.
 Awaiting the phases track's `05-verification.md`; the capture proof
 re-runs cleanly from a fresh checkout with the staged `DH_M9_*` dist
 artifacts (per `01-entry-and-staging.md`).
+
+## Re-run at emulator epoch 0.2.3 — 2026-09-16 (epoch-023 plan B, WP5)
+
+Bundle: reference-workload `workload-image-0.2.0` (staged at
+`~/.cache/dh-m9/dist-0.2.0/`, initramfs `941fff70…`), HEAD 8a97875,
+`--release`, `DH_M9_ALLOW_SKIP=0`.
+
+- `capture_engine_real_image_proves_both_surfaces`: PASS (Run surface
+  `feature_bytes=591B`, `fb=229376B`, lz4 1994B; both surfaces, restore
+  identity, layout-version guard).
+- `exporter_shaped_run_capture_smoke` (new): PASS — one plain `Run` with
+  `IcountBudget(M9_INSTR_PER_FRAME_ESTIMATE)` and a two-range `CaptureSpec`
+  (`wram` 0..27 = the v3 packed width, `meta` 0..16) returned
+  `BudgetReached`, `feature_bytes=43B`, `fb_lz4` 915B decoding to 229,376 B.
+  The same test read the guest meta page's `emu_version` field and matched
+  it to the staging stamp (`refwork-emu 0.2.3`): what runs is what was
+  staged.
+- Evidence: `$PR/evidence/hv-epoch-023-capture-proof.txt` (private root of
+  reference-workload). `2 passed; 0 failed` in 29.9 s.

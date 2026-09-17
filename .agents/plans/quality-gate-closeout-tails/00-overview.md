@@ -25,6 +25,11 @@
 >   autostart contract; dist: epoch_len OVERSHOOT `642206698 > 642190000`,
 >   identical to `jyo7`); blocked on `jyo7` (dependency already recorded).
 >   EXECUTED note in `05-*.md`; both beads annotated.
+> - **UPDATE 2026-09-16 (epoch-023 plan B, HEAD 8a97875):** Pkg 05 `i74w`
+>   EXECUTED as Case B on `workload-image-0.2.0` — corpus regenerated and
+>   reverified twice green; see the EXECUTED (Case B) note in `05-*.md`.
+>   Pkgs 01–03 re-verified at HEAD (02 needed toolchain-drift clippy fixes,
+>   ece5d87). Pkg 04 untouched (closed in July).
 > - Scope checks: `9f3x` untouched (waiting on bridge `l1w`); `jyo7` open,
 >   annotated as the blocker; `38b6` open, deferred M4 pipeline, out of
 >   scope. Runner-reservation caveat: kvm-intel runner service not pausable

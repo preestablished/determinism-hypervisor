@@ -73,8 +73,21 @@ const VNS_PER_SECOND: u64 = 1_000_000_000;
 const RUN_BUDGET: u64 = 100_000;
 const BURST_EVENTS: usize = 8;
 const M9_LINUX_CHILD_FRAMES: u32 = 5;
-const M9_LINUX_CHILD_HARD_CAP: u64 = 150_000_000;
-const M9_LINUX_CHILD_EPOCH_LEN: u64 = 745_000;
+/// Per-child icount budget for the 5-frame Linux segment. Re-derived
+/// 2026-09-16 (plan epoch-023 WP3): 5 × 33M (`common::M9_INSTR_PER_FRAME_ESTIMATE`,
+/// measured 32.09M steady state on workload-image-0.2.0; a child segment
+/// measures ~136M) × ~1.5 margin → 250M. The pre-epoch 150M value would have
+/// left <10% headroom at the new frame cost.
+const M9_LINUX_CHILD_HARD_CAP: u64 = 250_000_000;
+/// Epoch-hash grid for the Linux boot and child segments: the production
+/// default (50M), matching `dh-m9-ready-handoff` and the M9 corpus. The
+/// fixture-era 745,000 grid lands a boot-time boundary (icount 641,445,000)
+/// where PMI skid exceeds the margin and the engine fails loudly with
+/// OVERSHOOT on the real reference-workload image — the cause of the
+/// Linux M7 nightly canary failures since 2026-07 (`determinism-hypervisor-vitb`,
+/// history `jyo7`). Each ~136M-instr child still crosses several epoch
+/// boundaries, so per-child epoch hashes remain verified.
+const M9_LINUX_CHILD_EPOCH_LEN: u64 = dh_vmm::config::DEFAULT_EPOCH_LEN;
 const JOBS_ENV: &str = "DH_M7_ACCEPT_JOBS";
 const SLOT_CORES_ENV: &str = "DH_M7_ACCEPT_SLOT_CORES";
 const ALLOW_SKIP_ENV: &str = "DH_M7_ACCEPT_ALLOW_SKIP";

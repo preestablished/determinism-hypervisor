@@ -156,6 +156,34 @@ attached to its original evidence.
 | Linux timer/IRQ determinism | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture` | PASS: 100 cold Linux cases; `ready_icount=641343512`, vector `241`, delivered icounts `[642343512, 643343512, 644343512]`, final state hash `af397aa09f3d568388fb0b8ab88dbb259d0a1020975f160973c1379fdd606b57`; `1 passed`, no skips accepted. |
 | Linux landing/counting | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_landing_counting --release -- --ignored --nocapture` | PASS: 100 exact post-READY targets; `ready_icount=641343512`, `timer_vector=241`, `timer_delivered_icount=642343512`, first target hash `79420d3ae1bcebe610188c1eb1e0e53db018feaefcfca62e9a78b8cf9db128ba`, last target hash `ee8cd0198d7cf95c4ae765dd46ced05d115b4d810e2fb1afd1b7cf72cf900281`; `1 passed`, no skips accepted. |
 
+## Re-baseline at reference-workload epoch 0.2.3 (2026-09-16)
+
+Plan `epoch-023-rebaseline-and-intel-box-stack-redeploy` (WP3) re-ran the
+Linux Phase 1 rows on the reference host against reference-workload dist
+`workload-image-0.2.0` (emulator `refwork-emu 0.2.3`, manifest git rev
+`ce754be`), tested code `8a97875`, `--release`, `DH_M9_ALLOW_SKIP=0`. Host
+identity unchanged (infra-control, `6.8.0-124-generic`, i5-8400, microcode
+`0xfa`; determinism-class lock matched, 7 keys). The runner service could
+not be paused (no passwordless sudo); no `kvm-intel` workflow ran during the
+window. Previous rows stay under their original dates as history. Staging
+root is now the versioned `~/.cache/dh-m9/dist-0.2.0/` with a
+`staging-stamp.txt` (`docs/ops/test-partitioning.md`).
+
+| Artifact | BLAKE3 |
+|---|---|
+| `bzImage` | `595466463a37efac6822ffccf3e61d0a2230e7d223a94c0bce5eb78b2f43bee9` (unchanged) |
+| `initramfs.cpio` (decompressed dist) | `941fff703efbcc6c8465e2e671bc63d9b08852b787cb583362c32c1974caf9f3` |
+| `base.img` | `488de202f73bd976de4e7048f4e1f39a776d86d582b7348ff53bf432b987fca8` (unchanged) |
+| `game.img` | `e02849845005d9d34fa3245d98fa59116a0245ed0136b496dbd2defebdc203ac` (unchanged) |
+
+| Gate | Command | Evidence |
+|---|---|---|
+| Linux fixture contract | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_fixture_contract -- --ignored --nocapture` | PASS: `M9 initramfs contract ok`, autostart unit 0, exec `/usr/bin/refwork-harness`, expected regions `framebuffer`, `meta`, `wram`; `1 passed`. |
+| Linux Ready fixture | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_ready --release -- --ignored --nocapture` | PASS: `ready_icount=643240584`, `unit=0`, `region_count=3`, `manifest_generation=6`, `machine_config_hash=3f64c294ed51aee05a4339a2730ec4d06eacc1314a71931568b06027218ca768`, Ready state hash `44475871912fd6603424cb8f9f9704a52ba9f325d1ff38199353bf612b17b461`; `1 passed`. |
+| Linux Phase 1 CLI Ready/post-READY gate | `DH_M9_ALLOW_SKIP=0 cargo run -p dh-cli -- gate --linux --runs 100 …` | PASS: `gate linux-phase1 runs=100 verdict=PASS`; all runs `ready_event_kind=14`, `ready_unit=0`, `ready_region_count=3`, `ready_manifest_generation=6`, Ready payload digest `ddf4f8ffe8774c4ca4a78226302fefb0a67b1425da7940233a8ba4be99efdc16`, `ready_icount=643240584`, Ready state hash `44475871912fd6603424cb8f9f9704a52ba9f325d1ff38199353bf612b17b461`, config hash `3f64c294…`, `post_ready_budget=2000000`. |
+| Linux timer/IRQ determinism | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_timer_determinism --release -- --ignored --nocapture` | PASS: 100 cold cases; `ready_icount=643240584`, vector `241`, delivered icounts `[644240584, 645240584, 646240584]`, final state hash `6ac6d2dc943d366a747db44d156412b55f50d58885c5d7f1de6cd0145abbcf16`; `1 passed` in 421.6 s. |
+| Linux landing/counting | `DH_M9_ALLOW_SKIP=0 cargo test -p determinism-tests --test linux_landing_counting --release -- --ignored --nocapture` | PASS: 100 exact post-READY targets; `ready_icount=643240584`, `timer_vector=241`, `timer_delivered_icount=644240584`, first target hash `26ae65ce9911b805bb38ff42c7ddae8c52eb0c8889ffa427cb4dd33b785ce220`, last target hash `1f34c26307588f3d32b4ea695820e668f5cb9ab488b156073ab6a6887778030c`; `1 passed`. |
+
 ## Known refinements baked into the gate (not exceptions)
 
 - §3.1 exit-instruction retirement is the MEASURED rule (retire zero,
