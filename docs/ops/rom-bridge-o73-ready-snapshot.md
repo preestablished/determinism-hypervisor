@@ -267,3 +267,12 @@ private handoff file mode verified: pass
 private snapstore config mode verified: pass
 public summary redaction sweep: pass
 ```
+
+Evidence list (sanitized):
+
+- 2026-09-17, epoch 0.2.3 redeploy (`workload-image-0.2.0`, worker
+  `3fcf973`): every line above `pass`, `image guard: match`, worker
+  `build_profile=release` with a non-empty `image_identity`, READY ref
+  pinned, restore smoke `pass`, restart drill `pass`. Private record:
+  `$PR/evidence/hv-epoch-023-stack.txt`; plan completion:
+  `~/.agents/projects/determinism-hypervisor/plans/epoch-023-rebaseline-and-intel-box-stack-redeploy/COMPLETION.md`.

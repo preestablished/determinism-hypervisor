@@ -34,6 +34,10 @@ snapstore-server.workspace = true
 snapstore-types.workspace = true
 vm-memory.workspace = true
 
+[dev-dependencies]
+# Arch-independent unit tests (m9_epoch, preflight image-identity check).
+tempfile.workspace = true
+
 [target.'cfg(target_arch = "x86_64")'.dev-dependencies]
 # The M4 transparency acceptance (tests/m4_transparency.rs) drives real
 # segments on the landing-loop guest; it lives HERE because ARCH §1's
@@ -46,7 +50,6 @@ kvm-bindings = "0.14.0"
 libc.workspace = true
 nanokernel = { path = "../../tests/nanokernel" }
 serde_json.workspace = true
-tempfile.workspace = true
 tokio.workspace = true
 toml = "0.8"
 tower.workspace = true
