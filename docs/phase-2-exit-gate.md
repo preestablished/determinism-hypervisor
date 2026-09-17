@@ -256,7 +256,7 @@ staged image whose hashes/epoch disagree with the corpus pins.
 | Capture-engine proof + exporter-shaped smoke | `… --test capture_engine_real_image --release -- --ignored --nocapture --test-threads=1` | PASS: `2 passed`; smoke returned `BudgetReached`, `feature_bytes=43B`, framebuffer 229,376 B; guest meta `emu_version` = `refwork-emu 0.2.3` = staging stamp. |
 | Linux M7 cross-slot rerun determinism | `… m7_accept_cross_slot_rerun_10_seeded_forks_identical_refs …` | PASS (harness on the 50M grid, `M9_LINUX_CHILD_HARD_CAP` 250M): cross-slot progress `10/10`, `1 passed` in 25.4 s. The first attempt on the fixture-era 745k grid failed at the boot-time OVERSHOOT (`determinism-hypervisor-vitb`). |
 | Linux M7 full fork/VerifyReplay | `… --test m7_fork_verify --release -- --ignored --nocapture --test-threads=1` | PASS (same harness fix, filter `m7_accept`, `--test-threads=1`): `M7 Linux fork/verify done: verified=1000 divergence=0 unique_hashes=1 epoch_hashes=2000`; cross-slot samples completed; `2 passed` in 756.1 s. |
-| Linux M7 nightly canary | `nightly-drift.yaml` `m7-linux-fork-verify-100` on the `dist-0.2.0` paths | NIGHTLY_RESULT |
+| Linux M7 nightly canary | `nightly-drift.yaml` `m7-linux-fork-verify-100` on the `dist-0.2.0` paths | PASS: `workflow_dispatch` run 35167608341 (2026-09-17), job `m7-linux-fork-verify-100` success on the `dist-0.2.0` paths — the first green Linux canary since 2026-07-13. (The nanokernel `m7-fork-verify-100` job in the same run failed, as in the preceding scheduled runs; pre-existing and unrelated to the Linux artifacts.) |
 
 ## Known refinements baked into the gate
 
